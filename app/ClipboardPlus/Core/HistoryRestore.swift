@@ -37,7 +37,7 @@ struct HistoryRestorePlan {
                 let merged = HistoryEntry(
                     id: old.id, kind: old.kind, text: old.text, savedAt: min(old.savedAt, entry.savedAt),
                     lastCollectedAt: max(old.lastCollectedAt, entry.lastCollectedAt),
-                    collectionCount: max(old.collectionCount, entry.collectionCount),
+                    collectionCount: HistoryCollectionCount.clamped(max(old.collectionCount, entry.collectionCount)),
                     isPinned: old.isPinned || entry.isPinned,
                     source: entry.lastCollectedAt > old.lastCollectedAt ? entry.source : old.source, image: old.image)
                 if merged == old { counts.unchanged += 1 } else { counts.updated += 1; writes.append(merged) }
@@ -46,7 +46,8 @@ struct HistoryRestorePlan {
                 guard nextID < Int.max else { throw BackupError.unavailable }
                 nextID += 1
                 let added = HistoryEntry(id: nextID, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
-                                         lastCollectedAt: entry.lastCollectedAt, collectionCount: entry.collectionCount,
+                                         lastCollectedAt: entry.lastCollectedAt,
+                                         collectionCount: HistoryCollectionCount.clamped(entry.collectionCount),
                                          isPinned: entry.isPinned, source: entry.source, image: entry.image)
                 byKey[key] = added
                 writes.append(added)

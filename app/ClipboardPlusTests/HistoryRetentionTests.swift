@@ -295,6 +295,7 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertEqual(usage.count, 0)
         XCTAssertEqual(usage.byteCount, 0)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: files.directory.path), [])
+        waitForBackupCleanup()
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 
@@ -338,6 +339,7 @@ final class HistoryRetentionTests: XCTestCase {
             restored.fulfill()
         }
         wait(for: [restored], timeout: 5)
+        waitForBackupCleanup()
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 

@@ -101,7 +101,7 @@ final class HistoryDatabase: HistoryPersistence {
             let id: Int
             if let existing {
                 id = existing.id
-                try execute("UPDATE history SET collected_at = ?, collection_count = collection_count + 1, source = ? WHERE id = ?",
+                try execute("UPDATE history SET collected_at = ?, collection_count = MIN(collection_count, \(HistoryCollectionCount.maximum - 1)) + 1, source = ? WHERE id = ?",
                             [.real(max(existing.lastCollectedAt, timestamp).timeIntervalSince1970),
                              .text(timestamp >= existing.lastCollectedAt ? source.rawValue : existing.source.rawValue), .integer(id)])
             } else {
@@ -127,7 +127,7 @@ final class HistoryDatabase: HistoryPersistence {
             let id: Int
             if let existing {
                 id = existing.id
-                try execute("UPDATE history SET collected_at = ?, collection_count = collection_count + 1, source = ? WHERE id = ?",
+                try execute("UPDATE history SET collected_at = ?, collection_count = MIN(collection_count, \(HistoryCollectionCount.maximum - 1)) + 1, source = ? WHERE id = ?",
                             [.real(max(existing.lastCollectedAt, timestamp).timeIntervalSince1970),
                              .text(timestamp >= existing.lastCollectedAt ? source.rawValue : existing.source.rawValue), .integer(id)])
             } else {
@@ -181,7 +181,8 @@ final class HistoryDatabase: HistoryPersistence {
                     try execute("""
                         UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ? WHERE id = ?
                         """, [.real(min(old.savedAt, active.savedAt).timeIntervalSince1970),
-                              .real(latest.lastCollectedAt.timeIntervalSince1970), .integer(old.collectionCount + active.collectionCount),
+                              .real(latest.lastCollectedAt.timeIntervalSince1970),
+                              .integer(HistoryCollectionCount.adding(old.collectionCount, active.collectionCount)),
                               .integer(old.isPinned || active.isPinned ? 1 : 0), .text(latest.source.rawValue), .integer(old.id)])
                     try removeRows(predicate: "id = ?", bindings: [.integer(active.id)])
                 }

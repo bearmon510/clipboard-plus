@@ -19,6 +19,17 @@ enum HistorySource: String, Codable {
     case automatic, manual, drag
 }
 
+enum HistoryCollectionCount {
+    static let maximum = 1_000_000_000
+
+    static func clamped(_ value: Int) -> Int { min(maximum, max(1, value)) }
+
+    static func adding(_ lhs: Int, _ rhs: Int) -> Int {
+        // Clamp operands before adding, including values written by older versions.
+        min(maximum, clamped(lhs) + clamped(rhs))
+    }
+}
+
 struct HistoryEntry: Identifiable, Codable, Equatable {
     let id: Int
     let kind: HistoryKind

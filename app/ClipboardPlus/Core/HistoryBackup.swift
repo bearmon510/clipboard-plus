@@ -77,7 +77,8 @@ struct BackupManifest: Codable {
         for entry in entries {
             guard entry.savedAt.timeIntervalSince1970.isFinite,
                   entry.lastCollectedAt.timeIntervalSince1970.isFinite,
-                  entry.savedAt <= entry.lastCollectedAt, entry.collectionCount > 0 else { throw BackupError.manifest }
+                  entry.savedAt <= entry.lastCollectedAt, entry.collectionCount > 0,
+                  entry.collectionCount <= HistoryCollectionCount.maximum else { throw BackupError.manifest }
             if entry.kind == .image {
                 guard let image = entry.image, entry.text.isEmpty,
                       image.byteCount > 0, image.byteCount <= HistoryImageFiles.maximumByteCount,
@@ -104,8 +105,24 @@ struct BackupExport {
 final class ValidatedBackup {
     let directory: URL
     let entries: [HistoryEntry]
-    init(directory: URL, entries: [HistoryEntry]) { self.directory = directory; self.entries = entries }
-    func discard() { try? FileManager.default.removeItem(at: directory) }
+    private let temporaryFiles: BackupTemporaryFiles
+    private let lock = NSLock()
+    private var discarded = false
+
+    init(directory: URL, entries: [HistoryEntry], temporaryFiles: BackupTemporaryFiles = .shared) {
+        self.directory = directory
+        self.entries = entries
+        self.temporaryFiles = temporaryFiles
+    }
+
+    func discard() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !discarded else { return }
+        discarded = true
+        // Capture only the URL in the cleanup job, never self (also called by deinit).
+        temporaryFiles.remove(directory)
+    }
     deinit { discard() }
 }
 
@@ -122,9 +139,10 @@ enum HistoryBackup {
 
     static func write(entries: [HistoryEntry], files: HistoryImageFiles, to url: URL,
                       cancellation: BackupCancellation, createdAt: Date = Date(),
+                      temporaryFiles: BackupTemporaryFiles = .shared,
                       progress: (BackupProgress) -> Void = { _ in }) throws -> BackupExport {
         var succeeded = false
-        defer { if !succeeded { try? FileManager.default.removeItem(at: url) } }
+        defer { if !succeeded { temporaryFiles.remove(url) } }
         try cancellation.check()
         let manifest = BackupManifest(formatVersion: 1, createdAt: createdAt, itemCount: entries.count, entries: entries)
         try manifest.validate()
@@ -158,12 +176,14 @@ enum HistoryBackup {
         return BackupExport(url: url, manifestDigest: digest(json), count: entries.count)
     }
 
-    static func validate(at url: URL, temporaryRoot: URL = FileManager.default.temporaryDirectory,
+    static func validate(at url: URL, temporaryRoot: URL? = nil,
                          cancellation: BackupCancellation,
+                         temporaryFiles: BackupTemporaryFiles = .shared,
                          progress: (BackupProgress) -> Void = { _ in }) throws -> ValidatedBackup {
-        let directory = temporaryRoot.appendingPathComponent("clipboardplus-restore-\(UUID().uuidString)", isDirectory: true)
+        let directory = (temporaryRoot ?? temporaryFiles.processDirectory)
+            .appendingPathComponent("clipboardplus-restore-\(UUID().uuidString)", isDirectory: true)
         var succeeded = false
-        defer { if !succeeded { try? FileManager.default.removeItem(at: directory) } }
+        defer { if !succeeded { temporaryFiles.remove(directory) } }
         try cancellation.check()
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
@@ -206,7 +226,7 @@ enum HistoryBackup {
         guard try input.read(upToCount: 1)?.isEmpty != false else { throw BackupError.trailingData }
         try cancellation.check()
         succeeded = true
-        return ValidatedBackup(directory: directory, entries: entries)
+        return ValidatedBackup(directory: directory, entries: entries, temporaryFiles: temporaryFiles)
     }
 
     private static func prepareThumbnail(_ image: HistoryImage, in directory: URL) throws {

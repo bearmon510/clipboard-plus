@@ -118,6 +118,7 @@ final class BackupStoreTests: XCTestCase {
         for name in oldNames {
             XCTAssertFalse(FileManager.default.fileExists(atPath: store.imageFiles.url(for: name).path))
         }
+        waitForBackupCleanup()
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 
@@ -179,6 +180,7 @@ final class BackupStoreTests: XCTestCase {
         XCTAssertTrue(records.contains { $0.contains("開始") })
         XCTAssertTrue(records.contains { $0.contains("完了") && $0.contains("件数=1") })
         controller.removeExport() // Shared sheet's onDismiss.
+        waitForBackupCleanup()
         XCTAssertFalse(FileManager.default.fileExists(atPath: snapshot.url.path))
         let providerSecret = "private-provider-file-name"
         controller.importFailed(NSError(domain: "provider", code: 1, userInfo: [NSLocalizedDescriptionKey: providerSecret]))

@@ -36,7 +36,7 @@ final class BackupController: ObservableObject {
             case .success(let backup):
                 do { try token.check() }
                 catch {
-                    try? FileManager.default.removeItem(at: backup.url)
+                    self.store.backupTemporaryFiles.remove(backup.url)
                     self.fail(error, operation: "バックアップ作成")
                     return
                 }
@@ -97,9 +97,9 @@ final class BackupController: ObservableObject {
     func cancel() {
         cancellation?.cancel()
         if let backup = validated {
-            backup.discard()
             validated = nil
             estimate = nil
+            backup.discard()
             fail(BackupError.cancelled, operation: "バックアップ復元")
         }
     }
@@ -107,7 +107,7 @@ final class BackupController: ObservableObject {
     func close() { cancel(); export = nil; removeExport() }
 
     func removeExport() {
-        if let sharedURL { try? FileManager.default.removeItem(at: sharedURL) }
+        if let sharedURL { store.backupTemporaryFiles.remove(sharedURL) }
         sharedURL = nil
     }
 

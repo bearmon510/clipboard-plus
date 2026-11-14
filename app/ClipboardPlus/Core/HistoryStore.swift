@@ -59,6 +59,7 @@ final class HistoryStore {
 
     private let queue = DispatchQueue(label: "clipboardplus.history")
     private let backupQueue: DispatchQueue
+    let backupTemporaryFiles: BackupTemporaryFiles
     private let makeDatabase: () throws -> HistoryPersistence
     private let onEvent: @MainActor (Event) -> Void
     private let now: () -> Date
@@ -66,6 +67,7 @@ final class HistoryStore {
     let imageFiles: HistoryImageFiles
     private var imageAdmission = ImageAdmission()
     private var didCleanFiles = false
+    private var didScheduleBackupCleanup = false
     private var unusedFiles: Set<String> = []
     private var dragProtectedUntil: [String: Date] = [:]
     private var backupProtections: [UUID: Set<String>] = [:]
@@ -79,12 +81,14 @@ final class HistoryStore {
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
          now: @escaping () -> Date = Date.init,
          backupQueue: DispatchQueue = DispatchQueue(label: "clipboardplus.backup", qos: .userInitiated),
+         backupTemporaryFiles: BackupTemporaryFiles = .shared,
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.retention = retention
         self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase(now: now) }
         self.onEvent = onEvent
         self.now = now
         self.backupQueue = backupQueue
+        self.backupTemporaryFiles = backupTemporaryFiles
         self.imageFiles = HistoryImageFiles(directory: imageDirectory)
     }
 
@@ -258,10 +262,11 @@ final class HistoryStore {
                 let token = UUID()
                 self.backupProtections[token] = Set(entries.flatMap { $0.image?.filenames ?? [] })
                 self.backupQueue.async {
-                    let url = FileManager.default.temporaryDirectory.appendingPathComponent("clipboardplus-\(token).clipboardplus")
                     let result = Result {
-                        try HistoryBackup.write(entries: entries, files: self.imageFiles, to: url,
-                                                cancellation: cancellation, createdAt: createdAt) { value in
+                        let url = try self.backupTemporaryFiles.makeExportURL()
+                        return try HistoryBackup.write(entries: entries, files: self.imageFiles, to: url,
+                                                cancellation: cancellation, createdAt: createdAt,
+                                                temporaryFiles: self.backupTemporaryFiles) { value in
                             DispatchQueue.main.async { progress(value) }
                         }
                     }
@@ -289,7 +294,8 @@ final class HistoryStore {
             defer { cancellation.setCancellationHandler(nil) }
             coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
                 result = Result {
-                    try HistoryBackup.validate(at: readable, cancellation: cancellation) { value in
+                    try HistoryBackup.validate(at: readable, cancellation: cancellation,
+                                               temporaryFiles: self.backupTemporaryFiles) { value in
                         DispatchQueue.main.async { progress(value) }
                     }
                 }
@@ -399,6 +405,10 @@ final class HistoryStore {
     }
 
     private func requireDatabase() throws -> HistoryPersistence {
+        if !didScheduleBackupCleanup {
+            backupTemporaryFiles.cleanPreviousProcesses()
+            didScheduleBackupCleanup = true
+        }
         let opened: HistoryPersistence
         if let database { opened = database } else {
             opened = try makeDatabase()
