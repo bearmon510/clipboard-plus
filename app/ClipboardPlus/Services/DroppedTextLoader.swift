@@ -47,7 +47,38 @@ enum DroppedTextLoader {
         guard typeIdentifier == UTType.utf8PlainText.identifier || typeIdentifier == UTType.plainText.identifier else {
             return nil
         }
-        return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16)
+        return String(data: data, encoding: .utf8) ?? strictUTF16(data)
+    }
+
+    // Foundation's UTF-16 decoding turns invalid bytes into an empty string,
+    // so UTF-16 is accepted only with a byte order mark and valid code units.
+    private static func strictUTF16(_ data: Data) -> String? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 2, bytes.count % 2 == 0 else { return nil }
+        let bigEndian: Bool
+        switch (bytes[0], bytes[1]) {
+        case (0xFE, 0xFF): bigEndian = true
+        case (0xFF, 0xFE): bigEndian = false
+        default: return nil
+        }
+        var units: [UInt16] = []
+        units.reserveCapacity(bytes.count / 2 - 1)
+        var index = 2
+        while index < bytes.count {
+            let first = UInt16(bytes[index]), second = UInt16(bytes[index + 1])
+            units.append(bigEndian ? first << 8 | second : second << 8 | first)
+            index += 2
+        }
+        var scalars = String.UnicodeScalarView()
+        var decoder = UTF16()
+        var iterator = units.makeIterator()
+        while true {
+            switch decoder.decode(&iterator) {
+            case .scalarValue(let scalar): scalars.append(scalar)
+            case .emptyInput: return String(scalars)
+            case .error: return nil
+            }
+        }
     }
 
     private static func loadData(
