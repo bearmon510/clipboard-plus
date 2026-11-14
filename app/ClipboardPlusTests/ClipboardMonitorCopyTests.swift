@@ -326,4 +326,27 @@ final class ClipboardMonitorCopyTests: XCTestCase {
         XCTAssertTrue(emptyTypes.secondaryText.contains("hasStrings=false; string=nil=true; 形式一覧が空=true"))
         drain(monitor)
     }
+
+    @MainActor
+    func testBackupTypeIsSkippedBeforeReadingTextOrImagesAndNextCollectionStillWorks() throws {
+        let root = try ImageTestSupport.directory(self)
+        let url = root.appendingPathComponent("history.sqlite")
+        let pasteboard = TestClipboardPasteboard()
+        let monitor = try self.monitor(root: root, pasteboard: pasteboard) { try HistoryDatabase(url: url) }
+        drain(monitor)
+        monitor.start()
+        defer { monitor.stop() }
+        pasteboard.extraTypes = ["example.clipboardplus.backup"]
+        pasteboard.setData(ImageTestSupport.png(), forPasteboardType: "public.png")
+        monitor.pollPasteboard()
+        XCTAssertEqual(pasteboard.stringReadCount, 0)
+        XCTAssertEqual(pasteboard.imageReadCount, 0)
+        XCTAssertEqual(pasteboard.dataReadCount, 0)
+        drain(monitor)
+        XCTAssertTrue(monitor.entries.isEmpty)
+        pasteboard.writeExternally("ordinary", types: ["public.utf8-plain-text"])
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.map(\.text), ["ordinary"])
+    }
 }

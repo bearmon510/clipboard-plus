@@ -39,6 +39,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private lazy var store = HistoryStore(makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
         self?.handleStorageEvent(event)
     }
+    lazy var backup = BackupController(store: store, record: { [weak self] kind, details in
+        self?.record(kind, details: details)
+    }, remember: { [weak self] snapshot in
+        self?.admission.recordBackup(manifestDigest: snapshot.manifestDigest, url: snapshot.url)
+    })
     private var cleanupTimer: Timer?
     private var maintenancePending = false
     private var needsHistoryLoad = true
@@ -538,6 +543,13 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 kind: "秘密の印のため保存せず", changeCount: before, scene: readScene,
                 details: "取得元=\(source); pasteboard.types=\(types)"
             ))
+            return
+        }
+        if types.contains("example.clipboardplus.backup") {
+            admission.discardPendingSelfCopy()
+            store.resetImageAdmission()
+            detections.forEach { log.append($0) }
+            record("バックアップファイルのため保存せず", count: before)
             return
         }
         // hasImages is false for some image types, such as the WebP that Safari copies on a long press.

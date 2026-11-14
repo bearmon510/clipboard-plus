@@ -13,6 +13,8 @@ protocol HistoryPersistence: AnyObject {
     func takeRemovals() -> [HistoryEntry]
     func referencedImageFiles() throws -> Set<String>?
     func imageUsage() throws -> HistoryImageUsage
+    func estimateBackup(_ entries: [HistoryEntry]) throws -> RestoreCounts
+    func mergeBackup(_ entries: [HistoryEntry], beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts
 }
 
 extension HistoryPersistence {
@@ -22,6 +24,10 @@ extension HistoryPersistence {
     func takeRemovals() -> [HistoryEntry] { [] }
     func referencedImageFiles() throws -> Set<String>? { nil }
     func imageUsage() throws -> HistoryImageUsage { HistoryImageUsage() }
+    func estimateBackup(_ entries: [HistoryEntry]) throws -> RestoreCounts { throw BackupError.unavailable }
+    func mergeBackup(_ entries: [HistoryEntry], beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
+        throw BackupError.unavailable
+    }
 }
 
 final class HistoryStore {
@@ -49,6 +55,7 @@ final class HistoryStore {
     }
 
     private let queue = DispatchQueue(label: "clipboardplus.history")
+    private let backupQueue: DispatchQueue
     private let makeDatabase: () throws -> HistoryPersistence
     private let onEvent: @MainActor (Event) -> Void
     private let now: () -> Date
@@ -58,16 +65,19 @@ final class HistoryStore {
     private var didCleanFiles = false
     private var unusedFiles: Set<String> = []
     private var dragProtectedUntil: [String: Date] = [:]
+    private var backupProtections: [UUID: Set<String>] = [:]
     // Pending images contain only metadata. Uncommitted files are cleaned on the next launch.
     private var pending: [PendingCollection] = []
 
     init(makeDatabase: (() throws -> HistoryPersistence)? = nil,
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
          now: @escaping () -> Date = Date.init,
+         backupQueue: DispatchQueue = DispatchQueue(label: "clipboardplus.backup", qos: .userInitiated),
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase() }
         self.onEvent = onEvent
         self.now = now
+        self.backupQueue = backupQueue
         self.imageFiles = HistoryImageFiles(directory: imageDirectory)
     }
 
@@ -197,6 +207,104 @@ final class HistoryStore {
         }, completion: completion)
     }
 
+    func createBackup(cancellation: BackupCancellation,
+                      progress: @escaping @MainActor (BackupProgress) -> Void,
+                      completion: @escaping @MainActor (Result<BackupExport, Error>) -> Void) {
+        queue.async {
+            do {
+                try cancellation.check()
+                try self.savePending()
+                let database = try self.requireDatabase()
+                let entries = try database.fetchAll()
+                let createdAt = self.now()
+                let token = UUID()
+                self.backupProtections[token] = Set(entries.flatMap { $0.image?.filenames ?? [] })
+                self.backupQueue.async {
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent("clipboardplus-\(token).clipboardplus")
+                    let result = Result {
+                        try HistoryBackup.write(entries: entries, files: self.imageFiles, to: url,
+                                                cancellation: cancellation, createdAt: createdAt) { value in
+                            DispatchQueue.main.async { progress(value) }
+                        }
+                    }
+                    self.queue.async {
+                        self.backupProtections.removeValue(forKey: token)
+                        self.finishChanges(database)
+                        DispatchQueue.main.async { completion(result) }
+                    }
+                }
+            } catch { DispatchQueue.main.async { completion(.failure(error)) } }
+        }
+    }
+
+    func validateBackup(at url: URL, cancellation: BackupCancellation,
+                        progress: @escaping @MainActor (BackupProgress) -> Void,
+                        completion: @escaping @MainActor (Result<(ValidatedBackup, RestoreCounts), Error>) -> Void) {
+        backupQueue.async {
+            // Keep security-scoped access for the entire read, including cloud file coordination.
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            var coordinationError: NSError?
+            var result: Result<ValidatedBackup, Error> = .failure(BackupError.unavailable)
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            cancellation.setCancellationHandler { coordinator.cancel() }
+            defer { cancellation.setCancellationHandler(nil) }
+            coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
+                result = Result {
+                    try HistoryBackup.validate(at: readable, cancellation: cancellation) { value in
+                        DispatchQueue.main.async { progress(value) }
+                    }
+                }
+            }
+            if let error = coordinationError { result = .failure(error) }
+            do { try cancellation.check() } catch { result = .failure(error) }
+            switch result {
+            case .failure(let error): DispatchQueue.main.async { completion(.failure(error)) }
+            case .success(let backup):
+                self.queue.async {
+                    do {
+                        try cancellation.check()
+                        // Phase one is read-only: do not flush pending collections or purge deletions here.
+                        // The normal load opens the store before settings becomes usable.
+                        // If it failed, reject rather than letting validation initialize/purge/clean storage.
+                        guard let database = self.database else { throw BackupError.unavailable }
+                        let counts = try database.estimateBackup(backup.entries)
+                        DispatchQueue.main.async { completion(.success((backup, counts))) }
+                    } catch {
+                        backup.discard()
+                        DispatchQueue.main.async { completion(.failure(error)) }
+                    }
+                }
+            }
+        }
+    }
+
+    func restoreBackup(_ backup: ValidatedBackup, cancellation: BackupCancellation,
+                       progress: @escaping @MainActor (BackupProgress) -> Void,
+                       completion: @escaping @MainActor (Result<RestoreCounts, Error>) -> Void) {
+        queue.async {
+            let result: Result<RestoreCounts, Error>
+            do {
+                try cancellation.check()
+                try self.savePending()
+                let database = try self.requireDatabase()
+                let counts = try HistoryRestore.apply(backup, database: database, files: self.imageFiles,
+                                                      cancellation: cancellation) { value in
+                    DispatchQueue.main.async { progress(value) }
+                }
+                self.finishChanges(database)
+                // A read failure after COMMIT must not report the successful merge as rolled back.
+                do { self.emit(.replace(try database.fetchAll())) }
+                catch { self.emit(.saveFailed) }
+                result = .success(counts)
+            } catch {
+                backup.discard()
+                result = .failure(error)
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
     private func perform<T>(_ operation: @escaping (HistoryPersistence) throws -> T,
                             completion: @escaping @MainActor (Result<T, Error>) -> Void) {
         queue.async {
@@ -270,6 +378,7 @@ final class HistoryStore {
                 // Protected removals stay queued until a later maintenance pass.
                 let disposable = unusedFiles.subtracting(referenced).subtracting(pendingFiles)
                     .subtracting(dragProtectedUntil.keys)
+                    .subtracting(backupProtections.values.reduce(into: Set<String>()) { $0.formUnion($1) })
                 try imageFiles.remove(disposable)
                 unusedFiles.subtract(disposable)
             }

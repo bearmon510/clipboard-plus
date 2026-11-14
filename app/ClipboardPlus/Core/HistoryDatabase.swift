@@ -227,6 +227,59 @@ final class HistoryDatabase: HistoryPersistence {
                                count: Int(sqlite3_column_int64(statement, 2)))
     }
 
+    func estimateBackup(_ entries: [HistoryEntry]) throws -> RestoreCounts {
+        try backupPlan(entries).counts
+    }
+
+    func mergeBackup(_ entries: [HistoryEntry], beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
+        try transaction {
+            let plan = try backupPlan(entries)
+            let existingIDs = Set(try fetchAll().map(\.id))
+            for entry in plan.writes {
+                if existingIDs.contains(entry.id) {
+                    try execute("""
+                        UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ? WHERE id = ?
+                        """, [.real(entry.savedAt.timeIntervalSince1970), .real(entry.lastCollectedAt.timeIntervalSince1970),
+                              .integer(entry.collectionCount), .integer(entry.isPinned ? 1 : 0),
+                              .text(entry.source.rawValue), .integer(entry.id)])
+                } else {
+                    try execute("""
+                        INSERT INTO history(id, kind, text, saved_at, collected_at, collection_count, pinned, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, [.integer(entry.id), .text(entry.kind.rawValue), .text(entry.text),
+                              .real(entry.savedAt.timeIntervalSince1970), .real(entry.lastCollectedAt.timeIntervalSince1970),
+                              .integer(entry.collectionCount), .integer(entry.isPinned ? 1 : 0), .text(entry.source.rawValue)])
+                    if let image = entry.image {
+                        try execute("""
+                            UPDATE history SET image_hash = ?, image_file = ?, thumbnail_file = ?, image_bytes = ?,
+                                pixel_width = ?, pixel_height = ?, image_type = ? WHERE id = ?
+                            """, [.text(image.hash), .text(image.filename), .text(image.thumbnailFilename),
+                                  .integer(image.byteCount), .integer(image.pixelWidth), .integer(image.pixelHeight),
+                                  .text(image.typeIdentifier), .integer(entry.id)])
+                    }
+                }
+            }
+            // Use the same removal journal/file cleanup as normal limits. A stable tie
+            // order is needed only for restore; collect/collectImage keep their behavior.
+            for id in plan.removedIDs.sorted() {
+                try removeRows(predicate: "id = ?", bindings: [.integer(id)])
+            }
+            try enforceLimit()
+            try beforeCommit(plan.survivors)
+            return plan.counts
+        }
+    }
+
+    private func backupPlan(_ entries: [HistoryEntry]) throws -> HistoryRestorePlan {
+        // sqlite_sequence also includes previously deleted rows. Read it without changing the DB.
+        let statement = try prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'history'), 0)")
+        defer { sqlite3_finalize(statement) }
+        guard try step(statement) == SQLITE_ROW else { throw HistoryDatabaseError.invalidRow }
+        return try HistoryRestorePlan(existing: fetchAll(), incoming: entries,
+                                      lastID: Int(sqlite3_column_int64(statement, 0)),
+                                      unpinnedLimit: unpinnedLimit, imageByteLimit: imageByteLimit)
+    }
+
     private func markDeleted(predicate: String, bindings: [Value]) throws -> HistoryDeletion? {
         try transaction {
             try purgeExpired()

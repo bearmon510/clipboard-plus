@@ -53,8 +53,9 @@ struct SettingsView: View {
                     Text("履歴は端末内に保存します。ピン留めしていない項目は1,000件までで、最後に収集した時刻の古いものから削除します。ピン留めした項目は自動では削除しません。")
                     Text("削除後は5秒間取り消せます。取り消し待ちの項目は書き出しに含めません。")
                 }
+                BackupSection(backup: monitor.backup)
                 Section("JSONで書き出し") {
-                    Text("書き出すJSON（形式の版2）には文章の原文と画像の情報（時刻・回数・ピン留め・大きさ・ハッシュなど）が入ります。画像の実体は含まれません。共有先を確認してください。画像を含むバックアップと、このアプリでの復元には対応していません。")
+                    Text("書き出すJSON（形式の版2）には文章の原文と画像の情報（時刻・回数・ピン留め・大きさ・ハッシュなど）が入ります。画像の実体は含まれません。共有先を確認してください。画像を含む保存と復元には「バックアップ」を使ってください。")
                     Button("すべての履歴を書き出す", systemImage: "square.and.arrow.up") {
                         shareError = nil
                         isExporting = true
@@ -89,13 +90,14 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("閉じる") { dismiss() }.frame(minWidth: 44, minHeight: 44)
+                    Button("閉じる") { monitor.backup.close(); dismiss() }.frame(minWidth: 44, minHeight: 44)
                 }
             }
             .sheet(isPresented: $showLogs) { LogView(monitor: monitor, log: log) }
             .sheet(item: $export, onDismiss: removeSnapshot) { snapshot in
                 ActivitySheet(url: snapshot.url) { _ in shareError = "履歴を共有できませんでした。" }
             }
+            .onDisappear { monitor.backup.close() }
         }
     }
 
