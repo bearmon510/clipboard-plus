@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var deletion: HistoryDeletion?
     @State private var undoTask: Task<Void, Never>?
     @State private var didShowResume = false
+    @State private var isDropTargeted = false
 
     private var visibleEntries: [HistoryEntry] {
         monitor.entries.filter {
@@ -166,6 +167,16 @@ struct ContentView: View {
                      ? "記録の開始後にコピーした文章を収集します。開始前の文章は「ペースト」で保存できます。ここへ文章をドロップしても保存できます。"
                      : "条件に一致する履歴がありません。")
                     .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
+                    .frame(maxWidth: .infinity, minHeight: 100)
+                    .padding(.horizontal, 8)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
+                    }
+                    .contentShape(Rectangle())
+                    .onDrop(of: DroppedTextLoader.contentTypes, isTargeted: $isDropTargeted) { providers, _ in
+                        monitor.receiveDropped(providers, receivedAt: Date())
+                    }
             }
             ForEach(visibleEntries) { entry in
                 Button {
@@ -173,7 +184,7 @@ struct ContentView: View {
                     showNotice("コピーしました")
                 } label: { HistoryRow(entry: entry) }
                 .buttonStyle(.plain)
-                .draggable(entry.text)
+                .onDrag { DroppedTextLoader.rowProvider(text: entry.text) }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     Button(role: .destructive) { monitor.delete(entry) { showUndo($0) } } label: {
                         Label("削除", systemImage: "trash")
@@ -190,13 +201,13 @@ struct ContentView: View {
                     Button("削除", systemImage: "trash", role: .destructive) { monitor.delete(entry) { showUndo($0) } }
                 }
             }
+            .onInsert(of: DroppedTextLoader.contentTypes) { _, providers in
+                _ = monitor.receiveDropped(providers, receivedAt: Date())
+            }
             Text("タップでコピー、ドラッグで持ち出し。文章をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
                 .font(.footnote).foregroundStyle(.secondary)
         }
         .listStyle(.plain)
-        .dropDestination(for: String.self) { strings, _ in
-            monitor.saveDropped(strings, receivedAt: Date())
-        }
         // Stable row IDs and no scroll-to or insertion animation limit unsolicited movement.
         .transaction { $0.animation = nil }
     }

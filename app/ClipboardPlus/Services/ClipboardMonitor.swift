@@ -157,6 +157,21 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
+    func receiveDropped(_ providers: [NSItemProvider], receivedAt: Date) -> Bool {
+        let external = providers.filter { !DroppedTextLoader.isLocalRow($0) }
+        for provider in external {
+            DroppedTextLoader.load(provider) { result in
+                switch result {
+                case .success(let text):
+                    _ = self.saveDropped([text], receivedAt: receivedAt)
+                case .failure:
+                    self.record("ドラッグの読み込み失敗", details: "文章を取得できませんでした", timestamp: receivedAt)
+                }
+            }
+        }
+        return !external.isEmpty
+    }
+
     func saveDropped(_ strings: [String], receivedAt: Date) -> Bool {
         var saved = false
         for text in strings {
@@ -219,8 +234,33 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     func exportHistory(completion: @escaping (URL?) -> Void) {
         store.export { result in
             switch result {
-            case .success(let url): completion(url)
+            case .success(let url): self.rememberExport(at: url, completion: completion)
             case .failure: self.reportStorageFailure(); completion(nil)
+            }
+        }
+    }
+
+    func exportLog(completion: @escaping (URL?) -> Void) {
+        log.prepareExport(context: logContext()) { url in
+            guard let url else { completion(nil); return }
+            self.rememberExport(at: url, completion: completion)
+        }
+    }
+
+    private func rememberExport(at url: URL, completion: @escaping (URL?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try String(contentsOf: url, encoding: .utf8) }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let text):
+                    self.admission.recordExport(text)
+                    completion(url)
+                case .failure:
+                    self.record("書き出しの失敗", details: "自動収集から除外する本文を取得できませんでした")
+                    self.reportStorageFailure()
+                    try? FileManager.default.removeItem(at: url)
+                    completion(nil)
+                }
             }
         }
     }

@@ -8,6 +8,7 @@ struct HistoryAdmission {
 
     private(set) var previousText: String?
     private var pendingSelfCopy: String?
+    private var latestExport: String?
     private var changedDuringRead: (text: String, after: Int)?
 
     mutating func receive(_ text: String, before: Int? = nil, after: Int? = nil) -> Decision {
@@ -23,8 +24,15 @@ struct HistoryAdmission {
         let isRepeated = pendingSelfCopy.map { $0.utf8.elementsEqual(text.utf8) } ?? false
         pendingSelfCopy = nil
         previousText = text
+        if latestExport.map({ $0.utf8.elementsEqual(text.utf8) }) == true {
+            return .skip(reason: "このアプリが書き出した内容")
+        }
         if isRepeated { return .skip(reason: "直前の内容と同じ") }
         return repeatedRead ? .skip(reason: "読み取り中の変更を再確認") : .add
+    }
+
+    mutating func recordExport(_ text: String) {
+        latestExport = text
     }
 
     mutating func recordSelfCopy(_ text: String) {

@@ -2,6 +2,45 @@ import XCTest
 @testable import ClipboardPlus
 
 final class HistoryAdmissionTests: XCTestCase {
+    func testMatchingExportIsSkippedEveryTime() {
+        var admission = HistoryAdmission()
+        let text = "{\"entries\":[]}\n"
+        admission.recordExport(text)
+        XCTAssertEqual(admission.receive(text), .skip(reason: "このアプリが書き出した内容"))
+        XCTAssertEqual(admission.receive(text), .skip(reason: "このアプリが書き出した内容"))
+    }
+
+    func testDifferentTextAfterExportIsAdded() {
+        var admission = HistoryAdmission()
+        admission.recordExport("event\tdetails\n")
+        XCTAssertEqual(admission.receive("event\tdetails"), .add)
+        XCTAssertEqual(admission.receive("別の文章"), .add)
+    }
+
+    func testExportRemainsExcludedAfterOtherTextAndRecordingRestart() {
+        var admission = HistoryAdmission()
+        let text = "event\tdetails\n"
+        admission.recordExport(text)
+        XCTAssertEqual(admission.receive("別の文章"), .add)
+        admission.discardPendingSelfCopy()
+        XCTAssertEqual(admission.receive(text), .skip(reason: "このアプリが書き出した内容"))
+    }
+
+    func testOnlyLatestExportIsExcluded() {
+        var admission = HistoryAdmission()
+        admission.recordExport("古い書き出し")
+        admission.recordExport("新しい書き出し")
+        XCTAssertEqual(admission.receive("古い書き出し"), .add)
+        XCTAssertEqual(admission.receive("新しい書き出し"), .skip(reason: "このアプリが書き出した内容"))
+    }
+
+    func testExportMatchingUsesExactUTF8InsteadOfUnicodeEquivalence() {
+        var admission = HistoryAdmission()
+        admission.recordExport("\u{00E9}")
+        XCTAssertEqual(admission.receive("e\u{0301}"), .add)
+        XCTAssertEqual(admission.receive("\u{00E9}"), .skip(reason: "このアプリが書き出した内容"))
+    }
+
     func testConsecutiveExternalTextIsCollectedAgain() {
         var admission = HistoryAdmission()
         XCTAssertEqual(admission.receive("文章A"), .add)

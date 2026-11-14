@@ -7,6 +7,7 @@ struct LogView: View {
     @State private var confirmLogClear = false
     @State private var export: ExportSnapshot?
     @State private var exportedURL: URL?
+    @State private var isExporting = false
 
     private struct ExportSnapshot: Identifiable {
         let id = UUID()
@@ -27,7 +28,9 @@ struct LogView: View {
 
                 Section("操作") {
                     Button("ログを書き出す", systemImage: "square.and.arrow.up") {
-                        log.prepareExport(context: monitor.logContext()) { url in
+                        isExporting = true
+                        monitor.exportLog { url in
+                            isExporting = false
                             if let url {
                                 exportedURL = url
                                 export = ExportSnapshot(url: url)
@@ -35,7 +38,10 @@ struct LogView: View {
                         }
                     }
                     .frame(minHeight: 44)
-                    .disabled(log.isPerformingFileOperation)
+                    .disabled(isExporting || log.isPerformingFileOperation)
+                    if let error = monitor.storageError {
+                        Text(error).foregroundStyle(.red)
+                    }
                     Button("ログを消去…", systemImage: "trash", role: .destructive) {
                         confirmLogClear = true
                     }
