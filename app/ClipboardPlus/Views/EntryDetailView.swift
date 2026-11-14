@@ -58,23 +58,32 @@ struct EntryDetailView: View {
                 onCopy()
                 dismiss()
             } label: {
-                Label("コピー", systemImage: "doc.on.doc").frame(maxWidth: .infinity, minHeight: 28)
+                actionLabel("コピー", "doc.on.doc")
             }
             .buttonStyle(.borderedProminent)
             ShareLink(item: entry.text) {
-                Label("共有", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity, minHeight: 28)
+                actionLabel("共有", "square.and.arrow.up")
             }
             .buttonStyle(.bordered)
             if let linkURL {
                 Button {
                     openURL(linkURL)
                 } label: {
-                    Label("開く", systemImage: "safari").frame(maxWidth: .infinity, minHeight: 28)
+                    actionLabel("開く", "safari")
                 }
                 .buttonStyle(.bordered)
             }
         }
-        .controlSize(.large)
+        .buttonBorderShape(.roundedRectangle(radius: 12))
+    }
+
+    /// Icon above the title, so three buttons fit side by side in a narrow window.
+    private func actionLabel(_ title: String, _ symbol: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: symbol).font(.body.weight(.semibold))
+            Text(title).font(.footnote.weight(.semibold)).lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
     }
 
     private var details: some View {

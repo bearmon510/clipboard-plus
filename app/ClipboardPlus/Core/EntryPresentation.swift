@@ -145,6 +145,25 @@ enum EntrySections {
     }
 }
 
+enum EntryColumns {
+    /// How many columns of cards fit. A card needs about 300 points to read comfortably.
+    static func count(forWidth width: Double, minimumCardWidth: Double = 300, spacing: Double = 10,
+                      horizontalPadding: Double = 24) -> Int {
+        max(1, Int((width - horizontalPadding + spacing) / (minimumCardWidth + spacing)))
+    }
+
+    /// Deals entries across the columns in turn, so reading order runs left to right.
+    /// Always returns `count` columns, which keeps column widths equal in a short section.
+    static func split(_ entries: [HistoryEntry], into count: Int) -> [[HistoryEntry]] {
+        let count = max(1, count)
+        var columns = [[HistoryEntry]](repeating: [], count: count)
+        for (offset, entry) in entries.enumerated() {
+            columns[offset % count].append(entry)
+        }
+        return columns
+    }
+}
+
 struct EntrySnippet: Equatable {
     let text: String
     /// Ranges of the search term inside `text`.

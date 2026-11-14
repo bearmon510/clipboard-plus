@@ -80,7 +80,9 @@ struct ContentView: View {
 
     private var topBar: some View {
         HStack(spacing: 2) {
-            searchField.padding(.trailing, 4)
+            // Priority lets the field take the width first; the spacer only fills a wide window.
+            searchField.frame(maxWidth: 560).layoutPriority(1)
+            Spacer(minLength: 4)
             recordingButton
             if pictureInPicture.isSupported { pictureInPictureButton }
             moreMenu
@@ -257,8 +259,14 @@ struct ContentView: View {
                     }
                 }
                 .padding(.leading, 12)
-                .padding(.trailing, 4)
+                .padding(.trailing, 18)
             }
+            // Fades the chips out at the edge instead of cutting them off.
+            .mask(HStack(spacing: 0) {
+                Rectangle()
+                LinearGradient(colors: [Color.black, Color.clear], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: 18)
+            })
             .accessibilityElement(children: .contain)
             .accessibilityLabel("表示する履歴")
             pasteButton.padding(.trailing, 12)
@@ -303,38 +311,57 @@ struct ContentView: View {
     // MARK: History
 
     private var history: some View {
-        TimelineView(.periodic(from: .now, by: 20)) { context in
-            ScrollView {
-                if visibleEntries.isEmpty {
-                    emptyState
-                } else {
-                    grid(now: context.date)
+        GeometryReader { proxy in
+            // The periodic refresh keeps labels such as "3分前" current.
+            TimelineView(.periodic(from: .now, by: 20)) { context in
+                ScrollView {
+                    if visibleEntries.isEmpty {
+                        emptyState
+                    } else {
+                        sectionList(now: context.date, columnCount: EntryColumns.count(forWidth: proxy.size.width))
+                    }
                 }
+                .scrollDismissesKeyboard(.immediately)
             }
-            .scrollDismissesKeyboard(.immediately)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func grid(now: Date) -> some View {
+    private func sectionList(now: Date, columnCount: Int) -> some View {
         let sections = EntrySections.make(visibleEntries, separatesPinned: separatesPinned, now: now)
-        let columns = [GridItem(.adaptive(minimum: 300), spacing: 10, alignment: .top)]
-        return LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
+        return LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(sections) { section in
-                Section {
-                    if !(section.kind == .pinned && pinnedCollapsed) {
+                sectionHeader(section)
+                if !(section.kind == .pinned && pinnedCollapsed) {
+                    if columnCount == 1 {
+                        // One column stays fully lazy, which matters with a long history.
                         ForEach(section.entries) { entry in
-                            card(entry, section: section.kind, now: now)
+                            card(entry, section: section.kind, now: now).padding(.bottom, 10)
                         }
+                    } else {
+                        columns(section, count: columnCount, now: now).padding(.bottom, 10)
                     }
-                } header: {
-                    sectionHeader(section)
                 }
             }
         }
         .padding(.horizontal, 12)
         // Keeps the last card clear of the undo bar.
         .padding(.bottom, 96)
+    }
+
+    /// Cards of different heights pack tightly when each column is its own stack.
+    private func columns(_ section: EntrySection, count: Int, now: Date) -> some View {
+        let groups = EntryColumns.split(section.entries, into: count)
+        return HStack(alignment: .top, spacing: 10) {
+            ForEach(groups.indices, id: \.self) { index in
+                LazyVStack(spacing: 10) {
+                    ForEach(groups[index]) { entry in
+                        card(entry, section: section.kind, now: now)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .top)
+            }
+        }
     }
 
     private func card(_ entry: HistoryEntry, section: EntrySectionKind, now: Date) -> some View {
@@ -380,6 +407,7 @@ struct ContentView: View {
         .padding(.horizontal, 4)
         .padding(.top, 12)
         .frame(minHeight: 36, alignment: .bottom)
+        .padding(.bottom, 8)
         .contentShape(Rectangle())
     }
 

@@ -122,11 +122,8 @@ struct HistoryCard<Actions: View>: View {
 
     @ViewBuilder private var imageContent: some View {
         if let thumbnailURL {
-            HistoryFileImage(url: thumbnailURL, maximumPixels: 480)
-                .frame(maxWidth: .infinity)
-                .frame(height: 132)
-                .background(Theme.field)
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            HistoryFileImage(url: thumbnailURL, maximumPixels: 480, cornerRadius: 9)
+                .frame(maxWidth: .infinity, minHeight: 60, maxHeight: 150, alignment: .leading)
                 .accessibilityLabel("画像")
         }
     }
@@ -190,10 +187,11 @@ struct HistoryCard<Actions: View>: View {
         } label: {
             Image(systemName: "ellipsis")
                 .font(.footnote.weight(.semibold))
-                .foregroundStyle(.secondary)
                 .frame(width: 44, height: 40)
                 .contentShape(Rectangle())
         }
+        // The menu label takes its color from the tint, not from a foreground style.
+        .tint(Color(uiColor: .secondaryLabel))
         .accessibilityLabel("この項目の操作")
     }
 

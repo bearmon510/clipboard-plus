@@ -5,6 +5,8 @@ import UIKit
 struct HistoryFileImage: View {
     let url: URL
     let maximumPixels: Int
+    /// Rounds the picture itself, so no empty box shows around a tall or wide image.
+    var cornerRadius: CGFloat = 0
     @State private var loaded: UIImage?
     @State private var failed = false
 
@@ -12,6 +14,7 @@ struct HistoryFileImage: View {
         Group {
             if let loaded {
                 Image(uiImage: loaded).resizable().scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             } else if failed {
                 Label("画像を読み込めません", systemImage: "photo.badge.exclamationmark")
                     .font(.caption).foregroundStyle(.secondary)

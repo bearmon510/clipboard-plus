@@ -102,6 +102,25 @@ final class EntryPresentationTests: XCTestCase {
         XCTAssertTrue(EntrySections.make([], separatesPinned: true, now: now, calendar: calendar).isEmpty)
     }
 
+    // MARK: Columns
+
+    func testColumnCountGrowsWithTheWindow() {
+        XCTAssertEqual(EntryColumns.count(forWidth: 0), 1)
+        XCTAssertEqual(EntryColumns.count(forWidth: 360), 1)
+        XCTAssertEqual(EntryColumns.count(forWidth: 633), 1)
+        XCTAssertEqual(EntryColumns.count(forWidth: 634), 2)
+        XCTAssertEqual(EntryColumns.count(forWidth: 1_024), 3)
+        XCTAssertEqual(EntryColumns.count(forWidth: 1_366), 4)
+    }
+
+    func testColumnsDealEntriesInTurnAndKeepEmptyColumns() {
+        let now = Date()
+        let entries = (1...5).map { entry($0, at: now) }
+        XCTAssertEqual(EntryColumns.split(entries, into: 3).map { $0.map(\.id) }, [[1, 4], [2, 5], [3]])
+        XCTAssertEqual(EntryColumns.split(Array(entries.prefix(2)), into: 3).map { $0.map(\.id) }, [[1], [2], []])
+        XCTAssertEqual(EntryColumns.split(entries, into: 0).map { $0.map(\.id) }, [[1, 2, 3, 4, 5]])
+    }
+
     // MARK: Snippets
 
     func testSnippetWithoutQueryIsTheTrimmedBeginning() {
