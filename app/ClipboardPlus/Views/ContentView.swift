@@ -14,7 +14,6 @@ struct ContentView: View {
     @State private var noticeTask: Task<Void, Never>?
     @State private var deletion: HistoryDeletion?
     @State private var undoTask: Task<Void, Never>?
-    @State private var didShowResume = false
     @State private var isDropTargeted = false
 
     init(monitor: ClipboardMonitor, log: MeasurementLog) {
@@ -116,10 +115,7 @@ struct ContentView: View {
         .onAppear {
             updateScene(scenePhase)
             monitor.pendingDeletion { showUndo($0) }
-            if monitor.resumedAtLaunch && !didShowResume {
-                didShowResume = true
-                showNotice("記録を再開しました（起動時）")
-            }
+            // Recording at launch is now the normal state, so it is not announced.
         }
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
@@ -175,7 +171,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("clipboard+").font(.headline)
                 HStack(spacing: 4) {
-                    Text(monitor.isRecording ? "記録中" : "記録停止中").font(.subheadline)
+                    Text(monitor.isRecording ? "記録中" : "一時停止中").font(.subheadline)
                     if pictureInPicture.isEnabled && pictureInPicture.isSupported { pictureInPicturePreview }
                 }
             }
@@ -210,7 +206,7 @@ struct ContentView: View {
     }
 
     private var recordingButton: some View {
-        Button(monitor.isRecording ? "記録を停止" : "記録を開始") {
+        Button(monitor.isRecording ? "一時停止" : "記録を再開") {
             if monitor.isRecording { monitor.stop() } else { monitor.start() }
         }
         .buttonStyle(.borderedProminent)
@@ -232,7 +228,7 @@ struct ContentView: View {
             LazyVStack(spacing: 0) {
                 if visibleEntries.isEmpty {
                     Text(monitor.entries.isEmpty
-                         ? "記録の開始後にコピーした文章・画像を収集します。開始前の内容は「ペースト」で保存できます。ここへドロップしても保存できます。"
+                         ? "コピーした文章・画像を自動で収集します。アプリを開く前からクリップボードにある内容は「ペースト」で保存できます。ここへドロップしても保存できます。"
                          : "条件に一致する履歴がありません。")
                         .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
                         .frame(maxWidth: .infinity, minHeight: 100)
