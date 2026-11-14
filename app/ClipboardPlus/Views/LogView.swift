@@ -19,7 +19,7 @@ struct LogView: View {
                 if let error = log.errorMessage {
                     Section("ログのエラー") {
                         Text(error).foregroundStyle(.red).textSelection(.enabled)
-                        Text("ファイルへの追記に失敗した行は、メモリにだけ残っている場合があります。書き出しの対象はDocumentsのファイルです。")
+                        Text("追記に失敗した行は未保存として保持し、次の書き込みで再送します。書き出し時にも未保存なら、ファイル末尾の見出しの下に含めます。消去前の同期に失敗した場合は消去しません。")
                         Button("エラー表示を閉じる") { log.dismissError() }
                             .frame(minHeight: 44)
                     }
@@ -27,27 +27,36 @@ struct LogView: View {
 
                 Section("操作") {
                     Button("ログを書き出す", systemImage: "square.and.arrow.up") {
-                        if let url = log.prepareExport(context: monitor.logContext()) {
-                            exportedURL = url
-                            export = ExportSnapshot(url: url)
+                        log.prepareExport(context: monitor.logContext()) { url in
+                            if let url {
+                                exportedURL = url
+                                export = ExportSnapshot(url: url)
+                            }
                         }
                     }
                     .frame(minHeight: 44)
+                    .disabled(log.isPerformingFileOperation)
                     Button("ログを消去…", systemImage: "trash", role: .destructive) {
                         confirmLogClear = true
                     }
                     .frame(minHeight: 44)
+                    .disabled(log.isPerformingFileOperation)
                     Text("ログの消去はメモリとDocumentsのログファイルが対象です。履歴は残ります。書き出し済みのログは消えません。")
                         .font(.footnote)
                 }
 
                 Section("この起動中のログ: \(log.lines.count)行") {
-                    Text("タブ区切り: UTC時刻（ミリ秒）／種別／changeCount／scene／文字数／履歴番号／詳細／原文の冒頭（有効時のみ）。「-」は対応なし・未取得です。書き出すファイルには前回の起動までのログも含まれます。")
+                    Text("主表示は現地時刻（時:分:秒.ミリ秒）・種別・履歴番号です。ファイルはタブ区切り: 現地時刻（ISO 8601、ミリ秒3桁、UTCとの差付き）／起動ID／イベント番号／種別／changeCount／scene／文字数／履歴番号／詳細／原文の冒頭（有効時のみ）。「-」は対応なし・未取得です。起動IDとイベント番号で再送の重複や欠番を確認できます。書き出すファイルには前回の起動までのログ（旧形式を含む）も含まれます。")
                         .font(.footnote)
-                    ForEach(Array(log.lines.enumerated()), id: \.offset) { line in
-                        Text(line.element)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
+                    ForEach(log.lines) { line in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(line.primaryText)
+                                .font(.subheadline)
+                            Text(line.secondaryText)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                        .textSelection(.enabled)
                     }
                 }
             }

@@ -13,16 +13,13 @@ struct MeasurementEvent {
 
 struct LogLineFormatter {
     var includeTextPreview = false
+    var timeZone: TimeZone = .current
 
-    func format(_ event: MeasurementEvent) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
-
+    func format(_ event: MeasurementEvent, sessionID: String, eventNumber: Int) -> String {
         var fields = [
-            formatter.string(from: event.timestamp),
+            timestamp(event.timestamp),
+            escape(sessionID),
+            String(eventNumber),
             escape(event.kind),
             String(event.changeCount),
             escape(event.scene),
@@ -34,6 +31,19 @@ struct LogLineFormatter {
             fields.append("冒頭20文字=" + escape(String(text.prefix(20))))
         }
         return fields.joined(separator: "\t")
+    }
+
+    func timestamp(_ date: Date) -> String {
+        dateFormatter("yyyy-MM-dd'T'HH:mm:ss.SSSxxx").string(from: date)
+    }
+
+    private func dateFormatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timeZone
+        formatter.dateFormat = format
+        return formatter
     }
 
     private func escape(_ value: String) -> String {

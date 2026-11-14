@@ -99,4 +99,4 @@ Node.jsとCodex CLIがこのPCにインストールされ、Codexにログイン
 - Secretsは `ios-testflight` 環境に置く。名前はワークフローの「Validate signing configuration」の一覧のとおり。
 - ログは公開される。xcodebuildの全出力はファイルにだけ書き、失敗時は `scripts/print-redacted-xcodebuild-errors.sh` で証明書名などを伏せたエラー行だけを出す。署名関係のファイルやログを成果物としてアップロードしない。
 - ビルド番号はこのワークフローの実行番号。
-- TestFlightへの送信は利用者の承認を得てから実行する。
+- TestFlightへの送信は、利用者が2026年11月14日に「自由にやっていい」と承認した。確認なしで実行してよい。App Storeへの審査提出とリリースは対象外で、利用者が自分で行う。

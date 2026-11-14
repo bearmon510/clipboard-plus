@@ -107,7 +107,8 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 PasteButton(payloadType: String.self) { strings in
-                    DispatchQueue.main.async { monitor.saveManually(strings) }
+                    let receivedAt = Date()
+                    DispatchQueue.main.async { monitor.saveManually(strings, receivedAt: receivedAt) }
                 }
                 .labelStyle(.titleAndIcon)
                 .frame(minWidth: 100, minHeight: 44)
