@@ -14,7 +14,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var sceneState = "inactive"
     @Published private(set) var entries: [HistoryEntry] = []
-    @Published private(set) var method: CollectionMethod = .notification
+    // On the device test of 2026-11-14 (iPadOS 27.2.1), change notifications
+    // never arrived for copies made in Safari, while polling caught all three.
+    @Published private(set) var method: CollectionMethod = .polling
     @Published private(set) var pollingInterval: TimeInterval = 0.5
 
     let log: MeasurementLog

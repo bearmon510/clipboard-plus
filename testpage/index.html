@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clipboard+ 20件試験</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --text: #1d1f23; --muted: #5d6470;
+    --accent: #1f5fd6; --accent-text: #ffffff; --done: #1a7f37; --line: #d8dce3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a; --surface: #20232a; --text: #eceef2; --muted: #a3aab6;
+      --accent: #5b8ef0; --accent-text: #0d1117; --done: #4ac26b; --line: #343843;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.5 -apple-system, "Hiragino Sans", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 8px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+  .bar button { flex: 0 0 auto; }
+  ol { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+  li {
+    display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+  }
+  .text { overflow-wrap: anywhere; }
+  .time { display: block; font: 13px ui-monospace, Menlo, monospace; color: var(--done); min-height: 1em; }
+  button {
+    min-height: 48px; min-width: 88px; padding: 0 16px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 600;
+  }
+  button.secondary { background: var(--surface); color: var(--text); border: 1px solid var(--line); }
+  li.copied button { background: var(--done); }
+  #status { font-weight: 600; color: var(--text); }
+  #error { color: #d1242f; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>clipboard+ 20件試験</h1>
+  <p>上から順に、約1秒ごとに「コピー」を押してください。押した時刻（ミリ秒）が各行に表示されます。試験が終わったら、この画面のスクリーンショットを撮ってください。</p>
+  <p>文章はすべて試験用の架空のものです。</p>
+  <div class="bar">
+    <button id="reset" class="secondary" type="button">時刻を消す</button>
+    <span id="status" aria-live="polite"></span>
+  </div>
+  <p id="error" role="alert" hidden></p>
+  <ol id="items"></ol>
+</main>
+<script>
+  // Each text is unique so a missed or duplicated item is visible in the history.
+  const words = [
+    'りんごの木', '青い自転車', '朝の図書館', '夏祭りの夜', '小さな灯台',
+    '雨上がりの道', '古い時計台', '海辺の駅', '冬の天気予報', '星空の観測',
+    '山小屋の地図', '赤い郵便受け', '静かな公園', '紙飛行機', '午後の喫茶店',
+    '川沿いの桜', '音楽室の窓', '雪だるま', '港の朝市', '最後の一枚'
+  ];
+  const texts = words.map((word, index) =>
+    `試験${String(index + 1).padStart(2, '0')} ${word}`);
+
+  const list = document.getElementById('items');
+  const status = document.getElementById('status');
+  const errorBox = document.getElementById('error');
+  let copiedCount = 0;
+
+  function stamp(date) {
+    const pad = (n, w = 2) => String(n).padStart(w, '0');
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+  }
+
+  texts.forEach((text, index) => {
+    const item = document.createElement('li');
+    const label = document.createElement('div');
+    const body = document.createElement('span');
+    const time = document.createElement('span');
+    const button = document.createElement('button');
+    body.className = 'text';
+    body.textContent = text;
+    time.className = 'time';
+    label.append(body, time);
+    button.type = 'button';
+    button.textContent = 'コピー';
+    button.setAttribute('aria-label', `${text} をコピー`);
+    button.addEventListener('click', async () => {
+      const pressedAt = new Date();
+      try {
+        await navigator.clipboard.writeText(text);
+        time.textContent = `コピー ${stamp(pressedAt)}`;
+        if (!item.classList.contains('copied')) copiedCount += 1;
+        item.classList.add('copied');
+        status.textContent = `${copiedCount} / ${texts.length} 件コピー済み`;
+        errorBox.hidden = true;
+      } catch (error) {
+        errorBox.hidden = false;
+        errorBox.textContent = `${index + 1}件目をコピーできませんでした: ${error && error.message ? error.message : error}`;
+      }
+    });
+    item.append(label, button);
+    list.append(item);
+  });
+
+  document.getElementById('reset').addEventListener('click', () => {
+    copiedCount = 0;
+    status.textContent = '';
+    errorBox.hidden = true;
+    list.querySelectorAll('li').forEach((item) => {
+      item.classList.remove('copied');
+      item.querySelector('.time').textContent = '';
+    });
+  });
+</script>
+</body>
+</html>
