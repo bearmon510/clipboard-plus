@@ -15,11 +15,13 @@ targets:
     platform: iOS
     sources:
       - ClipboardPlus
+    dependencies:
+      - sdk: libsqlite3.tbd
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: example.clipboardplus
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "0.1.0"
+        MARKETING_VERSION: "0.2.0"
         CURRENT_PROJECT_VERSION: "1"
     info:
       path: Generated/ClipboardPlus-Info.plist

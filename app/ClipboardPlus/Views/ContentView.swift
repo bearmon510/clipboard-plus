@@ -4,171 +4,219 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
-    @State private var presentedSheet: Panel?
+    @State private var showSettings = false
     @State private var confirmHistoryClear = false
-    @State private var copiedNotice = false
+    @State private var searchText = ""
+    @State private var pinnedOnly = false
+    @State private var notice: String?
     @State private var noticeTask: Task<Void, Never>?
+    @State private var deletion: HistoryDeletion?
+    @State private var undoTask: Task<Void, Never>?
+    @State private var didShowResume = false
 
-    private enum Panel: String, Identifiable {
-        case settings, logs
-        var id: String { rawValue }
+    private var visibleEntries: [HistoryEntry] {
+        monitor.entries.filter {
+            (!pinnedOnly || $0.isPinned) &&
+                (searchText.isEmpty || $0.text.range(of: searchText, options: .caseInsensitive) != nil)
+        }
     }
 
     var body: some View {
         VStack(spacing: 8) {
             header
             controls
-            Text("自動収集で、他アプリのコピー内容を読む許可を求められる場合があります。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal)
             HStack {
-                Text(copiedNotice ? "コピーしました" : "履歴 \(monitor.entries.count)件")
-                    .foregroundStyle(copiedNotice ? Color.accentColor : Color.secondary)
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("履歴を検索", text: $searchText)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                if !searchText.isEmpty {
+                    Button { searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .accessibilityLabel("検索をクリア")
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal)
+            Picker("表示する履歴", selection: $pinnedOnly) {
+                Text("すべて").tag(false)
+                Text("ピン留め").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            HStack {
+                Text(notice ?? "履歴 \(visibleEntries.count)件")
                 Spacer()
                 Text("新しい順")
-                    .foregroundStyle(.secondary)
             }
             .font(.footnote)
+            .foregroundStyle(.secondary)
             .padding(.horizontal)
-
+            if let error = monitor.storageError {
+                Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal)
+            }
             history
-        }
-        .padding(.top, 8)
-        .onAppear { updateScene(scenePhase) }
-        .onChange(of: scenePhase) { _, phase in updateScene(phase) }
-        .sheet(item: $presentedSheet) { panel in
-            switch panel {
-            case .settings:
-                SettingsView(monitor: monitor, log: log)
-            case .logs:
-                LogView(monitor: monitor, log: log)
+            if let deletion {
+                HStack {
+                    Text("\(deletion.count)件を削除しました")
+                    Spacer()
+                    Button("元に戻す") {
+                        if monitor.undo(deletion) {
+                            self.deletion = nil
+                            undoTask?.cancel()
+                        }
+                    }
+                    .frame(minHeight: 44)
+                }
+                .font(.subheadline)
+                .padding(.horizontal)
+                .background(.regularMaterial)
             }
         }
-        .confirmationDialog("履歴をすべて消しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
-            Button("履歴\(monitor.entries.count)件を全消去", role: .destructive) {
-                monitor.deleteAllHistory()
+        .padding(.top, 8)
+        .onAppear {
+            updateScene(scenePhase)
+            showUndo(monitor.pendingDeletion())
+            if monitor.resumedAtLaunch && !didShowResume {
+                didShowResume = true
+                showNotice("記録を再開しました（起動時）")
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            updateScene(phase)
+            if phase == .active { showUndo(monitor.pendingDeletion()) }
+        }
+        .sheet(isPresented: $showSettings) { SettingsView(monitor: monitor, log: log) }
+        .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
+            Button("ピン留めを残して消去", role: .destructive) {
+                showUndo(monitor.deleteAllHistory(includePinned: false))
+            }
+            Button("ピン留めも含めてすべて消去", role: .destructive) {
+                showUndo(monitor.deleteAllHistory(includePinned: true))
             }
             Button("キャンセル", role: .cancel) {}
         } message: {
-            Text("このアプリの履歴だけを消します。計測ログとクリップボードの内容は残ります。元に戻せません。")
+            Text("5秒間は「元に戻す」で取り消せます。計測ログとクリップボードの内容は残ります。")
         }
     }
 
     private var header: some View {
-        HStack(alignment: .center) {
+        HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text("clipboard+").font(.headline)
-                Text(monitor.isRecording ? "記録: 開始中" : "記録: 停止中")
-                Text("scene: \(monitor.sceneState)")
-                    .monospaced()
+                Text(monitor.isRecording ? "記録中" : "記録停止中").font(.subheadline)
             }
-            .font(.subheadline)
             Spacer(minLength: 4)
             if log.errorMessage != nil {
-                Button {
-                    presentedSheet = .logs
-                } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                        Text("ログエラー").font(.caption2)
-                    }
+                Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
-                    .frame(minWidth: 44, minHeight: 44)
-                }
-                .accessibilityLabel("ログのエラーを確認")
+                    .accessibilityLabel("計測ログにエラーがあります。設定から確認できます")
             }
             Menu {
-                Button("設定", systemImage: "slider.horizontal.3") { presentedSheet = .settings }
-                Button("計測ログ", systemImage: "doc.text") { presentedSheet = .logs }
-                Divider()
+                Button("設定", systemImage: "slider.horizontal.3") { showSettings = true }
                 Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
                     confirmHistoryClear = true
                 }
                 .disabled(monitor.entries.isEmpty)
             } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.title2)
+                Image(systemName: "ellipsis.circle").font(.title2)
                     .frame(minWidth: 44, minHeight: 44)
             }
-            .accessibilityLabel("設定とログ、履歴の全消去")
+            .accessibilityLabel("設定と履歴の全消去")
         }
         .padding(.horizontal)
     }
 
     private var controls: some View {
-        HStack(spacing: 12) {
-            Button(monitor.isRecording ? "記録を停止" : "記録を開始") {
-                if monitor.isRecording { monitor.stop() } else { monitor.start() }
-            }
-            .buttonStyle(.borderedProminent)
-            .frame(minHeight: 44)
-
-            VStack(spacing: 0) {
-                PasteButton(payloadType: String.self) { strings in
-                    let receivedAt = Date()
-                    DispatchQueue.main.async { monitor.saveManually(strings, receivedAt: receivedAt) }
-                }
-                .labelStyle(.titleAndIcon)
-                .frame(minWidth: 100, minHeight: 44)
-                .accessibilityLabel("文章を手動保存")
-            }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) { recordingButton; pasteButton }
+            VStack(spacing: 4) { recordingButton; pasteButton }
         }
-        .controlSize(.large)
         .padding(.horizontal)
+    }
+
+    private var recordingButton: some View {
+        Button(monitor.isRecording ? "記録を停止" : "記録を開始") {
+            if monitor.isRecording { monitor.stop() } else { monitor.start() }
+        }
+        .buttonStyle(.borderedProminent)
+        .frame(minHeight: 44)
+    }
+
+    private var pasteButton: some View {
+        PasteButton(payloadType: String.self) { strings in
+            let receivedAt = Date()
+            DispatchQueue.main.async { monitor.saveManually(strings, receivedAt: receivedAt) }
+        }
+        .labelStyle(.titleAndIcon)
+        .frame(minWidth: 100, minHeight: 44)
+        .accessibilityLabel("文章を手動保存")
     }
 
     private var history: some View {
         List {
-            if monitor.entries.isEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("文章の履歴はまだありません。")
-                    Text("記録の開始後にコピーした文章を収集します。開始前の文章は「ペースト」で手動保存できます。")
-                    Text("自動収集では、他アプリのコピー内容を読む許可を求められる場合があります。")
-                }
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .padding(.vertical, 12)
+            if visibleEntries.isEmpty {
+                Text(monitor.entries.isEmpty
+                     ? "記録の開始後にコピーした文章を収集します。開始前の文章は「ペースト」で保存できます。ここへ文章をドロップしても保存できます。"
+                     : "条件に一致する履歴がありません。")
+                    .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
             }
-            ForEach(monitor.entries) { entry in
+            ForEach(visibleEntries) { entry in
                 Button {
                     monitor.copy(entry)
-                    showCopiedNotice()
-                } label: {
-                    HistoryRow(entry: entry)
-                }
+                    showNotice("コピーしました")
+                } label: { HistoryRow(entry: entry) }
                 .buttonStyle(.plain)
                 .draggable(entry.text)
-                .swipeActions {
-                    Button(role: .destructive) { monitor.delete(entry) } label: {
-                        Label("この履歴1件を削除", systemImage: "trash")
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) { showUndo(monitor.delete(entry)) } label: {
+                        Label("削除", systemImage: "trash")
                     }
+                    Button { monitor.togglePin(entry) } label: {
+                        Label(entry.isPinned ? "解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin")
+                    }
+                    .tint(.orange)
                 }
                 .contextMenu {
-                    Button("この履歴1件を削除（ログは残す）", role: .destructive) {
-                        monitor.delete(entry)
+                    Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
+                        monitor.togglePin(entry)
                     }
+                    Button("削除", systemImage: "trash", role: .destructive) { showUndo(monitor.delete(entry)) }
                 }
             }
-            if !monitor.entries.isEmpty {
-                Text("タップでコピー、長押ししてドラッグ。左へスワイプでこの履歴1件だけを削除します。計測ログとクリップボードの内容は残ります。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+            Text("タップでコピー、ドラッグで持ち出し。文章をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
+                .font(.footnote).foregroundStyle(.secondary)
         }
         .listStyle(.plain)
+        .dropDestination(for: String.self) { strings, _ in
+            monitor.saveDropped(strings, receivedAt: Date())
+        }
         // Stable row IDs and no scroll-to or insertion animation limit unsolicited movement.
         .transaction { $0.animation = nil }
     }
 
-    private func showCopiedNotice() {
-        noticeTask?.cancel()
-        copiedNotice = true
-        noticeTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+    private func showUndo(_ value: HistoryDeletion?) {
+        undoTask?.cancel()
+        deletion = value
+        guard let value else { return }
+        let remaining = value.expiresAt.timeIntervalSinceNow
+        guard remaining > 0 else { deletion = nil; return }
+        undoTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            copiedNotice = false
+            deletion = nil
+        }
+    }
+
+    private func showNotice(_ text: String) {
+        noticeTask?.cancel()
+        notice = text
+        noticeTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            notice = nil
         }
     }
 
@@ -187,24 +235,20 @@ private struct HistoryRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ViewThatFits(in: .horizontal) {
-                HStack {
-                    Text("#\(entry.id)").fontWeight(.semibold)
-                    Text(entry.savedAt, format: .dateTime.hour().minute().second())
-                    Spacer()
-                    Text("\(entry.characterCount)文字")
+            HStack {
+                if entry.isPinned {
+                    Image(systemName: "pin.fill").accessibilityLabel("ピン留め")
                 }
-                VStack(alignment: .leading) {
-                    Text("#\(entry.id) · \(entry.characterCount)文字")
-                    Text(entry.savedAt, format: .dateTime.hour().minute().second())
-                }
+                Text(entry.lastCollectedAt, format: .dateTime.month().day().hour().minute().second())
+                Spacer()
+                Text("\(entry.collectionCount)回")
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .font(.caption).foregroundStyle(.secondary)
+            if let domain = entry.domain {
+                Text(domain).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
             Text(entry.text.isEmpty ? "（空文字）" : String(entry.text.prefix(160)))
-                .font(.body)
-                .lineLimit(3)
-                .multilineTextAlignment(.leading)
+                .font(.body).lineLimit(3).multilineTextAlignment(.leading)
         }
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
         .padding(.vertical, 4)
@@ -212,4 +256,3 @@ private struct HistoryRow: View {
         .accessibilityHint("タップでコピー。ドラッグで他のアプリへ持ち出せます。")
     }
 }
-

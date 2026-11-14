@@ -2,10 +2,10 @@ import XCTest
 @testable import ClipboardPlus
 
 final class HistoryAdmissionTests: XCTestCase {
-    func testConsecutiveIdenticalTextIsSkippedWithReason() {
+    func testConsecutiveExternalTextIsCollectedAgain() {
         var admission = HistoryAdmission()
         XCTAssertEqual(admission.receive("文章A"), .add)
-        XCTAssertEqual(admission.receive("文章A"), .skip(reason: "直前の内容と同じ"))
+        XCTAssertEqual(admission.receive("文章A"), .add)
         XCTAssertEqual(admission.previousText, "文章A")
     }
 
@@ -33,15 +33,23 @@ final class HistoryAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.receive("A"), .add)
     }
 
-    func testEmptyTextIsAValidValueAndOnlyConsecutiveDuplicateIsSkipped() {
+    func testEmptyTextIsValidAndOnlySelfCopyReadbackIsSkipped() {
         var admission = HistoryAdmission()
         XCTAssertNil(admission.previousText)
         XCTAssertEqual(admission.receive(""), .add)
-        XCTAssertEqual(admission.receive(""), .skip(reason: "直前の内容と同じ"))
+        XCTAssertEqual(admission.receive(""), .add)
         XCTAssertEqual(admission.receive("A"), .add)
         XCTAssertEqual(admission.receive(""), .add)
         admission.recordSelfCopy("")
         XCTAssertEqual(admission.receive(""), .skip(reason: "直前の内容と同じ"))
+        XCTAssertEqual(admission.receive(""), .add)
+    }
+
+    func testDiscardingUnreadBaselineOrNonTextReadAllowsNextExternalCopy() {
+        var admission = HistoryAdmission()
+        admission.recordSelfCopy("A")
+        admission.discardPendingSelfCopy()
+        XCTAssertEqual(admission.receive("A"), .add)
     }
 }
 
