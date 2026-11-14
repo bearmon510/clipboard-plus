@@ -95,7 +95,7 @@ final class HistoryStoreTests: XCTestCase {
         store.collect("A", source: .automatic, at: firstDate)
         store.collect("B", source: .drag, at: secondDate)
         store.maintain { result in
-            XCTAssertNoThrow(try result.get())
+            if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") }
             XCTAssertEqual(failures, 2)
             XCTAssertEqual(spy?.attempts, ["A", "A", "A", "B"])
             XCTAssertEqual(saved.map(\.text), ["A", "B"])
@@ -151,7 +151,7 @@ final class HistoryStoreTests: XCTestCase {
         }
         for text in ["A", "B", "C"] { store.collect(text, source: .automatic, at: Date()) }
         store.maintain { result in
-            XCTAssertNoThrow(try result.get())
+            if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") }
             XCTAssertEqual(spy?.attempts, ["A", "B", "B", "B", "C"])
             XCTAssertEqual(saved.map(\.text), ["A", "B", "C"])
             XCTAssertEqual(saved.map(\.collectionCount), [1, 1, 1])
@@ -179,7 +179,7 @@ final class HistoryStoreTests: XCTestCase {
         }
         store.collect("A", source: .automatic, at: Date())
         store.maintain { result in
-            XCTAssertNoThrow(try result.get())
+            if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") }
             XCTAssertEqual(opens, 2)
             XCTAssertEqual(saved, ["A"])
             done.fulfill()
@@ -212,7 +212,7 @@ final class HistoryStoreTests: XCTestCase {
         store.collect("B", source: .automatic, at: Date())
         released.signal()
         store.maintain { result in
-            XCTAssertNoThrow(try result.get())
+            if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") }
             XCTAssertEqual(saved, ["A", "B"])
             done.fulfill()
         }
@@ -237,12 +237,12 @@ final class HistoryStoreTests: XCTestCase {
             default: break
             }
         }
-        store.load { result in XCTAssertNoThrow(try result.get()) }
+        store.load { result in if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") } }
         for (index, text) in ["A", "B", "A"].enumerated() {
             store.collect(text, source: .automatic, at: date.addingTimeInterval(Double(index)))
         }
         store.maintain { result in
-            XCTAssertNoThrow(try result.get())
+            if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") }
             XCTAssertEqual(spy?.fetchCount, 1)
             XCTAssertEqual(entries.map(\.text), ["A", "B"])
             XCTAssertEqual(entries.map(\.collectionCount), [2, 1])
@@ -293,7 +293,7 @@ final class HistoryStoreTests: XCTestCase {
             if case .success = result { XCTFail("Clear must wait for older collections") }
             XCTAssertEqual(saved, 0)
             store.maintain { result in
-                XCTAssertNoThrow(try result.get())
+                if case .failure(let error) = result { XCTFail("Unexpected failure: \(error)") }
                 XCTAssertEqual(saved, 1)
                 done.fulfill()
             }
