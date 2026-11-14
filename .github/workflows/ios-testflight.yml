@@ -1,0 +1,179 @@
+name: Upload iPad app to TestFlight
+
+# This repository is public, so its workflow logs and artifacts are too.
+# xcodebuild names the signing certificate, which carries the developer's
+# name, so its full output goes to files that are never printed or uploaded.
+# Only redacted error lines reach the log.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+jobs:
+  upload-testflight:
+    name: Archive and upload to TestFlight
+    runs-on: macos-26
+    timeout-minutes: 45
+    environment: ios-testflight
+    env:
+      ARCHIVE_PATH: ${{ runner.temp }}/ClipboardPlus.xcarchive
+      KEY_DIRECTORY: ${{ runner.temp }}/private_keys
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Validate signing configuration
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          CLIPBOARD_PLUS_BUNDLE_ID: ${{ secrets.CLIPBOARD_PLUS_BUNDLE_ID }}
+        run: |
+          missing=0
+          for name in APPLE_TEAM_ID APP_STORE_CONNECT_API_ISSUER_ID APP_STORE_CONNECT_API_KEY_ID \
+                      APP_STORE_CONNECT_API_KEY_BASE64 CLIPBOARD_PLUS_BUNDLE_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is not set in the ios-testflight environment."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Record Xcode and SDK versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Run script tests
+        run: node --test scripts/apple-signing-certificates.test.mjs scripts/codex-limit.test.mjs
+
+      - name: Generate Xcode project
+        working-directory: app
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Install App Store Connect API key
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: |
+          mkdir -p "$KEY_DIRECTORY"
+          key_path="$KEY_DIRECTORY/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "APP_STORE_CONNECT_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Snapshot development certificates before signing
+        env:
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: node scripts/apple-signing-certificates.mjs snapshot --output "$RUNNER_TEMP/development-certificates-before.json"
+
+      - name: Archive iPad app
+        working-directory: app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          CLIPBOARD_PLUS_BUNDLE_ID: ${{ secrets.CLIPBOARD_PLUS_BUNDLE_ID }}
+        run: |
+          log="$RUNNER_TEMP/archive.log"
+          if xcodebuild \
+              -project ClipboardPlus.xcodeproj \
+              -scheme ClipboardPlus \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -archivePath "$ARCHIVE_PATH" \
+              -allowProvisioningUpdates \
+              -authenticationKeyPath "$APP_STORE_CONNECT_API_KEY_PATH" \
+              -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
+              -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID" \
+              DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+              CODE_SIGN_STYLE=Automatic \
+              PRODUCT_BUNDLE_IDENTIFIER="$CLIPBOARD_PLUS_BUNDLE_ID" \
+              CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+              archive > "$log" 2>&1; then
+            echo "Archive succeeded. Build number: $GITHUB_RUN_NUMBER"
+          else
+            bash ../scripts/print-redacted-xcodebuild-errors.sh "$log"
+            exit 1
+          fi
+
+      - name: Create App Store export options
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>destination</key>
+            <string>upload</string>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Upload archive to TestFlight
+        env:
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: |
+          log="$RUNNER_TEMP/export.log"
+          if xcodebuild \
+              -exportArchive \
+              -archivePath "$ARCHIVE_PATH" \
+              -exportPath "$RUNNER_TEMP/TestFlightExport" \
+              -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+              -allowProvisioningUpdates \
+              -authenticationKeyPath "$APP_STORE_CONNECT_API_KEY_PATH" \
+              -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
+              -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID" \
+              > "$log" 2>&1; then
+            echo "Uploaded build $GITHUB_RUN_NUMBER. App Store Connect processes it before TestFlight shows it."
+          else
+            bash scripts/print-redacted-xcodebuild-errors.sh "$log"
+            exit 1
+          fi
+
+      - name: Clean up runner-owned development certificate
+        if: always()
+        env:
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: |
+          if [ ! -f "$RUNNER_TEMP/development-certificates-before.json" ]; then
+            exit 0
+          fi
+          security find-identity -v -p codesigning > "$RUNNER_TEMP/runner-signing-identities.txt"
+          node scripts/apple-signing-certificates.mjs cleanup-created \
+            --before "$RUNNER_TEMP/development-certificates-before.json" \
+            --identities "$RUNNER_TEMP/runner-signing-identities.txt" --apply
+
+      - name: Remove API key
+        if: always()
+        run: rm -rf "$KEY_DIRECTORY"

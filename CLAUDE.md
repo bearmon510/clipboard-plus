@@ -90,4 +90,13 @@ node scripts/invoke-codex.mjs --mode implement --model gpt-6.1-sol --effort high
 
 Node.jsとCodex CLIがこのPCにインストールされ、Codexにログイン済みであること。アカウントは既存設定を利用する。ClaudeとCodexはそれぞれの利用枠を消費する。
 
-スクリプトの制限判定は `node --test scripts/codex-limit.test.mjs` で検査できる。
+スクリプトのテストは `node --test scripts/codex-limit.test.mjs scripts/apple-signing-certificates.test.mjs` で実行する（このNode.jsではフォルダ指定が動かない）。
+
+## TestFlightへの送り方
+
+`.github/workflows/ios-testflight.yml` を手動で実行する（`gh workflow run ios-testflight.yml`）。署名はApp Store ConnectのAPIキーと `-allowProvisioningUpdates` による自動署名で、利用者が別のアプリで使ってきた方式に合わせた。実行の最後に、その実行で作られた開発用証明書を取り消す。
+
+- Secretsは `ios-testflight` 環境に置く。名前はワークフローの「Validate signing configuration」の一覧のとおり。
+- ログは公開される。xcodebuildの全出力はファイルにだけ書き、失敗時は `scripts/print-redacted-xcodebuild-errors.sh` で証明書名などを伏せたエラー行だけを出す。署名関係のファイルやログを成果物としてアップロードしない。
+- ビルド番号はこのワークフローの実行番号。
+- TestFlightへの送信は利用者の承認を得てから実行する。
