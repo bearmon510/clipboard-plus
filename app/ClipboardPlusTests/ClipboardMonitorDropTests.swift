@@ -95,7 +95,8 @@ final class ClipboardMonitorDropTests: XCTestCase {
             failed.fulfill()
         }
         XCTAssertTrue(monitor.receiveDropped([provider], receivedAt: Date()))
-        wait(for: [failed], timeout: 5)
+        // The provider's three load attempts once took over 25 seconds on a slow CI simulator.
+        wait(for: [failed], timeout: 60)
         observation.cancel()
         XCTAssertEqual(monitor.pendingSaveCount, 0)
         let done = expectation(description: "failed drop did not save")
