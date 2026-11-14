@@ -20,8 +20,26 @@ private final class TestClipboardPasteboard: ClipboardPasteboard {
     var types: [String] { (imageType.map { [$0] } ?? []) + extraTypes }
     var image: UIImage? { imageReadCount += 1; return nil }
 
+    /// Runs once inside the next string read, before the value is returned, to imitate
+    /// another app writing between the type check and the content read.
+    var beforeNextStringRead: (() -> Void)?
+
+    func writeExternally(_ text: String, types: [String]) {
+        storedString = text
+        imageData = nil
+        imageType = nil
+        extraTypes = types
+        changeCount += 1
+    }
+
     var string: String? {
-        get { stringReadCount += 1; return storedString }
+        get {
+            stringReadCount += 1
+            let hook = beforeNextStringRead
+            beforeNextStringRead = nil
+            hook?()
+            return storedString
+        }
         set {
             storedString = newValue
             imageData = nil
@@ -211,6 +229,31 @@ final class ClipboardMonitorCopyTests: XCTestCase {
         drain(monitor)
         XCTAssertEqual(monitor.entries.map(\.text), ["ordinary test value"])
         XCTAssertEqual(pasteboard.stringReadCount, 1)
+    }
+
+    @MainActor
+    func testConcealedContentWrittenDuringReadIsNeitherSavedNorLogged() throws {
+        let root = try ImageTestSupport.directory(self)
+        let url = root.appendingPathComponent("history.sqlite")
+        let pasteboard = TestClipboardPasteboard()
+        let monitor = try self.monitor(root: root, pasteboard: pasteboard) { try HistoryDatabase(url: url) }
+        drain(monitor)
+        monitor.log.includeTextPreview = true
+        monitor.start()
+        defer { monitor.stop() }
+        pasteboard.extraTypes = ["public.utf8-plain-text"]
+        pasteboard.string = "ordinary before race"
+        pasteboard.beforeNextStringRead = {
+            pasteboard.writeExternally("secret written during read",
+                                       types: ["public.utf8-plain-text", "org.nspasteboard.ConcealedType"])
+        }
+        monitor.pollPasteboard()
+        monitor.pollPasteboard() // The next check sees the marker before reading.
+        drain(monitor)
+        XCTAssertTrue(monitor.entries.isEmpty)
+        XCTAssertEqual(pasteboard.stringReadCount, 1)
+        XCTAssertFalse(monitor.log.lines.contains { $0.fileLine.contains("secret written during read") })
+        XCTAssertEqual(monitor.log.lines.filter { $0.primaryText.contains("秘密の印のため保存せず") }.count, 2)
     }
 
     @MainActor

@@ -23,6 +23,7 @@ final class PictureInPictureController: NSObject, ObservableObject {
     private var timer: Timer?
     private var status: PictureInPictureStatus?
     private var lastFrameError: String?
+    private var lastLayerError: String?
 
     init(monitor: ClipboardMonitor, defaults: UserDefaults = .standard) {
         self.monitor = monitor
@@ -118,7 +119,16 @@ final class PictureInPictureController: NSObject, ObservableObject {
             let sample = try PictureInPictureFrame.makeSampleBuffer(
                 from: pixelBuffer, presentationTime: CMClockGetTime(CMClockGetHostTimeClock())
             )
-            if displayLayer.status == .failed { displayLayer.flush() }
+            if displayLayer.status == .failed {
+                // enqueue does not throw; the layer reports its asynchronous failure only here.
+                let error = displayLayer.error as NSError?
+                let message = "domain=\(error?.domain ?? "-"); code=\(error?.code ?? 0); requiresFlushToResumeDecoding=\(displayLayer.requiresFlushToResumeDecoding)"
+                if message != lastLayerError { record("PiPの表示レイヤー失敗", details: message) }
+                lastLayerError = message
+                displayLayer.flush()
+            } else {
+                lastLayerError = nil
+            }
             displayLayer.enqueue(sample)
             lastFrameError = nil
         } catch {

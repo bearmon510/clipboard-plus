@@ -550,6 +550,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             }
             if input == nil, let image = pasteboard.image { input = .bitmap(image) }
             let after = pasteboard.changeCount
+            if skipConcealedChange(before: before, after: after, source: source, scene: readScene, detections: detections) {
+                return
+            }
             let finished = Date()
             let elapsed = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
             let details = "取得元=\(source); 読取時scene=\(readScene); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsed)); pasteboard.types=\(types)"
@@ -569,6 +572,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let checkedAt = Date()
         let text = hasStrings ? pasteboard.string : nil
         let after = pasteboard.changeCount
+        if skipConcealedChange(before: before, after: after, source: source, scene: readScene, detections: detections) {
+            return
+        }
         let finishedAt = Date()
         let elapsedMS = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
         let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsedMS)); hasImages=false; hasStrings=\(hasStrings); string=nil=\(text == nil); 形式一覧が空=\(types.isEmpty); pasteboard.types=\(types)"
@@ -606,6 +612,23 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         if before != after {
             record("読み取り中の変更", count: after, details: "\(details); 件数の欠落とは判定しない")
         }
+    }
+
+    /// The type check and the content read are not atomic. If the pasteboard changed during the read
+    /// and now carries a concealed marker, the content just read may be the secret: drop it unsaved and unlogged.
+    private func skipConcealedChange(before: Int, after: Int, source: String, scene: String,
+                                     detections: [MeasurementEvent]) -> Bool {
+        guard before != after else { return false }
+        let latest = pasteboard.types
+        guard ClipboardPrivacy.hasPrivateMarker(in: latest) else { return false }
+        admission.discardPendingSelfCopy()
+        store.resetImageAdmission()
+        detections.forEach { log.append($0) }
+        log.append(MeasurementEvent(
+            kind: "秘密の印のため保存せず", changeCount: after, scene: scene,
+            details: "取得元=\(source); 読み取り中に変更; 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); pasteboard.types=\(latest)"
+        ))
+        return true
     }
 
     private func flushLogBeforeSuspension() {
