@@ -22,6 +22,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var sceneState = "inactive"
     @Published private(set) var entries: [HistoryEntry] = []
     @Published private(set) var pollingInterval: TimeInterval = 0.5
+    @Published private(set) var historyRetention: HistoryRetention = .defaultValue
     @Published private(set) var storageError: String?
     @Published private(set) var pendingSaveCount = 0
     /// Successful saves since launch, including copies merged into an existing item.
@@ -36,7 +37,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private let defaults: UserDefaults
     private let makeDatabase: (() throws -> HistoryPersistence)?
     private let imageDirectory: URL
-    private lazy var store = HistoryStore(makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
+    private lazy var store = HistoryStore(retention: historyRetention, makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
         self?.handleStorageEvent(event)
     }
     lazy var backup = BackupController(store: store, record: { [weak self] kind, details in
@@ -70,6 +71,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         super.init()
         let storedInterval = defaults.object(forKey: "pollingInterval") as? Double ?? 0.5
         pollingInterval = storedInterval.isFinite ? min(5, max(0.1, storedInterval)) : 0.5
+        historyRetention = HistoryRetention.load(from: defaults)
         maintenancePending = true
         store.load { [weak self] result in
             self?.maintenancePending = false
@@ -119,6 +121,15 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
+    func setHistoryRetention(_ value: HistoryRetention) {
+        guard value != historyRetention else { return }
+        historyRetention = value
+        value.save(to: defaults)
+        store.setRetention(value) { result in
+            if case .failure = result { self.reportStorageFailure() }
+        }
+    }
+
     func updateScene(_ value: String) {
         guard sceneState != value else { return }
         let observedAt = Date()
@@ -138,7 +149,15 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         } else {
             log.append(sceneEvent)
         }
-        cleanupExpired()
+        if value == "active" {
+            // Enqueue even while periodic maintenance/load is pending; foreground
+            // transitions must never lose their forced age check.
+            store.maintain(forceRetention: true) { result in
+                if case .failure = result { self.reportStorageFailure() }
+            }
+        } else {
+            cleanupExpired()
+        }
         if value == "inactive" || value == "background" {
             flushLogBeforeSuspension()
         }
@@ -452,6 +471,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             imageNotice = message
             record("画像保存の見送り", details: details)
         case .imageUsage(let usage): imageUsage = usage
+        case .automaticallyDeleted(let count, let retention):
+            record("期限による自動削除", details: "件数=\(count); 日数=\(retention.rawValue)")
         case .cleanupFailed:
             imageNotice = "画像ファイルの後始末に失敗しました。自動で再試行します。"
             record("画像ファイルの後始末失敗")

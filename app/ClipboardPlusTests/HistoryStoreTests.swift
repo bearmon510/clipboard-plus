@@ -54,6 +54,11 @@ final class HistoryStoreTests: XCTestCase {
             return try database.purgeExpired()
         }
 
+        func purgeHistory(olderThan retention: HistoryRetention) throws -> Int {
+            XCTAssertFalse(Thread.isMainThread)
+            return try database.purgeHistory(olderThan: retention)
+        }
+
         func latestDeletion() throws -> HistoryDeletion? {
             XCTAssertFalse(Thread.isMainThread)
             return try database.latestDeletion()
@@ -77,7 +82,7 @@ final class HistoryStoreTests: XCTestCase {
         let firstDate = Date(timeIntervalSince1970: 100)
         let secondDate = firstDate.addingTimeInterval(1)
         let done = expectation(description: "retried in order")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             database.failedAttempts = [1, 2]
             spy = database
@@ -114,7 +119,7 @@ final class HistoryStoreTests: XCTestCase {
         var saved: [String] = []
         var failures = 0
         let done = expectation(description: "next collection retries")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             database.failedAttempts = [1]
             return database
@@ -141,7 +146,7 @@ final class HistoryStoreTests: XCTestCase {
         var spy: DatabaseSpy?
         var saved: [HistoryEntry] = []
         let done = expectation(description: "only failed suffix retried")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             database.failedAttempts = [2, 3]
             spy = database
@@ -166,7 +171,7 @@ final class HistoryStoreTests: XCTestCase {
         var opens = 0
         var saved: [String] = []
         let done = expectation(description: "connection recovered")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             XCTAssertFalse(Thread.isMainThread)
             opens += 1
             if opens == 1 { throw CocoaError(.fileWriteOutOfSpace) }
@@ -194,7 +199,7 @@ final class HistoryStoreTests: XCTestCase {
         let released = DispatchSemaphore(value: 0)
         let done = expectation(description: "both collections completed")
         var saved: [String] = []
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             database.beforeCollect = { [weak database] in
                 guard let database else { return }
@@ -226,7 +231,7 @@ final class HistoryStoreTests: XCTestCase {
         var entries: [HistoryEntry] = []
         let done = expectation(description: "incremental duplicate update")
         let date = Date(timeIntervalSince1970: 100)
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             spy = database
             return database
@@ -281,7 +286,7 @@ final class HistoryStoreTests: XCTestCase {
         let url = try databaseURL()
         var saved = 0
         let done = expectation(description: "clear cannot overtake pending")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             database.failedAttempts = [1, 2]
             return database
@@ -305,7 +310,7 @@ final class HistoryStoreTests: XCTestCase {
     func testExportRetriesPendingTextAndWritesSnapshot() throws {
         let url = try databaseURL()
         let done = expectation(description: "snapshot written")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             let database = try DatabaseSpy(url: url)
             database.failedAttempts = [1]
             return database

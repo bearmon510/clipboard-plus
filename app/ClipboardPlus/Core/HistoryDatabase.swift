@@ -197,6 +197,17 @@ final class HistoryDatabase: HistoryPersistence {
         try removeRows(predicate: "delete_after <= ?", bindings: [.real(now().timeIntervalSince1970)])
     }
 
+    @discardableResult
+    func purgeHistory(olderThan retention: HistoryRetention) throws -> Int {
+        guard let cutoff = retention.cutoff(relativeTo: now()) else { return 0 }
+        return try transaction {
+            let previousCount = removals.count
+            try removeRows(predicate: "deletion_id IS NULL AND pinned = 0 AND collected_at < ?",
+                           bindings: [.real(cutoff.timeIntervalSince1970)])
+            return removals.count - previousCount
+        }
+    }
+
     // Drain only after a successful transaction. Rollbacks also roll back this journal.
     func takeRemovals() -> [HistoryEntry] {
         defer { removals.removeAll() }
@@ -227,13 +238,14 @@ final class HistoryDatabase: HistoryPersistence {
                                count: Int(sqlite3_column_int64(statement, 2)))
     }
 
-    func estimateBackup(_ entries: [HistoryEntry]) throws -> RestoreCounts {
-        try backupPlan(entries).counts
+    func estimateBackup(_ entries: [HistoryEntry], retentionCutoff: Date? = nil) throws -> RestoreCounts {
+        try backupPlan(entries, retentionCutoff: retentionCutoff).counts
     }
 
-    func mergeBackup(_ entries: [HistoryEntry], beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
+    func mergeBackup(_ entries: [HistoryEntry], retentionCutoff: Date? = nil,
+                     beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
         try transaction {
-            let plan = try backupPlan(entries)
+            let plan = try backupPlan(entries, retentionCutoff: retentionCutoff)
             let existingIDs = Set(try fetchAll().map(\.id))
             for entry in plan.writes {
                 if existingIDs.contains(entry.id) {
@@ -270,14 +282,15 @@ final class HistoryDatabase: HistoryPersistence {
         }
     }
 
-    private func backupPlan(_ entries: [HistoryEntry]) throws -> HistoryRestorePlan {
+    private func backupPlan(_ entries: [HistoryEntry], retentionCutoff: Date?) throws -> HistoryRestorePlan {
         // sqlite_sequence also includes previously deleted rows. Read it without changing the DB.
         let statement = try prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'history'), 0)")
         defer { sqlite3_finalize(statement) }
         guard try step(statement) == SQLITE_ROW else { throw HistoryDatabaseError.invalidRow }
         return try HistoryRestorePlan(existing: fetchAll(), incoming: entries,
                                       lastID: Int(sqlite3_column_int64(statement, 0)),
-                                      unpinnedLimit: unpinnedLimit, imageByteLimit: imageByteLimit)
+                                      unpinnedLimit: unpinnedLimit, imageByteLimit: imageByteLimit,
+                                      retentionCutoff: retentionCutoff)
     }
 
     private func markDeleted(predicate: String, bindings: [Value]) throws -> HistoryDeletion? {

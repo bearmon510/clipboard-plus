@@ -48,10 +48,25 @@ struct SettingsView: View {
                     Text("印のない秘密情報は判別できないため、必要に応じて記録を停止し、保存済みの履歴を削除してください。")
                 }
                 Section("履歴の保存") {
+                    Picker("自動削除", selection: Binding(
+                        get: { monitor.historyRetention },
+                        set: { monitor.setHistoryRetention($0) }
+                    )) {
+                        ForEach(HistoryRetention.allCases, id: \.self) { retention in
+                            Text(retention.displayName).tag(retention)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(minHeight: 44)
+                    Text("最後に収集した日時を基準に、指定した日数を過ぎた履歴を自動で削除します。ピン留めした項目は消えません。自動削除した項目は元に戻せません。期間を短くすると、その場で対象の履歴が消えます。")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("初期値は30日です。この機能への更新後、最初の起動でも30日を過ぎた履歴が削除されます。起動時、前面に戻ったとき、起動中は1時間ごとに確認します。")
+                        .font(.footnote)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text("画像 \(monitor.imageUsage.count)件 · \(ByteCountFormatter.string(fromByteCount: Int64(monitor.imageUsage.byteCount), countStyle: .decimal))")
                     Text("画像は1件20MBまで。ピン留め以外の画像の実体は合計500MBまでで、古いものから削除します。件数の上限は文章と画像の合計です。使用量はピン留めと取り消し待ちの実体を含み、縮小画像は含みません。")
                     Text("履歴は端末内に保存します。ピン留めしていない項目は1,000件までで、最後に収集した時刻の古いものから削除します。ピン留めした項目は自動では削除しません。")
-                    Text("削除後は5秒間取り消せます。取り消し待ちの項目は書き出しに含めません。")
+                    Text("手動の削除後は5秒間取り消せます。取り消し待ちの項目は書き出しに含めません。")
                 }
                 BackupSection(backup: monitor.backup)
                 Section("JSONで書き出し") {

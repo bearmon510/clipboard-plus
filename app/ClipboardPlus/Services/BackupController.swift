@@ -73,15 +73,23 @@ final class BackupController: ObservableObject {
         let token = begin("バックアップ復元（反映）")
         validated = nil
         estimate = nil
-        store.restoreBackup(backup, cancellation: token, progress: updateProgress) { result in
+        store.restoreBackup(backup, cancellation: token, expectedCounts: expected, progress: updateProgress) { result in
             self.isBusy = false
             self.cancellation = nil
             switch result {
             case .success(let counts):
                 self.resultMessage = "復元しました。\n\(counts.description)"
-                    + (counts == expected ? "" : "\n確認後に履歴が変わったため、見積もりと件数が異なります。")
                 self.record("バックアップ復元の完了", counts.description)
-            case .failure(let error): self.fail(error, operation: "バックアップ復元")
+            case .failure(let error):
+                if let changed = error as? RestoreEstimateChanged {
+                    do { try token.check() }
+                    catch { backup.discard(); self.fail(error, operation: "バックアップ復元"); return }
+                    self.validated = backup
+                    self.estimate = changed.counts
+                    self.resultMessage = "履歴・設定・時刻の変化により件数が変わりました。新しい見積もりを確認して、もう一度「復元する」を押してください。"
+                } else {
+                    self.fail(error, operation: "バックアップ復元")
+                }
             }
         }
     }

@@ -5,10 +5,15 @@ struct RestoreCounts: Equatable {
     var updated = 0
     var unchanged = 0
     var removedByLimit = 0
+    var removedByRetention = 0
 
     var description: String {
-        "追加 \(added)件・更新 \(updated)件・変化なし \(unchanged)件\n上限で消える項目 \(removedByLimit)件"
+        "追加 \(added)件・更新 \(updated)件・変化なし \(unchanged)件\n上限で消える項目 \(removedByLimit)件\n期限を過ぎているため削除される \(removedByRetention)件"
     }
+}
+
+struct RestoreEstimateChanged: Error {
+    let counts: RestoreCounts
 }
 
 // Estimate and application share the same pure plan. At equal timestamps, a stable
@@ -20,7 +25,7 @@ struct HistoryRestorePlan {
     let counts: RestoreCounts
 
     init(existing: [HistoryEntry], incoming: [HistoryEntry], lastID: Int,
-         unpinnedLimit: Int, imageByteLimit: Int) throws {
+         unpinnedLimit: Int, imageByteLimit: Int, retentionCutoff: Date? = nil) throws {
         var counts = RestoreCounts()
         var byKey = Dictionary(uniqueKeysWithValues: existing.map { (Self.key($0), $0) })
         var writes: [HistoryEntry] = []
@@ -48,7 +53,14 @@ struct HistoryRestorePlan {
                 counts.added += 1
             }
         }
-        let ordered = byKey.values.sorted {
+        // Age is evaluated after merging (newer collection dates and pins win),
+        // before either cap. Each removed row belongs to exactly one category.
+        let retained = byKey.values.filter {
+            guard let retentionCutoff else { return true }
+            return $0.isPinned || $0.lastCollectedAt >= retentionCutoff
+        }
+        counts.removedByRetention = byKey.count - retained.count
+        let ordered = retained.sorted {
             $0.lastCollectedAt == $1.lastCollectedAt
                 ? Self.key($0).lexicographicallyPrecedes(Self.key($1)) : $0.lastCollectedAt > $1.lastCollectedAt
         }
@@ -65,7 +77,7 @@ struct HistoryRestorePlan {
             removed.insert(entry.id)
         }
         survivors.removeAll { removed.contains($0.id) }
-        counts.removedByLimit = byKey.count - survivors.count
+        counts.removedByLimit = retained.count - survivors.count
         self.writes = writes
         self.survivors = survivors
         self.removedIDs = Set(byKey.values.map(\.id)).subtracting(survivors.map(\.id))
@@ -83,6 +95,7 @@ enum HistoryRestore {
     // Fresh UUID names ensure rollback only removes files created by this operation.
     static func apply(_ backup: ValidatedBackup, database: HistoryPersistence, files: HistoryImageFiles,
                       cancellation: BackupCancellation,
+                      retentionCutoff: Date? = nil,
                       move: (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) },
                       progress: (BackupProgress) -> Void = { _ in }) throws -> RestoreCounts {
         var placed = Set<String>()
@@ -90,7 +103,7 @@ enum HistoryRestore {
         defer { backup.discard() }
         do {
             try cancellation.check()
-            return try database.mergeBackup(backup.entries) { survivors in
+            return try database.mergeBackup(backup.entries, retentionCutoff: retentionCutoff) { survivors in
                 let needed = Set(survivors.compactMap { $0.image?.filename })
                 progress(BackupProgress(completed: 0, total: backup.entries.count))
                 for (index, entry) in backup.entries.enumerated() {

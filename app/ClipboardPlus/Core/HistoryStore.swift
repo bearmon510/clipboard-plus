@@ -8,13 +8,14 @@ protocol HistoryPersistence: AnyObject {
     func deleteAll(includePinned: Bool) throws -> HistoryDeletion?
     func undo(_ deletion: HistoryDeletion) throws -> Bool
     func purgeExpired() throws -> Bool
+    func purgeHistory(olderThan retention: HistoryRetention) throws -> Int
     func latestDeletion() throws -> HistoryDeletion?
     func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry
     func takeRemovals() -> [HistoryEntry]
     func referencedImageFiles() throws -> Set<String>?
     func imageUsage() throws -> HistoryImageUsage
-    func estimateBackup(_ entries: [HistoryEntry]) throws -> RestoreCounts
-    func mergeBackup(_ entries: [HistoryEntry], beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts
+    func estimateBackup(_ entries: [HistoryEntry], retentionCutoff: Date?) throws -> RestoreCounts
+    func mergeBackup(_ entries: [HistoryEntry], retentionCutoff: Date?, beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts
 }
 
 extension HistoryPersistence {
@@ -24,14 +25,15 @@ extension HistoryPersistence {
     func takeRemovals() -> [HistoryEntry] { [] }
     func referencedImageFiles() throws -> Set<String>? { nil }
     func imageUsage() throws -> HistoryImageUsage { HistoryImageUsage() }
-    func estimateBackup(_ entries: [HistoryEntry]) throws -> RestoreCounts { throw BackupError.unavailable }
-    func mergeBackup(_ entries: [HistoryEntry], beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
+    func estimateBackup(_ entries: [HistoryEntry], retentionCutoff: Date? = nil) throws -> RestoreCounts { throw BackupError.unavailable }
+    func mergeBackup(_ entries: [HistoryEntry], retentionCutoff: Date? = nil, beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
         throw BackupError.unavailable
     }
 }
 
 final class HistoryStore {
     static let dragProtectionInterval: TimeInterval = 5 * 60
+    static let retentionCheckInterval: TimeInterval = 60 * 60
 
     enum Event {
         case replace([HistoryEntry])
@@ -44,6 +46,7 @@ final class HistoryStore {
         case imageRejected(message: String, details: String)
         case imageUsage(HistoryImageUsage)
         case cleanupFailed
+        case automaticallyDeleted(count: Int, retention: HistoryRetention)
     }
 
     private struct PendingCollection {
@@ -68,13 +71,17 @@ final class HistoryStore {
     private var backupProtections: [UUID: Set<String>] = [:]
     // Pending images contain only metadata. Uncommitted files are cleaned on the next launch.
     private var pending: [PendingCollection] = []
+    private var retention: HistoryRetention
+    private var lastRetentionCheck: Date?
 
-    init(makeDatabase: (() throws -> HistoryPersistence)? = nil,
+    init(retention: HistoryRetention = .defaultValue,
+         makeDatabase: (() throws -> HistoryPersistence)? = nil,
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
          now: @escaping () -> Date = Date.init,
          backupQueue: DispatchQueue = DispatchQueue(label: "clipboardplus.backup", qos: .userInitiated),
          onEvent: @escaping @MainActor (Event) -> Void) {
-        self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase() }
+        self.retention = retention
+        self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase(now: now) }
         self.onEvent = onEvent
         self.now = now
         self.backupQueue = backupQueue
@@ -149,15 +156,46 @@ final class HistoryStore {
 
     func load(completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
+            try self.applyRetention(database, force: true)
             self.emit(.replace(try database.fetchAll()))
             return try database.latestDeletion()
         }, completion: completion)
     }
 
-    func maintain(completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+    func maintain(forceRetention: Bool = false, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
             if try database.purgeExpired() { self.emit(.replace(try database.fetchAll())) }
+            try self.applyRetention(database, force: forceRetention)
         }, completion: completion)
+    }
+
+    func setRetention(_ value: HistoryRetention, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        queue.async {
+            self.retention = value
+            // Keep the new policy due even if flushing pending writes fails.
+            self.lastRetentionCheck = nil
+            let result = Result {
+                try self.savePending()
+                let database = try self.requireDatabase()
+                try self.applyRetention(database, force: true)
+                self.finishChanges(database)
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    private func applyRetention(_ database: HistoryPersistence, force: Bool) throws {
+        let date = now()
+        if !force, let lastRetentionCheck,
+           date.timeIntervalSince(lastRetentionCheck) < Self.retentionCheckInterval,
+           date >= lastRetentionCheck { return }
+        let count = try database.purgeHistory(olderThan: retention)
+        lastRetentionCheck = date
+        recordAutomaticDeletion(count)
+    }
+
+    private func recordAutomaticDeletion(_ count: Int) {
+        if count > 0 { emit(.automaticallyDeleted(count: count, retention: retention)) }
     }
 
     func delete(id: Int, completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
@@ -268,7 +306,8 @@ final class HistoryStore {
                         // The normal load opens the store before settings becomes usable.
                         // If it failed, reject rather than letting validation initialize/purge/clean storage.
                         guard let database = self.database else { throw BackupError.unavailable }
-                        let counts = try database.estimateBackup(backup.entries)
+                        let counts = try database.estimateBackup(backup.entries,
+                                                               retentionCutoff: self.retention.cutoff(relativeTo: self.now()))
                         DispatchQueue.main.async { completion(.success((backup, counts))) }
                     } catch {
                         backup.discard()
@@ -280,6 +319,7 @@ final class HistoryStore {
     }
 
     func restoreBackup(_ backup: ValidatedBackup, cancellation: BackupCancellation,
+                       expectedCounts: RestoreCounts? = nil,
                        progress: @escaping @MainActor (BackupProgress) -> Void,
                        completion: @escaping @MainActor (Result<RestoreCounts, Error>) -> Void) {
         queue.async {
@@ -288,17 +328,26 @@ final class HistoryStore {
                 try cancellation.check()
                 try self.savePending()
                 let database = try self.requireDatabase()
+                // Freeze the cutoff for re-estimation and application on this serial queue.
+                let date = self.now()
+                let cutoff = self.retention.cutoff(relativeTo: date)
+                let estimate = try database.estimateBackup(backup.entries, retentionCutoff: cutoff)
+                if let expectedCounts, estimate != expectedCounts {
+                    throw RestoreEstimateChanged(counts: estimate)
+                }
                 let counts = try HistoryRestore.apply(backup, database: database, files: self.imageFiles,
-                                                      cancellation: cancellation) { value in
+                                                      cancellation: cancellation, retentionCutoff: cutoff) { value in
                     DispatchQueue.main.async { progress(value) }
                 }
+                self.lastRetentionCheck = date
+                self.recordAutomaticDeletion(counts.removedByRetention)
                 self.finishChanges(database)
                 // A read failure after COMMIT must not report the successful merge as rolled back.
                 do { self.emit(.replace(try database.fetchAll())) }
                 catch { self.emit(.saveFailed) }
                 result = .success(counts)
             } catch {
-                backup.discard()
+                if !(error is RestoreEstimateChanged) { backup.discard() }
                 result = .failure(error)
             }
             DispatchQueue.main.async { completion(result) }
@@ -390,11 +439,11 @@ final class HistoryStore {
         DispatchQueue.main.async { self.onEvent(event) }
     }
 
-    private static func openDatabase() throws -> HistoryPersistence {
+    private static func openDatabase(now: @escaping () -> Date) throws -> HistoryPersistence {
         let directory = try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
         )
-        return try HistoryDatabase(url: directory.appendingPathComponent("clipboardplus.sqlite"))
+        return try HistoryDatabase(url: directory.appendingPathComponent("clipboardplus.sqlite"), now: now)
     }
 }
 

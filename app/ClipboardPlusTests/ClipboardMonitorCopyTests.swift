@@ -67,6 +67,7 @@ final class ClipboardMonitorCopyTests: XCTestCase {
                          makeDatabase: @escaping () throws -> HistoryPersistence) throws -> ClipboardMonitor {
         let suite = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        HistoryRetention.never.save(to: defaults)
         addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         let log = MeasurementLog(writer: MeasurementLogWriter(fileURL: root.appendingPathComponent("log.tsv")))
         let monitor = ClipboardMonitor(defaults: defaults, log: log, makeDatabase: makeDatabase,

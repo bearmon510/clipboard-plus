@@ -29,7 +29,7 @@ final class ImageStoreTests: XCTestCase {
         var entries: [HistoryEntry] = []
         var saved: [HistoryEntry] = []
         var usage = HistoryImageUsage()
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, imageByteLimit: limit) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, imageByteLimit: limit) }, imageDirectory: directory) { event in
             switch event {
             case .saved(let entry, _): saved.append(entry); HistoryList.upsert(entry, into: &entries)
             case .upsert(let entry): HistoryList.upsert(entry, into: &entries)
@@ -76,7 +76,7 @@ final class ImageStoreTests: XCTestCase {
         var now = Date(timeIntervalSince1970: 100)
         var entry: HistoryEntry?
         var usage = HistoryImageUsage()
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, now: { now }) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, now: { now }) }, imageDirectory: directory) { event in
             if case .saved(let value, _) = event { entry = value }
             if case .imageUsage(let value) = event { usage = value }
         }
@@ -140,7 +140,7 @@ final class ImageStoreTests: XCTestCase {
             try database.delete(id: row.id)
         }
         var loaded: [HistoryEntry] = []
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, now: { now }) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, now: { now }) }, imageDirectory: directory) { event in
             if case .replace(let values) = event { loaded = values }
         }
         let done = expectation(description: "startup cleanup")
@@ -167,7 +167,7 @@ final class ImageStoreTests: XCTestCase {
         var prepared: [HistoryImage] = []
         var saved: [HistoryEntry] = []
         let failed = expectation(description: "DB failed")
-        let store = HistoryStore(makeDatabase: {
+        let store = HistoryStore(retention: .never, makeDatabase: {
             XCTAssertFalse(Thread.isMainThread)
             return try HistoryDatabase(url: url)
         }, imageDirectory: directory) { event in
@@ -202,7 +202,7 @@ final class ImageStoreTests: XCTestCase {
         let directory = root.appendingPathComponent("images")
         let url = root.appendingPathComponent("history.sqlite")
         var rejections: [String] = []
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
             switch event {
             case .imageRejected(let message, let details): rejections.append(message + details)
             case .saved, .saveFailed: XCTFail("Rejected image must not enter the save queue")
@@ -227,7 +227,7 @@ final class ImageStoreTests: XCTestCase {
         try Data([1]).write(to: directory)
         let url = root.appendingPathComponent("history.sqlite")
         var rejected = 0
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
             if case .imageRejected(let message, _) = event {
                 rejected += 1
                 XCTAssertEqual(message, HistoryImageError.fileWrite.message)
@@ -255,7 +255,7 @@ final class ImageStoreTests: XCTestCase {
         let hash = try HistoryImageFiles.hash(data)
         var saved: [HistoryEntry] = []
         var skipped = 0
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
             if case .saved(let entry, _) = event { saved.append(entry) }
             if case .imageSkipped = event { skipped += 1 }
         }
@@ -281,7 +281,7 @@ final class ImageStoreTests: XCTestCase {
         let directory = root.appendingPathComponent("images")
         let url = root.appendingPathComponent("history.sqlite")
         var entries: [HistoryEntry] = []
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) }, imageDirectory: directory) { event in
             if case .saved(let entry, _) = event { HistoryList.upsert(entry, into: &entries) }
             if case .remove(let id) = event { entries.removeAll { $0.id == id } }
         }
@@ -299,7 +299,7 @@ final class ImageStoreTests: XCTestCase {
         let url = root.appendingPathComponent("history.sqlite")
         var now = Date(timeIntervalSince1970: 100)
         var entries: [HistoryEntry] = []
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) },
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) },
                                  imageDirectory: directory, now: { now }) { event in
             if case .saved(let entry, _) = event { HistoryList.upsert(entry, into: &entries) }
             if case .remove(let id) = event { entries.removeAll { $0.id == id } }
@@ -341,7 +341,7 @@ final class ImageStoreTests: XCTestCase {
         let url = root.appendingPathComponent("history.sqlite")
         var now = Date(timeIntervalSince1970: 100)
         var entry: HistoryEntry?
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, now: { now }) },
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, now: { now }) },
                                  imageDirectory: directory, now: { now }) { event in
             if case .saved(let value, _) = event { entry = value }
             if case .cleanupFailed = event { XCTFail("Unexpected cleanup failure") }
@@ -379,7 +379,7 @@ final class ImageStoreTests: XCTestCase {
         let directory = root.appendingPathComponent("images")
         let url = root.appendingPathComponent("history.sqlite")
         var saved: [HistoryEntry] = []
-        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url) }, imageDirectory: directory) { event in
             if case .saved(let value, _) = event { saved.append(value) }
         }
         let data = ImageTestSupport.png()

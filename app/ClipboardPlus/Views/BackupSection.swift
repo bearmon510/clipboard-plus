@@ -24,7 +24,7 @@ struct BackupSection: View {
             if let estimate = backup.estimate {
                 Text("今の履歴にマージします。\n\(estimate.description)")
                     .fixedSize(horizontal: false, vertical: true)
-                Text("確認中も収集が続くため、反映時に件数が変わることがあります。")
+                Text("確認中も収集が続きます。履歴・設定・時刻の変化で件数が変わった場合は、新しい見積もりを確認してから復元します。")
                     .font(.footnote)
                 Button("復元する") { backup.restore() }.frame(minHeight: 44)
                 Button("キャンセル", role: .cancel) { backup.cancel() }.frame(minHeight: 44)
