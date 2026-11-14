@@ -29,6 +29,13 @@ final class HistoryImageFiles {
 
     init(directory: URL) { self.directory = directory }
 
+    /// Image types among the pasteboard's type names, preferred types first.
+    static func imageTypes(in types: [String]) -> [String] {
+        let preferred = preferredTypes.filter { types.contains($0) }
+        let others = types.filter { !preferred.contains($0) && UTType($0)?.conforms(to: .image) == true }
+        return preferred + others
+    }
+
     static var defaultDirectory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("HistoryImages", isDirectory: true)

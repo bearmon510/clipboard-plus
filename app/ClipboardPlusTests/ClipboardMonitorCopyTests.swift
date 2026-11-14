@@ -8,9 +8,12 @@ private final class TestClipboardPasteboard: ClipboardPasteboard {
     private var storedString: String?
     private var imageData: Data?
     private var imageType: String?
-    var hasImages: Bool { imageData != nil }
+    /// False imitates UIPasteboard.hasImages ignoring some image types, such as WebP.
+    var reportsImages = true
+    var extraTypes: [String] = []
+    var hasImages: Bool { reportsImages && imageData != nil }
     var hasStrings: Bool { storedString != nil }
-    var types: [String] { imageType.map { [$0] } ?? [] }
+    var types: [String] { (imageType.map { [$0] } ?? []) + extraTypes }
     var image: UIImage? { nil }
 
     var string: String? {
@@ -141,5 +144,32 @@ final class ClipboardMonitorCopyTests: XCTestCase {
         let external = try XCTUnwrap(monitor.entries.first { $0.text == "external text before tap" })
         XCTAssertEqual(external.source, .automatic)
         XCTAssertEqual(external.collectionCount, 1)
+    }
+
+    @MainActor
+    func testImageTypeIsCollectedEvenWhenHasImagesIsFalse() throws {
+        let root = try ImageTestSupport.directory(self)
+        let url = root.appendingPathComponent("history.sqlite")
+        let pasteboard = TestClipboardPasteboard()
+        pasteboard.reportsImages = false
+        pasteboard.extraTypes = ["public.url"]
+        let monitor = try self.monitor(root: root, pasteboard: pasteboard) { try HistoryDatabase(url: url) }
+        drain(monitor)
+        monitor.start()
+        defer { monitor.stop() }
+        pasteboard.setData(ImageTestSupport.png(), forPasteboardType: "public.png")
+        XCTAssertFalse(pasteboard.hasImages)
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.count, 1)
+        XCTAssertEqual(monitor.entries.first?.kind, .image)
+        XCTAssertEqual(monitor.entries.first?.image?.typeIdentifier, "public.png")
+    }
+
+    func testImageTypesFindsWebPAndKeepsPreferredOrder() {
+        XCTAssertEqual(HistoryImageFiles.imageTypes(in: ["org.webmproject.webp", "public.url"]), ["org.webmproject.webp"])
+        XCTAssertEqual(HistoryImageFiles.imageTypes(in: ["public.jpeg", "public.png", "public.utf8-plain-text"]),
+                       ["public.png", "public.jpeg"])
+        XCTAssertEqual(HistoryImageFiles.imageTypes(in: ["public.utf8-plain-text", "public.url"]), [])
     }
 }

@@ -516,11 +516,13 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let before = pasteboard.changeCount
         // A change during this read must remain eligible at the next check.
         lastObservedChangeCount = before
-        if pasteboard.hasImages {
+        let types = pasteboard.types
+        // hasImages is false for some image types, such as the WebP that Safari copies on a long press.
+        let imageTypes = HistoryImageFiles.imageTypes(in: types)
+        if pasteboard.hasImages || !imageTypes.isEmpty {
             admission.discardPendingSelfCopy()
-            let types = pasteboard.types
             var input: HistoryImageInput?
-            for type in HistoryImageFiles.preferredTypes {
+            for type in imageTypes.isEmpty ? HistoryImageFiles.preferredTypes : imageTypes {
                 if let data = pasteboard.data(forPasteboardType: type) {
                     input = .data(data, typeIdentifier: type)
                     break
@@ -546,8 +548,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let hasStrings = pasteboard.hasStrings
         let checkedAt = Date()
         let text = hasStrings ? pasteboard.string : nil
-        // Type names only, to tell why an image copy (for example Safari's long press) arrived as text.
-        let types = pasteboard.types
         let after = pasteboard.changeCount
         let finishedAt = Date()
         let elapsedMS = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
