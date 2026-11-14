@@ -67,9 +67,11 @@ jobs:
         working-directory: app
         env:
           SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+          # xcodebuild passes TEST_RUNNER_* to the tests without the prefix.
+          TEST_RUNNER_SNAPSHOT_DIR: ${{ github.workspace }}/app/build/snapshots
         run: |
           set -euo pipefail
-          mkdir -p build
+          mkdir -p build build/snapshots
           xcodebuild test \
             -project ClipboardPlus.xcodeproj \
             -scheme ClipboardPlus \
@@ -79,6 +81,29 @@ jobs:
             -derivedDataPath DerivedData \
             -resultBundlePath build/ClipboardPlusTests.xcresult \
             CODE_SIGNING_ALLOWED=NO
+
+      # Pictures of the main screens with fictional sample data, for design review.
+      - name: Collect screen snapshots
+        if: always()
+        working-directory: app
+        env:
+          SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -uo pipefail
+          mkdir -p build/snapshots
+          if [ -z "$(ls -A build/snapshots)" ]; then
+            fallback=$(find "$HOME/Library/Developer/CoreSimulator/Devices/$SIMULATOR_ID" -type d -name clipboardplus-snapshots 2>/dev/null | head -n 1)
+            if [ -n "$fallback" ]; then cp "$fallback"/*.png build/snapshots/ || true; fi
+          fi
+          ls -la build/snapshots
+
+      - name: Upload screen snapshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: screen-snapshots
+          path: app/build/snapshots
+          if-no-files-found: ignore
 
       - name: Upload test results
         if: always()

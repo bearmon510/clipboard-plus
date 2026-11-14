@@ -2,112 +2,51 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openURL) private var openURL
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
     @StateObject private var pictureInPicture: PictureInPictureController
+    @AppStorage("pinnedSectionCollapsed") private var pinnedCollapsed = false
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
-    @State private var searchText = ""
+    @State private var searchText: String
     @State private var filter = HistoryFilter.all
-    @State private var previewEntry: HistoryEntry?
-    @State private var notice: String?
-    @State private var noticeTask: Task<Void, Never>?
+    @State private var detailEntry: HistoryEntry?
+    @State private var toast: String?
+    @State private var toastTask: Task<Void, Never>?
     @State private var deletion: HistoryDeletion?
     @State private var undoTask: Task<Void, Never>?
+    @State private var copiedID: Int?
+    @State private var copiedTask: Task<Void, Never>?
     @State private var isDropTargeted = false
 
-    init(monitor: ClipboardMonitor, log: MeasurementLog) {
+    /// `initialSearch` lets previews and screenshot tests open the screen mid-search.
+    init(monitor: ClipboardMonitor, log: MeasurementLog, initialSearch: String = "") {
         self.monitor = monitor
         self.log = log
         _pictureInPicture = StateObject(wrappedValue: PictureInPictureController(monitor: monitor))
+        _searchText = State(initialValue: initialSearch)
     }
 
     private var visibleEntries: [HistoryEntry] {
         HistoryFilter.entries(monitor.entries, filter: filter, search: searchText)
     }
 
+    /// Pinned items get their own section only in the plain, unfiltered list.
+    private var separatesPinned: Bool { filter == .all && searchText.isEmpty }
+
     var body: some View {
-        VStack(spacing: 8) {
-            header
-            if pictureInPicture.isStarting {
-                Text("PiPを準備中です").font(.caption).foregroundStyle(.secondary)
-            }
-            if let message = pictureInPicture.failureMessage {
-                Text(message).font(.caption).foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal)
-            }
-            controls
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("履歴を検索", text: $searchText)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                if !searchText.isEmpty {
-                    Button { searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
-                        .accessibilityLabel("検索をクリア")
-                        .frame(minWidth: 44, minHeight: 44)
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(minHeight: 44)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-            .padding(.horizontal)
-            HStack(spacing: 4) {
-                ForEach(HistoryFilter.allCases, id: \.self) { value in
-                    Button { filter = value } label: {
-                        Text(value.title)
-                            .font(.subheadline)
-                            .frame(maxWidth: .infinity, minHeight: 44)
-                            .background(filter == value ? Color.accentColor.opacity(0.15) : Color.clear,
-                                        in: RoundedRectangle(cornerRadius: 8))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(filter == value ? [.isSelected] : [])
-                }
-            }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("表示する履歴")
-            .padding(.horizontal)
-            HStack {
-                Text(notice ?? "履歴 \(visibleEntries.count)件")
-                Spacer()
-                Text("新しい順")
-            }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal)
-            if monitor.pendingSaveCount > 0 {
-                Text("保存待ち \(monitor.pendingSaveCount)件")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
-            }
-            if let error = monitor.storageError {
-                Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal)
-            }
-            if let message = monitor.imageNotice {
-                Text(message).font(.caption).foregroundStyle(.red).padding(.horizontal)
-            }
+        VStack(spacing: 0) {
+            topBar
+            statusStrip
+            filterBar
             history
-            if let deletion {
-                HStack {
-                    Text("\(deletion.count)件を削除しました")
-                    Spacer()
-                    Button("元に戻す") {
-                        showUndo(nil)
-                        monitor.undo(deletion) { restored in
-                            if !restored { showNotice("元に戻せませんでした") }
-                        }
-                    }
-                    .frame(minHeight: 44)
-                }
-                .font(.subheadline)
-                .padding(.horizontal)
-                .background(.regularMaterial)
-            }
         }
-        .padding(.top, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(uiColor: .systemBackground))
+        .background(Theme.page.ignoresSafeArea())
+        .overlay(alignment: .bottom) { bottomOverlay }
+        .overlay { dropOverlay }
+        .tint(Theme.accent)
         .contentShape(Rectangle())
         .onDrop(of: HistoryImageLoader.contentTypes, isTargeted: $isDropTargeted) { providers, _ in
             monitor.receiveDropped(providers, receivedAt: Date())
@@ -115,7 +54,6 @@ struct ContentView: View {
         .onAppear {
             updateScene(scenePhase)
             monitor.pendingDeletion { showUndo($0) }
-            // Recording at launch is now the normal state, so it is not announced.
         }
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
@@ -124,11 +62,7 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture)
         }
-        .sheet(item: $previewEntry) { entry in
-            if let image = entry.image {
-                HistoryImagePreview(image: image, url: monitor.imageURL(image, thumbnail: false))
-            }
-        }
+        .sheet(item: $detailEntry) { entry in detail(entry) }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
             Button("ピン留めを残して消去", role: .destructive) {
                 monitor.deleteAllHistory(includePinned: false) { showUndo($0) }
@@ -138,79 +72,222 @@ struct ContentView: View {
             }
             Button("キャンセル", role: .cancel) {}
         } message: {
-            Text("5秒間は「元に戻す」で取り消せます。計測ログとクリップボードの内容は残ります。")
+            Text("5秒間は「元に戻す」で取り消せます。")
         }
     }
 
-    private var pictureInPicturePreview: some View {
-        // Keep one visible, nonzero source in the window; never hide or fade its layer.
-        PictureInPicturePreview(displayLayer: pictureInPicture.displayLayer,
-                                onReadinessChanged: pictureInPicture.sourceReadinessChanged)
-            .frame(width: 16, height: 9)
-            .accessibilityHidden(true)
+    // MARK: Top bar
+
+    private var topBar: some View {
+        HStack(spacing: 2) {
+            searchField.padding(.trailing, 4)
+            recordingButton
+            if pictureInPicture.isSupported { pictureInPictureButton }
+            moreMenu
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 4)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
     }
 
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField("検索", text: $searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("検索をクリア")
+            }
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, searchText.isEmpty ? 10 : 2)
+        .frame(height: 40)
+        .background(Theme.field, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+    }
+
+    private var recordingButton: some View {
+        Button {
+            if monitor.isRecording { monitor.stop() } else { monitor.start() }
+        } label: {
+            Image(systemName: monitor.isRecording ? "pause.fill" : "play.fill")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(monitor.isRecording ? Color.secondary : Color.orange)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(monitor.isRecording ? "記録を一時停止" : "記録を再開")
+    }
+
+    /// The button is a tiny screen. Once PiP is on, the live picture that feeds the
+    /// PiP window sits inside it, which AVKit needs to stay visible in the window.
     private var pictureInPictureButton: some View {
         Button {
             pictureInPicture.togglePictureInPicture()
         } label: {
-            Label(pictureInPicture.isActive ? "PiPを終了" : "PiP",
-                  systemImage: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
-                .font(.subheadline)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(minWidth: 44, minHeight: 44)
+            ZStack {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(pictureInPicture.isEnabled ? Color.black : Theme.field)
+                if pictureInPicture.isEnabled {
+                    PictureInPicturePreview(displayLayer: pictureInPicture.displayLayer,
+                                            onReadinessChanged: pictureInPicture.sourceReadinessChanged)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+                if pictureInPicture.isStarting && !pictureInPicture.isActive {
+                    ProgressView().controlSize(.mini).tint(Color.white)
+                } else {
+                    Image(systemName: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(pictureInPicture.isEnabled ? Color.white : Theme.accent)
+                }
+            }
+            .frame(width: 40, height: 22.5)
+            .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .strokeBorder(pictureInPicture.isActive ? Theme.accent : Color.primary.opacity(0.15),
+                              lineWidth: pictureInPicture.isActive ? 2 : 1))
+            .frame(width: 46, height: 44)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.bordered)
-        .labelStyle(.titleAndIcon)
+        .buttonStyle(.plain)
         .disabled(pictureInPicture.isStarting && !pictureInPicture.isActive)
-        .accessibilityHint(pictureInPicture.isActive ? "小窓を閉じます。記録は続きます。" : "記録を開始して小窓を表示します。")
+        .accessibilityLabel(pictureInPicture.isActive ? "PiPを終了" : "PiPを開始")
+        .accessibilityHint(pictureInPicture.isActive ? "小窓を閉じます。記録は続きます。" : "小窓を出して、ほかのアプリを使っている間も収集します。")
     }
 
-    private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("clipboard+").font(.headline)
-                HStack(spacing: 4) {
-                    Text(monitor.isRecording ? "記録中" : "一時停止中").font(.subheadline)
-                    if pictureInPicture.isEnabled && pictureInPicture.isSupported { pictureInPicturePreview }
-                }
+    private var moreMenu: some View {
+        Menu {
+            Button("設定", systemImage: "gearshape") { showSettings = true }
+            Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
+                confirmHistoryClear = true
             }
-            Spacer(minLength: 4)
-            if pictureInPicture.isSupported { pictureInPictureButton }
+            .disabled(monitor.entries.isEmpty)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("設定と履歴の全消去")
+    }
+
+    // MARK: Status
+
+    private var statusStrip: some View {
+        VStack(spacing: 6) {
+            if !monitor.isRecording { pausedBanner }
+            if pictureInPicture.isStarting && !pictureInPicture.isActive {
+                statusRow("PiPを準備中です", symbol: "pip", tint: Color.secondary)
+            }
+            if let message = pictureInPicture.failureMessage {
+                statusRow(message, symbol: "exclamationmark.triangle.fill", tint: Color.red)
+            }
+            if let error = monitor.storageError {
+                statusRow(error, symbol: "exclamationmark.triangle.fill", tint: Color.red)
+            }
+            if let message = monitor.imageNotice {
+                statusRow(message, symbol: "photo", tint: Color.red)
+            }
+            if monitor.pendingSaveCount > 0 {
+                statusRow("保存待ち \(monitor.pendingSaveCount)件", symbol: "clock", tint: Color.secondary)
+            }
             if log.errorMessage != nil {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                    .accessibilityLabel("計測ログにエラーがあります。設定から確認できます")
+                statusRow("計測ログにエラーがあります。設定の「開発者向け」で確認できます。",
+                          symbol: "exclamationmark.triangle.fill", tint: Color.red)
             }
-            Menu {
-                Button("設定", systemImage: "slider.horizontal.3") { showSettings = true }
-                Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
-                    confirmHistoryClear = true
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private var pausedBanner: some View {
+        Button {
+            monitor.start()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "pause.circle.fill")
+                Text("一時停止中").fontWeight(.semibold)
+                Text("コピーしても記録しません").foregroundStyle(Color.orange.opacity(0.8)).lineLimit(1)
+                Spacer(minLength: 4)
+                Text("再開").fontWeight(.semibold)
+            }
+            .font(.footnote)
+            .foregroundStyle(Color.orange)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 40)
+            .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("一時停止中。タップで記録を再開")
+    }
+
+    private func statusRow(_ text: String, symbol: String, tint: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: symbol).accessibilityHidden(true)
+            Text(text).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .font(.footnote)
+        .foregroundStyle(tint)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    // MARK: Filters
+
+    private var filterBar: some View {
+        HStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(HistoryFilter.allCases, id: \.self) { value in
+                        filterChip(value)
+                    }
                 }
-                .disabled(monitor.entries.isEmpty)
-            } label: {
-                Image(systemName: "ellipsis.circle").font(.title2)
-                    .frame(minWidth: 44, minHeight: 44)
+                .padding(.leading, 12)
+                .padding(.trailing, 4)
             }
-            .accessibilityLabel("設定と履歴の全消去")
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("表示する履歴")
+            pasteButton.padding(.trailing, 12)
         }
-        .padding(.horizontal)
+        .padding(.top, 2)
+        .padding(.bottom, 2)
     }
 
-    private var controls: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 12) { recordingButton; pasteButton }
-            VStack(spacing: 4) { recordingButton; pasteButton }
+    private func filterChip(_ value: HistoryFilter) -> some View {
+        let selected = filter == value
+        return Button {
+            filter = value
+        } label: {
+            HStack(spacing: 4) {
+                if let symbol = value.symbolName {
+                    Image(systemName: selected && value == .pinned ? "pin.fill" : symbol)
+                        .font(.caption.weight(.semibold))
+                }
+                Text(value.title).font(.subheadline.weight(selected ? .semibold : .regular))
+            }
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .padding(.horizontal, 12)
+            .frame(height: 32)
+            .background(selected ? Theme.accent : Theme.field, in: Capsule())
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal)
-    }
-
-    private var recordingButton: some View {
-        Button(monitor.isRecording ? "一時停止" : "記録を再開") {
-            if monitor.isRecording { monitor.stop() } else { monitor.start() }
-        }
-        .buttonStyle(.borderedProminent)
-        .frame(minHeight: 44)
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
     private var pasteButton: some View {
@@ -218,84 +295,266 @@ struct ContentView: View {
             let receivedAt = Date()
             DispatchQueue.main.async { monitor.saveManually(providers, receivedAt: receivedAt) }
         }
-        .labelStyle(.titleAndIcon)
-        .frame(minWidth: 100, minHeight: 44)
-        .accessibilityLabel("文章・画像を手動保存")
+        .labelStyle(.iconOnly)
+        .buttonBorderShape(.capsule)
+        .accessibilityLabel("今のクリップボードの内容を保存")
     }
+
+    // MARK: History
 
     private var history: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
+        TimelineView(.periodic(from: .now, by: 20)) { context in
+            ScrollView {
                 if visibleEntries.isEmpty {
-                    Text(monitor.entries.isEmpty
-                         ? "コピーした文章・画像を自動で収集します。アプリを開く前からクリップボードにある内容は「ペースト」で保存できます。ここへドロップしても保存できます。"
-                         : "条件に一致する履歴がありません。")
-                        .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
-                        .frame(maxWidth: .infinity, minHeight: 100)
+                    emptyState
+                } else {
+                    grid(now: context.date)
                 }
-                ForEach(visibleEntries, id: \.id) { entry in
-                    VStack(spacing: 0) {
-                        HStack(spacing: 8) {
-                            Button {
-                                monitor.copy(entry) { success in
-                                    showNotice(success ? "コピーしました" : "コピーできませんでした")
-                                }
-                            } label: {
-                                HistoryRow(entry: entry, thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) })
-                            }
-                            .buttonStyle(.plain)
-                            .onDrag { monitor.rowProvider(entry) }
-                            Menu {
-                                rowActions(entry)
-                            } label: {
-                                Image(systemName: "ellipsis")
-                                    .frame(minWidth: 44, minHeight: 44)
-                                    .contentShape(Rectangle())
-                            }
-                            .accessibilityLabel("履歴の操作")
-                        }
-                        .padding(.vertical, 6)
-                        .contextMenu { rowActions(entry) }
-                        Divider()
-                    }
-                }
-                Text("タップでコピー、ドラッグで持ち出し。「⋯」または長押しで拡大表示・ピン留め・削除。文章・画像をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 12)
             }
-            .padding(.horizontal)
+            .scrollDismissesKeyboard(.immediately)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay {
-            if isDropTargeted {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color.accentColor, lineWidth: 3)
-                    .padding(4)
-                    .overlay(alignment: .top) {
-                        Text("ドロップして保存")
-                            .font(.headline)
-                            .padding(12)
-                            .background(.regularMaterial, in: Capsule())
-                            .padding(.top, 12)
-                    }
-                    .allowsHitTesting(false)
-            }
-        }
-        // Stable row IDs and no scroll-to or insertion animation limit unsolicited movement.
-        .transaction { $0.animation = nil }
     }
 
-    @ViewBuilder
-    private func rowActions(_ entry: HistoryEntry) -> some View {
-        if entry.kind == .image {
-            Button("拡大表示", systemImage: "arrow.up.left.and.arrow.down.right") { previewEntry = entry }
+    private func grid(now: Date) -> some View {
+        let sections = EntrySections.make(visibleEntries, separatesPinned: separatesPinned, now: now)
+        let columns = [GridItem(.adaptive(minimum: 300), spacing: 10, alignment: .top)]
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
+            ForEach(sections) { section in
+                Section {
+                    if !(section.kind == .pinned && pinnedCollapsed) {
+                        ForEach(section.entries) { entry in
+                            card(entry, section: section.kind, now: now)
+                        }
+                    }
+                } header: {
+                    sectionHeader(section)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        // Keeps the last card clear of the undo bar.
+        .padding(.bottom, 96)
+    }
+
+    private func card(_ entry: HistoryEntry, section: EntrySectionKind, now: Date) -> some View {
+        HistoryCard(
+            entry: entry,
+            thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) },
+            timeLabel: EntryTime.label(for: entry.lastCollectedAt, now: now,
+                                       includesDay: section != .today && section != .yesterday),
+            query: searchText,
+            isCopied: copiedID == entry.id,
+            onCopy: { copy(entry) },
+            dragProvider: { monitor.rowProvider(entry) },
+            actions: { rowActions(entry) }
+        )
+    }
+
+    @ViewBuilder private func sectionHeader(_ section: EntrySection) -> some View {
+        if section.kind == .pinned {
+            Button {
+                pinnedCollapsed.toggle()
+            } label: {
+                sectionTitle(section, chevron: pinnedCollapsed ? "chevron.right" : "chevron.down")
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(pinnedCollapsed ? "ピン留めを表示します" : "ピン留めをたたみます")
+        } else {
+            sectionTitle(section, chevron: nil)
+        }
+    }
+
+    private func sectionTitle(_ section: EntrySection, chevron: String?) -> some View {
+        HStack(spacing: 6) {
+            if section.kind == .pinned {
+                Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Color.orange)
+            }
+            Text(section.kind.title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            Text("\(section.entries.count)").font(.caption.weight(.medium)).foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+            if let chevron {
+                Image(systemName: chevron).font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.top, 12)
+        .frame(minHeight: 36, alignment: .bottom)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder private func rowActions(_ entry: HistoryEntry) -> some View {
+        Button("コピー", systemImage: "doc.on.doc") { copy(entry) }
+        Button(entry.kind == .image ? "拡大表示" : "全文を表示", systemImage: "arrow.up.left.and.arrow.down.right") {
+            detailEntry = entry
+        }
+        if entry.kind == .url, let url = URL(string: entry.text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            Button("リンクを開く", systemImage: "safari") { openURL(url) }
         }
         Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
             monitor.togglePin(entry)
         }
+        Divider()
         Button("削除", systemImage: "trash", role: .destructive) {
             monitor.delete(entry) { showUndo($0) }
+        }
+    }
+
+    @ViewBuilder private func detail(_ entry: HistoryEntry) -> some View {
+        if let image = entry.image {
+            HistoryImagePreview(image: image, url: monitor.imageURL(image, thumbnail: false))
+        } else {
+            EntryDetailView(entry: entry) { copy(entry) }
+        }
+    }
+
+    // MARK: Empty states
+
+    @ViewBuilder private var emptyState: some View {
+        if monitor.entries.isEmpty {
+            VStack(spacing: 14) {
+                emptySymbol("doc.on.clipboard")
+                Text("コピーすると、ここに並びます").font(.title3.weight(.semibold))
+                Text("ほかのアプリで文章や画像をコピーしてみてください。ここへドラッグしても保存できます。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                if pictureInPicture.isSupported && !pictureInPicture.isActive {
+                    pictureInPictureTip
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 48)
+            .frame(maxWidth: 440)
+            .frame(maxWidth: .infinity)
+        } else {
+            VStack(spacing: 14) {
+                emptySymbol("magnifyingglass")
+                Text("見つかりませんでした").font(.title3.weight(.semibold))
+                Button("条件をクリア") {
+                    searchText = ""
+                    filter = .all
+                }
+                .buttonStyle(.bordered)
+                .frame(minHeight: 44)
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 48)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private func emptySymbol(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 38, weight: .medium))
+            .foregroundStyle(Theme.accent)
+            .frame(width: 92, height: 92)
+            .background(Theme.accent.opacity(0.12), in: Circle())
+            .accessibilityHidden(true)
+    }
+
+    private var pictureInPictureTip: some View {
+        VStack(spacing: 10) {
+            Text("全画面のアプリを使うときは、PiPの小窓を出しておくと、その間のコピーも収集できます。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button {
+                pictureInPicture.togglePictureInPicture()
+            } label: {
+                Label("PiPの小窓を出す", systemImage: "pip.enter").frame(minHeight: 28)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+        .padding(.top, 8)
+    }
+
+    // MARK: Overlays
+
+    private var bottomOverlay: some View {
+        VStack(spacing: 8) {
+            if let toast {
+                Text(toast)
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.regularMaterial, in: Capsule())
+                    .shadow(color: Color.black.opacity(0.12), radius: 10, y: 3)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .allowsHitTesting(false)
+            }
+            if let deletion {
+                undoBar(deletion)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: toast)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: deletion)
+    }
+
+    private func undoBar(_ deletion: HistoryDeletion) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "trash").foregroundStyle(.secondary).accessibilityHidden(true)
+            Text("\(deletion.count)件を削除しました").font(.subheadline)
+            Spacer(minLength: 8)
+            Button("元に戻す") {
+                showUndo(nil)
+                monitor.undo(deletion) { restored in
+                    if !restored { showToast("元に戻せませんでした") }
+                }
+            }
+            .font(.subheadline.weight(.semibold))
+            .frame(minHeight: 44)
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 12)
+        .frame(maxWidth: 520)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+        .shadow(color: Color.black.opacity(0.12), radius: 10, y: 3)
+    }
+
+    @ViewBuilder private var dropOverlay: some View {
+        if isDropTargeted {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Theme.accent, lineWidth: 3)
+                .background(Theme.accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .padding(6)
+                .overlay(alignment: .top) {
+                    Label("ドロップして保存", systemImage: "arrow.down.doc")
+                        .font(.headline)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.regularMaterial, in: Capsule())
+                        .padding(.top, 18)
+                }
+                .allowsHitTesting(false)
+        }
+    }
+
+    // MARK: Actions
+
+    private func copy(_ entry: HistoryEntry) {
+        monitor.copy(entry) { success in
+            if success {
+                showCopied(entry.id)
+            } else {
+                showToast("コピーできませんでした")
+            }
+        }
+    }
+
+    private func showCopied(_ id: Int) {
+        copiedTask?.cancel()
+        copiedID = id
+        copiedTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_100_000_000)
+            guard !Task.isCancelled else { return }
+            copiedID = nil
         }
     }
 
@@ -312,13 +571,13 @@ struct ContentView: View {
         }
     }
 
-    private func showNotice(_ text: String) {
-        noticeTask?.cancel()
-        notice = text
-        noticeTask = Task { @MainActor in
+    private func showToast(_ text: String) {
+        toastTask?.cancel()
+        toast = text
+        toastTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard !Task.isCancelled else { return }
-            notice = nil
+            toast = nil
         }
     }
 
@@ -329,42 +588,5 @@ struct ContentView: View {
         case .background: monitor.updateScene("background")
         @unknown default: monitor.updateScene("inactive")
         }
-    }
-}
-
-private struct HistoryRow: View {
-    let entry: HistoryEntry
-    let thumbnailURL: URL?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                if entry.isPinned {
-                    Image(systemName: "pin.fill").accessibilityLabel("ピン留め")
-                }
-                Text(entry.lastCollectedAt, format: .dateTime.month().day().hour().minute().second())
-                Spacer()
-                Text("\(entry.collectionCount)回")
-            }
-            .font(.caption).foregroundStyle(.secondary)
-            if let domain = entry.domain {
-                Text(domain).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            if let image = entry.image, let thumbnailURL {
-                HistoryFileImage(url: thumbnailURL, maximumPixels: 480)
-                    .frame(maxWidth: .infinity).frame(height: 120)
-                    .accessibilityLabel("履歴の画像")
-                Text("\(image.pixelWidth) × \(image.pixelHeight) px · \(ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .decimal))")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text(entry.text.isEmpty ? "（空文字）" : String(entry.text.prefix(160)))
-                    .font(.body).lineLimit(3).multilineTextAlignment(.leading)
-            }
-        }
-        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-        .accessibilityHint("タップでコピー。ドラッグで他のアプリへ持ち出せます。")
     }
 }
