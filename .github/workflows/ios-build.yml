@@ -1,0 +1,89 @@
+name: iOS build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Show Xcode and available iPad simulators
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun simctl list devices available --json | jq '
+            .devices | to_entries[]
+            | select(.key | contains("SimRuntime.iOS-"))
+            | .key as $runtime
+            | .value[]
+            | select(.isAvailable == true and (.name | contains("iPad")))
+            | {runtime: $runtime, name: .name, udid: .udid, state: .state}'
+
+      - uses: actions/checkout@v7
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: app
+        run: xcodegen generate
+
+      - name: Select an available iPad simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          simulator_id=$(xcrun simctl list devices available --json | jq -r '
+            [.devices | to_entries[]
+            | select(.key | contains("SimRuntime.iOS-"))
+            | .value[]
+            | select(.isAvailable == true and (.name | contains("iPad")))
+            | .udid] | first // empty')
+          if [ -z "$simulator_id" ]; then
+            echo "No available iPad simulator was found."
+            exit 1
+          fi
+          echo "id=$simulator_id" >> "$GITHUB_OUTPUT"
+
+      - name: Build without signing
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project ClipboardPlus.xcodeproj \
+            -scheme ClipboardPlus \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Run pure logic unit tests on iPad
+        working-directory: app
+        env:
+          SIMULATOR_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild test \
+            -project ClipboardPlus.xcodeproj \
+            -scheme ClipboardPlus \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -destination-timeout 120 \
+            -derivedDataPath DerivedData \
+            -resultBundlePath build/ClipboardPlusTests.xcresult \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ClipboardPlusTests-results
+          path: app/build/ClipboardPlusTests.xcresult
+          if-no-files-found: ignore
