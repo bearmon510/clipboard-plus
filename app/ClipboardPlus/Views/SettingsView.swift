@@ -4,6 +4,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
+    @ObservedObject var pictureInPicture: PictureInPictureController
     @State private var showLogs = false
     @State private var export: ExportSnapshot?
     @State private var exportedURL: URL?
@@ -29,10 +30,22 @@ struct SettingsView: View {
                     Text("0.1〜5.0秒。間隔と記録の状態は、アプリを開き直しても保持します。")
                         .font(.footnote)
                 }
+                Section("PiPの技術検証") {
+                    Toggle("PiPで裏でも収集（試験中）", isOn: Binding(
+                        get: { pictureInPicture.isEnabled },
+                        set: { pictureInPicture.setEnabled($0) }
+                    ))
+                    .frame(minHeight: 44)
+                    Text("試験中の機能です。初期値はオフで、裏で収集できるかは実機で確認が必要です。オンにした後、本体画面の「PiPを開始」で小窓を出します。")
+                    Text("小窓には状態だけが表示され、内容を触って操作することはできません。小窓の再生で記録を開始し、一時停止で記録を停止します。画面を更新し続けるため、電池を使います。")
+                        .font(.footnote)
+                }
                 Section("自動収集について") {
                     Text("他のアプリからのペースト許可が求められる場合があります。記録開始前・起動時の再開前からある文章は自動では読みません。手動保存には「ペースト」を使ってください。")
-                    Text("確認の間に複数回コピーされると、途中の内容は取り戻せません。アプリが画面にない間は収集できず、戻った時点の内容だけを確認します。")
+                    Text("確認の間に複数回コピーされると、途中の内容は取り戻せません。PiPの試験を使わない場合、アプリが画面にない間は収集できず、戻った時点の内容だけを確認します。")
                     Text("同じ原文は1項目にまとめ、最後に収集した時刻と回数を更新します。履歴をコピーした直後の読み取りは更新しません。")
+                    Text("自動収集では、秘密・一時的・自動生成の印が付いた内容は読まずに保存を見送ります。")
+                    Text("印のない秘密情報は判別できないため、必要に応じて記録を停止し、保存済みの履歴を削除してください。")
                 }
                 Section("履歴の保存") {
                     Text("画像 \(monitor.imageUsage.count)件 · \(ByteCountFormatter.string(fromByteCount: Int64(monitor.imageUsage.byteCount), countStyle: .decimal))")

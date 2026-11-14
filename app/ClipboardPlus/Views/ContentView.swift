@@ -4,6 +4,7 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
+    @StateObject private var pictureInPicture: PictureInPictureController
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
     @State private var searchText = ""
@@ -16,6 +17,12 @@ struct ContentView: View {
     @State private var didShowResume = false
     @State private var isDropTargeted = false
 
+    init(monitor: ClipboardMonitor, log: MeasurementLog) {
+        self.monitor = monitor
+        self.log = log
+        _pictureInPicture = StateObject(wrappedValue: PictureInPictureController(monitor: monitor))
+    }
+
     private var visibleEntries: [HistoryEntry] {
         HistoryFilter.entries(monitor.entries, filter: filter, search: searchText)
     }
@@ -23,6 +30,7 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 8) {
             header
+            if pictureInPicture.isEnabled { pictureInPictureControls }
             controls
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -111,7 +119,9 @@ struct ContentView: View {
             updateScene(phase)
             if phase == .active { monitor.pendingDeletion { showUndo($0) } }
         }
-        .sheet(isPresented: $showSettings) { SettingsView(monitor: monitor, log: log) }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture)
+        }
         .sheet(item: $previewEntry) { entry in
             if let image = entry.image {
                 HistoryImagePreview(image: image, url: monitor.imageURL(image, thumbnail: false))
@@ -128,6 +138,41 @@ struct ContentView: View {
         } message: {
             Text("5秒間は「元に戻す」で取り消せます。計測ログとクリップボードの内容は残ります。")
         }
+    }
+
+    private var pictureInPictureControls: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if pictureInPicture.isSupported {
+                HStack(spacing: 12) { pictureInPicturePreview; pictureInPictureButton }
+                if !pictureInPicture.isPossible && !pictureInPicture.isActive {
+                    Text("PiPを準備中です").font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("この端末ではPiPを使えません").font(.footnote)
+            }
+            if let message = pictureInPicture.failureMessage {
+                Text(message).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+    }
+
+    private var pictureInPicturePreview: some View {
+        PictureInPicturePreview(displayLayer: pictureInPicture.displayLayer)
+            .frame(width: 60 * 16 / 9, height: 60)
+            .accessibilityLabel("PiPの状態表示。\(monitor.isRecording ? "記録中" : "停止中")")
+    }
+
+    private var pictureInPictureButton: some View {
+        Button {
+            pictureInPicture.togglePictureInPicture()
+        } label: {
+            Text(pictureInPicture.isActive ? "PiPを終了" : "PiPを開始")
+                .frame(minWidth: 44, minHeight: 44)
+        }
+        .buttonStyle(.bordered)
+        .disabled(pictureInPicture.isStarting || (!pictureInPicture.isActive && !pictureInPicture.isPossible))
     }
 
     private var header: some View {

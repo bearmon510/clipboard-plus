@@ -46,3 +46,20 @@
 ## App Storeの審査について
 
 この実験では分からない。動画でない内容をPiPで出し続け、裏で収集する使い方は、審査ガイドライン2.5.4（バックグラウンド機能の用途）、2.5.1（APIの意図した用途）、5.1.1と2.5.14（記録の明示と同意）で問題にされる恐れがある。市販アプリに通過例はあるが、このアプリの保証にはならない。公開する場合は、PiPを利用者が開始・停止する任意の機能にし、PiPなしでもアプリが成立する構成にして、審査で外せるようにしておく。
+
+## 実装メモ
+
+- 0.3.1の最小試作。設定をUserDefaultsに保持し、初期値はオフ。オフでの起動時にはPiPのレイヤー・コントローラー・描画タイマー・オーディオセッションを作動させない。オンでも自動開始せず、本体のボタン操作でだけ開始する。PiPの終了と記録の停止は別で、記録は小窓の再生・一時停止または従来の記録ボタンで切り替える。
+- 表示は640×360のBGRA・IOSurface付きバッファ。描画関数には状態・件数・時刻・タイムゾーンだけを渡す。件数は現在の履歴の文章＋URL／画像の項目数（重複統合後、削除で減る）、最終取り込みはその履歴の最新収集時刻。累積収集数や試験専用のカウンターは追加しない。
+- `entries`／`isRecording`の変更とcommonモードの1秒タイマーで映像を更新。ピクセルバッファ・フォーマット・サンプルの生成結果コードとオプショナルを確認し、サンプルのCF辞書に`DisplayImmediately`を直接設定する。画面のレイヤーは1つのUIViewだけに載せる。
+- PiP開始・終了・開始失敗・中断状態・再生操作・音声設定失敗を既存ログへ記録。背景の生存確認は既存の収集タイマー内で、背景に入って最初の確認時と以後10秒以上の間隔で残す。activeでは追加しない。非同期画像処理のログにも読み取り開始時のsceneをdetailsに保持する。ログからOSによる拒否の理由を断定はしない。
+- 秘密の印はPiP設定に関係なく、自動収集の本文・画像読み取りより前に除外する。changeCountを進め、文章・画像の自己コピー判定状態を破棄する。手動ペースト・ドロップの受信経路は変更しない。
+- テストを12件追加：描画サイズ・BGRA・IOSurface、0件／大きな件数、不正サイズ、映像化と添付、再生状態、3種類の秘密の印、印付き文章の未読・未保存と次の通常収集、印付き画像の未読、背景ログの抑制、nil本文と空の形式一覧の区別。既存テストの期待値は維持。
+- Windowsで差分を静的確認。Swiftコンパイル、XCTest、XcodeGenによる生成、360pt画面の描画は未確認。GitHub ActionsのmacOS（Xcode 26.6・Swift 5・iPadシミュレータ）で既存テストを含むビルド・テストが必要。コミット・push・Actions起動は行っていない。
+- 実機では、本書の文章20件＋画像5枚、端へ隠した状態、ペースト許可別のログ、再生・一時停止、設定オフによるPiP終了、他の音声との共存、360pt表示、30分の発熱・継続性、パスワード管理アプリの印を確認する。
+
+API宣言の参照（Apple公式）：
+[PiP再生デリゲート](https://developer.apple.com/documentation/avkit/avpictureinpicturesamplebufferplaybackdelegate)、
+[CVPixelBufferCreate](https://developer.apple.com/documentation/corevideo/cvpixelbuffercreate(_:_:_:_:_:_:))、
+[CMSampleBufferCreateReadyWithImageBuffer](https://developer.apple.com/documentation/coremedia/cmsamplebuffercreatereadywithimagebuffer(allocator:imagebuffer:formatdescription:sampletiming:samplebufferout:))、
+[サンプル添付のCF辞書](https://developer.apple.com/documentation/coremedia/cmsamplebuffergetsampleattachmentsarray(_:createifnecessary:))。

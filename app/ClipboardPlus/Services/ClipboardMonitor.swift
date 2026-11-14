@@ -43,6 +43,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private var admission = HistoryAdmission()
     private var lastObservedChangeCount = 0
     private var timer: Timer?
+    private var lastBackgroundPollUptime: TimeInterval?
     private var isReading = false
     private var isCopying = false
     private var isWriting = false
@@ -116,6 +117,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let observedAt = Date()
         let previous = sceneState
         sceneState = value
+        lastBackgroundPollUptime = nil
         let count = pasteboard.changeCount
         let sceneEvent = MeasurementEvent(
             timestamp: observedAt, kind: "scene状態の変化", changeCount: count,
@@ -482,6 +484,14 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         guard isRecording else { return }
         let detectedAt = Date()
         let count = pasteboard.changeCount
+        // Use the collection timer itself: a separate timer cannot prove it is running.
+        if sceneState == "background" {
+            let uptime = ProcessInfo.processInfo.systemUptime
+            if lastBackgroundPollUptime.map({ uptime - $0 >= 10 }) ?? true {
+                lastBackgroundPollUptime = uptime
+                record("裏での定期確認", count: count, timestamp: detectedAt)
+            }
+        }
         guard count != lastObservedChangeCount else { return }
         readIfChanged(count: count, source: "定期確認", detections: [
             MeasurementEvent(timestamp: detectedAt, kind: "定期確認での検知", changeCount: count, scene: sceneState)
@@ -517,6 +527,16 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         // A change during this read must remain eligible at the next check.
         lastObservedChangeCount = before
         let types = pasteboard.types
+        if ClipboardPrivacy.hasPrivateMarker(in: types) {
+            admission.discardPendingSelfCopy()
+            store.resetImageAdmission()
+            detections.forEach { log.append($0) }
+            log.append(MeasurementEvent(
+                kind: "秘密の印のため保存せず", changeCount: before, scene: readScene,
+                details: "取得元=\(source); pasteboard.types=\(types)"
+            ))
+            return
+        }
         // hasImages is false for some image types, such as the WebP that Safari copies on a long press.
         let imageTypes = HistoryImageFiles.imageTypes(in: types)
         if pasteboard.hasImages || !imageTypes.isEmpty {
@@ -532,7 +552,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             let after = pasteboard.changeCount
             let finished = Date()
             let elapsed = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
-            let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsed)); pasteboard.types=\(types)"
+            let details = "取得元=\(source); 読取時scene=\(readScene); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsed)); pasteboard.types=\(types)"
             detections.forEach { log.append($0) }
             if let input {
                 admitImage(input, route: .automatic, timestamp: finished, before: before, after: after, details: details)
@@ -551,7 +571,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let after = pasteboard.changeCount
         let finishedAt = Date()
         let elapsedMS = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
-        let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsedMS)); hasImages=false; pasteboard.types=\(types)"
+        let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsedMS)); hasImages=false; hasStrings=\(hasStrings); string=nil=\(text == nil); 形式一覧が空=\(types.isEmpty); pasteboard.types=\(types)"
 
         // Preserve detection times while reading before any log formatting or disk submission.
         detections.forEach { log.append($0) }
