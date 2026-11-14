@@ -30,7 +30,13 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 8) {
             header
-            if pictureInPicture.isEnabled { pictureInPictureControls }
+            if pictureInPicture.isStarting {
+                Text("PiPを準備中です").font(.caption).foregroundStyle(.secondary)
+            }
+            if let message = pictureInPicture.failureMessage {
+                Text(message).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal)
+            }
             controls
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -140,48 +146,41 @@ struct ContentView: View {
         }
     }
 
-    private var pictureInPictureControls: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if pictureInPicture.isSupported {
-                HStack(spacing: 12) { pictureInPicturePreview; pictureInPictureButton }
-                if !pictureInPicture.isPossible && !pictureInPicture.isActive {
-                    Text("PiPを準備中です").font(.caption).foregroundStyle(.secondary)
-                }
-            } else {
-                Text("この端末ではPiPを使えません").font(.footnote)
-            }
-            if let message = pictureInPicture.failureMessage {
-                Text(message).font(.caption).foregroundStyle(.red)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal)
-    }
-
     private var pictureInPicturePreview: some View {
-        PictureInPicturePreview(displayLayer: pictureInPicture.displayLayer)
-            .frame(width: 60 * 16 / 9, height: 60)
-            .accessibilityLabel("PiPの状態表示。\(monitor.isRecording ? "記録中" : "停止中")")
+        // Keep one visible, nonzero source in the window; never hide or fade its layer.
+        PictureInPicturePreview(displayLayer: pictureInPicture.displayLayer,
+                                onReadinessChanged: pictureInPicture.sourceReadinessChanged)
+            .frame(width: 16, height: 9)
+            .accessibilityHidden(true)
     }
 
     private var pictureInPictureButton: some View {
         Button {
             pictureInPicture.togglePictureInPicture()
         } label: {
-            Text(pictureInPicture.isActive ? "PiPを終了" : "PiPを開始")
+            Label(pictureInPicture.isActive ? "PiPを終了" : "PiP",
+                  systemImage: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(minWidth: 44, minHeight: 44)
         }
         .buttonStyle(.bordered)
-        .disabled(pictureInPicture.isStarting || (!pictureInPicture.isActive && !pictureInPicture.isPossible))
+        .labelStyle(.titleAndIcon)
+        .disabled(pictureInPicture.isStarting && !pictureInPicture.isActive)
+        .accessibilityHint(pictureInPicture.isActive ? "小窓を閉じます。記録は続きます。" : "記録を開始して小窓を表示します。")
     }
 
     private var header: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text("clipboard+").font(.headline)
-                Text(monitor.isRecording ? "記録中" : "記録停止中").font(.subheadline)
+                HStack(spacing: 4) {
+                    Text(monitor.isRecording ? "記録中" : "記録停止中").font(.subheadline)
+                    if pictureInPicture.isEnabled && pictureInPicture.isSupported { pictureInPicturePreview }
+                }
             }
             Spacer(minLength: 4)
+            if pictureInPicture.isSupported { pictureInPictureButton }
             if log.errorMessage != nil {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
