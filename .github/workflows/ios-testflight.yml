@@ -21,11 +21,14 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     environment: ios-testflight
-    env:
-      ARCHIVE_PATH: ${{ runner.temp }}/ClipboardPlus.xcarchive
-      KEY_DIRECTORY: ${{ runner.temp }}/private_keys
 
     steps:
+      # The runner context is not available in job-level env.
+      - name: Set working paths
+        run: |
+          echo "ARCHIVE_PATH=$RUNNER_TEMP/ClipboardPlus.xcarchive" >> "$GITHUB_ENV"
+          echo "KEY_DIRECTORY=$RUNNER_TEMP/private_keys" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v7
 
