@@ -47,8 +47,8 @@ final class PictureInPictureController: NSObject, ObservableObject {
             } catch { recordAudioFailure(error, operation: "有効化") }
             guard isSupported else { return }
             if controller == nil { prepareController() }
-            statusSubscription = monitor.$entries.combineLatest(monitor.$isRecording)
-                .sink { [weak self] entries, recording in
+            statusSubscription = monitor.$entries.combineLatest(monitor.$isRecording, monitor.$savedCount)
+                .sink { [weak self] entries, recording, saved in
                     guard let self else { return }
                     let recordingChanged = self.status?.isRecording != recording
                     self.status = PictureInPictureStatus(
@@ -56,7 +56,7 @@ final class PictureInPictureController: NSObject, ObservableObject {
                         textCount: entries.filter { $0.kind != .image }.count,
                         imageCount: entries.filter { $0.kind == .image }.count,
                         lastCollectedAt: entries.map(\.lastCollectedAt).max(),
-                        updatedAt: Date(), timeZone: .current
+                        updatedAt: Date(), timeZone: .current, savedCount: saved
                     )
                     if recordingChanged { self.controller?.invalidatePlaybackState() }
                     self.enqueueFrame()
@@ -112,7 +112,8 @@ final class PictureInPictureController: NSObject, ObservableObject {
         guard isEnabled, let status else { return }
         let frameStatus = PictureInPictureStatus(
             isRecording: status.isRecording, textCount: status.textCount, imageCount: status.imageCount,
-            lastCollectedAt: status.lastCollectedAt, updatedAt: Date(), timeZone: .current
+            lastCollectedAt: status.lastCollectedAt, updatedAt: Date(), timeZone: .current,
+            savedCount: status.savedCount
         )
         do {
             let pixelBuffer = try PictureInPictureFrame.render(frameStatus)

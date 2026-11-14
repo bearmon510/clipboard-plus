@@ -10,6 +10,8 @@ struct PictureInPictureStatus {
     let lastCollectedAt: Date?
     let updatedAt: Date
     let timeZone: TimeZone
+    /// Saves since launch. Unlike the item counts, it grows when a copy merges into an existing item.
+    var savedCount: Int = 0
 
     var isPlaybackPaused: Bool { !isRecording }
 }
@@ -62,10 +64,10 @@ enum PictureInPictureFrame {
         let collected = status.lastCollectedAt.map { formatter.string(from: $0) } ?? "—"
         draw(status.isRecording ? "記録中" : "停止中", y: 20, size: 52,
              color: UIColor(red: 0.4, green: 0.9, blue: 0.7, alpha: 1))
-        draw("文章・URL  \(status.textCount)件", y: 94, size: 36)
-        draw("画像  \(status.imageCount)件", y: 150, size: 36)
-        draw("最終取り込み  \(collected)", y: 222, size: 30)
-        draw("画面更新  \(formatter.string(from: status.updatedAt))", y: 278, size: 30)
+        draw("取り込み  \(status.savedCount)回", y: 94, size: 40)
+        draw("最終取り込み  \(collected)", y: 156, size: 34)
+        draw("履歴  文章\(status.textCount)件・画像\(status.imageCount)件", y: 222, size: 28)
+        draw("画面更新  \(formatter.string(from: status.updatedAt))", y: 278, size: 28)
         return buffer
     }
 

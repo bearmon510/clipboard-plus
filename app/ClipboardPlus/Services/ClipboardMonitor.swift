@@ -24,6 +24,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var pollingInterval: TimeInterval = 0.5
     @Published private(set) var storageError: String?
     @Published private(set) var pendingSaveCount = 0
+    /// Successful saves since launch, including copies merged into an existing item.
+    @Published private(set) var savedCount = 0
     @Published private(set) var imageUsage = HistoryImageUsage()
     @Published private(set) var imageNotice: String?
     private(set) var resumedAtLaunch = false
@@ -427,6 +429,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         case .remove(let id): entries.removeAll { $0.id == id }
         case .saved(let entry, let retried):
             pendingSaveCount -= 1
+            savedCount += 1
             HistoryList.upsert(entry, into: &entries)
             if pendingSaveCount == 0 { storageError = nil }
             record(retried ? "履歴保存の再試行成功" : "履歴保存成功", text: entry.text,
