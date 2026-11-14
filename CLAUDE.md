@@ -90,7 +90,7 @@ node scripts/invoke-codex.mjs --mode implement --model gpt-6.1-sol --effort high
 
 Node.jsとCodex CLIがこのPCにインストールされ、Codexにログイン済みであること。アカウントは既存設定を利用する。ClaudeとCodexはそれぞれの利用枠を消費する。
 
-スクリプトのテストは `node --test scripts/codex-limit.test.mjs scripts/apple-signing-certificates.test.mjs` で実行する（このNode.jsではフォルダ指定が動かない）。
+スクリプトのテストは `node --test scripts/codex-limit.test.mjs scripts/apple-signing-certificates.test.mjs scripts/testflight-distribute.test.mjs` で実行する（このNode.jsではフォルダ指定が動かない）。
 
 ## TestFlightへの送り方
 
@@ -99,4 +99,5 @@ Node.jsとCodex CLIがこのPCにインストールされ、Codexにログイン
 - Secretsは `ios-testflight` 環境に置く。名前はワークフローの「Validate signing configuration」の一覧のとおり。
 - ログは公開される。xcodebuildの全出力はファイルにだけ書き、失敗時は `scripts/print-redacted-xcodebuild-errors.sh` で証明書名などを伏せたエラー行だけを出す。署名関係のファイルやログを成果物としてアップロードしない。
 - ビルド番号はこのワークフローの実行番号。
+- アップロード後、Linuxのジョブ（`scripts/testflight-distribute.mjs`）がApp Store Connectの処理完了を待ち、ビルドを内部テストのグループへ追加する。利用者が毎回手で追加しなくて済むようにするため（2026年11月14日の要望）。自動配信が有効なグループには追加しない。
 - TestFlightへの送信は、利用者が2026年11月14日に「自由にやっていい」と承認した。確認なしで実行してよい。App Storeへの審査提出とリリースは対象外で、利用者が自分で行う。

@@ -61,7 +61,7 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
 
       - name: Run script tests
-        run: node --test scripts/apple-signing-certificates.test.mjs scripts/codex-limit.test.mjs
+        run: node --test scripts/apple-signing-certificates.test.mjs scripts/codex-limit.test.mjs scripts/testflight-distribute.test.mjs
 
       - name: Generate Xcode project
         working-directory: app
@@ -180,3 +180,45 @@ jobs:
       - name: Remove API key
         if: always()
         run: rm -rf "$KEY_DIRECTORY"
+
+  # Processing takes minutes to tens of minutes, so the wait runs on a Linux
+  # runner instead of holding the macOS one.
+  distribute-internal:
+    name: Add the build to internal TestFlight groups
+    needs: upload-testflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: ios-testflight
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install App Store Connect API key
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: |
+          key_directory="$RUNNER_TEMP/private_keys"
+          mkdir -p "$key_directory"
+          key_path="$key_directory/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "APP_STORE_CONNECT_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Wait for processing and add to internal groups
+        env:
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          CLIPBOARD_PLUS_BUNDLE_ID: ${{ secrets.CLIPBOARD_PLUS_BUNDLE_ID }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: node scripts/testflight-distribute.mjs
+
+      - name: Remove API key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/private_keys"
