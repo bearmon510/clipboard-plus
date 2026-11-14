@@ -546,10 +546,12 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let hasStrings = pasteboard.hasStrings
         let checkedAt = Date()
         let text = hasStrings ? pasteboard.string : nil
+        // Type names only, to tell why an image copy (for example Safari's long press) arrived as text.
+        let types = pasteboard.types
         let after = pasteboard.changeCount
         let finishedAt = Date()
         let elapsedMS = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
-        let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsedMS))"
+        let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsedMS)); hasImages=false; pasteboard.types=\(types)"
 
         // Preserve detection times while reading before any log formatting or disk submission.
         detections.forEach { log.append($0) }
