@@ -120,6 +120,37 @@ final class ImageHistoryTests: XCTestCase {
         XCTAssertEqual(try database.fetchAll().map(\.id), [empty.id, first.id, second.id])
     }
 
+    func testOlderDuplicateKeepsLatestImageTimeSourceAndOrder() throws {
+        let root = try ImageTestSupport.directory(self)
+        let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
+        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"))
+        let image = try ImageTestSupport.prepare(files)
+        let latest = Date(timeIntervalSince1970: 200)
+        let first = try database.collectImage(image, source: .automatic, at: latest)
+        let other = try database.collect("B", source: .drag, at: latest.addingTimeInterval(-1))
+        let duplicate = try database.collectImage(image, source: .manual, at: latest.addingTimeInterval(-2))
+        XCTAssertEqual(duplicate.id, first.id)
+        XCTAssertEqual(duplicate.savedAt, first.savedAt)
+        XCTAssertEqual(duplicate.image, first.image)
+        XCTAssertEqual(duplicate.lastCollectedAt, latest)
+        XCTAssertEqual(duplicate.source, .automatic)
+        XCTAssertEqual(duplicate.collectionCount, 2)
+        XCTAssertEqual(try database.fetchAll().map(\.id), [first.id, other.id])
+    }
+
+    func testSameTimeImageDuplicateUpdatesSourceAndCount() throws {
+        let root = try ImageTestSupport.directory(self)
+        let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
+        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"))
+        let image = try ImageTestSupport.prepare(files)
+        let date = Date(timeIntervalSince1970: 200)
+        try database.collectImage(image, source: .automatic, at: date)
+        let duplicate = try database.collectImage(image, source: .manual, at: date)
+        XCTAssertEqual(duplicate.lastCollectedAt, date)
+        XCTAssertEqual(duplicate.source, .manual)
+        XCTAssertEqual(duplicate.collectionCount, 2)
+    }
+
     func testImageByteLimitRemovesOldestAndKeepsPins() throws {
         let directory = try ImageTestSupport.directory(self)
         let files = HistoryImageFiles(directory: directory.appendingPathComponent("images"))

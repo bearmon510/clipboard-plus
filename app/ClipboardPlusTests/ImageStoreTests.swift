@@ -293,6 +293,87 @@ final class ImageStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDragProviderKeepsEvictedImageUntilProtectionExpires() throws {
+        let root = try ImageTestSupport.directory(self)
+        let directory = root.appendingPathComponent("images")
+        let url = root.appendingPathComponent("history.sqlite")
+        var now = Date(timeIntervalSince1970: 100)
+        var entries: [HistoryEntry] = []
+        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) },
+                                 imageDirectory: directory, now: { now }) { event in
+            if case .saved(let entry, _) = event { HistoryList.upsert(entry, into: &entries) }
+            if case .remove(let id) = event { entries.removeAll { $0.id == id } }
+            if case .cleanupFailed = event { XCTFail("Unexpected cleanup failure") }
+        }
+        let data = ImageTestSupport.png()
+        store.collectImage(.data(data, typeIdentifier: "public.png"), source: .manual, at: now)
+        drain(store)
+        let image = try XCTUnwrap(entries.first?.image)
+        // Creating the provider must register protection before subsequent mutations.
+        let provider = HistoryImageLoader.rowProvider(image: image, store: store)
+        store.collect("new text", source: .automatic, at: now.addingTimeInterval(1))
+        drain(store)
+        XCTAssertEqual(entries.map(\.text), ["new text"])
+        XCTAssertEqual(try HistoryDatabase(url: url).fetchAll().map(\.text), ["new text"])
+        XCTAssertEqual(try filenames(directory), image.filenames)
+
+        now.addTimeInterval(HistoryStore.dragProtectionInterval - 1)
+        drain(store)
+        XCTAssertEqual(try filenames(directory), image.filenames)
+        let loaded = expectation(description: "evicted image still provided to drag destination")
+        provider.loadDataRepresentation(forTypeIdentifier: image.typeIdentifier) { original, error in
+            XCTAssertNil(error)
+            XCTAssertEqual(original, data)
+            loaded.fulfill()
+        }
+        wait(for: [loaded], timeout: 5)
+
+        now.addTimeInterval(1)
+        drain(store)
+        XCTAssertTrue(try filenames(directory).isEmpty)
+        XCTAssertEqual(entries.map(\.text), ["new text"])
+    }
+
+    @MainActor
+    func testDragProtectionOutlastsUndoExpiryAndRepeatedDragExtendsDeadline() throws {
+        let root = try ImageTestSupport.directory(self)
+        let directory = root.appendingPathComponent("images")
+        let url = root.appendingPathComponent("history.sqlite")
+        var now = Date(timeIntervalSince1970: 100)
+        var entry: HistoryEntry?
+        let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, now: { now }) },
+                                 imageDirectory: directory, now: { now }) { event in
+            if case .saved(let value, _) = event { entry = value }
+            if case .cleanupFailed = event { XCTFail("Unexpected cleanup failure") }
+        }
+        store.collectImage(.data(ImageTestSupport.png(), typeIdentifier: "public.png"), source: .manual, at: now)
+        drain(store)
+        let original = try XCTUnwrap(entry)
+        let image = try XCTUnwrap(original.image)
+        store.protectImageForDrag(image)
+        drain(store)
+        now.addTimeInterval(10)
+        store.protectImageForDrag(image)
+        let deleted = expectation(description: "dragged image deleted")
+        store.delete(id: original.id) { result in
+            if case .failure(let error) = result { XCTFail("\(error)") }
+            deleted.fulfill()
+        }
+        wait(for: [deleted], timeout: 5)
+        now.addTimeInterval(HistoryDatabase.undoInterval)
+        drain(store)
+        XCTAssertEqual(try filenames(directory), image.filenames)
+        XCTAssertEqual(try HistoryDatabase(url: url, now: { now }).imageUsage(), HistoryImageUsage())
+
+        now = Date(timeIntervalSince1970: 100).addingTimeInterval(HistoryStore.dragProtectionInterval)
+        drain(store)
+        XCTAssertEqual(try filenames(directory), image.filenames)
+        now.addTimeInterval(10)
+        drain(store)
+        XCTAssertTrue(try filenames(directory).isEmpty)
+    }
+
+    @MainActor
     func testUndoMergeDiscardsRecollectedFilesAndKeepsOriginalFiles() throws {
         let root = try ImageTestSupport.directory(self)
         let directory = root.appendingPathComponent("images")

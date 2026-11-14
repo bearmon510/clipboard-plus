@@ -55,12 +55,16 @@ enum HistoryImageLoader {
         }
     }
 
-    static func rowProvider(image: HistoryImage, files: HistoryImageFiles) -> NSItemProvider {
+    static func rowProvider(image: HistoryImage, store: HistoryStore) -> NSItemProvider {
+        store.protectImageForDrag(image)
         let provider = NSItemProvider()
         provider.registerDataRepresentation(forTypeIdentifier: image.typeIdentifier, visibility: .all) { completion in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do { completion(try files.read(image), nil) }
-                catch { completion(nil, HistoryImageError.unavailable) }
+            // Keep the store alive with the provider, and serialize reads with cleanup.
+            store.readImage(image) { result in
+                switch result {
+                case .success(let data): completion(data, nil)
+                case .failure: completion(nil, HistoryImageError.unavailable)
+                }
             }
             return nil
         }

@@ -68,6 +68,30 @@ final class HistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(try database.fetchAll().map(\.id), [a.id, b.id])
     }
 
+    func testOlderDuplicateKeepsLatestTextTimeSourceAndOrder() throws {
+        let (database, _, _) = try fixture()
+        let latest = Date(timeIntervalSince1970: 200)
+        let first = try database.collect("A", source: .automatic, at: latest)
+        let other = try database.collect("B", source: .drag, at: latest.addingTimeInterval(-1))
+        let duplicate = try database.collect("A", source: .manual, at: latest.addingTimeInterval(-2))
+        XCTAssertEqual(duplicate.id, first.id)
+        XCTAssertEqual(duplicate.savedAt, first.savedAt)
+        XCTAssertEqual(duplicate.lastCollectedAt, latest)
+        XCTAssertEqual(duplicate.source, .automatic)
+        XCTAssertEqual(duplicate.collectionCount, 2)
+        XCTAssertEqual(try database.fetchAll().map(\.id), [first.id, other.id])
+    }
+
+    func testSameTimeTextDuplicateUpdatesSourceAndCount() throws {
+        let (database, _, _) = try fixture()
+        let date = Date(timeIntervalSince1970: 200)
+        try database.collect("A", source: .automatic, at: date)
+        let duplicate = try database.collect("A", source: .manual, at: date)
+        XCTAssertEqual(duplicate.lastCollectedAt, date)
+        XCTAssertEqual(duplicate.source, .manual)
+        XCTAssertEqual(duplicate.collectionCount, 2)
+    }
+
     func testWhitespaceAndNewlineDifferencesRemainSeparate() throws {
         let (database, _, _) = try fixture()
         let texts = ["A", " A", "A ", "A\n", "A\r\n", "a", ""]

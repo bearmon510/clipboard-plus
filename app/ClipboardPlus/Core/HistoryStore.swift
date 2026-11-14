@@ -25,6 +25,8 @@ extension HistoryPersistence {
 }
 
 final class HistoryStore {
+    static let dragProtectionInterval: TimeInterval = 5 * 60
+
     enum Event {
         case replace([HistoryEntry])
         case upsert(HistoryEntry)
@@ -49,19 +51,23 @@ final class HistoryStore {
     private let queue = DispatchQueue(label: "clipboardplus.history")
     private let makeDatabase: () throws -> HistoryPersistence
     private let onEvent: @MainActor (Event) -> Void
+    private let now: () -> Date
     private var database: HistoryPersistence?
     let imageFiles: HistoryImageFiles
     private var imageAdmission = ImageAdmission()
     private var didCleanFiles = false
     private var unusedFiles: Set<String> = []
+    private var dragProtectedUntil: [String: Date] = [:]
     // Pending images contain only metadata. Uncommitted files are cleaned on the next launch.
     private var pending: [PendingCollection] = []
 
     init(makeDatabase: (() throws -> HistoryPersistence)? = nil,
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
+         now: @escaping () -> Date = Date.init,
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase() }
         self.onEvent = onEvent
+        self.now = now
         self.imageFiles = HistoryImageFiles(directory: imageDirectory)
     }
 
@@ -112,6 +118,15 @@ final class HistoryStore {
         queue.async {
             let result = Result { try self.imageFiles.read(image) }
             DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func protectImageForDrag(_ image: HistoryImage) {
+        queue.async {
+            let expiry = self.now().addingTimeInterval(Self.dragProtectionInterval)
+            for filename in image.filenames {
+                self.dragProtectedUntil[filename] = max(self.dragProtectedUntil[filename] ?? expiry, expiry)
+            }
         }
     }
 
@@ -243,6 +258,8 @@ final class HistoryStore {
     }
 
     private func finishChanges(_ database: HistoryPersistence) {
+        let date = now()
+        dragProtectedUntil = dragProtectedUntil.filter { $0.value > date }
         for entry in database.takeRemovals() {
             emit(.remove(entry.id))
             unusedFiles.formUnion(entry.image?.filenames ?? [])
@@ -250,7 +267,9 @@ final class HistoryStore {
         do {
             if !unusedFiles.isEmpty, let referenced = try database.referencedImageFiles() {
                 let pendingFiles = Set(pending.flatMap { $0.image?.filenames ?? [] })
+                // Protected removals stay queued until a later maintenance pass.
                 let disposable = unusedFiles.subtracting(referenced).subtracting(pendingFiles)
+                    .subtracting(dragProtectedUntil.keys)
                 try imageFiles.remove(disposable)
                 unusedFiles.subtract(disposable)
             }

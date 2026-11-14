@@ -102,7 +102,8 @@ final class HistoryDatabase: HistoryPersistence {
             if let existing {
                 id = existing.id
                 try execute("UPDATE history SET collected_at = ?, collection_count = collection_count + 1, source = ? WHERE id = ?",
-                            [.real(timestamp.timeIntervalSince1970), .text(source.rawValue), .integer(id)])
+                            [.real(max(existing.lastCollectedAt, timestamp).timeIntervalSince1970),
+                             .text(timestamp >= existing.lastCollectedAt ? source.rawValue : existing.source.rawValue), .integer(id)])
             } else {
                 try execute("INSERT INTO history(kind, text, saved_at, collected_at, collection_count, source) VALUES (?, ?, ?, ?, 1, ?)",
                             [.text(HistoryKind.classify(text).rawValue), .text(text), .real(timestamp.timeIntervalSince1970),
@@ -127,7 +128,8 @@ final class HistoryDatabase: HistoryPersistence {
             if let existing {
                 id = existing.id
                 try execute("UPDATE history SET collected_at = ?, collection_count = collection_count + 1, source = ? WHERE id = ?",
-                            [.real(timestamp.timeIntervalSince1970), .text(source.rawValue), .integer(id)])
+                            [.real(max(existing.lastCollectedAt, timestamp).timeIntervalSince1970),
+                             .text(timestamp >= existing.lastCollectedAt ? source.rawValue : existing.source.rawValue), .integer(id)])
             } else {
                 try execute("""
                     INSERT INTO history(kind, text, saved_at, collected_at, collection_count, source,

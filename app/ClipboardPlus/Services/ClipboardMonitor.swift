@@ -3,6 +3,20 @@ import Foundation
 import UIKit
 
 @MainActor
+protocol ClipboardPasteboard: AnyObject {
+    var changeCount: Int { get }
+    var hasImages: Bool { get }
+    var hasStrings: Bool { get }
+    var types: [String] { get }
+    var string: String? { get set }
+    var image: UIImage? { get }
+    func data(forPasteboardType pasteboardType: String) -> Data?
+    func setData(_ data: Data, forPasteboardType pasteboardType: String)
+}
+
+extension UIPasteboard: ClipboardPasteboard {}
+
+@MainActor
 final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var sceneState = "inactive"
@@ -16,7 +30,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     let log: MeasurementLog
 
-    private let pasteboard = UIPasteboard.general
+    private let pasteboard: ClipboardPasteboard
     private let defaults: UserDefaults
     private let makeDatabase: (() throws -> HistoryPersistence)?
     private let imageDirectory: URL
@@ -30,6 +44,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private var lastObservedChangeCount = 0
     private var timer: Timer?
     private var isReading = false
+    private var isCopying = false
     private var isWriting = false
     private var deferredDetections: [MeasurementEvent] = []
     private var pendingLogFlushes = 0
@@ -37,11 +52,13 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     init(defaults: UserDefaults = .standard, log: MeasurementLog? = nil,
          makeDatabase: (() throws -> HistoryPersistence)? = nil, schedulesMaintenance: Bool = true,
-         imageDirectory: URL = HistoryImageFiles.defaultDirectory) {
+         imageDirectory: URL = HistoryImageFiles.defaultDirectory,
+         pasteboard: ClipboardPasteboard? = nil) {
         self.defaults = defaults
         self.log = log ?? MeasurementLog()
         self.makeDatabase = makeDatabase
         self.imageDirectory = imageDirectory
+        self.pasteboard = pasteboard ?? UIPasteboard.general
         super.init()
         let storedInterval = defaults.object(forKey: "pollingInterval") as? Double ?? 0.5
         pollingInterval = storedInterval.isFinite ? min(5, max(0.1, storedInterval)) : 0.5
@@ -132,11 +149,13 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func copy(_ entry: HistoryEntry, completion: ((Bool) -> Void)? = nil) {
-        guard !isWriting && !isReading else { completion?(false); return }
+        guard !isCopying && !isWriting && !isReading else { completion?(false); return }
+        isCopying = true
         if let image = entry.image {
             copyImage(entry, image: image, completion: completion)
             return
         }
+        readBeforeCopy()
         store.resetImageAdmission()
         let before = pasteboard.changeCount
         isWriting = true
@@ -167,6 +186,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         } else {
             log.append(copyEvent)
         }
+        isCopying = false
         completion?(true)
     }
 
@@ -175,29 +195,31 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func rowProvider(_ entry: HistoryEntry) -> NSItemProvider {
-        if let image = entry.image { return HistoryImageLoader.rowProvider(image: image, files: store.imageFiles) }
+        if let image = entry.image { return HistoryImageLoader.rowProvider(image: image, store: store) }
         return DroppedTextLoader.rowProvider(text: entry.text)
     }
 
     private func copyImage(_ entry: HistoryEntry, image: HistoryImage, completion: ((Bool) -> Void)?) {
-        isWriting = true
         store.readImage(image) { result in
+            let succeeded: Bool
             switch result {
             case .success(let data):
+                self.readBeforeCopy()
                 let before = self.pasteboard.changeCount
                 self.admission.discardPendingSelfCopy()
+                self.isWriting = true
                 self.pasteboard.setData(data, forPasteboardType: image.typeIdentifier)
                 let after = self.pasteboard.changeCount
                 self.store.recordImageCopy(hash: image.hash, changeCount: after)
+                self.isWriting = false
                 self.record("自己コピー", count: after, historyNumber: entry.id,
                             details: "画像; 形式=\(image.typeIdentifier); バイト数=\(data.count); ピクセル=\(image.pixelWidth)x\(image.pixelHeight); hash=\(image.hash.prefix(8)); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
-                completion?(true)
+                succeeded = true
             case .failure:
                 self.imageNotice = HistoryImageError.unavailable.message
                 self.record("画像コピーの失敗", historyNumber: entry.id)
-                completion?(false)
+                succeeded = false
             }
-            self.isWriting = false
             let detections = self.deferredDetections
             self.deferredDetections.removeAll()
             if self.isRecording {
@@ -205,7 +227,16 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             } else {
                 detections.forEach { self.log.append($0) }
             }
+            self.isCopying = false
+            completion?(succeeded)
         }
+    }
+
+    private func readBeforeCopy() {
+        guard isRecording else { return }
+        // Capture unread external contents before replacing them, including changes
+        // since the last poll while an image was waiting on the storage queue.
+        readIfChanged(count: pasteboard.changeCount, source: "自己コピー前の確認", detections: [])
     }
 
     func saveManually(_ providers: [NSItemProvider], receivedAt: Date) {
@@ -444,6 +475,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     @objc private func pollPasteboard(_ timer: Timer) {
+        pollPasteboard()
+    }
+
+    func pollPasteboard() {
         guard isRecording else { return }
         let detectedAt = Date()
         let count = pasteboard.changeCount
