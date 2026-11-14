@@ -32,6 +32,10 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
+        # Shows the Documents folder (measurement log only) in the Files app.
+        # History, images and backups stay outside it.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UTExportedTypeDeclarations:
           - UTTypeIdentifier: example.clipboardplus.backup
             UTTypeDescription: clipboard+ バックアップ
