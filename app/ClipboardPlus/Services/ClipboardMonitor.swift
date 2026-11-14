@@ -158,26 +158,36 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func receiveDropped(_ providers: [NSItemProvider], receivedAt: Date) -> Bool {
-        let external = providers.filter { !DroppedTextLoader.isLocalRow($0) }
-        for provider in external {
-            DroppedTextLoader.load(provider) { result in
+        let providerDetails = providers.enumerated().map { index, provider in
+            "provider[\(index)].registeredTypeIdentifiers=\(provider.registeredTypeIdentifiers)"
+        }.joined(separator: "; ")
+        record("ドロップを受信", details: "providers=\(providers.count); \(providerDetails)", timestamp: receivedAt)
+        var accepted = false
+        for (index, provider) in providers.enumerated() {
+            guard !DroppedTextLoader.isLocalRow(provider) else {
+                record("追加の見送り", details: "取得元=ドラッグ; provider[\(index)]; 理由=自分の履歴の行", timestamp: receivedAt)
+                continue
+            }
+            accepted = true
+            DroppedTextLoader.load(provider) { result, attempts in
+                let details = "provider[\(index)]; \(attempts)"
                 switch result {
                 case .success(let text):
-                    _ = self.saveDropped([text], receivedAt: receivedAt)
+                    _ = self.saveDropped([text], receivedAt: receivedAt, details: details)
                 case .failure:
-                    self.record("ドラッグの読み込み失敗", details: "文章を取得できませんでした", timestamp: receivedAt)
+                    self.record("ドラッグの読み込み失敗", details: details, timestamp: receivedAt)
                 }
             }
         }
-        return !external.isEmpty
+        return accepted
     }
 
-    func saveDropped(_ strings: [String], receivedAt: Date) -> Bool {
+    func saveDropped(_ strings: [String], receivedAt: Date, details: String = "") -> Bool {
         var saved = false
         for text in strings {
             if admit(text, source: "ドラッグ", route: .drag, timestamp: receivedAt) {
                 saved = true
-                record("ドラッグで受信", text: text, timestamp: receivedAt)
+                record("ドラッグで受信", text: text, details: details, timestamp: receivedAt)
             }
         }
         return saved

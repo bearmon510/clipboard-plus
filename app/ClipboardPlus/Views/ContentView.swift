@@ -81,6 +81,12 @@ struct ContentView: View {
             }
         }
         .padding(.top, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(uiColor: .systemBackground))
+        .contentShape(Rectangle())
+        .onDrop(of: DroppedTextLoader.contentTypes, isTargeted: $isDropTargeted) { providers, _ in
+            monitor.receiveDropped(providers, receivedAt: Date())
+        }
         .onAppear {
             updateScene(scenePhase)
             monitor.pendingDeletion { showUndo($0) }
@@ -161,55 +167,73 @@ struct ContentView: View {
     }
 
     private var history: some View {
-        List {
-            if visibleEntries.isEmpty {
-                Text(monitor.entries.isEmpty
-                     ? "記録の開始後にコピーした文章を収集します。開始前の文章は「ペースト」で保存できます。ここへ文章をドロップしても保存できます。"
-                     : "条件に一致する履歴がありません。")
-                    .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, minHeight: 100)
-                    .padding(.horizontal, 8)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
-                    }
-                    .contentShape(Rectangle())
-                    .onDrop(of: DroppedTextLoader.contentTypes, isTargeted: $isDropTargeted) { providers, _ in
-                        monitor.receiveDropped(providers, receivedAt: Date())
-                    }
-            }
-            ForEach(visibleEntries) { entry in
-                Button {
-                    monitor.copy(entry)
-                    showNotice("コピーしました")
-                } label: { HistoryRow(entry: entry) }
-                .buttonStyle(.plain)
-                .onDrag { DroppedTextLoader.rowProvider(text: entry.text) }
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    Button(role: .destructive) { monitor.delete(entry) { showUndo($0) } } label: {
-                        Label("削除", systemImage: "trash")
-                    }
-                    Button { monitor.togglePin(entry) } label: {
-                        Label(entry.isPinned ? "解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin")
-                    }
-                    .tint(.orange)
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                if visibleEntries.isEmpty {
+                    Text(monitor.entries.isEmpty
+                         ? "記録の開始後にコピーした文章を収集します。開始前の文章は「ペースト」で保存できます。ここへ文章をドロップしても保存できます。"
+                         : "条件に一致する履歴がありません。")
+                        .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
+                        .frame(maxWidth: .infinity, minHeight: 100)
                 }
-                .contextMenu {
-                    Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
-                        monitor.togglePin(entry)
+                ForEach(visibleEntries, id: \.id) { entry in
+                    VStack(spacing: 0) {
+                        HStack(spacing: 8) {
+                            Button {
+                                monitor.copy(entry)
+                                showNotice("コピーしました")
+                            } label: { HistoryRow(entry: entry) }
+                            .buttonStyle(.plain)
+                            .onDrag { DroppedTextLoader.rowProvider(text: entry.text) }
+                            Menu {
+                                rowActions(entry)
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .frame(minWidth: 44, minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityLabel("履歴の操作")
+                        }
+                        .padding(.vertical, 6)
+                        .contextMenu { rowActions(entry) }
+                        Divider()
                     }
-                    Button("削除", systemImage: "trash", role: .destructive) { monitor.delete(entry) { showUndo($0) } }
                 }
+                Text("タップでコピー、ドラッグで持ち出し。「⋯」または長押しでピン留め・削除。文章をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 12)
             }
-            .onInsert(of: DroppedTextLoader.contentTypes) { _, providers in
-                _ = monitor.receiveDropped(providers, receivedAt: Date())
-            }
-            Text("タップでコピー、ドラッグで持ち出し。文章をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
-                .font(.footnote).foregroundStyle(.secondary)
+            .padding(.horizontal)
         }
-        .listStyle(.plain)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .padding(4)
+                    .overlay(alignment: .top) {
+                        Text("ドロップして保存")
+                            .font(.headline)
+                            .padding(12)
+                            .background(.regularMaterial, in: Capsule())
+                            .padding(.top, 12)
+                    }
+                    .allowsHitTesting(false)
+            }
+        }
         // Stable row IDs and no scroll-to or insertion animation limit unsolicited movement.
         .transaction { $0.animation = nil }
+    }
+
+    @ViewBuilder
+    private func rowActions(_ entry: HistoryEntry) -> some View {
+        Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
+            monitor.togglePin(entry)
+        }
+        Button("削除", systemImage: "trash", role: .destructive) {
+            monitor.delete(entry) { showUndo($0) }
+        }
     }
 
     private func showUndo(_ value: HistoryDeletion?) {
