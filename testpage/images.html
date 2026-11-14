@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clipboard+ 画像試験</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #ffffff; --text: #1d1f23; --muted: #5d6470;
+    --accent: #1f5fd6; --accent-text: #ffffff; --done: #1a7f37; --line: #d8dce3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15171a; --surface: #20232a; --text: #eceef2; --muted: #a3aab6;
+      --accent: #5b8ef0; --accent-text: #0d1117; --done: #4ac26b; --line: #343843;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.5 -apple-system, "Hiragino Sans", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 8px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  a { color: var(--accent); }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+  ol { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+  li {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+  }
+  img { display: block; width: 160px; max-width: 40vw; height: auto; border-radius: 6px; }
+  .time { display: block; font: 13px ui-monospace, Menlo, monospace; color: var(--done); min-height: 1em; }
+  button {
+    min-height: 48px; min-width: 88px; padding: 0 16px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 600;
+  }
+  button.secondary { background: var(--surface); color: var(--text); border: 1px solid var(--line); }
+  li.copied button { background: var(--done); }
+  #status { font-weight: 600; color: var(--text); }
+  #error { color: #d1242f; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>clipboard+ 画像試験</h1>
+  <p>上から順に「コピー」を押してください。押した時刻（ミリ秒）が各行に表示されます。画像を長押しして「コピー」を選ぶ方法や、画像をclipboard+へドラッグする方法も試せます。</p>
+  <p>画像はすべて試験用に作ったものです。<a href="./">文章の20件試験はこちら</a></p>
+  <div class="bar">
+    <button id="reset" class="secondary" type="button">時刻を消す</button>
+    <span id="status" aria-live="polite"></span>
+  </div>
+  <p id="error" role="alert" hidden></p>
+  <ol id="items"></ol>
+</main>
+<script>
+  // Each image has different pixels so a missed or merged item is visible in the history.
+  const images = [
+    ['01', 'りんごの木'], ['02', '青い自転車'], ['03', '朝の図書館'],
+    ['04', '夏祭りの夜'], ['05', '小さな灯台']
+  ];
+
+  const list = document.getElementById('items');
+  const status = document.getElementById('status');
+  const errorBox = document.getElementById('error');
+  let copiedCount = 0;
+
+  function stamp(date) {
+    const pad = (n, w = 2) => String(n).padStart(w, '0');
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+  }
+
+  images.forEach(([number, word]) => {
+    const url = `images/test-${number}.png`;
+    const name = `画像${number} ${word}`;
+    const item = document.createElement('li');
+    const picture = document.createElement('img');
+    const label = document.createElement('div');
+    const body = document.createElement('span');
+    const time = document.createElement('span');
+    const button = document.createElement('button');
+    picture.src = url;
+    picture.alt = name;
+    picture.width = 800;
+    picture.height = 600;
+    body.textContent = name;
+    time.className = 'time';
+    label.append(body, time);
+    button.type = 'button';
+    button.textContent = 'コピー';
+    button.setAttribute('aria-label', `${name} をコピー`);
+    button.addEventListener('click', async () => {
+      const pressedAt = new Date();
+      try {
+        // Safari needs the pending image inside the ClipboardItem created during the tap.
+        const blob = fetch(url).then((response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.blob();
+        });
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        time.textContent = `コピー ${stamp(pressedAt)}`;
+        if (!item.classList.contains('copied')) copiedCount += 1;
+        item.classList.add('copied');
+        status.textContent = `${copiedCount} / ${images.length} 件コピー済み`;
+        errorBox.hidden = true;
+      } catch (error) {
+        errorBox.hidden = false;
+        errorBox.textContent = `${name} をコピーできませんでした: ${error && error.message ? error.message : error}`;
+      }
+    });
+    item.append(picture, label, button);
+    list.append(item);
+  });
+
+  document.getElementById('reset').addEventListener('click', () => {
+    copiedCount = 0;
+    status.textContent = '';
+    errorBox.hidden = true;
+    list.querySelectorAll('li').forEach((item) => {
+      item.classList.remove('copied');
+      item.querySelector('.time').textContent = '';
+    });
+  });
+</script>
+</body>
+</html>

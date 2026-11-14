@@ -23,6 +23,7 @@
   main { max-width: 720px; margin: 0 auto; }
   h1 { font-size: 1.3rem; margin: 0 0 8px; }
   p { margin: 0 0 12px; color: var(--muted); }
+  a { color: var(--accent); }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
   .bar button { flex: 0 0 auto; }
   ol { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
@@ -46,7 +47,7 @@
 <main>
   <h1>clipboard+ 20件試験</h1>
   <p>上から順に、約1秒ごとに「コピー」を押してください。押した時刻（ミリ秒）が各行に表示されます。試験が終わったら、この画面のスクリーンショットを撮ってください。</p>
-  <p>文章はすべて試験用の架空のものです。</p>
+  <p>文章はすべて試験用の架空のものです。<a href="images.html">画像の試験はこちら</a></p>
   <div class="bar">
     <button id="reset" class="secondary" type="button">時刻を消す</button>
     <span id="status" aria-live="polite"></span>
