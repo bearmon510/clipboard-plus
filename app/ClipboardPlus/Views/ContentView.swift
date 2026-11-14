@@ -54,6 +54,10 @@ struct ContentView: View {
             .font(.footnote)
             .foregroundStyle(.secondary)
             .padding(.horizontal)
+            if monitor.pendingSaveCount > 0 {
+                Text("保存待ち \(monitor.pendingSaveCount)件")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+            }
             if let error = monitor.storageError {
                 Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal)
             }
@@ -63,9 +67,9 @@ struct ContentView: View {
                     Text("\(deletion.count)件を削除しました")
                     Spacer()
                     Button("元に戻す") {
-                        if monitor.undo(deletion) {
-                            self.deletion = nil
-                            undoTask?.cancel()
+                        showUndo(nil)
+                        monitor.undo(deletion) { restored in
+                            if !restored { showNotice("元に戻せませんでした") }
                         }
                     }
                     .frame(minHeight: 44)
@@ -78,7 +82,7 @@ struct ContentView: View {
         .padding(.top, 8)
         .onAppear {
             updateScene(scenePhase)
-            showUndo(monitor.pendingDeletion())
+            monitor.pendingDeletion { showUndo($0) }
             if monitor.resumedAtLaunch && !didShowResume {
                 didShowResume = true
                 showNotice("記録を再開しました（起動時）")
@@ -86,15 +90,15 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
-            if phase == .active { showUndo(monitor.pendingDeletion()) }
+            if phase == .active { monitor.pendingDeletion { showUndo($0) } }
         }
         .sheet(isPresented: $showSettings) { SettingsView(monitor: monitor, log: log) }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
             Button("ピン留めを残して消去", role: .destructive) {
-                showUndo(monitor.deleteAllHistory(includePinned: false))
+                monitor.deleteAllHistory(includePinned: false) { showUndo($0) }
             }
             Button("ピン留めも含めてすべて消去", role: .destructive) {
-                showUndo(monitor.deleteAllHistory(includePinned: true))
+                monitor.deleteAllHistory(includePinned: true) { showUndo($0) }
             }
             Button("キャンセル", role: .cancel) {}
         } message: {
@@ -171,7 +175,7 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .draggable(entry.text)
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    Button(role: .destructive) { showUndo(monitor.delete(entry)) } label: {
+                    Button(role: .destructive) { monitor.delete(entry) { showUndo($0) } } label: {
                         Label("削除", systemImage: "trash")
                     }
                     Button { monitor.togglePin(entry) } label: {
@@ -183,7 +187,7 @@ struct ContentView: View {
                     Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
                         monitor.togglePin(entry)
                     }
-                    Button("削除", systemImage: "trash", role: .destructive) { showUndo(monitor.delete(entry)) }
+                    Button("削除", systemImage: "trash", role: .destructive) { monitor.delete(entry) { showUndo($0) } }
                 }
             }
             Text("タップでコピー、ドラッグで持ち出し。文章をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")

@@ -9,14 +9,20 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var entries: [HistoryEntry] = []
     @Published private(set) var pollingInterval: TimeInterval = 0.5
     @Published private(set) var storageError: String?
+    @Published private(set) var pendingSaveCount = 0
     private(set) var resumedAtLaunch = false
 
     let log: MeasurementLog
 
     private let pasteboard = UIPasteboard.general
     private let defaults: UserDefaults
-    private var database: HistoryDatabase?
+    private let makeDatabase: (() throws -> HistoryPersistence)?
+    private lazy var store = HistoryStore(makeDatabase: makeDatabase) { [weak self] event in
+        self?.handleStorageEvent(event)
+    }
     private var cleanupTimer: Timer?
+    private var maintenancePending = false
+    private var needsHistoryLoad = true
     private var admission = HistoryAdmission()
     private var lastObservedChangeCount = 0
     private var timer: Timer?
@@ -26,22 +32,27 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private var pendingLogFlushes = 0
     private var logFlushTask: UIBackgroundTaskIdentifier = .invalid
 
-    override init() {
-        defaults = .standard
-        log = MeasurementLog()
+    init(defaults: UserDefaults = .standard, log: MeasurementLog? = nil,
+         makeDatabase: (() throws -> HistoryPersistence)? = nil, schedulesMaintenance: Bool = true) {
+        self.defaults = defaults
+        self.log = log ?? MeasurementLog()
+        self.makeDatabase = makeDatabase
         super.init()
         let storedInterval = defaults.object(forKey: "pollingInterval") as? Double ?? 0.5
         pollingInterval = storedInterval.isFinite ? min(5, max(0.1, storedInterval)) : 0.5
-        do {
-            let directory = try FileManager.default.url(
-                for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
-            )
-            database = try HistoryDatabase(url: directory.appendingPathComponent("clipboardplus.sqlite"))
-            entries = try requireDatabase().fetchAll()
-        } catch { reportStorageFailure() }
-        let cleanup = Timer(timeInterval: 1, target: self, selector: #selector(cleanupTimerFired(_:)), userInfo: nil, repeats: true)
-        RunLoop.main.add(cleanup, forMode: .common)
-        cleanupTimer = cleanup
+        maintenancePending = true
+        store.load { [weak self] result in
+            self?.maintenancePending = false
+            switch result {
+            case .success: self?.needsHistoryLoad = false
+            case .failure: self?.reportStorageFailure()
+            }
+        }
+        if schedulesMaintenance {
+            let cleanup = Timer(timeInterval: 1, target: self, selector: #selector(cleanupTimerFired(_:)), userInfo: nil, repeats: true)
+            RunLoop.main.add(cleanup, forMode: .common)
+            cleanupTimer = cleanup
+        }
         if defaults.bool(forKey: "isRecording") {
             resumedAtLaunch = true
             start(resuming: true)
@@ -95,7 +106,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         } else {
             log.append(sceneEvent)
         }
-        // Resume collection before database maintenance can block the main thread.
         cleanupExpired()
         if value == "inactive" || value == "background" {
             flushLogBeforeSuspension()
@@ -106,9 +116,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let count = pasteboard.changeCount
         let details = "PasteButtonから受信; changeCountは処理時点の観測値で、本文との対応は未確定"
         for text in strings {
-            let number = admit(text, source: "手動保存", route: .manual, timestamp: receivedAt, count: count, additionalDetails: details)
+            admit(text, source: "手動保存", route: .manual, timestamp: receivedAt, count: count, additionalDetails: details)
             record(
-                "手動保存", count: count, text: text, historyNumber: number,
+                "手動保存", count: count, text: text,
                 details: details,
                 timestamp: receivedAt
             )
@@ -150,61 +160,69 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     func saveDropped(_ strings: [String], receivedAt: Date) -> Bool {
         var saved = false
         for text in strings {
-            if let number = admit(text, source: "ドラッグ", route: .drag, timestamp: receivedAt) {
+            if admit(text, source: "ドラッグ", route: .drag, timestamp: receivedAt) {
                 saved = true
-                record("ドラッグで保存", text: text, historyNumber: number, timestamp: receivedAt)
+                record("ドラッグで受信", text: text, timestamp: receivedAt)
             }
         }
         return saved
     }
 
-    func delete(_ entry: HistoryEntry) -> HistoryDeletion? {
-        do {
-            let deletion = try requireDatabase().delete(id: entry.id)
-            try reloadHistory()
-            record("削除", historyNumber: entry.id, details: "履歴1件; 5秒間取り消し可能")
-            return deletion
-        } catch { reportStorageFailure(); return nil }
+    func delete(_ entry: HistoryEntry, completion: @escaping (HistoryDeletion?) -> Void) {
+        store.delete(id: entry.id) { result in
+            switch result {
+            case .success(let deletion):
+                self.record("削除", historyNumber: entry.id, details: "履歴1件; 5秒間取り消し可能")
+                completion(deletion)
+            case .failure: self.reportStorageFailure(); completion(nil)
+            }
+        }
     }
 
-    func deleteAllHistory(includePinned: Bool) -> HistoryDeletion? {
-        do {
-            let deletion = try requireDatabase().deleteAll(includePinned: includePinned)
-            try reloadHistory()
-            record("削除", details: "履歴全消去=\(deletion?.count ?? 0)件; ピン留めを含む=\(includePinned)")
-            return deletion
-        } catch { reportStorageFailure(); return nil }
+    func deleteAllHistory(includePinned: Bool, completion: @escaping (HistoryDeletion?) -> Void) {
+        store.deleteAll(includePinned: includePinned) { result in
+            switch result {
+            case .success(let deletion):
+                self.record("削除", details: "履歴全消去=\(deletion?.count ?? 0)件; ピン留めを含む=\(includePinned)")
+                completion(deletion)
+            case .failure: self.reportStorageFailure(); completion(nil)
+            }
+        }
     }
 
-    func undo(_ deletion: HistoryDeletion) -> Bool {
-        do {
-            let restored = try requireDatabase().undo(deletion)
-            try reloadHistory()
-            record("削除の取り消し", details: "復元=\(restored)")
-            return true
-        } catch { reportStorageFailure(); return false }
+    func undo(_ deletion: HistoryDeletion, completion: @escaping (Bool) -> Void) {
+        store.undo(deletion) { result in
+            switch result {
+            case .success(let restored):
+                self.record("削除の取り消し", details: "復元=\(restored)")
+                completion(restored)
+            case .failure: self.reportStorageFailure(); completion(false)
+            }
+        }
     }
 
-    func pendingDeletion() -> HistoryDeletion? {
-        do { return try requireDatabase().latestDeletion() }
-        catch { reportStorageFailure(); return nil }
+    func pendingDeletion(completion: @escaping (HistoryDeletion?) -> Void) {
+        store.latestDeletion { result in
+            switch result {
+            case .success(let deletion): completion(deletion)
+            case .failure: self.reportStorageFailure(); completion(nil)
+            }
+        }
     }
 
     func togglePin(_ entry: HistoryEntry) {
-        do {
-            try requireDatabase().togglePin(id: entry.id)
-            try reloadHistory()
-        } catch { reportStorageFailure() }
+        store.togglePin(id: entry.id) { result in
+            if case .failure = result { self.reportStorageFailure() }
+        }
     }
 
-    func exportHistory() -> URL? {
-        do {
-            let entries = try requireDatabase().fetchAll()
-            let data = try HistoryExport.data(entries: entries, exportedAt: Date())
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("clipboardplus-\(UUID().uuidString).json")
-            try data.write(to: url, options: .atomic)
-            return url
-        } catch { reportStorageFailure(); return nil }
+    func exportHistory(completion: @escaping (URL?) -> Void) {
+        store.export { result in
+            switch result {
+            case .success(let url): completion(url)
+            case .failure: self.reportStorageFailure(); completion(nil)
+            }
+        }
     }
 
     @objc private func cleanupTimerFired(_ timer: Timer) {
@@ -212,23 +230,45 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     private func cleanupExpired() {
-        guard !isReading, !isWriting, database != nil else { return }
-        do { try requireDatabase().purgeExpired() }
-        catch { reportStorageFailure() }
+        guard !maintenancePending else { return }
+        maintenancePending = true
+        if needsHistoryLoad {
+            store.load { result in
+                self.maintenancePending = false
+                switch result {
+                case .success:
+                    self.needsHistoryLoad = false
+                    if self.pendingSaveCount == 0 { self.storageError = nil }
+                case .failure: self.reportStorageFailure()
+                }
+            }
+            return
+        }
+        store.maintain { result in
+            self.maintenancePending = false
+            if case .failure = result { self.reportStorageFailure() }
+        }
     }
 
-    private func requireDatabase() throws -> HistoryDatabase {
-        guard let database else { throw HistoryDatabaseError.invalidRow }
-        return database
-    }
-
-    private func reloadHistory() throws {
-        entries = try requireDatabase().fetchAll()
-        storageError = nil
+    private func handleStorageEvent(_ event: HistoryStore.Event) {
+        switch event {
+        case .replace(let values): entries = values
+        case .upsert(let entry): HistoryList.upsert(entry, into: &entries)
+        case .remove(let id): entries.removeAll { $0.id == id }
+        case .saved(let entry, let retried):
+            pendingSaveCount -= 1
+            HistoryList.upsert(entry, into: &entries)
+            if pendingSaveCount == 0 { storageError = nil }
+            record(retried ? "履歴保存の再試行成功" : "履歴保存成功", text: entry.text,
+                   historyNumber: entry.id, details: "経路=\(entry.source.rawValue); 保存待ち=\(pendingSaveCount)件")
+        case .saveFailed:
+            reportStorageFailure()
+            record("履歴保存の失敗", details: "未保存キューを保持して再試行; 保存待ち=\(pendingSaveCount)件")
+        }
     }
 
     private func reportStorageFailure() {
-        storageError = "履歴の保存・読み込み・書き出しに失敗しました。空き容量を確認してアプリを開き直してください。"
+        storageError = "履歴の保存・読み込み・書き出しに失敗しました。空き容量を確認してください。保存待ちは自動で再試行します。"
     }
 
     func logContext() -> MeasurementEvent {
@@ -309,14 +349,13 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             details: "hasStrings=\(hasStrings); \(details)"
         ))
         if let text {
-            let number = admit(text, source: source, timestamp: finishedAt, count: after)
+            admit(text, source: source, timestamp: finishedAt, count: after, before: before, after: after)
             log.append(MeasurementEvent(
                 timestamp: finishedAt,
                 kind: "読み取り成功",
                 changeCount: after,
                 scene: readScene,
                 characterCount: text.count,
-                historyNumber: number,
                 details: details,
                 text: text
             ))
@@ -357,16 +396,15 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @discardableResult
     private func admit(
         _ text: String, source: String, route: HistorySource = .automatic,
-        timestamp: Date = Date(), count: Int? = nil, additionalDetails: String = ""
-    ) -> Int? {
-        let decision = route == .automatic ? admission.receive(text) : .add
+        timestamp: Date = Date(), count: Int? = nil, additionalDetails: String = "",
+        before: Int? = nil, after: Int? = nil
+    ) -> Bool {
+        let decision = route == .automatic ? admission.receive(text, before: before, after: after) : .add
         switch decision {
         case .add:
-            do {
-                let entry = try requireDatabase().collect(text, source: route, at: timestamp)
-                try reloadHistory()
-                return entry.id
-            } catch { reportStorageFailure(); return nil }
+            pendingSaveCount += 1
+            store.collect(text, source: route, at: timestamp)
+            return true
         case .skip(let reason):
             record(
                 "追加の見送り",
@@ -375,7 +413,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 details: "取得元=\(source); 理由=\(reason)" + (additionalDetails.isEmpty ? "" : "; \(additionalDetails)"),
                 timestamp: timestamp
             )
-            return nil
+            return false
         }
     }
 

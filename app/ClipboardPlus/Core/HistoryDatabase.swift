@@ -13,7 +13,7 @@ enum HistoryDatabaseError: Error {
     case invalidRow
 }
 
-final class HistoryDatabase {
+final class HistoryDatabase: HistoryPersistence {
     static let schemaVersion = 1
     static let undoInterval: TimeInterval = 5
     private var connection: OpaquePointer?
@@ -98,10 +98,12 @@ final class HistoryDatabase {
         }
     }
 
-    func togglePin(id: Int) throws {
+    @discardableResult
+    func togglePin(id: Int) throws -> HistoryEntry? {
         try transaction {
             try execute("UPDATE history SET pinned = 1 - pinned WHERE id = ? AND deletion_id IS NULL", [.integer(id)])
             try enforceLimit()
+            return try rows("SELECT \(columns) FROM history WHERE id = ? AND deletion_id IS NULL", [.integer(id)]).first
         }
     }
 
@@ -138,8 +140,10 @@ final class HistoryDatabase {
         }
     }
 
-    func purgeExpired() throws {
+    @discardableResult
+    func purgeExpired() throws -> Bool {
         try execute("DELETE FROM history WHERE delete_after <= ?", [.real(now().timeIntervalSince1970)])
+        return sqlite3_changes(connection) > 0
     }
 
     func latestDeletion() throws -> HistoryDeletion? {

@@ -8,22 +8,34 @@ struct HistoryAdmission {
 
     private(set) var previousText: String?
     private var pendingSelfCopy: String?
+    private var changedDuringRead: (text: String, after: Int)?
 
-    mutating func receive(_ text: String) -> Decision {
+    mutating func receive(_ text: String, before: Int? = nil, after: Int? = nil) -> Decision {
+        let repeatedRead = changedDuringRead.map {
+            $0.after == before && before == after && $0.text.utf8.elementsEqual(text.utf8)
+        } ?? false
+        // Only the next stable read at the observed endpoint can be explained by the earlier race.
+        changedDuringRead = nil
+        if let before, let after, after > before {
+            changedDuringRead = (text, after)
+        }
         // Only the immediate readback is suppressed; later external copies count again.
         let isRepeated = pendingSelfCopy.map { $0.utf8.elementsEqual(text.utf8) } ?? false
         pendingSelfCopy = nil
         previousText = text
-        return isRepeated ? .skip(reason: "直前の内容と同じ") : .add
+        if isRepeated { return .skip(reason: "直前の内容と同じ") }
+        return repeatedRead ? .skip(reason: "読み取り中の変更を再確認") : .add
     }
 
     mutating func recordSelfCopy(_ text: String) {
+        changedDuringRead = nil
         previousText = text
         pendingSelfCopy = text
     }
 
     mutating func discardPendingSelfCopy() {
         pendingSelfCopy = nil
+        changedDuringRead = nil
     }
 }
 

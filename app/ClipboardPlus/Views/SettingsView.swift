@@ -8,6 +8,7 @@ struct SettingsView: View {
     @State private var export: ExportSnapshot?
     @State private var exportedURL: URL?
     @State private var shareError: String?
+    @State private var isExporting = false
 
     private struct ExportSnapshot: Identifiable {
         let id = UUID()
@@ -41,12 +42,17 @@ struct SettingsView: View {
                     Text("書き出したファイルには、すべての履歴の原文が入ります。共有先を確認してください。このアプリでの復元には対応していません。")
                     Button("すべての履歴を書き出す", systemImage: "square.and.arrow.up") {
                         shareError = nil
-                        if let url = monitor.exportHistory() {
-                            exportedURL = url
-                            export = ExportSnapshot(url: url)
+                        isExporting = true
+                        monitor.exportHistory { url in
+                            isExporting = false
+                            if let url {
+                                exportedURL = url
+                                export = ExportSnapshot(url: url)
+                            }
                         }
                     }
                     .frame(minHeight: 44)
+                    .disabled(isExporting)
                     if let error = shareError ?? monitor.storageError {
                         Text(error).foregroundStyle(.red)
                     }

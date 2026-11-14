@@ -51,5 +51,58 @@ final class HistoryAdmissionTests: XCTestCase {
         admission.discardPendingSelfCopy()
         XCTAssertEqual(admission.receive("A"), .add)
     }
+
+    func testSameTextAtEndpointOfChangedReadIsNotCountedTwice() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("B", before: 10, after: 11), .add)
+        XCTAssertEqual(admission.receive("B", before: 11, after: 11), .skip(reason: "読み取り中の変更を再確認"))
+        XCTAssertEqual(admission.receive("B", before: 12, after: 12), .add)
+    }
+
+    func testDifferentTextAfterChangedReadPreservesBoth() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("A", before: 10, after: 11), .add)
+        XCTAssertEqual(admission.receive("B", before: 11, after: 11), .add)
+    }
+
+    func testNewChangeBeyondReadEndpointCountsSameExternalTextAgain() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("B", before: 10, after: 11), .add)
+        XCTAssertEqual(admission.receive("B", before: 12, after: 12), .add)
+    }
+
+    func testMultipleChangesDuringReadOnlySuppressEndpointReadback() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("B", before: 10, after: 13), .add)
+        XCTAssertEqual(admission.receive("B", before: 13, after: 13), .skip(reason: "読み取り中の変更を再確認"))
+    }
+
+    func testAnotherRaceIsPreservedAndItsStableReadbackIsSuppressed() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("B", before: 10, after: 11), .add)
+        XCTAssertEqual(admission.receive("B", before: 11, after: 12), .add)
+        XCTAssertEqual(admission.receive("B", before: 12, after: 12), .skip(reason: "読み取り中の変更を再確認"))
+    }
+
+    func testRaceComparisonPreservesExactUTF8Differences() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("é", before: 10, after: 11), .add)
+        XCTAssertEqual(admission.receive("e\u{301}", before: 11, after: 11), .add)
+    }
+
+    func testBaselineAndNonTextReadDiscardRaceState() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("B", before: 10, after: 11), .add)
+        admission.discardPendingSelfCopy()
+        XCTAssertEqual(admission.receive("B", before: 11, after: 11), .add)
+    }
+
+    func testSelfCopyReplacesRaceState() {
+        var admission = HistoryAdmission()
+        XCTAssertEqual(admission.receive("B", before: 10, after: 11), .add)
+        admission.recordSelfCopy("A")
+        XCTAssertEqual(admission.receive("A", before: 12, after: 12), .skip(reason: "直前の内容と同じ"))
+        XCTAssertEqual(admission.receive("B", before: 13, after: 13), .add)
+    }
 }
 
