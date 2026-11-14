@@ -10,6 +10,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var pollingInterval: TimeInterval = 0.5
     @Published private(set) var storageError: String?
     @Published private(set) var pendingSaveCount = 0
+    @Published private(set) var imageUsage = HistoryImageUsage()
+    @Published private(set) var imageNotice: String?
     private(set) var resumedAtLaunch = false
 
     let log: MeasurementLog
@@ -17,7 +19,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private let pasteboard = UIPasteboard.general
     private let defaults: UserDefaults
     private let makeDatabase: (() throws -> HistoryPersistence)?
-    private lazy var store = HistoryStore(makeDatabase: makeDatabase) { [weak self] event in
+    private let imageDirectory: URL
+    private lazy var store = HistoryStore(makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
         self?.handleStorageEvent(event)
     }
     private var cleanupTimer: Timer?
@@ -33,10 +36,12 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private var logFlushTask: UIBackgroundTaskIdentifier = .invalid
 
     init(defaults: UserDefaults = .standard, log: MeasurementLog? = nil,
-         makeDatabase: (() throws -> HistoryPersistence)? = nil, schedulesMaintenance: Bool = true) {
+         makeDatabase: (() throws -> HistoryPersistence)? = nil, schedulesMaintenance: Bool = true,
+         imageDirectory: URL = HistoryImageFiles.defaultDirectory) {
         self.defaults = defaults
         self.log = log ?? MeasurementLog()
         self.makeDatabase = makeDatabase
+        self.imageDirectory = imageDirectory
         super.init()
         let storedInterval = defaults.object(forKey: "pollingInterval") as? Double ?? 0.5
         pollingInterval = storedInterval.isFinite ? min(5, max(0.1, storedInterval)) : 0.5
@@ -63,6 +68,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         guard !isRecording else { return }
         // The baseline is not read, so it must not suppress the next external change.
         admission.discardPendingSelfCopy()
+        store.resetImageAdmission()
         lastObservedChangeCount = pasteboard.changeCount
         isRecording = true
         defaults.set(true, forKey: "isRecording")
@@ -125,7 +131,13 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
-    func copy(_ entry: HistoryEntry) {
+    func copy(_ entry: HistoryEntry, completion: ((Bool) -> Void)? = nil) {
+        guard !isWriting && !isReading else { completion?(false); return }
+        if let image = entry.image {
+            copyImage(entry, image: image, completion: completion)
+            return
+        }
+        store.resetImageAdmission()
         let before = pasteboard.changeCount
         isWriting = true
         admission.recordSelfCopy(entry.text)
@@ -155,6 +167,88 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         } else {
             log.append(copyEvent)
         }
+        completion?(true)
+    }
+
+    func imageURL(_ image: HistoryImage, thumbnail: Bool) -> URL {
+        store.imageFiles.url(for: thumbnail ? image.thumbnailFilename : image.filename)
+    }
+
+    func rowProvider(_ entry: HistoryEntry) -> NSItemProvider {
+        if let image = entry.image { return HistoryImageLoader.rowProvider(image: image, files: store.imageFiles) }
+        return DroppedTextLoader.rowProvider(text: entry.text)
+    }
+
+    private func copyImage(_ entry: HistoryEntry, image: HistoryImage, completion: ((Bool) -> Void)?) {
+        isWriting = true
+        store.readImage(image) { result in
+            switch result {
+            case .success(let data):
+                let before = self.pasteboard.changeCount
+                self.admission.discardPendingSelfCopy()
+                self.pasteboard.setData(data, forPasteboardType: image.typeIdentifier)
+                let after = self.pasteboard.changeCount
+                self.store.recordImageCopy(hash: image.hash, changeCount: after)
+                self.record("自己コピー", count: after, historyNumber: entry.id,
+                            details: "画像; 形式=\(image.typeIdentifier); バイト数=\(data.count); ピクセル=\(image.pixelWidth)x\(image.pixelHeight); hash=\(image.hash.prefix(8)); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
+                completion?(true)
+            case .failure:
+                self.imageNotice = HistoryImageError.unavailable.message
+                self.record("画像コピーの失敗", historyNumber: entry.id)
+                completion?(false)
+            }
+            self.isWriting = false
+            let detections = self.deferredDetections
+            self.deferredDetections.removeAll()
+            if self.isRecording {
+                self.readIfChanged(count: self.pasteboard.changeCount, source: "自己コピー後の確認", detections: detections)
+            } else {
+                detections.forEach { self.log.append($0) }
+            }
+        }
+    }
+
+    func saveManually(_ providers: [NSItemProvider], receivedAt: Date) {
+        for provider in providers {
+            receiveProvider(provider, route: .manual, receivedAt: receivedAt,
+                            details: "PasteButtonから受信; registeredTypeIdentifiers=\(provider.registeredTypeIdentifiers)")
+        }
+    }
+
+    private func receiveProvider(_ provider: NSItemProvider, route: HistorySource, receivedAt: Date, details: String) {
+        if HistoryImageLoader.hasImage(provider) {
+            let start = ProcessInfo.processInfo.systemUptime
+            HistoryImageLoader.load(provider) { result in
+                let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+                let measured = "\(details); registeredTypeIdentifiers=\(provider.registeredTypeIdentifiers); 所要ms=\(String(format: "%.3f", elapsed))"
+                switch result {
+                case .success(let input):
+                    self.admitImage(input, route: route, timestamp: receivedAt, details: measured)
+                case .failure:
+                    self.imageNotice = HistoryImageError.invalidImage.message
+                    self.record("画像の読み込み失敗", details: measured, timestamp: receivedAt)
+                }
+            }
+        } else {
+            DroppedTextLoader.load(provider) { result, attempts in
+                switch result {
+                case .success(let text):
+                    if route == .manual { self.saveManually([text], receivedAt: receivedAt) }
+                    else { _ = self.saveDropped([text], receivedAt: receivedAt, details: "\(details); \(attempts)") }
+                case .failure:
+                    self.record(route == .manual ? "手動保存の読み込み失敗" : "ドラッグの読み込み失敗",
+                                details: "\(details); \(attempts)", timestamp: receivedAt)
+                }
+            }
+        }
+    }
+
+    private func admitImage(_ input: HistoryImageInput, route: HistorySource, timestamp: Date,
+                            before: Int? = nil, after: Int? = nil, details: String) {
+        pendingSaveCount += 1
+        imageNotice = nil
+        store.collectImage(input, source: route, at: timestamp, before: before, after: after,
+                           details: "経路=\(route.rawValue); \(details)")
     }
 
     func receiveDropped(_ providers: [NSItemProvider], receivedAt: Date) -> Bool {
@@ -169,15 +263,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 continue
             }
             accepted = true
-            DroppedTextLoader.load(provider) { result, attempts in
-                let details = "provider[\(index)]; \(attempts)"
-                switch result {
-                case .success(let text):
-                    _ = self.saveDropped([text], receivedAt: receivedAt, details: details)
-                case .failure:
-                    self.record("ドラッグの読み込み失敗", details: details, timestamp: receivedAt)
-                }
-            }
+            receiveProvider(provider, route: .drag, receivedAt: receivedAt,
+                            details: "provider[\(index)]")
         }
         return accepted
     }
@@ -314,6 +401,19 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         case .saveFailed:
             reportStorageFailure()
             record("履歴保存の失敗", details: "未保存キューを保持して再試行; 保存待ち=\(pendingSaveCount)件")
+        case .imageProcessed(let image, let details):
+            record("画像の読み取り成功", details: "\(details); ピクセル=\(image.pixelWidth)x\(image.pixelHeight)")
+        case .imageSkipped(let details):
+            pendingSaveCount -= 1
+            record("追加の見送り", details: details)
+        case .imageRejected(let message, let details):
+            pendingSaveCount -= 1
+            imageNotice = message
+            record("画像保存の見送り", details: details)
+        case .imageUsage(let usage): imageUsage = usage
+        case .cleanupFailed:
+            imageNotice = "画像ファイルの後始末に失敗しました。自動で再試行します。"
+            record("画像ファイルの後始末失敗")
         }
     }
 
@@ -381,6 +481,33 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let before = pasteboard.changeCount
         // A change during this read must remain eligible at the next check.
         lastObservedChangeCount = before
+        if pasteboard.hasImages {
+            admission.discardPendingSelfCopy()
+            let types = pasteboard.types
+            var input: HistoryImageInput?
+            for type in HistoryImageFiles.preferredTypes {
+                if let data = pasteboard.data(forPasteboardType: type) {
+                    input = .data(data, typeIdentifier: type)
+                    break
+                }
+            }
+            if input == nil, let image = pasteboard.image { input = .bitmap(image) }
+            let after = pasteboard.changeCount
+            let finished = Date()
+            let elapsed = (ProcessInfo.processInfo.systemUptime - startUptime) * 1_000
+            let details = "取得元=\(source); 読み取り前changeCount=\(before); 読み取り後changeCount=\(after); 所要ms=\(String(format: "%.3f", elapsed)); pasteboard.types=\(types)"
+            detections.forEach { log.append($0) }
+            if let input {
+                admitImage(input, route: .automatic, timestamp: finished, before: before, after: after, details: details)
+            } else {
+                store.resetImageAdmission()
+                imageNotice = HistoryImageError.invalidImage.message
+                record("画像の読み込み失敗", count: after, details: details, timestamp: finished)
+            }
+            if before != after { record("読み取り中の変更", count: after, details: details) }
+            return
+        }
+        store.resetImageAdmission()
         let hasStrings = pasteboard.hasStrings
         let checkedAt = Date()
         let text = hasStrings ? pasteboard.string : nil

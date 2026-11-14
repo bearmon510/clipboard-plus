@@ -7,7 +7,8 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
     @State private var searchText = ""
-    @State private var pinnedOnly = false
+    @State private var filter = HistoryFilter.all
+    @State private var previewEntry: HistoryEntry?
     @State private var notice: String?
     @State private var noticeTask: Task<Void, Never>?
     @State private var deletion: HistoryDeletion?
@@ -16,10 +17,7 @@ struct ContentView: View {
     @State private var isDropTargeted = false
 
     private var visibleEntries: [HistoryEntry] {
-        monitor.entries.filter {
-            (!pinnedOnly || $0.isPinned) &&
-                (searchText.isEmpty || $0.text.range(of: searchText, options: .caseInsensitive) != nil)
-        }
+        HistoryFilter.entries(monitor.entries, filter: filter, search: searchText)
     }
 
     var body: some View {
@@ -41,11 +39,22 @@ struct ContentView: View {
             .frame(minHeight: 44)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
             .padding(.horizontal)
-            Picker("表示する履歴", selection: $pinnedOnly) {
-                Text("すべて").tag(false)
-                Text("ピン留め").tag(true)
+            HStack(spacing: 4) {
+                ForEach(HistoryFilter.allCases, id: \.self) { value in
+                    Button { filter = value } label: {
+                        Text(value.title)
+                            .font(.subheadline)
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .background(filter == value ? Color.accentColor.opacity(0.15) : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 8))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(filter == value ? [.isSelected] : [])
+                }
             }
-            .pickerStyle(.segmented)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("表示する履歴")
             .padding(.horizontal)
             HStack {
                 Text(notice ?? "履歴 \(visibleEntries.count)件")
@@ -61,6 +70,9 @@ struct ContentView: View {
             }
             if let error = monitor.storageError {
                 Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal)
+            }
+            if let message = monitor.imageNotice {
+                Text(message).font(.caption).foregroundStyle(.red).padding(.horizontal)
             }
             history
             if let deletion {
@@ -84,7 +96,7 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(uiColor: .systemBackground))
         .contentShape(Rectangle())
-        .onDrop(of: DroppedTextLoader.contentTypes, isTargeted: $isDropTargeted) { providers, _ in
+        .onDrop(of: HistoryImageLoader.contentTypes, isTargeted: $isDropTargeted) { providers, _ in
             monitor.receiveDropped(providers, receivedAt: Date())
         }
         .onAppear {
@@ -100,6 +112,11 @@ struct ContentView: View {
             if phase == .active { monitor.pendingDeletion { showUndo($0) } }
         }
         .sheet(isPresented: $showSettings) { SettingsView(monitor: monitor, log: log) }
+        .sheet(item: $previewEntry) { entry in
+            if let image = entry.image {
+                HistoryImagePreview(image: image, url: monitor.imageURL(image, thumbnail: false))
+            }
+        }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
             Button("ピン留めを残して消去", role: .destructive) {
                 monitor.deleteAllHistory(includePinned: false) { showUndo($0) }
@@ -157,13 +174,13 @@ struct ContentView: View {
     }
 
     private var pasteButton: some View {
-        PasteButton(payloadType: String.self) { strings in
+        PasteButton(supportedContentTypes: HistoryImageLoader.contentTypes) { providers in
             let receivedAt = Date()
-            DispatchQueue.main.async { monitor.saveManually(strings, receivedAt: receivedAt) }
+            DispatchQueue.main.async { monitor.saveManually(providers, receivedAt: receivedAt) }
         }
         .labelStyle(.titleAndIcon)
         .frame(minWidth: 100, minHeight: 44)
-        .accessibilityLabel("文章を手動保存")
+        .accessibilityLabel("文章・画像を手動保存")
     }
 
     private var history: some View {
@@ -171,7 +188,7 @@ struct ContentView: View {
             LazyVStack(spacing: 0) {
                 if visibleEntries.isEmpty {
                     Text(monitor.entries.isEmpty
-                         ? "記録の開始後にコピーした文章を収集します。開始前の文章は「ペースト」で保存できます。ここへ文章をドロップしても保存できます。"
+                         ? "記録の開始後にコピーした文章・画像を収集します。開始前の内容は「ペースト」で保存できます。ここへドロップしても保存できます。"
                          : "条件に一致する履歴がありません。")
                         .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 12)
                         .frame(maxWidth: .infinity, minHeight: 100)
@@ -180,11 +197,14 @@ struct ContentView: View {
                     VStack(spacing: 0) {
                         HStack(spacing: 8) {
                             Button {
-                                monitor.copy(entry)
-                                showNotice("コピーしました")
-                            } label: { HistoryRow(entry: entry) }
+                                monitor.copy(entry) { success in
+                                    showNotice(success ? "コピーしました" : "コピーできませんでした")
+                                }
+                            } label: {
+                                HistoryRow(entry: entry, thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) })
+                            }
                             .buttonStyle(.plain)
-                            .onDrag { DroppedTextLoader.rowProvider(text: entry.text) }
+                            .onDrag { monitor.rowProvider(entry) }
                             Menu {
                                 rowActions(entry)
                             } label: {
@@ -199,7 +219,7 @@ struct ContentView: View {
                         Divider()
                     }
                 }
-                Text("タップでコピー、ドラッグで持ち出し。「⋯」または長押しでピン留め・削除。文章をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
+                Text("タップでコピー、ドラッグで持ち出し。「⋯」または長押しで拡大表示・ピン留め・削除。文章・画像をドロップすると保存します。自動収集では他のアプリからのペースト許可を求められる場合があります。")
                     .font(.footnote).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 12)
@@ -228,6 +248,9 @@ struct ContentView: View {
 
     @ViewBuilder
     private func rowActions(_ entry: HistoryEntry) -> some View {
+        if entry.kind == .image {
+            Button("拡大表示", systemImage: "arrow.up.left.and.arrow.down.right") { previewEntry = entry }
+        }
         Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
             monitor.togglePin(entry)
         }
@@ -271,6 +294,7 @@ struct ContentView: View {
 
 private struct HistoryRow: View {
     let entry: HistoryEntry
+    let thumbnailURL: URL?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -286,8 +310,17 @@ private struct HistoryRow: View {
             if let domain = entry.domain {
                 Text(domain).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            Text(entry.text.isEmpty ? "（空文字）" : String(entry.text.prefix(160)))
-                .font(.body).lineLimit(3).multilineTextAlignment(.leading)
+            if let image = entry.image, let thumbnailURL {
+                HistoryFileImage(url: thumbnailURL, maximumPixels: 480)
+                    .frame(maxWidth: .infinity).frame(height: 120)
+                    .accessibilityLabel("履歴の画像")
+                Text("\(image.pixelWidth) × \(image.pixelHeight) px · \(ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .decimal))")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(entry.text.isEmpty ? "（空文字）" : String(entry.text.prefix(160)))
+                    .font(.body).lineLimit(3).multilineTextAlignment(.leading)
+            }
         }
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
         .padding(.vertical, 4)

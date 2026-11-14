@@ -35,11 +35,13 @@ struct SettingsView: View {
                     Text("同じ原文は1項目にまとめ、最後に収集した時刻と回数を更新します。履歴をコピーした直後の読み取りは更新しません。")
                 }
                 Section("履歴の保存") {
+                    Text("画像 \(monitor.imageUsage.count)件 · \(ByteCountFormatter.string(fromByteCount: Int64(monitor.imageUsage.byteCount), countStyle: .decimal))")
+                    Text("画像は1件20MBまで。ピン留め以外の画像の実体は合計500MBまでで、古いものから削除します。件数の上限は文章と画像の合計です。使用量はピン留めと取り消し待ちの実体を含み、縮小画像は含みません。")
                     Text("履歴は端末内に保存します。ピン留めしていない項目は1,000件までで、最後に収集した時刻の古いものから削除します。ピン留めした項目は自動では削除しません。")
                     Text("削除後は5秒間取り消せます。取り消し待ちの項目は書き出しに含めません。")
                 }
                 Section("JSONで書き出し") {
-                    Text("書き出したファイルには、すべての履歴の原文が入ります。共有先を確認してください。このアプリでの復元には対応していません。")
+                    Text("書き出すJSON（形式の版2）には文章の原文と画像の情報（時刻・回数・ピン留め・大きさ・ハッシュなど）が入ります。画像の実体は含まれません。共有先を確認してください。画像を含むバックアップと、このアプリでの復元には対応していません。")
                     Button("すべての履歴を書き出す", systemImage: "square.and.arrow.up") {
                         shareError = nil
                         isExporting = true

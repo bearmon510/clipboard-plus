@@ -287,7 +287,7 @@ final class HistoryDatabaseTests: XCTestCase {
         let entries = try database.fetchAll()
         let data = try HistoryExport.data(entries: entries, exportedAt: clock.date)
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(root["formatVersion"] as? Int, 1)
+        XCTAssertEqual(root["formatVersion"] as? Int, 2)
         XCTAssertEqual(root["exportedAt"] as? String, "1970-01-01T00:16:41.000Z")
         let rows = try XCTUnwrap(root["entries"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 2)
@@ -308,9 +308,9 @@ final class HistoryDatabaseTests: XCTestCase {
     func testSchemaVersionIsStoredAndPreservedOnReopen() throws {
         let (database, url, clock) = try fixture()
         XCTAssertEqual(try database.readSchemaVersion(), HistoryDatabase.schemaVersion)
-        XCTAssertEqual(try scalar("PRAGMA user_version", url: url), 1)
+        XCTAssertEqual(try scalar("PRAGMA user_version", url: url), 2)
         let reopened = try HistoryDatabase(url: url, now: { clock.date })
-        XCTAssertEqual(try reopened.readSchemaVersion(), 1)
+        XCTAssertEqual(try reopened.readSchemaVersion(), 2)
     }
 
     func testFutureSchemaIsRejectedWithoutChangingDataOrVersion() throws {

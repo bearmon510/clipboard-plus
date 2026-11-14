@@ -13,12 +13,16 @@ enum DroppedTextLoader {
 
     static func rowProvider(text: String) -> NSItemProvider {
         let provider = NSItemProvider(object: text as NSString)
+        markLocalRow(provider)
+        return provider
+    }
+
+    static func markLocalRow(_ provider: NSItemProvider) {
         // Keep the origin marker private while allowing other apps to read the text.
         provider.registerDataRepresentation(forTypeIdentifier: localRowType, visibility: .ownProcess) { completion in
             completion(Data(), nil)
             return nil
         }
-        return provider
     }
 
     static func isLocalRow(_ provider: NSItemProvider) -> Bool {

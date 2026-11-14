@@ -14,14 +14,20 @@ enum HistoryDatabaseError: Error {
 }
 
 final class HistoryDatabase: HistoryPersistence {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
     static let undoInterval: TimeInterval = 5
     private var connection: OpaquePointer?
     private let now: () -> Date
-    private let columns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source"
+    private let columns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source, image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type"
+    private let unpinnedLimit: Int
+    private let imageByteLimit: Int
+    private var removals: [HistoryEntry] = []
 
-    init(url: URL, now: @escaping () -> Date = Date.init) throws {
+    init(url: URL, now: @escaping () -> Date = Date.init, unpinnedLimit: Int = 1_000,
+         imageByteLimit: Int = HistoryImageFiles.maximumTotalByteCount) throws {
         self.now = now
+        self.unpinnedLimit = max(0, unpinnedLimit)
+        self.imageByteLimit = max(0, imageByteLimit)
         let result = sqlite3_open(url.path, &connection)
         guard result == SQLITE_OK else {
             sqlite3_close(connection)
@@ -53,6 +59,18 @@ final class HistoryDatabase: HistoryPersistence {
                     try execute("PRAGMA user_version = 1")
                 }
             }
+            if version < 2 {
+                try transaction {
+                    for column in ["image_hash TEXT", "image_file TEXT", "thumbnail_file TEXT", "image_bytes INTEGER",
+                                   "pixel_width INTEGER", "pixel_height INTEGER", "image_type TEXT"] {
+                        try execute("ALTER TABLE history ADD COLUMN \(column)")
+                    }
+                    try execute("DROP INDEX history_active_text")
+                    try execute("CREATE UNIQUE INDEX history_active_text ON history(text) WHERE deletion_id IS NULL AND kind != 'image'")
+                    try execute("CREATE UNIQUE INDEX history_active_image ON history(image_hash) WHERE deletion_id IS NULL AND kind = 'image'")
+                    try execute("PRAGMA user_version = 2")
+                }
+            }
             try purgeExpired()
         } catch {
             sqlite3_close(connection)
@@ -79,7 +97,7 @@ final class HistoryDatabase: HistoryPersistence {
         let timestamp = date ?? now()
         return try transaction {
             try purgeExpired()
-            let existing = try rows("SELECT \(columns) FROM history WHERE text = ? AND deletion_id IS NULL", [.text(text)]).first
+            let existing = try rows("SELECT \(columns) FROM history WHERE kind != 'image' AND text = ? AND deletion_id IS NULL", [.text(text)]).first
             let id: Int
             if let existing {
                 id = existing.id
@@ -94,6 +112,36 @@ final class HistoryDatabase: HistoryPersistence {
             let entry = try rows("SELECT \(columns) FROM history WHERE id = ?", [.integer(id)]).first
             try enforceLimit()
             guard let entry else { throw HistoryDatabaseError.invalidRow }
+            return entry
+        }
+    }
+
+    @discardableResult
+    func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry {
+        let timestamp = date ?? now()
+        return try transaction {
+            try purgeExpired()
+            let existing = try rows("SELECT \(columns) FROM history WHERE kind = 'image' AND image_hash = ? AND deletion_id IS NULL",
+                                    [.text(image.hash)]).first
+            let id: Int
+            if let existing {
+                id = existing.id
+                try execute("UPDATE history SET collected_at = ?, collection_count = collection_count + 1, source = ? WHERE id = ?",
+                            [.real(timestamp.timeIntervalSince1970), .text(source.rawValue), .integer(id)])
+            } else {
+                try execute("""
+                    INSERT INTO history(kind, text, saved_at, collected_at, collection_count, source,
+                        image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type)
+                    VALUES ('image', '', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [.real(timestamp.timeIntervalSince1970), .real(timestamp.timeIntervalSince1970), .text(source.rawValue),
+                          .text(image.hash), .text(image.filename), .text(image.thumbnailFilename), .integer(image.byteCount),
+                          .integer(image.pixelWidth), .integer(image.pixelHeight), .text(image.typeIdentifier)])
+                id = Int(sqlite3_last_insert_rowid(connection))
+            }
+            guard let entry = try rows("SELECT \(columns) FROM history WHERE id = ?", [.integer(id)]).first else {
+                throw HistoryDatabaseError.invalidRow
+            }
+            try enforceLimit()
             return entry
         }
     }
@@ -122,7 +170,9 @@ final class HistoryDatabase: HistoryPersistence {
             let deleted = try rows("SELECT \(columns) FROM history WHERE deletion_id = ?", [.text(deletion.id)])
             guard !deleted.isEmpty else { return false }
             for old in deleted {
-                let active = try rows("SELECT \(columns) FROM history WHERE text = ? AND deletion_id IS NULL", [.text(old.text)]).first
+                let predicate = old.kind == .image ? "kind = 'image' AND image_hash = ?" : "kind != 'image' AND text = ?"
+                let key = old.image?.hash ?? old.text
+                let active = try rows("SELECT \(columns) FROM history WHERE \(predicate) AND deletion_id IS NULL", [.text(key)]).first
                 if let active {
                     // A fresh collection during the undo window must survive restoration.
                     let latest = active.lastCollectedAt >= old.lastCollectedAt ? active : old
@@ -131,7 +181,7 @@ final class HistoryDatabase: HistoryPersistence {
                         """, [.real(min(old.savedAt, active.savedAt).timeIntervalSince1970),
                               .real(latest.lastCollectedAt.timeIntervalSince1970), .integer(old.collectionCount + active.collectionCount),
                               .integer(old.isPinned || active.isPinned ? 1 : 0), .text(latest.source.rawValue), .integer(old.id)])
-                    try execute("DELETE FROM history WHERE id = ?", [.integer(active.id)])
+                    try removeRows(predicate: "id = ?", bindings: [.integer(active.id)])
                 }
                 try execute("UPDATE history SET deletion_id = NULL, delete_after = NULL WHERE id = ?", [.integer(old.id)])
             }
@@ -142,8 +192,25 @@ final class HistoryDatabase: HistoryPersistence {
 
     @discardableResult
     func purgeExpired() throws -> Bool {
-        try execute("DELETE FROM history WHERE delete_after <= ?", [.real(now().timeIntervalSince1970)])
-        return sqlite3_changes(connection) > 0
+        try removeRows(predicate: "delete_after <= ?", bindings: [.real(now().timeIntervalSince1970)])
+    }
+
+    // Drain only after a successful transaction. Rollbacks also roll back this journal.
+    func takeRemovals() -> [HistoryEntry] {
+        defer { removals.removeAll() }
+        return removals
+    }
+
+    func referencedImageFiles() throws -> Set<String>? {
+        Set(try rows("SELECT \(columns) FROM history WHERE kind = 'image'").flatMap { $0.image?.filenames ?? [] })
+    }
+
+    func imageUsage() throws -> HistoryImageUsage {
+        // Undo-pending originals still occupy space until purge.
+        let statement = try prepare("SELECT COUNT(*), COALESCE(SUM(image_bytes), 0) FROM history WHERE kind = 'image'")
+        defer { sqlite3_finalize(statement) }
+        guard try step(statement) == SQLITE_ROW else { throw HistoryDatabaseError.invalidRow }
+        return HistoryImageUsage(count: Int(sqlite3_column_int64(statement, 0)), byteCount: Int(sqlite3_column_int64(statement, 1)))
     }
 
     func latestDeletion() throws -> HistoryDeletion? {
@@ -171,12 +238,26 @@ final class HistoryDatabase: HistoryPersistence {
     }
 
     private func enforceLimit() throws {
-        try execute("""
-            DELETE FROM history WHERE id IN (
+        try removeRows(predicate: """
+            id IN (
                 SELECT id FROM history WHERE deletion_id IS NULL AND pinned = 0
-                ORDER BY collected_at DESC, id DESC LIMIT -1 OFFSET 1000
+                ORDER BY collected_at DESC, id DESC LIMIT -1 OFFSET ?
             )
-            """)
+            """, bindings: [.integer(unpinnedLimit)])
+        let images = try rows("SELECT \(columns) FROM history WHERE deletion_id IS NULL AND pinned = 0 AND kind = 'image' ORDER BY collected_at ASC, id ASC")
+        var total = images.reduce(0) { $0 + ($1.image?.byteCount ?? 0) }
+        for entry in images where total > imageByteLimit {
+            try removeRows(predicate: "id = ?", bindings: [.integer(entry.id)])
+            total -= entry.image?.byteCount ?? 0
+        }
+    }
+
+    @discardableResult
+    private func removeRows(predicate: String, bindings: [Value]) throws -> Bool {
+        let removed = try rows("SELECT \(columns) FROM history WHERE \(predicate)", bindings)
+        try execute("DELETE FROM history WHERE \(predicate)", bindings)
+        removals.append(contentsOf: removed)
+        return !removed.isEmpty
     }
 
     private enum Value {
@@ -236,7 +317,12 @@ final class HistoryDatabase: HistoryPersistence {
                 id: Int(sqlite3_column_int64(statement, 0)), kind: kind, text: string(statement, 2),
                 savedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
                 lastCollectedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
-                collectionCount: Int(sqlite3_column_int64(statement, 5)), isPinned: sqlite3_column_int(statement, 6) != 0, source: source
+                collectionCount: Int(sqlite3_column_int64(statement, 5)), isPinned: sqlite3_column_int(statement, 6) != 0, source: source,
+                image: kind == .image ? HistoryImage(
+                    hash: string(statement, 8), filename: string(statement, 9), thumbnailFilename: string(statement, 10),
+                    byteCount: Int(sqlite3_column_int64(statement, 11)), pixelWidth: Int(sqlite3_column_int64(statement, 12)),
+                    pixelHeight: Int(sqlite3_column_int64(statement, 13)), typeIdentifier: string(statement, 14)
+                ) : nil
             ))
         }
         return result
@@ -248,6 +334,7 @@ final class HistoryDatabase: HistoryPersistence {
     }
 
     private func transaction<T>(_ body: () throws -> T) throws -> T {
+        let previousRemovals = removals.count
         try execute("BEGIN IMMEDIATE")
         do {
             let result = try body()
@@ -255,6 +342,7 @@ final class HistoryDatabase: HistoryPersistence {
             return result
         } catch {
             try? execute("ROLLBACK")
+            removals.removeLast(removals.count - previousRemovals)
             throw error
         }
     }

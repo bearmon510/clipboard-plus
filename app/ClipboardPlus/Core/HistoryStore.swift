@@ -9,6 +9,19 @@ protocol HistoryPersistence: AnyObject {
     func undo(_ deletion: HistoryDeletion) throws -> Bool
     func purgeExpired() throws -> Bool
     func latestDeletion() throws -> HistoryDeletion?
+    func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry
+    func takeRemovals() -> [HistoryEntry]
+    func referencedImageFiles() throws -> Set<String>?
+    func imageUsage() throws -> HistoryImageUsage
+}
+
+extension HistoryPersistence {
+    func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry {
+        throw HistoryImageError.unavailable
+    }
+    func takeRemovals() -> [HistoryEntry] { [] }
+    func referencedImageFiles() throws -> Set<String>? { nil }
+    func imageUsage() throws -> HistoryImageUsage { HistoryImageUsage() }
 }
 
 final class HistoryStore {
@@ -18,12 +31,18 @@ final class HistoryStore {
         case remove(Int)
         case saved(HistoryEntry, retried: Bool)
         case saveFailed
+        case imageProcessed(HistoryImage, details: String)
+        case imageSkipped(String)
+        case imageRejected(message: String, details: String)
+        case imageUsage(HistoryImageUsage)
+        case cleanupFailed
     }
 
     private struct PendingCollection {
         let text: String
         let source: HistorySource
         let date: Date
+        var image: HistoryImage? = nil
         var failed = false
     }
 
@@ -31,18 +50,69 @@ final class HistoryStore {
     private let makeDatabase: () throws -> HistoryPersistence
     private let onEvent: @MainActor (Event) -> Void
     private var database: HistoryPersistence?
-    // Stage 2 accepts losing unsaved collections when the process exits; this queue is memory-only.
+    let imageFiles: HistoryImageFiles
+    private var imageAdmission = ImageAdmission()
+    private var didCleanFiles = false
+    private var unusedFiles: Set<String> = []
+    // Pending images contain only metadata. Uncommitted files are cleaned on the next launch.
     private var pending: [PendingCollection] = []
 
     init(makeDatabase: (() throws -> HistoryPersistence)? = nil,
+         imageDirectory: URL = HistoryImageFiles.defaultDirectory,
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase() }
         self.onEvent = onEvent
+        self.imageFiles = HistoryImageFiles(directory: imageDirectory)
     }
 
     deinit {
         // Keep the connection's final release on the same queue as its operations.
         if let database { queue.async { withExtendedLifetime(database) {} } }
+        let abandoned = Set(pending.flatMap { $0.image?.filenames ?? [] }).union(unusedFiles)
+        let files = imageFiles
+        queue.async { try? files.remove(abandoned) }
+    }
+
+    func resetImageAdmission() { queue.async { self.imageAdmission.reset() } }
+
+    func recordImageCopy(hash: String, changeCount: Int) {
+        queue.async { self.imageAdmission.recordSelfCopy(hash: hash, changeCount: changeCount) }
+    }
+
+    func collectImage(_ input: HistoryImageInput, source: HistorySource, at date: Date,
+                      before: Int? = nil, after: Int? = nil, details: String = "") {
+        queue.async {
+            autoreleasepool {
+                var diagnostics = details
+                do {
+                    let (data, type) = try input.encoded()
+                    diagnostics += "; 形式=\(type); バイト数=\(data.count)"
+                    let hash = try HistoryImageFiles.hash(data)
+                    let measured = "\(diagnostics); hash=\(hash.prefix(8))"
+                    if source == .automatic, let before, let after,
+                       case .skip(let reason) = self.imageAdmission.receive(hash: hash, before: before, after: after) {
+                        self.emit(.imageSkipped("\(measured); 理由=\(reason)"))
+                        return
+                    }
+                    let image = try self.imageFiles.prepare(data, typeIdentifier: type, hash: hash)
+                    self.emit(.imageProcessed(image, details: measured))
+                    self.pending.append(PendingCollection(text: "", source: source, date: date, image: image))
+                } catch {
+                    if source == .automatic { self.imageAdmission.reset() }
+                    let failure = error as? HistoryImageError ?? .fileWrite
+                    self.emit(.imageRejected(message: failure.message, details: "\(diagnostics); \(failure)"))
+                    return
+                }
+                try? self.savePending()
+            }
+        }
+    }
+
+    func readImage(_ image: HistoryImage, completion: @escaping @MainActor (Result<Data, Error>) -> Void) {
+        queue.async {
+            let result = Result { try self.imageFiles.read(image) }
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 
     func collect(_ text: String, source: HistorySource, at date: Date) {
@@ -119,7 +189,9 @@ final class HistoryStore {
             do {
                 // Mutations and export must not overtake an older unsaved collection.
                 try self.savePending()
-                result = .success(try operation(self.requireDatabase()))
+                let database = try self.requireDatabase()
+                result = .success(try operation(database))
+                self.finishChanges(database)
             } catch {
                 result = .failure(error)
             }
@@ -129,24 +201,61 @@ final class HistoryStore {
 
     private func savePending() throws {
         while !pending.isEmpty {
+            let item = pending[0]
+            let database: HistoryPersistence
+            let entry: HistoryEntry
             do {
-                let item = pending[0]
-                let entry = try requireDatabase().collect(item.text, source: item.source, at: item.date)
-                pending.removeFirst()
-                emit(.saved(entry, retried: item.failed))
+                database = try requireDatabase()
+                if let image = item.image {
+                    entry = try database.collectImage(image, source: item.source, at: item.date)
+                } else {
+                    entry = try database.collect(item.text, source: item.source, at: item.date)
+                }
             } catch {
                 pending[0].failed = true
                 emit(.saveFailed)
                 throw error
             }
+            // A committed collection is never retried, even if subsequent file cleanup fails.
+            pending.removeFirst()
+            if let image = item.image, image.filename != entry.image?.filename {
+                unusedFiles.formUnion(image.filenames)
+            }
+            emit(.saved(entry, retried: item.failed))
+            finishChanges(database)
         }
     }
 
     private func requireDatabase() throws -> HistoryPersistence {
-        if let database { return database }
-        let opened = try makeDatabase()
-        database = opened
+        let opened: HistoryPersistence
+        if let database { opened = database } else {
+            opened = try makeDatabase()
+            database = opened
+        }
+        if !didCleanFiles {
+            if let referenced = try opened.referencedImageFiles() {
+                let pendingFiles = Set(pending.flatMap { $0.image?.filenames ?? [] })
+                try imageFiles.cleanUnreferenced(keeping: referenced.union(pendingFiles))
+            }
+            didCleanFiles = true
+        }
         return opened
+    }
+
+    private func finishChanges(_ database: HistoryPersistence) {
+        for entry in database.takeRemovals() {
+            emit(.remove(entry.id))
+            unusedFiles.formUnion(entry.image?.filenames ?? [])
+        }
+        do {
+            if !unusedFiles.isEmpty, let referenced = try database.referencedImageFiles() {
+                let pendingFiles = Set(pending.flatMap { $0.image?.filenames ?? [] })
+                let disposable = unusedFiles.subtracting(referenced).subtracting(pendingFiles)
+                try imageFiles.remove(disposable)
+                unusedFiles.subtract(disposable)
+            }
+            emit(.imageUsage(try database.imageUsage()))
+        } catch { emit(.cleanupFailed) }
     }
 
     private func emit(_ event: Event) {

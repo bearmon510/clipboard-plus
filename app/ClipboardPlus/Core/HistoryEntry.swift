@@ -1,7 +1,7 @@
 import Foundation
 
 enum HistoryKind: String, Codable {
-    case text, url
+    case text, url, image
 
     static func classify(_ text: String) -> HistoryKind {
         guard !text.isEmpty,
@@ -28,6 +28,20 @@ struct HistoryEntry: Identifiable, Codable, Equatable {
     let collectionCount: Int
     let isPinned: Bool
     let source: HistorySource
+    let image: HistoryImage?
+
+    init(id: Int, kind: HistoryKind, text: String, savedAt: Date, lastCollectedAt: Date,
+         collectionCount: Int, isPinned: Bool, source: HistorySource, image: HistoryImage? = nil) {
+        self.id = id
+        self.kind = kind
+        self.text = text
+        self.savedAt = savedAt
+        self.lastCollectedAt = lastCollectedAt
+        self.collectionCount = collectionCount
+        self.isPinned = isPinned
+        self.source = source
+        self.image = image
+    }
 
     var characterCount: Int { text.count }
     var domain: String? { kind == .url ? URLComponents(string: text)?.host : nil }
@@ -47,7 +61,25 @@ struct HistoryExport: Codable {
             var container = encoder.singleValueContainer()
             try container.encode(formatter.string(from: date))
         }
-        return try encoder.encode(HistoryExport(formatVersion: 1, exportedAt: exportedAt, entries: entries))
+        return try encoder.encode(HistoryExport(formatVersion: 2, exportedAt: exportedAt, entries: entries))
     }
+}
+
+// Only metadata is Codable. Original bytes and thumbnails never enter JSON or the pending queue.
+struct HistoryImage: Codable, Equatable {
+    let hash: String
+    let filename: String
+    let thumbnailFilename: String
+    let byteCount: Int
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let typeIdentifier: String
+
+    var filenames: Set<String> { [filename, thumbnailFilename] }
+}
+
+struct HistoryImageUsage: Equatable {
+    var count = 0
+    var byteCount = 0
 }
 
