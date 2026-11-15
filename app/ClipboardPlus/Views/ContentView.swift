@@ -30,6 +30,8 @@ struct ContentView: View {
     @State private var showCaptureGuide = false
     /// A capture waiting for an open sheet to finish closing. Opened from the sheet's onDismiss.
     @State private var queuedCapture: CaptureRequest?
+    /// A direct capture asked for from outside, waiting for the app to be active and uncovered.
+    @State private var queuedDirectMode: CaptureMode?
 
     /// A still picture to choose from, and what to do with the chosen part.
     struct CaptureRequest: Identifiable {
@@ -82,11 +84,20 @@ struct ContentView: View {
                     onClose: { if capture?.id == request.id { capture = nil } }
                 )
             }
-            // A shortcut delivers its screenshot here.
-            .onReceive(CaptureInbox.shared.$pending) { pending in
-                guard let pending else { return }
-                CaptureInbox.shared.pending = nil
-                openFromOutside(CaptureRequest(source: pending, mode: .text))
+            // Shortcuts, Siri and Control Center deliver here: a screenshot to cut out, or a
+            // request to take the screen directly.
+            .onReceive(CaptureInbox.shared.$request) { request in
+                guard let request else { return }
+                // As below, clear it on the next turn, because @Published stores it after announcing.
+                DispatchQueue.main.async {
+                    if CaptureInbox.shared.request?.id == request.id { CaptureInbox.shared.request = nil }
+                }
+                if let source = request.source {
+                    openFromOutside(CaptureRequest(source: source,
+                                                   mode: request.mode ?? CaptureSettings.screenshotMode()))
+                } else if let mode = request.mode {
+                    startFromOutside(mode)
+                }
             }
             // An iPad screenshot, picked up from Photos when that experiment is on.
             .onReceive(screenshots.$delivered) { delivered in
@@ -128,7 +139,11 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
             // A capture queued behind a sheet is dropped when the app leaves the screen.
-            if phase == .background { queuedCapture = nil }
+            if phase == .background {
+                queuedCapture = nil
+                queuedDirectMode = nil
+            }
+            if phase == .active { startQueuedDirectCapture() }
             if phase == .active {
                 monitor.pendingDeletion { showUndo($0) }
                 // Marks the system permission screen going away, so that the first capture
@@ -745,6 +760,7 @@ struct ContentView: View {
         }
         // Only the newest arrival waits; an older one is simply replaced.
         queuedCapture = request
+        queuedDirectMode = nil
         showSettings = false
         showCaptureGuide = false
         detailEntry = nil
@@ -752,10 +768,36 @@ struct ContentView: View {
 
     /// Called when a sheet has finished closing.
     private func presentQueuedCapture() {
-        guard let request = queuedCapture else { return }
+        if let request = queuedCapture {
+            queuedCapture = nil
+            guard capture == nil else { return }
+            capture = request
+            return
+        }
+        startQueuedDirectCapture()
+    }
+
+    /// Starts taking the screen for Shortcuts, Siri or Control Center. The app has usually just
+    /// come to the front, so this waits until it is active and no sheet covers it.
+    private func startFromOutside(_ mode: CaptureMode) {
+        guard capture == nil, capturePending == nil else { return }
         queuedCapture = nil
+        queuedDirectMode = mode
+        if showSettings || showCaptureGuide || detailEntry != nil {
+            showSettings = false
+            showCaptureGuide = false
+            detailEntry = nil
+            return
+        }
+        startQueuedDirectCapture()
+    }
+
+    private func startQueuedDirectCapture() {
+        guard let mode = queuedDirectMode, scenePhase == .active else { return }
+        guard !(showSettings || showCaptureGuide || detailEntry != nil) else { return }
+        queuedDirectMode = nil
         guard capture == nil else { return }
-        capture = request
+        startCapture(mode)
     }
 
     /// Opens a saved picture so that a part of it can be cut out or read.

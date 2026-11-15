@@ -166,6 +166,32 @@ final class HistoryStore {
         }, completion: completion)
     }
 
+    /// Explicit shortcut saves report the committed result. A failed request is not retained
+    /// for an invisible retry after Shortcuts has already reported failure.
+    func saveFromShortcut(text: String, pngData: Data?,
+                          completion: @escaping @MainActor (Result<HistoryEntry, Error>) -> Void) {
+        perform({ database in
+            let entry: HistoryEntry
+            if let data = pngData {
+                let image = try self.imageFiles.prepare(data, typeIdentifier: "public.png",
+                                                       hash: HistoryImageFiles.hash(data))
+                do {
+                    entry = try database.collectImage(image, source: .manual, at: self.now())
+                } catch {
+                    try? self.imageFiles.remove(image.filenames)
+                    throw error
+                }
+                if image.filename != entry.image?.filename {
+                    self.unusedFiles.formUnion(image.filenames)
+                }
+            } else {
+                entry = try database.collect(text, source: .manual, at: self.now())
+            }
+            self.emit(.saved(entry, retried: false))
+            return entry
+        }, completion: completion)
+    }
+
     func maintain(forceRetention: Bool = false, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
             if try database.purgeExpired() { self.emit(.replace(try database.fetchAll())) }

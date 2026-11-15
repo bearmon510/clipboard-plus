@@ -18,6 +18,13 @@ extension UIPasteboard: ClipboardPasteboard {}
 
 @MainActor
 final class ClipboardMonitor: NSObject, ObservableObject {
+    /// Also available when App Intents launches the process without a window.
+    static let shared: ClipboardMonitor = {
+        let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        if !isTestHost { UserDefaults.standard.register(defaults: ["isRecording": true]) }
+        return ClipboardMonitor(resumesRecordingOnInit: false)
+    }()
+
     @Published private(set) var isRecording = false
     @Published private(set) var sceneState = "inactive"
     @Published private(set) var entries: [HistoryEntry] = []
@@ -54,6 +61,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private var isReading = false
     private var isCopying = false
     private var isWriting = false
+    private var resumeRecordingOnActivation = false
+    private var shortcutOperationCount = 0
     private var deferredDetections: [MeasurementEvent] = []
     private var pendingLogFlushes = 0
     private var logFlushTask: UIBackgroundTaskIdentifier = .invalid
@@ -61,13 +70,14 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     init(defaults: UserDefaults = .standard, log: MeasurementLog? = nil,
          makeDatabase: (() throws -> HistoryPersistence)? = nil, schedulesMaintenance: Bool = true,
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
-         pasteboard: ClipboardPasteboard? = nil) {
+         pasteboard: ClipboardPasteboard? = nil, resumesRecordingOnInit: Bool = true) {
         self.defaults = defaults
         self.log = log ?? MeasurementLog()
         self.makeDatabase = makeDatabase
         self.imageDirectory = imageDirectory
         self.pasteboard = pasteboard ?? UIPasteboard.general
         super.init()
+        resumeRecordingOnActivation = !resumesRecordingOnInit
         let storedInterval = defaults.object(forKey: "pollingInterval") as? Double ?? 0.5
         pollingInterval = storedInterval.isFinite ? min(5, max(0.1, storedInterval)) : 0.5
         historyRetention = HistoryRetention.load(from: defaults)
@@ -84,7 +94,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             RunLoop.main.add(cleanup, forMode: .common)
             cleanupTimer = cleanup
         }
-        if defaults.bool(forKey: "isRecording") {
+        if resumesRecordingOnInit, defaults.bool(forKey: "isRecording") {
             start(resuming: true)
         }
     }
@@ -129,6 +139,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func updateScene(_ value: String) {
+        if value == "active", resumeRecordingOnActivation {
+            resumeRecordingOnActivation = false
+            if defaults.bool(forKey: "isRecording") { start(resuming: true) }
+        }
         guard sceneState != value else { return }
         let observedAt = Date()
         let previous = sceneState
@@ -188,6 +202,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         admission.recordSelfCopy(entry.text)
         pasteboard.string = entry.text
         let after = pasteboard.changeCount
+        if shortcutOperationCount > 0 {
+            lastObservedChangeCount = after
+            // No readback is needed. A later external copy of the same text must count.
+            admission.discardPendingSelfCopy()
+        }
         let writtenAt = Date()
         isWriting = false
         let copyEvent = MeasurementEvent(
@@ -200,7 +219,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             details: "読み書き前changeCount=\(before); 書き込み後changeCount=\(after)",
             text: entry.text
         )
-        if isRecording {
+        if isRecording && shortcutOperationCount == 0 {
             let detections = deferredDetections
             deferredDetections.removeAll()
             let checkedAt = Date()
@@ -217,6 +236,89 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     // MARK: Content made inside the app
+
+    /// The storage queue orders this after the initial load and any pending writes. Its main
+    /// queue completion follows the replace event, so callers never see an uninitialized list.
+    func historyForShortcuts() async throws -> [HistoryEntry] {
+        try await withCheckedThrowingContinuation { continuation in
+            store.load { result in
+                switch result {
+                case .success:
+                    self.needsHistoryLoad = false
+                    continuation.resume(returning: self.entries)
+                case .failure:
+                    self.reportStorageFailure()
+                    continuation.resume(throwing: ShortcutError.storageUnavailable)
+                }
+            }
+        }
+    }
+
+    /// Suppress pasteboard reads for the whole async operation, including timer/scene callbacks.
+    /// Nested and concurrent intents share the counter; one completion cannot resume another's reads.
+    func performShortcut<T>(_ name: String, operation: @MainActor () async throws -> T) async throws -> T {
+        shortcutOperationCount += 1
+        defer { shortcutOperationCount -= 1 }
+        let start = ProcessInfo.processInfo.systemUptime
+        record("インテントの開始", details: "インテント=\(name)")
+        do {
+            _ = try await historyForShortcuts()
+            try Task.checkCancellation()
+            let value = try await operation()
+            await finishShortcutLog(name, start: start, succeeded: true)
+            return value
+        } catch {
+            await finishShortcutLog(name, start: start, succeeded: false)
+            throw error
+        }
+    }
+
+    private func finishShortcutLog(_ name: String, start: TimeInterval, succeeded: Bool) async {
+        let milliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+        record("インテントの終了", details: "インテント=\(name); 所要ms=\(String(format: "%.3f", milliseconds)); 成否=\(succeeded ? "成功" : "失敗")")
+        await withCheckedContinuation { continuation in
+            log.flush(context: logContext()) { continuation.resume() }
+        }
+    }
+
+    /// When both inputs are supplied, keep both as separate entries; copy the image last.
+    func saveFromShortcut(text: String?, pngData: Data?, copyToClipboard: Bool) async throws {
+        let text = ShortcutContent.joinedText(text.map { [$0] })
+        guard text != nil || pngData != nil else { throw ShortcutError.missingContent }
+        var saved: HistoryEntry?
+        if let text { saved = try await persistShortcut(text: text, pngData: nil) }
+        if let pngData { saved = try await persistShortcut(text: "", pngData: pngData) }
+        if copyToClipboard, let saved { try await copyForShortcut(saved) }
+    }
+
+    private func persistShortcut(text: String, pngData: Data?) async throws -> HistoryEntry {
+        pendingSaveCount += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            store.saveFromShortcut(text: text, pngData: pngData) { result in
+                switch result {
+                case .success(let entry): continuation.resume(returning: entry)
+                case .failure(let error):
+                    self.pendingSaveCount -= 1
+                    self.reportStorageFailure()
+                    self.record("ショートカットの保存失敗", details: "自動再試行なし")
+                    if let imageError = error as? HistoryImageError {
+                        continuation.resume(throwing: ShortcutError.imageSaveFailed(imageError.message))
+                    } else {
+                        continuation.resume(throwing: ShortcutError.storageUnavailable)
+                    }
+                }
+            }
+        }
+    }
+
+    func copyForShortcut(_ entry: HistoryEntry) async throws {
+        shortcutOperationCount += 1
+        defer { shortcutOperationCount -= 1 }
+        let succeeded: Bool = await withCheckedContinuation { continuation in
+            copy(entry) { continuation.resume(returning: $0) }
+        }
+        guard succeeded else { throw ShortcutError.copyFailed }
+    }
 
     /// Saves text read from a picture and puts it on the pasteboard, ready to paste.
     func saveCaptured(text: String) {
@@ -281,6 +383,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 self.isWriting = true
                 self.pasteboard.setData(data, forPasteboardType: image.typeIdentifier)
                 let after = self.pasteboard.changeCount
+                if self.shortcutOperationCount > 0 { self.lastObservedChangeCount = after }
                 self.store.recordImageCopy(hash: image.hash, changeCount: after)
                 self.isWriting = false
                 self.record("自己コピー", count: after, historyNumber: entry.id,
@@ -293,7 +396,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             }
             let detections = self.deferredDetections
             self.deferredDetections.removeAll()
-            if self.isRecording {
+            if self.isRecording && self.shortcutOperationCount == 0 {
                 self.readIfChanged(count: self.pasteboard.changeCount, source: "自己コピー後の確認", detections: detections)
             } else {
                 detections.forEach { self.log.append($0) }
@@ -304,7 +407,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     private func readBeforeCopy() {
-        guard isRecording else { return }
+        guard isRecording, shortcutOperationCount == 0 else { return }
         // Capture unread external contents before replacing them, including changes
         // since the last poll while an image was waiting on the storage queue.
         readIfChanged(count: pasteboard.changeCount, source: "自己コピー前の確認", detections: [])
@@ -553,7 +656,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func pollPasteboard() {
-        guard isRecording else { return }
+        guard isRecording, shortcutOperationCount == 0 else { return }
         let detectedAt = Date()
         let count = pasteboard.changeCount
         // Use the collection timer itself: a separate timer cannot prove it is running.
@@ -573,6 +676,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     private func readIfChanged(count: Int, source: String, detections: [MeasurementEvent]) {
+        guard shortcutOperationCount == 0 else {
+            detections.forEach { log.append($0) }
+            return
+        }
         if isReading || isWriting {
             deferredDetections.append(contentsOf: detections)
             return

@@ -24,11 +24,36 @@ struct CaptureSource: Identifiable {
     }
 }
 
-/// Hands a screenshot from a shortcut to the screen. The intent runs in the app's process.
+/// Hands a request from Shortcuts, Siri or Control Center to the screen. The intents run in the
+/// app's process. `source` is a picture to cut out; without one, the screen is taken directly.
 @MainActor
 final class CaptureInbox: ObservableObject {
+    struct Request: Identifiable {
+        let id = UUID()
+        let source: CaptureSource?
+        /// nil uses the mode chosen in settings.
+        let mode: CaptureMode?
+    }
+
     static let shared = CaptureInbox()
-    @Published var pending: CaptureSource?
+    @Published var request: Request?
+
+    func open(_ source: CaptureSource, mode: CaptureMode?) {
+        request = Request(source: source, mode: mode)
+    }
+
+    func startDirect(_ mode: CaptureMode) {
+        request = Request(source: nil, mode: mode)
+    }
+}
+
+extension CaptureMode {
+    init(_ option: CaptureModeOption) {
+        switch option {
+        case .text: self = .text
+        case .image: self = .image
+        }
+    }
 }
 
 enum CaptureIntentError: Error, CustomLocalizedStringResourceConvertible {
@@ -49,10 +74,18 @@ struct CaptureRegionIntent: AppIntent {
     @Parameter(title: "画像", supportedTypeIdentifiers: ["public.image"])
     var picture: IntentFile
 
+    /// Left empty, the capture screen opens in the mode chosen in settings.
+    @Parameter(title: "方式")
+    var mode: CaptureModeOption?
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("\(\.$picture)を\(\.$mode)で切り取る")
+    }
+
     @MainActor
     func perform() async throws -> some IntentResult {
         guard let image = UIImage(data: picture.data) else { throw CaptureIntentError.unreadableImage }
-        CaptureInbox.shared.pending = CaptureSource(image: image)
+        CaptureInbox.shared.open(CaptureSource(image: image), mode: mode.map(CaptureMode.init))
         return .result()
     }
 }
