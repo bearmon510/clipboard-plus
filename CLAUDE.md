@@ -16,6 +16,7 @@ Claude Codeが作業全体を管理し、Codex CLIを実装・レビューの担
 - PCはWindowsで、利用者はMacを持っていない。アプリは `app/project.yml` からXcodeGenでXcodeプロジェクトを生成し、GitHub ActionsのmacOSでビルドする。実機へはTestFlightで入れる。詳細は `docs/試作1の実装方針.md`。
 - このPCではSwiftをビルドできない。コンパイルの成否はGitHub Actionsの結果で判断し、iPadでの動作は利用者の報告で判断する。どちらも推測で報告しない。
 - `ios-build.yml` は `app/` かそのワークフロー自身を変えたpushでだけ動く。文書だけのpushではビルドは走らない。
+- ビルドはXcode 27.1（ランナー `xcode-27`）で行う。実機向けSDKとシミュレータ向けSDKで使えるAPIが違うことがあるため（ScreenCaptureKitの一部の設定が実機向けで使えなかった）、`ios-build.yml` は実機向けの署名なしビルドも行う。
 
 ## 公開リポジトリとしての扱い
 
