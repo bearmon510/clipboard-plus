@@ -22,14 +22,25 @@ struct ContentView: View {
     @State private var copiedID: Int?
     @State private var copiedTask: Task<Void, Never>?
     @State private var isDropTargeted = false
-    @State private var captureSource: CaptureSource?
+    @StateObject private var screenCapture: ScreenCaptureController
+    @State private var capture: CaptureRequest?
+    /// The mode whose button is waiting for a picture of the screen.
+    @State private var capturePending: CaptureMode?
     @State private var showCaptureGuide = false
+
+    /// A still picture to choose from, and what to do with the chosen part.
+    struct CaptureRequest: Identifiable {
+        let id = UUID()
+        let source: CaptureSource
+        let mode: CaptureMode
+    }
 
     /// `initialSearch` lets previews and screenshot tests open the screen mid-search.
     init(monitor: ClipboardMonitor, log: MeasurementLog, initialSearch: String = "") {
         self.monitor = monitor
         self.log = log
         _pictureInPicture = StateObject(wrappedValue: PictureInPictureController(monitor: monitor))
+        _screenCapture = StateObject(wrappedValue: ScreenCaptureController(log: log))
         _searchText = State(initialValue: initialSearch)
     }
 
@@ -42,15 +53,21 @@ struct ContentView: View {
     var body: some View {
         screen
             .sheet(isPresented: $showCaptureGuide) { CaptureGuideView() }
-            .fullScreenCover(item: $captureSource) { source in
+            .fullScreenCover(item: $capture) { request in
                 CaptureView(
-                    source: source,
-                    onText: { monitor.saveCaptured(text: $0) },
+                    source: request.source,
+                    mode: request.mode,
+                    onText: { text in
+                        monitor.saveCaptured(text: text)
+                        screenCapture.noteCaptureUsed()
+                        showToast("文字をコピーしました：" + Self.toastPreview(text))
+                    },
                     onImage: { data in
                         monitor.saveCaptured(pngData: data)
-                        showToast("切り取った画像を保存してコピーしました")
+                        screenCapture.noteCaptureUsed()
+                        showToast("画像をコピーしました")
                     },
-                    onClose: { captureSource = nil }
+                    onClose: { capture = nil }
                 )
             }
             // A shortcut delivers its screenshot here. Other sheets close so the picture can open.
@@ -61,11 +78,12 @@ struct ContentView: View {
                 showSettings = false
                 showCaptureGuide = false
                 detailEntry = nil
+                let request = CaptureRequest(source: pending, mode: .text)
                 if wasPresenting {
                     // A new cover cannot open while another sheet is still closing.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { captureSource = pending }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { capture = request }
                 } else {
-                    captureSource = pending
+                    capture = request
                 }
             }
     }
@@ -93,6 +111,9 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
             if phase == .active { monitor.pendingDeletion { showUndo($0) } }
+            // Only leaving the screen stops it: a side window turns inactive whenever
+            // another app is touched, and the system picker does the same.
+            screenCapture.sceneDidChange(isActive: phase != .background)
         }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings) {
@@ -119,8 +140,10 @@ struct ContentView: View {
             // Priority lets the field take the width first; the spacer only fills a wide window.
             searchField.frame(maxWidth: 560).layoutPriority(1)
             Spacer(minLength: 4)
-            recordingButton
-            if pictureInPicture.isSupported { pictureInPictureButton }
+            captureButton(.text)
+            captureButton(.image)
+            // PiP is set aside. Its button appears only when turned on under 開発者向け.
+            if pictureInPicture.isSupported && pictureInPicture.isEnabled { pictureInPictureButton }
             moreMenu
         }
         .padding(.leading, 12)
@@ -155,18 +178,37 @@ struct ContentView: View {
         .background(Theme.field, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 
-    private var recordingButton: some View {
-        Button {
-            if monitor.isRecording { monitor.stop() } else { monitor.start() }
+    /// Icon over a short word, so that the two capture buttons read clearly in a narrow window.
+    private func captureButton(_ mode: CaptureMode) -> some View {
+        let waiting = capturePending == mode
+        return Button {
+            startCapture(mode)
         } label: {
-            Image(systemName: monitor.isRecording ? "pause.fill" : "play.fill")
-                .font(.body.weight(.semibold))
-                .foregroundStyle(monitor.isRecording ? Color.secondary : Color.orange)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
+            VStack(spacing: 1) {
+                ZStack {
+                    if waiting {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: mode.symbolName).font(.body.weight(.semibold))
+                    }
+                }
+                .frame(height: 22)
+                Text(mode.title).font(.caption2.weight(.semibold))
+            }
+            .foregroundStyle(Theme.accent)
+            .frame(width: 46, height: 44)
+            .overlay(alignment: .topTrailing) {
+                // Shows that the screen is being taken in, so that it is never a secret.
+                if screenCapture.state == .running {
+                    Circle().fill(Color.green).frame(width: 7, height: 7).offset(x: -6, y: 3)
+                }
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(monitor.isRecording ? "記録を一時停止" : "記録を再開")
+        .disabled(capturePending != nil)
+        .accessibilityLabel(mode == .text ? "文字で切り取る" : "画像で切り取る")
+        .accessibilityHint("画面を止めて範囲を選ぶと、クリップボードにコピーします")
     }
 
     /// The button is a tiny screen. Once PiP is on, the live picture that feeds the
@@ -207,7 +249,17 @@ struct ContentView: View {
 
     private var moreMenu: some View {
         Menu {
-            Button("画面の切り取り…", systemImage: "crop") { showCaptureGuide = true }
+            if monitor.isRecording {
+                Button("記録を一時停止", systemImage: "pause") { monitor.stop() }
+            } else {
+                Button("記録を再開", systemImage: "play") { monitor.start() }
+            }
+            if screenCapture.state == .running {
+                Button("画面の取り込みを止める", systemImage: "stop.circle") {
+                    screenCapture.stop(reason: "メニューから停止")
+                }
+            }
+            Button("切り取りの使い方", systemImage: "questionmark.circle") { showCaptureGuide = true }
             Button("設定", systemImage: "gearshape") { showSettings = true }
             Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
                 confirmHistoryClear = true
@@ -219,7 +271,7 @@ struct ContentView: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
-        .accessibilityLabel("設定と履歴の全消去")
+        .accessibilityLabel("その他の操作")
     }
 
     // MARK: Status
@@ -460,8 +512,9 @@ struct ContentView: View {
             detailEntry = entry
         }
         if entry.kind == .image {
-            Button("文字を読み取る", systemImage: "text.viewfinder") { readText(of: entry) }
-            Button("切り取る…", systemImage: "crop") { openCapture(entry) }
+            Button("全体の文字を読み取る", systemImage: "doc.text.viewfinder") { readText(of: entry) }
+            Button("文字で切り取る…", systemImage: CaptureMode.text.symbolName) { openCapture(entry, mode: .text) }
+            Button("画像で切り取る…", systemImage: CaptureMode.image.symbolName) { openCapture(entry, mode: .image) }
         }
         if entry.kind == .url, let url = URL(string: entry.text.trimmingCharacters(in: .whitespacesAndNewlines)) {
             Button("リンクを開く", systemImage: "safari") { openURL(url) }
@@ -494,9 +547,7 @@ struct ContentView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                if pictureInPicture.isSupported && !pictureInPicture.isActive {
-                    pictureInPictureTip
-                }
+                captureTip
             }
             .padding(.horizontal, 28)
             .padding(.top, 48)
@@ -528,18 +579,22 @@ struct ContentView: View {
             .accessibilityHidden(true)
     }
 
-    private var pictureInPictureTip: some View {
+    private var captureTip: some View {
         VStack(spacing: 10) {
-            Text("全画面のアプリを使うときは、PiPの小窓を出しておくと、その間のコピーも収集できます。")
+            HStack(spacing: 14) {
+                ForEach(CaptureMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.symbolName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+            Text("上の「文字」「画像」で、画面の一部を選んでコピーできます。選んだ範囲の文字を読み取るか、画像として取り込みます。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button {
-                pictureInPicture.togglePictureInPicture()
-            } label: {
-                Label("PiPの小窓を出す", systemImage: "pip.enter").frame(minHeight: 28)
-            }
-            .buttonStyle(.bordered)
+            Button("使い方") { showCaptureGuide = true }
+                .font(.footnote.weight(.semibold))
+                .frame(minHeight: 44)
         }
         .padding(14)
         .frame(maxWidth: .infinity)
@@ -623,16 +678,48 @@ struct ContentView: View {
         }
     }
 
+    /// Freezes the screen and opens the capture mode. Without ScreenCaptureKit, explains the
+    /// screenshot route instead.
+    private func startCapture(_ mode: CaptureMode) {
+        guard capturePending == nil else { return }
+        guard screenCapture.isSupported else {
+            showCaptureGuide = true
+            return
+        }
+        capturePending = mode
+        screenCapture.requestFrame { result in
+            capturePending = nil
+            switch result {
+            case .success(let image):
+                capture = CaptureRequest(source: CaptureSource(image: image), mode: mode)
+            case .failure(.unsupported):
+                showCaptureGuide = true
+            case .failure(.declined):
+                showToast("画面の取り込みが許可されませんでした")
+            case .failure(.timeout):
+                showToast("画面を取り込めませんでした。もう一度お試しください")
+            case .failure(.failed):
+                showToast("画面を取り込めませんでした")
+            }
+        }
+    }
+
     /// Opens a saved picture so that a part of it can be cut out or read.
-    private func openCapture(_ entry: HistoryEntry) {
+    private func openCapture(_ entry: HistoryEntry, mode: CaptureMode) {
         guard let image = entry.image else { return }
         monitor.imageData(image) { data in
             guard let data, let picture = UIImage(data: data) else {
                 showToast("画像を読み込めませんでした")
                 return
             }
-            captureSource = CaptureSource(image: picture)
+            capture = CaptureRequest(source: CaptureSource(image: picture), mode: mode)
         }
+    }
+
+    /// The start of a text, on one line, for a short confirmation.
+    static func toastPreview(_ text: String, limit: Int = 24) -> String {
+        let line = text.split(whereSeparator: { $0.isNewline }).joined(separator: " ")
+        return line.count > limit ? String(line.prefix(limit)) + "…" : line
     }
 
     /// Reads all the text in a saved picture, saves it as a new item and copies it.

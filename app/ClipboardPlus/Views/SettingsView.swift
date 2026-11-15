@@ -30,29 +30,6 @@ struct SettingsView: View {
                     .accessibilityLabel("定期確認の間隔、秒")
                     Text("0.1〜5.0秒。間隔と記録の状態は、アプリを開き直しても保持します。")
                         .font(.footnote)
-                    Toggle("PiPで裏でも収集", isOn: Binding(
-                        get: { pictureInPicture.isEnabled },
-                        set: { pictureInPicture.setEnabled($0) }
-                    ))
-                    .frame(minHeight: 44)
-                    .disabled(!pictureInPicture.isSupported)
-                    Toggle(isOn: Binding(
-                        get: { pictureInPicture.automaticallyStarts },
-                        set: { pictureInPicture.setAutomaticallyStarts($0) }
-                    )) {
-                        Text("離れたら自動でPiPを出す")
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(minHeight: 44)
-                    .disabled(!pictureInPicture.isSupported)
-                    if !pictureInPicture.isSupported {
-                        Text("この端末ではPiPを使えません。").font(.footnote)
-                    }
-                    Text("本体画面の右上にある、小さな画面の形のボタンで、記録と小窓の表示を始められます。自動で出す設定は初期値オンで、「PiPで裏でも収集」がオンかつ記録中のとき、アプリを離れると小窓を表示します。")
-                        .font(.footnote)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("小窓には状態だけが表示され、内容を触って操作することはできません。小窓の再生で記録を開始し、一時停止で記録を停止します。画面を更新し続けるため、電池を使います。")
-                        .font(.footnote)
                 }
                 Section("履歴の保存") {
                     Picker("自動削除", selection: Binding(
@@ -77,7 +54,7 @@ struct SettingsView: View {
                 }
                 Section("自動収集について") {
                     Text("他のアプリからのペースト許可が求められる場合があります。記録は初期状態で動いています。アプリの起動前や一時停止中からクリップボードにある内容は、自動では読みません。その内容を保存するには、絞り込みの右にあるペーストのボタンを使ってください。")
-                    Text("確認の間に複数回コピーされると、途中の内容は取り戻せません。PiPを使わない場合、アプリが画面にない間は収集できず、戻った時点の内容だけを確認します。")
+                    Text("確認の間に複数回コピーされると、途中の内容は取り戻せません。通常は、clipboard+の小窓を隠している間や別のアプリを全画面で使っている間は収集せず、戻ったときに最後の1件だけ取り込みます。")
                     Text("同じ原文は1項目にまとめ、最後に収集した時刻と回数を更新します。履歴をコピーした直後の読み取りは更新しません。")
                     Text("自動収集では、秘密・一時的・自動生成の印が付いた内容は読まずに保存を見送ります。")
                     Text("印のない秘密情報は判別できないため、必要に応じて記録を停止し、保存済みの履歴を削除してください。")
@@ -104,6 +81,30 @@ struct SettingsView: View {
                 BackupSection(backup: monitor.backup)
                 Section {
                     DisclosureGroup("開発者向け", isExpanded: $showDeveloperSettings) {
+                        Toggle(isOn: Binding(
+                            get: { pictureInPicture.isEnabled },
+                            set: { pictureInPicture.setEnabled($0) }
+                        )) {
+                            Text("PiPで裏でも収集（試験的）")
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(minHeight: 44)
+                        .disabled(!pictureInPicture.isSupported)
+                        Toggle(isOn: Binding(
+                            get: { pictureInPicture.automaticallyStarts },
+                            set: { pictureInPicture.setAutomaticallyStarts($0) }
+                        )) {
+                            Text("離れたら自動でPiPを出す")
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(minHeight: 44)
+                        .disabled(!pictureInPicture.isSupported)
+                        if !pictureInPicture.isSupported {
+                            Text("この端末ではPiPを使えません。").font(.footnote)
+                        }
+                        Text("オンかつ記録中なら、離れたときにPiPで収集を続けられます。小窓には状態だけを表示し、電池を使います。")
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
                         Button("計測ログ", systemImage: "doc.text") { showLogs = true }
                             .frame(minHeight: 44)
                         Toggle(isOn: $log.includeTextPreview) {

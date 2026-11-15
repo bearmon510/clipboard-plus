@@ -60,11 +60,28 @@ final class ScreenSnapshotTests: XCTestCase {
     @MainActor
     func testRenderCaptureScreens() throws {
         let source = CaptureSource(image: Self.sampleScreenshot())
-        let chosen = CaptureView(source: source, initialSelection: CGRect(x: 0.08, y: 0.2, width: 0.6, height: 0.28),
+        // Mid-drag in a wide window: the selection and the magnifier at the finger.
+        let dragging = CaptureView(source: source, mode: .text,
+                                   previewSelection: CGRect(x: 0.08, y: 0.2, width: 0.6, height: 0.28),
+                                   previewTouch: CGPoint(x: 700, y: 520),
+                                   onText: { _ in }, onImage: { _ in }, onClose: {})
+        try save(render(dragging, size: Self.wide, style: .light), "capture-wide-dragging")
+        // A narrow side window, where the magnifier matters most.
+        let narrow = CaptureView(source: source, mode: .text,
+                                 previewSelection: CGRect(x: 0.08, y: 0.2, width: 0.45, height: 0.1),
+                                 previewTouch: CGPoint(x: 190, y: 420),
                                  onText: { _ in }, onImage: { _ in }, onClose: {})
-        try save(render(chosen, size: Self.wide, style: .light), "capture-wide-selected")
-        let untouched = CaptureView(source: source, onText: { _ in }, onImage: { _ in }, onClose: {})
-        try save(render(untouched, size: Self.narrow, style: .light), "capture-narrow-whole")
+        try save(render(narrow, size: Self.narrow, style: .light), "capture-narrow-dragging")
+        let untouched = CaptureView(source: source, mode: .image, onText: { _ in }, onImage: { _ in }, onClose: {})
+        try save(render(untouched, size: Self.narrow, style: .dark), "capture-narrow-image")
+        let reading = CaptureView(source: source, mode: .text,
+                                  previewSelection: CGRect(x: 0.08, y: 0.2, width: 0.6, height: 0.28),
+                                  previewPhase: .reading,
+                                  onText: { _ in }, onImage: { _ in }, onClose: {})
+        try save(render(reading, size: Self.wide, style: .light), "capture-wide-reading")
+        let noText = CaptureView(source: source, mode: .text, previewPhase: .noText,
+                                 onText: { _ in }, onImage: { _ in }, onClose: {})
+        try save(render(noText, size: Self.narrow, style: .light), "capture-narrow-notext")
         try save(render(CaptureGuideView(), size: Self.narrow, style: .light), "capture-guide-narrow-light")
     }
 

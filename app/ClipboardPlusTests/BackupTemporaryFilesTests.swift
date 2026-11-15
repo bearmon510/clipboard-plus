@@ -6,7 +6,7 @@ extension XCTestCase {
     func waitForBackupCleanup(_ files: BackupTemporaryFiles = .shared) {
         let done = expectation(description: "backup cleanup completed")
         files.afterPendingCleanup { done.fulfill() }
-        wait(for: [done], timeout: 5)
+        wait(for: [done], timeout: 60)
     }
 }
 

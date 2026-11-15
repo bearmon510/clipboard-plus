@@ -1,17 +1,39 @@
 import CoreGraphics
 import Foundation
 
+/// What a capture produces once a part of the screen is chosen.
+enum CaptureMode: String, CaseIterable, Identifiable {
+    case text, image
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .text: return "文字"
+        case .image: return "画像"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .text: return "text.viewfinder"
+        case .image: return "crop"
+        }
+    }
+
+    var hint: String {
+        switch self {
+        case .text: return "ドラッグで範囲を選ぶと、文字を読み取ってコピーします"
+        case .image: return "ドラッグで範囲を選ぶと、画像としてコピーします"
+        }
+    }
+}
+
 /// Geometry for choosing a part of a picture by dragging. All functions are pure.
 /// A "unit" rectangle is in the picture's own space, 0...1 on both axes, origin top-left.
 enum CropGeometry {
-    enum DragMode: Equatable {
-        /// Start a new selection from the touched point.
-        case new
-        /// Move the existing selection.
-        case move
-        /// Resize the existing selection, keeping the opposite corner in place.
-        case resize(anchor: CGPoint)
-    }
+    /// A selection smaller than this, in points on screen, counts as a stray tap.
+    static let minimumSelectionSide: CGFloat = 12
 
     /// Where an aspect-fit picture sits inside a container.
     static func fittedFrame(imageSize: CGSize, in container: CGSize) -> CGRect {
@@ -30,12 +52,9 @@ enum CropGeometry {
                       width: abs(first.x - second.x), height: abs(first.y - second.y))
     }
 
-    /// `rect` shifted by `translation`, stopped at the edges of `bounds` without changing its size.
-    static func moved(_ rect: CGRect, by translation: CGSize, within bounds: CGRect) -> CGRect {
-        var result = rect.offsetBy(dx: translation.width, dy: translation.height)
-        result.origin.x = min(max(result.origin.x, bounds.minX), max(bounds.minX, bounds.maxX - result.width))
-        result.origin.y = min(max(result.origin.y, bounds.minY), max(bounds.minY, bounds.maxY - result.height))
-        return result
+    /// Whether a selection on screen is big enough to act on.
+    static func isMeaningful(_ rect: CGRect) -> Bool {
+        rect.width >= minimumSelectionSide && rect.height >= minimumSelectionSide
     }
 
     static func unit(_ rect: CGRect, in frame: CGRect) -> CGRect {
@@ -59,24 +78,31 @@ enum CropGeometry {
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
-    /// What a drag that starts at `point` should do, given the current selection in view coordinates.
-    static func dragMode(at point: CGPoint, selection: CGRect?, handleRadius: CGFloat = 28) -> DragMode {
-        guard let selection, selection.width > 0, selection.height > 0 else { return .new }
-        let corners = [
-            (CGPoint(x: selection.minX, y: selection.minY), CGPoint(x: selection.maxX, y: selection.maxY)),
-            (CGPoint(x: selection.maxX, y: selection.minY), CGPoint(x: selection.minX, y: selection.maxY)),
-            (CGPoint(x: selection.minX, y: selection.maxY), CGPoint(x: selection.maxX, y: selection.minY)),
-            (CGPoint(x: selection.maxX, y: selection.maxY), CGPoint(x: selection.minX, y: selection.minY)),
-        ]
-        var nearest: (distance: CGFloat, anchor: CGPoint)?
-        for (corner, opposite) in corners {
-            let distance = hypot(point.x - corner.x, point.y - corner.y)
-            if distance <= handleRadius, distance < (nearest?.distance ?? .greatestFiniteMagnitude) {
-                nearest = (distance, opposite)
-            }
-        }
-        if let nearest { return .resize(anchor: nearest.anchor) }
-        return selection.contains(point) ? .move : .new
+    // MARK: Magnifier
+
+    /// Where the magnifier sits for a touch: above the finger, or below it near the top edge,
+    /// and never past the left or right edge of the container.
+    static func magnifierCenter(for touch: CGPoint, in container: CGSize, diameter: CGFloat, gap: CGFloat) -> CGPoint {
+        let radius = diameter / 2
+        let above = touch.y - gap - radius
+        let y = above - radius >= 0 ? above : touch.y + gap + radius
+        let x = min(max(touch.x, radius), max(radius, container.width - radius))
+        return CGPoint(x: x, y: y)
+    }
+
+    /// How much the magnifier enlarges the picture as shown. At least `minimum`, and enough to
+    /// show the screen at its real size when the picture is shrunk to fit a narrow window.
+    static func magnification(displayedWidth: CGFloat, imagePointWidth: CGFloat,
+                              minimum: CGFloat = 2, maximum: CGFloat = 4) -> CGFloat {
+        guard displayedWidth > 0, imagePointWidth > 0 else { return minimum }
+        return min(maximum, max(minimum, imagePointWidth / displayedWidth))
+    }
+
+    /// Where the enlarged picture's top-left corner goes, relative to the magnifier's top-left
+    /// corner, so that the touched point appears in the middle of the magnifier.
+    static func magnifiedOrigin(touch: CGPoint, frame: CGRect, magnification: CGFloat, diameter: CGFloat) -> CGPoint {
+        CGPoint(x: diameter / 2 - (touch.x - frame.minX) * magnification,
+                y: diameter / 2 - (touch.y - frame.minY) * magnification)
     }
 
     private static func clamp(_ point: CGPoint, to bounds: CGRect) -> CGPoint {

@@ -98,11 +98,34 @@ final class PictureInPictureControllerTests: XCTestCase {
     @MainActor
     func testExistingPiPEnabledKeyIsStillLoaded() throws {
         try withController { _, monitor, defaults in
+            // withController's first launch has already performed the 0.8.0 migration.
+            XCTAssertTrue(defaults.bool(forKey: PictureInPictureController.disabledForCaptureModeKey))
             defaults.set(true, forKey: "pictureInPictureEnabled")
             let reloaded = PictureInPictureController(monitor: monitor, defaults: defaults)
             defer { reloaded.setEnabled(false) }
             XCTAssertTrue(reloaded.isEnabled)
             XCTAssertTrue(reloaded.automaticallyStarts)
+        }
+    }
+
+    @MainActor
+    func testCaptureModeMigrationDisablesPiPOnlyOnce() throws {
+        try withController { _, monitor, defaults in
+            defaults.removeObject(forKey: PictureInPictureController.disabledForCaptureModeKey)
+            defaults.set(true, forKey: PictureInPictureController.enabledKey)
+            defaults.set(false, forKey: PictureInPictureController.automaticallyStartsKey)
+            let migrated = PictureInPictureController(monitor: monitor, defaults: defaults)
+            XCTAssertFalse(migrated.isEnabled)
+            XCTAssertFalse(defaults.bool(forKey: PictureInPictureController.enabledKey))
+            XCTAssertTrue(defaults.bool(forKey: PictureInPictureController.disabledForCaptureModeKey))
+            XCTAssertFalse(migrated.automaticallyStarts)
+
+            defaults.set(true, forKey: PictureInPictureController.enabledKey)
+            let reloaded = PictureInPictureController(monitor: monitor, defaults: defaults)
+            defer { reloaded.setEnabled(false) }
+            XCTAssertTrue(reloaded.isEnabled)
+            XCTAssertTrue(defaults.bool(forKey: PictureInPictureController.enabledKey))
+            XCTAssertFalse(reloaded.automaticallyStarts)
         }
     }
 

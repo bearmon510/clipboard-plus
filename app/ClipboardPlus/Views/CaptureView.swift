@@ -1,9 +1,8 @@
 import SwiftUI
 import UIKit
 
-/// Shows a picture, usually a screenshot, dimmed like a frozen screen. Dragging chooses a part;
-/// the two main buttons then read the text in that part or save it as a picture.
-/// With nothing chosen, both buttons work on the whole picture.
+/// Shows a still picture of the screen. Dragging chooses a part of it, and lifting the finger
+/// finishes: the text in that part, or the part as a picture, goes to the clipboard.
 struct CaptureView: View {
     let source: CaptureSource
     /// Called with text that was read. The caller saves it and puts it on the pasteboard.
@@ -12,40 +11,49 @@ struct CaptureView: View {
     let onImage: (Data) -> Void
     let onClose: () -> Void
 
-    /// The chosen part in the picture's unit space. Nil means the whole picture.
+    @State private var mode: CaptureMode
+    /// The chosen part in the picture's unit space.
     @State private var selection: CGRect?
-    @State private var dragMode: CropGeometry.DragMode?
-    @State private var selectionAtDragStart: CGRect?
-    @State private var isReading = false
-    @State private var outcome: Outcome?
+    /// Where the finger is during a drag, in view coordinates. Drives the magnifier.
+    @State private var touch: CGPoint?
+    @State private var phase: Phase
 
-    private enum Outcome: Equatable {
-        case text(String)
+    enum Phase: Equatable {
+        case choosing
+        case reading
         case noText
         case failed
     }
 
-    init(source: CaptureSource, initialSelection: CGRect? = nil,
+    private static let magnifierDiameter: CGFloat = 124
+
+    /// `preview*` values let screenshot tests show a state that normally appears only mid-drag.
+    init(source: CaptureSource, mode: CaptureMode,
+         previewSelection: CGRect? = nil, previewTouch: CGPoint? = nil, previewPhase: Phase = .choosing,
          onText: @escaping (String) -> Void, onImage: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
         self.source = source
         self.onText = onText
         self.onImage = onImage
         self.onClose = onClose
-        _selection = State(initialValue: initialSelection)
+        _mode = State(initialValue: mode)
+        _selection = State(initialValue: previewSelection)
+        _touch = State(initialValue: previewTouch)
+        _phase = State(initialValue: previewPhase)
     }
 
     var body: some View {
-        // The picture fills the whole window like a frozen screen. The panels stay
-        // inside the safe area so that they clear the home indicator.
+        // The picture fills the window like a frozen screen. The controls stay inside the
+        // safe area so that they clear the home indicator.
         ZStack {
             canvas.ignoresSafeArea()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay(alignment: .top) { hint }
-        .overlay(alignment: .bottom) { bottomPanel }
+        .overlay(alignment: .top) { topBar }
         .tint(Theme.accent)
         .statusBarHidden(true)
     }
+
+    // MARK: Picture
 
     private var canvas: some View {
         GeometryReader { proxy in
@@ -56,18 +64,19 @@ struct CaptureView: View {
                     .resizable()
                     .frame(width: frame.width, height: frame.height)
                     .offset(x: frame.minX, y: frame.minY)
-                    .accessibilityLabel("切り取る画像")
+                    .accessibilityLabel("止めた画面")
                 shade(frame: frame, container: proxy.size)
                 if let selection {
                     selectionOutline(CropGeometry.viewRect(selection, in: frame))
+                }
+                if let touch, phase == .choosing {
+                    magnifier(touch: touch, frame: frame, container: proxy.size)
                 }
             }
             .contentShape(Rectangle())
             .gesture(dragGesture(frame: frame))
         }
     }
-
-    // MARK: Picture and selection
 
     /// Darkens everything except the chosen part.
     private func shade(frame: CGRect, container: CGSize) -> some View {
@@ -77,219 +86,197 @@ struct CaptureView: View {
                 path.addRect(CropGeometry.viewRect(selection, in: frame))
             }
         }
-        .fill(Color.black.opacity(selection == nil ? 0.28 : 0.55), style: FillStyle(eoFill: true))
+        .fill(Color.black.opacity(selection == nil ? 0.3 : 0.55), style: FillStyle(eoFill: true))
         .allowsHitTesting(false)
     }
 
     private func selectionOutline(_ rect: CGRect) -> some View {
-        ZStack(alignment: .topLeading) {
+        ZStack {
             Rectangle()
                 .strokeBorder(Color.white, lineWidth: 2)
-                .frame(width: rect.width, height: rect.height)
-                .offset(x: rect.minX, y: rect.minY)
-            ForEach(0..<4, id: \.self) { index in
-                Circle()
-                    .fill(Color.white)
-                    .overlay(Circle().strokeBorder(Theme.accent, lineWidth: 3))
-                    .frame(width: 18, height: 18)
-                    .offset(x: (index % 2 == 0 ? rect.minX : rect.maxX) - 9,
-                            y: (index < 2 ? rect.minY : rect.maxY) - 9)
+            if phase == .reading {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(Color.white)
+                    .padding(14)
+                    .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
         }
-        .shadow(color: Color.black.opacity(0.4), radius: 3)
+        .frame(width: rect.width, height: rect.height)
+        .offset(x: rect.minX, y: rect.minY)
+        .shadow(color: Color.black.opacity(0.45), radius: 3)
         .allowsHitTesting(false)
+    }
+
+    /// A round lens above the finger that shows the screen under it, enlarged,
+    /// with a cross at the exact point. Without it, a narrow window makes small text hard to aim at.
+    private func magnifier(touch: CGPoint, frame: CGRect, container: CGSize) -> some View {
+        let diameter = Self.magnifierDiameter
+        let scale = CropGeometry.magnification(displayedWidth: frame.width, imagePointWidth: source.image.size.width)
+        let origin = CropGeometry.magnifiedOrigin(touch: touch, frame: frame, magnification: scale, diameter: diameter)
+        let center = CropGeometry.magnifierCenter(for: touch, in: container, diameter: diameter, gap: 36)
+        return ZStack(alignment: .topLeading) {
+            Color.black
+            Image(uiImage: source.image)
+                .resizable()
+                .frame(width: frame.width * scale, height: frame.height * scale)
+                .offset(x: origin.x, y: origin.y)
+            crosshair.frame(width: diameter, height: diameter)
+        }
+        .frame(width: diameter, height: diameter)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(Color.white, lineWidth: 3))
+        .shadow(color: Color.black.opacity(0.4), radius: 8, y: 2)
+        .position(center)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var crosshair: some View {
+        ZStack {
+            Rectangle().fill(Theme.accent).frame(width: 18, height: 2)
+            Rectangle().fill(Theme.accent).frame(width: 2, height: 18)
+        }
     }
 
     private func dragGesture(frame: CGRect) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
-                guard outcome == nil, !isReading else { return }
-                let current = selection.map { CropGeometry.viewRect($0, in: frame) }
-                if dragMode == nil {
-                    dragMode = CropGeometry.dragMode(at: value.startLocation, selection: current)
-                    selectionAtDragStart = current
-                }
-                let rect: CGRect
-                switch dragMode {
-                case .move:
-                    rect = CropGeometry.moved(selectionAtDragStart ?? .zero, by: value.translation, within: frame)
-                case .resize(let anchor):
-                    rect = CropGeometry.rect(from: anchor, to: value.location, within: frame)
-                case .new, .none:
-                    rect = CropGeometry.rect(from: value.startLocation, to: value.location, within: frame)
-                }
+                guard phase != .reading else { return }
+                phase = .choosing
+                touch = value.location
+                let rect = CropGeometry.rect(from: value.startLocation, to: value.location, within: frame)
                 selection = CropGeometry.unit(rect, in: frame)
             }
-            .onEnded { _ in
-                dragMode = nil
-                selectionAtDragStart = nil
-                // A tap, or a sliver too small to mean anything, clears the choice.
-                if let selection {
-                    let rect = CropGeometry.viewRect(selection, in: frame)
-                    if rect.width < 12 || rect.height < 12 { self.selection = nil }
+            .onEnded { value in
+                guard phase == .choosing else { return }
+                touch = nil
+                let rect = CropGeometry.rect(from: value.startLocation, to: value.location, within: frame)
+                // A stray tap does nothing, so that a slip of the finger never closes the screen.
+                guard CropGeometry.isMeaningful(rect) else {
+                    selection = nil
+                    return
                 }
+                selection = CropGeometry.unit(rect, in: frame)
+                finish()
             }
     }
 
-    // MARK: Panels
+    // MARK: Controls
 
-    @ViewBuilder private var hint: some View {
-        if outcome == nil {
-            Text(selection == nil ? "ドラッグして範囲を選べます。選ばなければ全体が対象です。" : "角を引くと大きさを変えられます。外側をドラッグすると選び直せます。")
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(Color.white)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Color.black.opacity(0.6), in: Capsule())
-                .padding(.top, 14)
-                .padding(.horizontal, 16)
-                .allowsHitTesting(false)
-        }
-    }
-
-    @ViewBuilder private var bottomPanel: some View {
-        if let outcome {
-            resultPanel(outcome)
-        } else {
-            actionBar
-        }
-    }
-
-    private var actionBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                onClose()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 48, height: 48)
-            }
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.circle)
-            .accessibilityLabel("閉じる")
-            Button {
-                readText()
-            } label: {
-                actionLabel(isReading ? "読み取り中" : "文字を読み取る", "text.viewfinder")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(isReading)
-            Button {
-                saveImage()
-            } label: {
-                actionLabel("画像で保存", "crop")
-            }
-            .buttonStyle(.bordered)
-            .disabled(isReading)
-        }
-        .buttonBorderShape(.roundedRectangle(radius: 14))
-        .padding(10)
-        .frame(maxWidth: 480)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 14)
-    }
-
-    /// Side by side where there is room; in a narrow window the icon moves above the title
-    /// so that the title is never cut off.
-    private func actionLabel(_ title: String, _ symbol: String) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 6) {
-                Image(systemName: symbol).font(.body.weight(.semibold))
-                Text(title).font(.subheadline.weight(.semibold)).lineLimit(1).fixedSize()
-            }
-            VStack(spacing: 3) {
-                Image(systemName: symbol).font(.body.weight(.semibold))
-                Text(title).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7)
-            }
-        }
-        .frame(maxWidth: .infinity, minHeight: 38)
-    }
-
-    private func resultPanel(_ outcome: Outcome) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            switch outcome {
-            case .text(let text):
-                Label("読み取ってコピーしました", systemImage: "checkmark.circle.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Theme.accent)
-                ScrollView {
-                    Text(text)
-                        .font(.body)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 160)
-            case .noText:
-                Label("文字が見つかりませんでした", systemImage: "text.badge.xmark")
-                    .font(.subheadline.weight(.semibold))
-                Text("範囲を選び直すと読み取れることがあります。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            case .failed:
-                Label("文字を読み取れませんでした", systemImage: "exclamationmark.triangle.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Color.red)
-            }
+    private var topBar: some View {
+        VStack(spacing: 10) {
             HStack(spacing: 10) {
-                Button {
-                    self.outcome = nil
-                } label: {
-                    Text("続けて選ぶ").font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 34)
-                }
-                .buttonStyle(.bordered)
+                modePicker
+                Spacer(minLength: 8)
                 Button {
                     onClose()
                 } label: {
-                    Text("閉じる").font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 34)
+                    Image(systemName: "xmark")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(Color.white)
+                        .frame(width: 44, height: 44)
+                        .background(Color.black.opacity(0.55), in: Circle())
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
+                .accessibilityLabel("切り取りをやめる")
             }
-            .buttonBorderShape(.roundedRectangle(radius: 14))
+            notice
         }
-        .padding(14)
-        .frame(maxWidth: 480)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 14)
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .disabled(phase == .reading)
     }
 
-    // MARK: Actions
+    private var modePicker: some View {
+        HStack(spacing: 2) {
+            ForEach(CaptureMode.allCases) { value in
+                Button {
+                    mode = value
+                } label: {
+                    Label(value.title, systemImage: value.symbolName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(mode == value ? Color.black : Color.white)
+                        .padding(.horizontal, 14)
+                        .frame(height: 40)
+                        .background(mode == value ? Color.white : Color.clear, in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(mode == value ? [.isSelected] : [])
+            }
+        }
+        .padding(3)
+        .background(Color.black.opacity(0.55), in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("切り取ったものの扱い")
+    }
 
-    /// The chosen part of the picture, or the whole picture when nothing is chosen.
+    private var notice: some View {
+        let text: String
+        var symbol: String?
+        switch phase {
+        case .choosing: text = mode.hint
+        case .reading: text = "文字を読み取っています"
+        case .noText:
+            text = "文字が見つかりませんでした。もう一度選んでください"
+            symbol = "text.badge.xmark"
+        case .failed:
+            text = "切り取れませんでした。もう一度選んでください"
+            symbol = "exclamationmark.triangle.fill"
+        }
+        return HStack(spacing: 6) {
+            if let symbol { Image(systemName: symbol) }
+            Text(text).fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.footnote.weight(.medium))
+        .foregroundStyle(Color.white)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.6), in: Capsule())
+        .allowsHitTesting(false)
+    }
+
+    // MARK: Finishing
+
+    /// The chosen part of the picture, or nil when nothing usable is chosen.
     private func chosenImage() -> CGImage? {
-        guard let whole = source.image.cgImage else { return nil }
-        guard let selection else { return whole }
+        guard let whole = source.image.cgImage, let selection else { return nil }
         return whole.cropping(to: CropGeometry.pixelRect(selection, imageWidth: whole.width, imageHeight: whole.height))
     }
 
-    private func readText() {
-        guard let image = chosenImage() else { outcome = .failed; return }
-        isReading = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { try TextRecognizer.text(in: image) }
-            DispatchQueue.main.async {
-                isReading = false
-                switch result {
-                case .success(let text) where !text.isEmpty:
-                    onText(text)
-                    outcome = .text(text)
-                case .success:
-                    outcome = .noText
-                case .failure:
-                    outcome = .failed
+    private func finish() {
+        guard let image = chosenImage() else {
+            phase = .failed
+            return
+        }
+        switch mode {
+        case .image:
+            guard let data = UIImage(cgImage: image).pngData() else {
+                phase = .failed
+                return
+            }
+            onImage(data)
+            onClose()
+        case .text:
+            phase = .reading
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Result { try TextRecognizer.text(in: image) }
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let text) where !text.isEmpty:
+                        onText(text)
+                        onClose()
+                    case .success:
+                        selection = nil
+                        phase = .noText
+                    case .failure:
+                        selection = nil
+                        phase = .failed
+                    }
                 }
             }
         }
-    }
-
-    private func saveImage() {
-        guard let image = chosenImage(), let data = UIImage(cgImage: image).pngData() else {
-            outcome = .failed
-            return
-        }
-        onImage(data)
-        onClose()
     }
 }

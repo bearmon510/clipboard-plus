@@ -6,6 +6,7 @@ import Combine
 final class PictureInPictureController: NSObject, ObservableObject {
     static let enabledKey = "pictureInPictureEnabled"
     static let automaticallyStartsKey = "pictureInPictureAutomaticallyStarts"
+    static let disabledForCaptureModeKey = "pictureInPictureDisabledForCaptureMode080"
     @Published private(set) var isEnabled = false
     @Published private(set) var automaticallyStarts: Bool
     @Published private(set) var isActive = false
@@ -36,6 +37,11 @@ final class PictureInPictureController: NSObject, ObservableObject {
     init(monitor: ClipboardMonitor, defaults: UserDefaults = .standard) {
         self.monitor = monitor
         self.defaults = defaults
+        // Apply before loading the enabled preference or creating any PiP resources.
+        if !defaults.bool(forKey: Self.disabledForCaptureModeKey) {
+            defaults.set(false, forKey: Self.enabledKey)
+            defaults.set(true, forKey: Self.disabledForCaptureModeKey)
+        }
         automaticallyStarts = defaults.object(forKey: Self.automaticallyStartsKey) as? Bool ?? true
         super.init()
         if defaults.bool(forKey: Self.enabledKey) { setEnabled(true) }

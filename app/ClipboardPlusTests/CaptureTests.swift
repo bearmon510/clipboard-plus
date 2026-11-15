@@ -20,13 +20,11 @@ final class CaptureTests: XCTestCase {
         XCTAssertEqual(CropGeometry.rect(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 500, y: 500), within: bounds), bounds)
     }
 
-    func testMoveStopsAtTheEdgesWithoutChangingSize() {
-        let bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
-        let rect = CGRect(x: 10, y: 10, width: 30, height: 20)
-        XCTAssertEqual(CropGeometry.moved(rect, by: CGSize(width: 5, height: 7), within: bounds),
-                       CGRect(x: 15, y: 17, width: 30, height: 20))
-        XCTAssertEqual(CropGeometry.moved(rect, by: CGSize(width: 500, height: -500), within: bounds),
-                       CGRect(x: 70, y: 0, width: 30, height: 20))
+    func testTinySelectionsCountAsStrayTaps() {
+        XCTAssertFalse(CropGeometry.isMeaningful(.zero))
+        XCTAssertFalse(CropGeometry.isMeaningful(CGRect(x: 0, y: 0, width: 200, height: 11)))
+        XCTAssertFalse(CropGeometry.isMeaningful(CGRect(x: 0, y: 0, width: 11, height: 200)))
+        XCTAssertTrue(CropGeometry.isMeaningful(CGRect(x: 0, y: 0, width: 12, height: 12)))
     }
 
     func testUnitAndViewRectsAreInverse() {
@@ -50,20 +48,55 @@ final class CaptureTests: XCTestCase {
                        CGRect(x: 9, y: 9, width: 1, height: 1))
     }
 
-    func testDragModeDependsOnWhereTheDragStarts() {
-        let selection = CGRect(x: 100, y: 100, width: 200, height: 100)
-        XCTAssertEqual(CropGeometry.dragMode(at: CGPoint(x: 10, y: 10), selection: nil), .new)
-        XCTAssertEqual(CropGeometry.dragMode(at: CGPoint(x: 200, y: 150), selection: selection), .move)
-        XCTAssertEqual(CropGeometry.dragMode(at: CGPoint(x: 500, y: 500), selection: selection), .new)
-        // A drag from a corner resizes around the opposite corner.
-        XCTAssertEqual(CropGeometry.dragMode(at: CGPoint(x: 105, y: 96), selection: selection),
-                       .resize(anchor: CGPoint(x: 300, y: 200)))
-        XCTAssertEqual(CropGeometry.dragMode(at: CGPoint(x: 310, y: 210), selection: selection),
-                       .resize(anchor: CGPoint(x: 100, y: 100)))
-        // In a small selection the nearest corner wins.
-        let small = CGRect(x: 100, y: 100, width: 20, height: 20)
-        XCTAssertEqual(CropGeometry.dragMode(at: CGPoint(x: 118, y: 118), selection: small),
-                       .resize(anchor: CGPoint(x: 100, y: 100)))
+    // MARK: Magnifier
+
+    func testMagnifierSitsAboveTheFingerOrBelowItNearTheTop() {
+        let container = CGSize(width: 360, height: 700)
+        XCTAssertEqual(CropGeometry.magnifierCenter(for: CGPoint(x: 180, y: 400), in: container, diameter: 120, gap: 30),
+                       CGPoint(x: 180, y: 310))
+        // Too close to the top for the lens to fit above, so it goes below.
+        XCTAssertEqual(CropGeometry.magnifierCenter(for: CGPoint(x: 180, y: 100), in: container, diameter: 120, gap: 30),
+                       CGPoint(x: 180, y: 190))
+        // Never past the side edges.
+        XCTAssertEqual(CropGeometry.magnifierCenter(for: CGPoint(x: 5, y: 400), in: container, diameter: 120, gap: 30).x, 60)
+        XCTAssertEqual(CropGeometry.magnifierCenter(for: CGPoint(x: 355, y: 400), in: container, diameter: 120, gap: 30).x, 300)
+    }
+
+    func testMagnificationShowsRealSizeInANarrowWindow() {
+        // A 1366-point screen shrunk into a 340-point window needs about 4x to show it at real size.
+        XCTAssertEqual(CropGeometry.magnification(displayedWidth: 341.5, imagePointWidth: 1_366), 4)
+        XCTAssertEqual(CropGeometry.magnification(displayedWidth: 1_000, imagePointWidth: 2_500), 2.5)
+        // A wide window still gets the minimum.
+        XCTAssertEqual(CropGeometry.magnification(displayedWidth: 1_366, imagePointWidth: 1_366), 2)
+        XCTAssertEqual(CropGeometry.magnification(displayedWidth: 100, imagePointWidth: 10_000), 4)
+        XCTAssertEqual(CropGeometry.magnification(displayedWidth: 0, imagePointWidth: 100), 2)
+    }
+
+    func testMagnifiedOriginPutsTheTouchedPointInTheMiddle() {
+        let frame = CGRect(x: 20, y: 50, width: 300, height: 200)
+        let touch = CGPoint(x: 120, y: 150)
+        let origin = CropGeometry.magnifiedOrigin(touch: touch, frame: frame, magnification: 3, diameter: 100)
+        // The touched point lies 100 by 100 points into the picture; enlarged three times it is
+        // 300 by 300 points in, and must land at the lens centre (50, 50).
+        XCTAssertEqual(origin, CGPoint(x: -250, y: -250))
+        XCTAssertEqual(origin.x + (touch.x - frame.minX) * 3, 50)
+    }
+
+    // MARK: Modes
+
+    func testModesHaveDistinctTitlesAndSymbols() {
+        XCTAssertEqual(CaptureMode.allCases, [.text, .image])
+        XCTAssertNotEqual(CaptureMode.text.symbolName, CaptureMode.image.symbolName)
+        XCTAssertEqual(CaptureMode.text.title, "文字")
+        XCTAssertEqual(CaptureMode.image.title, "画像")
+    }
+
+    @MainActor
+    func testToastPreviewKeepsOneShortLine() {
+        XCTAssertEqual(ContentView.toastPreview("一行目\n二行目"), "一行目 二行目")
+        XCTAssertEqual(ContentView.toastPreview(String(repeating: "あ", count: 30), limit: 24),
+                       String(repeating: "あ", count: 24) + "…")
+        XCTAssertEqual(ContentView.toastPreview("短い"), "短い")
     }
 
     // MARK: Text order
