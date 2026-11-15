@@ -191,12 +191,20 @@ struct CaptureView: View {
         .padding(.bottom, 14)
     }
 
+    /// Side by side where there is room; in a narrow window the icon moves above the title
+    /// so that the title is never cut off.
     private func actionLabel(_ title: String, _ symbol: String) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: symbol).font(.body.weight(.semibold))
-            Text(title).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
+                Image(systemName: symbol).font(.body.weight(.semibold))
+                Text(title).font(.subheadline.weight(.semibold)).lineLimit(1).fixedSize()
+            }
+            VStack(spacing: 3) {
+                Image(systemName: symbol).font(.body.weight(.semibold))
+                Text(title).font(.caption.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7)
+            }
         }
-        .frame(maxWidth: .infinity, minHeight: 34)
+        .frame(maxWidth: .infinity, minHeight: 38)
     }
 
     private func resultPanel(_ outcome: Outcome) -> some View {
