@@ -63,14 +63,15 @@ final class ScreenSnapshotTests: XCTestCase {
         // Mid-drag in a wide window: the selection and the magnifier at the finger.
         let dragging = CaptureView(source: source, mode: .text,
                                    previewSelection: CGRect(x: 0.08, y: 0.2, width: 0.6, height: 0.28),
-                                   // The finger at the selection's bottom-right corner, over the last line.
-                                   previewTouch: CGPoint(x: 696, y: 352),
+                                   // The finger over the third line of text, so the lens shows enlarged letters.
+                                   previewTouch: CGPoint(x: 420, y: 288),
                                    onText: { _ in }, onImage: { _ in }, onClose: {})
         try save(render(dragging, size: Self.wide, style: .light), "capture-wide-dragging")
         // A narrow side window, where the magnifier matters most.
         let narrow = CaptureView(source: source, mode: .text,
                                  previewSelection: CGRect(x: 0.08, y: 0.2, width: 0.45, height: 0.1),
-                                 previewTouch: CGPoint(x: 190, y: 420),
+                                 // Over the second line of text in the shrunk picture.
+                                 previewTouch: CGPoint(x: 110, y: 334),
                                  onText: { _ in }, onImage: { _ in }, onClose: {})
         try save(render(narrow, size: Self.narrow, style: .light), "capture-narrow-dragging")
         let untouched = CaptureView(source: source, mode: .image, onText: { _ in }, onImage: { _ in }, onClose: {})
