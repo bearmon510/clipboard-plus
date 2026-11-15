@@ -67,12 +67,8 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
         // as unavailable, unlike allowedPickerModes itself.
         configuration.showsMicrophoneControl = false
         configuration.showsCameraControl = false
-        configuration.allowsChangingSelectedContent = false
-        if let identifier = Bundle.main.bundleIdentifier {
-            // Documented as a picker exclusion, not a guarantee that our window
-            // is removed from a full-display frame. Correctness does not rely on it.
-            configuration.excludedBundleIDs = [identifier]
-        }
+        // allowsChangingSelectedContent and excludedBundleIDs exist in the documentation,
+        // but the iOS 27.1 device SDK marks them unavailable (the simulator SDK does not).
         picker.defaultConfiguration = configuration
         picker.add(self)
         picker.isActive = true
@@ -110,11 +106,9 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
         let configuration = SCStreamConfiguration()
         configuration.width = Int(width)
         configuration.height = Int(height)
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 4)
-        configuration.queueDepth = 3
-        configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        configuration.showsCursor = false
-        configuration.scalesToFit = false
+        // minimumFrameInterval, queueDepth, pixelFormat, showsCursor and scalesToFit are
+        // unavailable in the iOS 27.1 device SDK, so the system decides the frame rate and
+        // pixel format. Only the newest frame is kept, and it is converted only on request.
         configuration.capturesAudio = false
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         self.stream = stream

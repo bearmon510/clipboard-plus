@@ -76,6 +76,25 @@ jobs:
             -derivedDataPath DerivedData \
             CODE_SIGNING_ALLOWED=NO
 
+      # The device SDK can differ from the simulator SDK: in iOS 27.1 several
+      # ScreenCaptureKit settings compile for the simulator but not for a device.
+      # This catches that before a TestFlight upload does.
+      - name: Build for a device without signing
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project ClipboardPlus.xcodeproj \
+            -scheme ClipboardPlus \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData-device \
+            CODE_SIGNING_ALLOWED=NO > device-build.log 2>&1 || {
+              grep -E "error:" device-build.log | sort -u | head -40
+              exit 1
+            }
+          echo "Device build succeeded."
+
       - name: Run pure logic unit tests on iPad
         working-directory: app
         env:
