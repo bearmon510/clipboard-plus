@@ -29,6 +29,19 @@ final class ScreenCaptureKitSource: ScreenCaptureSource {
         session = nil
     }
 
+    func resume() {
+        guard let session else {
+            onEvent?(.failed(domain: "ScreenCapture.MissingFilter", code: 1))
+            return
+        }
+        session.resume()
+    }
+
+    func stopStream(completion: @escaping @MainActor () -> Void) {
+        guard let session else { return }
+        session.stopStream(completion: completion)
+    }
+
     func convertLatestFrame(notBefore: Date,
                             completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void) {
         guard let session else { completion(.failure(.failed("capture stopped"))); return }
@@ -41,7 +54,10 @@ final class ScreenCaptureKitSource: ScreenCaptureSource {
 @available(iOS 27.0, *)
 @MainActor
 private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObserver, SCStreamDelegate {
-    let frames: ScreenCaptureFrameBuffer
+    private(set) var frames: ScreenCaptureFrameBuffer
+    private let context: CIContext
+    private let conversionQueue: DispatchQueue
+    private var filter: SCContentFilter?
     private let event: @MainActor (ScreenCaptureSourceEvent) -> Void
     private var stream: SCStream?
     private var output: ScreenCaptureOutput?
@@ -51,8 +67,17 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
     init(context: CIContext, conversionQueue: DispatchQueue,
          event: @escaping @MainActor (ScreenCaptureSourceEvent) -> Void) {
         self.event = event
+        self.context = context
+        self.conversionQueue = conversionQueue
         frames = ScreenCaptureFrameBuffer(context: context, conversionQueue: conversionQueue)
         super.init()
+    }
+
+    private func prepareFrames() {
+        // Each stream gets a separate slot: late samples from a stopped stream
+        // must never be accepted by a subsequent burst.
+        frames.clear()
+        frames = ScreenCaptureFrameBuffer(context: context, conversionQueue: conversionQueue)
         frames.onEvent = { [weak self] event in
             guard let self, self.active else { return }
             self.event(event)
@@ -78,6 +103,7 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
     func close() {
         guard active else { return }
         active = false
+        filter = nil
         frames.clear()
         let picker = SCContentSharingPicker.shared
         picker.remove(self)
@@ -88,14 +114,39 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
         previous?.stopCapture(completionHandler: nil)
     }
 
-    private func begin(filter: SCContentFilter) {
+    func stopStream(completion: @escaping @MainActor () -> Void) {
+        guard active, let previous = stream else { return }
+        frames.clear()
+        // Keep the stream reference until stop completes to serialize restart.
+        previous.stopCapture { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self, self.active, self.stream === previous else { return }
+                if let error { self.report(error); return }
+                self.stream = nil
+                self.output = nil
+                completion()
+            }
+        }
+    }
+
+    func resume() {
+        guard active, let filter, stream == nil else {
+            event(.failed(domain: "ScreenCapture.MissingFilter", code: 1))
+            return
+        }
+        begin(filter: filter, isPermission: false)
+    }
+
+    private func begin(filter: SCContentFilter, isPermission: Bool = true) {
         guard active, stream == nil else { return }
+        self.filter = filter
         let rect = filter.contentRect
         let pointPixelScale = CGFloat(filter.pointPixelScale)
         let scale = ScreenCaptureFrameBuffer.imageScale(pointPixelScale)
-        event(.permissionGranted(contentRect: rect, pointPixelScale: pointPixelScale))
+        if isPermission { event(.permissionGranted(contentRect: rect, pointPixelScale: pointPixelScale)) }
         // The callback may synchronously stop this session.
         guard active else { return }
+        prepareFrames()
         let width = (rect.width * scale).rounded()
         let height = (rect.height * scale).rounded()
         guard width.isFinite, height.isFinite, width > 0, height > 0,
@@ -153,6 +204,9 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
                                          didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.active, stream == nil || self.stream === stream else { return }
+            // A nil-stream picker callback is only a grant while waiting for
+            // the first filter; it must not start unsolicited bursts in ready.
+            guard self.filter == nil else { return }
             self.begin(filter: filter)
         }
     }

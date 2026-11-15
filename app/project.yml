@@ -21,7 +21,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: example.clipboardplus
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "0.8.1"
+        MARKETING_VERSION: "0.9.0"
         CURRENT_PROJECT_VERSION: "1"
     info:
       path: Generated/ClipboardPlus-Info.plist
@@ -33,6 +33,7 @@ targets:
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
         NSScreenCaptureUsageDescription: 選んだ範囲の文字や画像をクリップボードに保存するために、画面の内容を取り込みます。取り込んだ画面は保存せず、外へ送りません。
+        NSPhotoLibraryUsageDescription: 撮ったスクリーンショットを見つけて、範囲を選んで切り取るために使います。写真を外へ送ることはありません。
         # Shows the Documents folder (measurement log only) in the Files app.
         # History, images and backups stay outside it.
         UIFileSharingEnabled: true

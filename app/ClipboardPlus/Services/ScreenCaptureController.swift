@@ -2,6 +2,11 @@ import Combine
 import Foundation
 import UIKit
 
+enum ScreenCaptureStrategy: String, CaseIterable {
+    case continuous
+    case burst
+}
+
 enum ScreenCaptureError: Error, Equatable {
     case unsupported
     case declined
@@ -33,6 +38,10 @@ protocol ScreenCaptureSource: AnyObject {
     var isSupported: Bool { get }
     var onEvent: (@MainActor (ScreenCaptureSourceEvent) -> Void)? { get set }
     func requestPermission()
+    func resume()
+    /// Stops only the stream and clears its pixels, retaining the permission session.
+    /// Completion follows stopCapture; failures are reported through onEvent.
+    func stopStream(completion: @escaping @MainActor () -> Void)
     func convertLatestFrame(notBefore: Date,
                             completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void)
     func stop()
@@ -40,11 +49,13 @@ protocol ScreenCaptureSource: AnyObject {
 
 @MainActor
 final class ScreenCaptureController: ObservableObject {
-    enum State: Equatable { case unsupported, idle, requestingPermission, starting, running }
+    enum State: Equatable { case unsupported, idle, requestingPermission, starting, running, ready }
     @Published private(set) var state: State
+    @Published private(set) var strategy: ScreenCaptureStrategy
     var isSupported: Bool { source.isSupported }
 
     private let log: MeasurementLog
+    private let defaults: UserDefaults
     private let now: () -> Date
     private let source: ScreenCaptureSource
     private let schedulesTimers: Bool
@@ -60,6 +71,8 @@ final class ScreenCaptureController: ObservableObject {
     private var frameValidity = UUID()
     private var frameVersion = UUID()
     private var sceneIsActive = true
+    private var isResuming = false
+    private var resumeFirstFrameLogged = false
     /// When the person approved capture in this session. The first frames after it can still
     /// show the system permission screen, so they are not used until that screen is gone.
     private var grantedAt: Date?
@@ -75,9 +88,11 @@ final class ScreenCaptureController: ObservableObject {
     private static let frameTimeout: TimeInterval = 8
     private static let idleTimeout: TimeInterval = 5 * 60
 
-    init(log: MeasurementLog, now: @escaping () -> Date = Date.init,
+    init(log: MeasurementLog, defaults: UserDefaults = .standard, now: @escaping () -> Date = Date.init,
          source: ScreenCaptureSource? = nil, schedulesTimers: Bool = true) {
         self.log = log
+        self.defaults = defaults
+        strategy = defaults.string(forKey: "screenCaptureStrategy").flatMap(ScreenCaptureStrategy.init(rawValue:)) ?? .continuous
         self.now = now
         self.source = source ?? makeScreenCaptureSource()
         self.schedulesTimers = schedulesTimers
@@ -103,20 +118,65 @@ final class ScreenCaptureController: ObservableObject {
             requestDeadline = now().addingTimeInterval(Self.frameTimeout)
         }
         if state == .idle {
-            generation = UUID()
-            let token = generation
-            source.onEvent = { [weak self] event in
-                guard let self, self.generation == token else { return }
-                self.receive(event)
-            }
+            beginPermissionRequest()
+        } else if state == .ready {
+            bindSourceEvents()
             requestedAt = now()
-            state = .requestingPermission
-            record("画面取り込みの許可画面を表示")
-            startTimerIfNeeded()
-            source.requestPermission()
+            lastUsedAt = requestedAt
+            grantedAt = nil
+            reactivatedAfterGrant = nil
+            startedAt = nil
+            hasUsableFrame = false
+            isResuming = true
+            resumeFirstFrameLogged = false
+            state = .starting
+            requestDeadline = now().addingTimeInterval(Self.frameTimeout)
+            record("画面取り込みの再開要求")
+            source.resume()
         } else {
             deliverLatestFrameIfReady()
         }
+    }
+
+    func setStrategy(_ value: ScreenCaptureStrategy) {
+        guard strategy != value else { return }
+        strategy = value
+        defaults.set(value.rawValue, forKey: "screenCaptureStrategy")
+        stop(reason: "strategy changed")
+    }
+
+    private func bindSourceEvents() {
+        generation = UUID()
+        let token = generation
+        source.onEvent = { [weak self] event in
+            guard let self, self.generation == token else { return }
+            self.receive(event)
+        }
+    }
+
+    private func beginPermissionRequest() {
+        bindSourceEvents()
+        requestedAt = now()
+        requestDeadline = nil
+        state = .requestingPermission
+        record("画面取り込みの許可画面を表示")
+        startTimerIfNeeded()
+        source.requestPermission()
+    }
+
+    private func retryPermission(domain: String, code: Int) {
+        record("画面取り込みの再開失敗・許可を再要求", details: "domain=\(domain); code=\(code)")
+        generation = UUID()
+        source.onEvent = nil
+        source.stop()
+        hasUsableFrame = false
+        isConverting = false
+        startedAt = nil
+        grantedAt = nil
+        reactivatedAfterGrant = nil
+        lastUsedAt = nil
+        isResuming = false
+        beginPermissionRequest()
     }
 
     func stop(reason: String) {
@@ -152,7 +212,7 @@ final class ScreenCaptureController: ObservableObject {
     }
 
     func noteCaptureUsed() {
-        guard state == .running else { return }
+        guard state == .running || state == .ready else { return }
         lastUsedAt = now()
     }
 
@@ -160,7 +220,8 @@ final class ScreenCaptureController: ObservableObject {
     func checkDeadlines() {
         let date = now()
         if let deadline = requestDeadline, date >= deadline {
-            finishSession(reason: "frame timeout", error: .timeout)
+            if isResuming { retryPermission(domain: "ScreenCapture.ResumeTimeout", code: 8) }
+            else { finishSession(reason: "frame timeout", error: .timeout) }
         } else if let lastUsedAt, date.timeIntervalSince(lastUsedAt) >= Self.idleTimeout {
             stop(reason: "unused for 5 minutes")
         }
@@ -195,7 +256,13 @@ final class ScreenCaptureController: ObservableObject {
             lastUsedAt = date
             state = .running
             record("画面取り込みの開始成功")
+            if isResuming { record("画面取り込みの再開開始成功") }
         case .frameReceived(let date, let width, let height):
+            if isResuming, !resumeFirstFrameLogged, state == .running, width > 0, height > 0 {
+                resumeFirstFrameLogged = true
+                let elapsed = max(0, date.timeIntervalSince(requestedAt ?? date))
+                record("画面取り込みの再開後最初のコマ", details: "resume_ms=\(Int(elapsed * 1000)); pixels=\(width)x\(height)")
+            }
             guard state == .running, let startedAt, let usableFrom = self.usableFrom,
                   date >= usableFrom, width > 0, height > 0 else { return }
             if !hasUsableFrame {
@@ -214,6 +281,7 @@ final class ScreenCaptureController: ObservableObject {
             record("画面取り込みの許可取り消し")
             finishSession(reason: "picker cancelled", error: .declined)
         case .failed(let domain, let code):
+            if isResuming { retryPermission(domain: domain, code: code); return }
             let reason = "\(domain) (\(code))"
             record(state == .running ? "画面取り込みの映像停止" : "画面取り込みの開始失敗",
                    details: "domain=\(domain); code=\(code)")
@@ -238,7 +306,26 @@ final class ScreenCaptureController: ObservableObject {
             }
             switch result {
             case .success(let image):
-                self.completeRequests(.success(image))
+                if self.strategy == .burst {
+                    // Keep requests coalesced until the old stream has actually stopped.
+                    self.isConverting = true
+                    self.source.stopStream { [weak self] in
+                        guard let self, self.generation == token else { return }
+                        self.checkDeadlines()
+                        guard self.generation == token else { return }
+                        self.isConverting = false
+                        self.hasUsableFrame = false
+                        self.startedAt = nil
+                        self.state = .ready
+                        self.lastUsedAt = self.now()
+                        if self.isResuming { self.record("画面取り込みの再開成功") }
+                        self.isResuming = false
+                        self.record("画面取り込みの映像のみ停止", details: "filter=retained")
+                        self.completeRequests(.success(image))
+                    }
+                } else {
+                    self.completeRequests(.success(image))
+                }
             case .unavailable:
                 if self.frameVersion == version { self.hasUsableFrame = false }
                 self.deliverLatestFrameIfReady()
@@ -265,6 +352,7 @@ final class ScreenCaptureController: ObservableObject {
         timer = nil
         hasUsableFrame = false
         isConverting = false
+        isResuming = false
         requestedAt = nil
         startedAt = nil
         lastUsedAt = nil
@@ -287,6 +375,8 @@ private final class UnsupportedScreenCaptureSource: ScreenCaptureSource {
     let isSupported = false
     var onEvent: (@MainActor (ScreenCaptureSourceEvent) -> Void)?
     func requestPermission() {}
+    func resume() {}
+    func stopStream(completion: @escaping @MainActor () -> Void) { completion() }
     func stop() {}
     func convertLatestFrame(notBefore: Date,
                             completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void) {

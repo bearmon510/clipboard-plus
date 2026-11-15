@@ -33,11 +33,22 @@ struct CaptureGuideView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
                     section(
-                        title: "スクリーンショットから",
+                        title: "スクリーンショットで開く（試験）",
                         symbol: "camera.viewfinder",
-                        lead: "iPadOS 26以前や、画面の取り込みを許可しないときの方法です。",
+                        lead: "録画の表示を出さずに、撮った瞬間の画面から切り取ります。設定の「切り取り」で「スクリーンショットで切り取りを開く」をオンにします。",
                         steps: [
-                            "スクリーンショットを撮り、左下の小さな画像から「コピーして削除」を選びます。履歴に画像が入ります。",
+                            "clipboard+を小窓やSlide Overで画面に出しておきます。",
+                            "iPadでスクリーンショットを撮ります。画面の隅からのスワイプをスクリーンショットに割り当てておくと、指1本で撮れます（「設定」の「マルチタスクとジェスチャ」にある、隅からのスワイプの項目）。",
+                            "スクリーンショットのプレビューを閉じると、clipboard+に切り取りの画面が開いています。範囲を選んで指を離します。",
+                            "使ったスクリーンショットは写真に残ります。設定の「切り取り」からまとめて削除できます。",
+                        ]
+                    )
+                    section(
+                        title: "保存した画像から",
+                        symbol: "photo.on.rectangle",
+                        lead: "iPadOS 26以前や、ほかの方法を使わないときの方法です。",
+                        steps: [
+                            "スクリーンショットを撮り、プレビューから「コピー」を選びます。履歴に画像が入ります。",
                             "履歴の画像の「⋯」から「文字で切り取る」か「画像で切り取る」を選ぶと、同じ方法で範囲を選べます。",
                         ]
                     )

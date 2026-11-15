@@ -20,6 +20,11 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
     var onEvent: (@MainActor (ScreenCaptureSourceEvent) -> Void)?
     var permissionRequests = 0
     var stops = 0
+    var streamStops = 0
+    var resumes = 0
+    var hasFilter = false
+    var deferStop = false
+    var stopped: (@MainActor () -> Void)?
     var conversions = 0
     var latest: UIImage?
     var latestDate: Date?
@@ -31,12 +36,22 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
     var reactivatesOnGrant = true
 
     func requestPermission() { permissionRequests += 1 }
+    func resume() { resumes += 1 }
+    func stopStream(completion: @escaping @MainActor () -> Void) {
+        streamStops += 1
+        latest = nil
+        latestDate = nil
+        if deferStop { stopped = completion }
+        else { completion() }
+    }
     func stop() {
         stops += 1
+        hasFilter = false
         latest = nil
         latestDate = nil
     }
     func grant() {
+        hasFilter = true
         onEvent?(.permissionGranted(contentRect: CGRect(x: 0, y: 0, width: 100, height: 200),
                                     pointPixelScale: 2))
         if reactivatesOnGrant { controller?.sceneDidActivate() }
@@ -71,7 +86,7 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
 
 final class ScreenCaptureControllerTests: XCTestCase {
     @MainActor
-    private func withController(supported: Bool = true,
+    private func withController(supported: Bool = true, strategy: ScreenCaptureStrategy = .continuous,
                                 _ body: (ScreenCaptureController, FakeScreenCaptureSource,
                                          CaptureTestClock, MeasurementLog) throws -> Void) throws {
         let root = try ImageTestSupport.directory(self)
@@ -79,7 +94,11 @@ final class ScreenCaptureControllerTests: XCTestCase {
         let source = FakeScreenCaptureSource()
         source.isSupported = supported
         let clock = CaptureTestClock()
-        let controller = ScreenCaptureController(log: log, now: { clock.date }, source: source,
+        let suite = "ScreenCaptureTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(strategy.rawValue, forKey: "screenCaptureStrategy")
+        let controller = ScreenCaptureController(log: log, defaults: defaults, now: { clock.date }, source: source,
                                                  schedulesTimers: false)
         source.controller = controller
         defer {
@@ -520,6 +539,228 @@ final class ScreenCaptureControllerTests: XCTestCase {
             XCTAssertEqual(controller.state, .unsupported)
             XCTAssertEqual(source.permissionRequests, 0)
             XCTAssertEqual(source.stops, 0)
+        }
+    }
+
+    @MainActor
+    func testBurstStopsOnlyStreamAndNextRequestResumesAfterSettling() throws {
+        try withController(strategy: .burst) { controller, source, clock, log in
+            var images: [UIImage] = []
+            let receive: @MainActor (Result<UIImage, ScreenCaptureError>) -> Void = {
+                if case .failure(let error) = $0 { XCTFail("\(error)") }
+                if case .success(let image) = $0 { images.append(image) }
+            }
+            controller.requestFrame(completion: receive)
+            source.reactivatesOnGrant = false
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(0.7)
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertTrue(images.isEmpty) // First burst still waits for the permission screen.
+            controller.sceneDidActivate()
+            clock.advance(0.5)
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertEqual(images.count, 1)
+            XCTAssertEqual(controller.state, .ready)
+            XCTAssertTrue(source.hasFilter)
+            XCTAssertEqual(source.streamStops, 1)
+            XCTAssertEqual(source.stops, 0)
+            XCTAssertNil(source.latest)
+
+            controller.requestFrame(completion: receive)
+            XCTAssertEqual(controller.state, .starting)
+            XCTAssertEqual(source.resumes, 1)
+            XCTAssertEqual(source.permissionRequests, 1)
+            source.start(at: clock.date)
+            clock.advance(0.59)
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertEqual(images.count, 1)
+            clock.advance(0.02)
+            let next = UIImage()
+            source.frame(next, at: clock.date)
+            XCTAssertTrue(images.last === next)
+            XCTAssertEqual(images.count, 2)
+            XCTAssertEqual(controller.state, .ready)
+            XCTAssertEqual(source.streamStops, 2)
+            XCTAssertTrue(log.lines.contains { $0.fileLine.contains("resume_ms=") })
+            XCTAssertTrue(log.lines.contains { $0.primaryText.contains("再開成功") })
+        }
+    }
+
+    @MainActor
+    func testBurstResumeFailuresRetryPermissionWithinSameRequest() throws {
+        // Start error, stream error after start, and no-frame timeout each fall back once.
+        for failure in 0..<3 {
+            try withController(strategy: .burst) { controller, source, clock, log in
+                controller.requestFrame { if case .failure(let error) = $0 { XCTFail("\(error)") } }
+                source.grant()
+                source.start(at: clock.date)
+                clock.advance(1)
+                source.frame(UIImage(), at: clock.date)
+                var results: [Result<UIImage, ScreenCaptureError>] = []
+                controller.requestFrame { results.append($0) }
+                let oldEvents = source.onEvent
+                if failure == 0 {
+                    source.onEvent?(.failed(domain: "TestResume", code: -42))
+                } else {
+                    source.start(at: clock.date)
+                    if failure == 1 { source.onEvent?(.failed(domain: "TestResume", code: -43)) }
+                    else { clock.advance(8); controller.checkDeadlines() }
+                }
+                XCTAssertTrue(results.isEmpty)
+                XCTAssertEqual(source.permissionRequests, 2)
+                XCTAssertEqual(source.resumes, 1)
+                XCTAssertFalse(source.hasFilter)
+                XCTAssertEqual(controller.state, .requestingPermission)
+                oldEvents?(.failed(domain: "LateOldStream", code: -99))
+                XCTAssertEqual(controller.state, .requestingPermission)
+                source.grant()
+                source.start(at: clock.date)
+                clock.advance(1)
+                source.frame(UIImage(), at: clock.date)
+                XCTAssertEqual(results.count, 1)
+                if case .failure(let error)? = results.first { XCTFail("\(error)") }
+                XCTAssertEqual(controller.state, .ready)
+                XCTAssertTrue(log.lines.contains { $0.primaryText.contains("再開失敗") && $0.fileLine.contains("code=") })
+            }
+        }
+    }
+
+    @MainActor
+    func testBurstFallbackFailureCompletesInsteadOfRetryingForever() throws {
+        try withController(strategy: .burst) { controller, source, clock, _ in
+            controller.requestFrame { if case .failure(let error) = $0 { XCTFail("\(error)") } }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            var results: [Result<UIImage, ScreenCaptureError>] = []
+            controller.requestFrame { results.append($0) }
+            source.onEvent?(.failed(domain: "Resume", code: 1))
+            source.grant()
+            source.onEvent?(.failed(domain: "FreshStart", code: 2))
+            XCTAssertEqual(results.count, 1)
+            guard case .failure(.failed("FreshStart (2)"))? = results.first else { return XCTFail("Expected failure") }
+            XCTAssertEqual(source.permissionRequests, 2)
+            XCTAssertEqual(controller.state, .idle)
+        }
+    }
+
+    @MainActor
+    func testBurstReadyDiscardsFilterOnBackgroundManualStopAndStrategyChange() throws {
+        for action in 0..<3 {
+            try withController(strategy: .burst) { controller, source, clock, _ in
+                controller.requestFrame { if case .failure(let error) = $0 { XCTFail("\(error)") } }
+                source.grant()
+                source.start(at: clock.date)
+                clock.advance(1)
+                source.frame(UIImage(), at: clock.date)
+                if action == 0 { controller.sceneDidChange(isActive: false) }
+                if action == 1 { controller.stop(reason: "manual") }
+                if action == 2 { controller.setStrategy(.continuous) }
+                XCTAssertEqual(controller.state, .idle)
+                XCTAssertFalse(source.hasFilter)
+                XCTAssertEqual(source.stops, 1)
+                controller.sceneDidChange(isActive: true)
+                controller.requestFrame { _ in }
+                XCTAssertEqual(source.permissionRequests, 2)
+            }
+        }
+    }
+
+    @MainActor
+    func testBurstReadyExpiresFiveMinutesAfterLastUse() throws {
+        try withController(strategy: .burst) { controller, source, clock, _ in
+            controller.requestFrame { if case .failure(let error) = $0 { XCTFail("\(error)") } }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            clock.advance(299)
+            controller.checkDeadlines()
+            XCTAssertEqual(controller.state, .ready)
+            controller.noteCaptureUsed()
+            clock.advance(299)
+            controller.checkDeadlines()
+            XCTAssertTrue(source.hasFilter)
+            clock.advance(1)
+            controller.checkDeadlines()
+            XCTAssertEqual(controller.state, .idle)
+            XCTAssertFalse(source.hasFilter)
+        }
+    }
+
+    @MainActor
+    func testBurstOverlappingRequestsWaitForStopAndCanRequestAgainInCompletion() throws {
+        try withController(strategy: .burst) { controller, source, clock, _ in
+            var delivered = 0
+            controller.requestFrame { result in
+                if case .failure(let error) = result { XCTFail("\(error)") }
+                delivered += 1
+                controller.requestFrame { _ in } // Must start a fresh burst, not use the old frame.
+            }
+            source.grant()
+            source.start(at: clock.date)
+            source.deferStop = true
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            controller.requestFrame { result in
+                if case .failure(let error) = result { XCTFail("\(error)") }
+                delivered += 1
+            }
+            XCTAssertEqual(delivered, 0)
+            XCTAssertEqual(source.streamStops, 1)
+            source.stopped?()
+            XCTAssertEqual(delivered, 2)
+            XCTAssertEqual(source.resumes, 1)
+            XCTAssertEqual(source.permissionRequests, 1)
+            XCTAssertEqual(controller.state, .starting)
+        }
+    }
+
+    @MainActor
+    func testBurstStopCompletionCannotDeliverAfterBackgrounding() throws {
+        try withController(strategy: .burst) { controller, source, clock, _ in
+            var results: [Result<UIImage, ScreenCaptureError>] = []
+            controller.requestFrame { results.append($0) }
+            source.grant()
+            source.start(at: clock.date)
+            source.deferStop = true
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertTrue(results.isEmpty)
+            controller.sceneDidChange(isActive: false)
+            source.stopped?()
+            XCTAssertEqual(results.count, 1)
+            guard case .failure? = results.first else { return XCTFail("Expected stopped request") }
+            XCTAssertEqual(controller.state, .idle)
+        }
+    }
+
+    @MainActor
+    func testStrategyPersistenceDefaultAndSwitchStopsContinuous() throws {
+        try withController { controller, source, clock, log in
+            XCTAssertEqual(controller.strategy, .continuous)
+            controller.requestFrame { if case .failure(let error) = $0 { XCTFail("\(error)") } }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            controller.setStrategy(.burst)
+            XCTAssertEqual(controller.state, .idle)
+            XCTAssertEqual(source.stops, 1)
+            let suite = "StrategyPersistence.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let first = ScreenCaptureController(log: log, defaults: defaults, source: FakeScreenCaptureSource(), schedulesTimers: false)
+            XCTAssertEqual(first.strategy, .continuous)
+            first.setStrategy(.burst)
+            XCTAssertEqual(defaults.string(forKey: "screenCaptureStrategy"), "burst")
+            let second = ScreenCaptureController(log: log, defaults: defaults, source: FakeScreenCaptureSource(), schedulesTimers: false)
+            XCTAssertEqual(second.strategy, .burst)
+            defaults.set("unknown", forKey: "screenCaptureStrategy")
+            let fallback = ScreenCaptureController(log: log, defaults: defaults, source: FakeScreenCaptureSource(), schedulesTimers: false)
+            XCTAssertEqual(fallback.strategy, .continuous)
         }
     }
 

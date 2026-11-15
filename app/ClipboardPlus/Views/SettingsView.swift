@@ -5,6 +5,8 @@ struct SettingsView: View {
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
     @ObservedObject var pictureInPicture: PictureInPictureController
+    let screenCapture: ScreenCaptureController
+    let screenshots: ScreenshotWatcher
     @State private var showLogs = false
     @State private var showDeveloperSettings = false
     @State private var export: ExportSnapshot?
@@ -31,6 +33,7 @@ struct SettingsView: View {
                     Text("0.1〜5.0秒。間隔と記録の状態は、アプリを開き直しても保持します。")
                         .font(.footnote)
                 }
+                CaptureSettingsSection(screenCapture: screenCapture, screenshots: screenshots)
                 Section("履歴の保存") {
                     Picker("自動削除", selection: Binding(
                         get: { monitor.historyRetention },

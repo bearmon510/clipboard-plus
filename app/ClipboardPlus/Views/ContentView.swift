@@ -23,6 +23,7 @@ struct ContentView: View {
     @State private var copiedTask: Task<Void, Never>?
     @State private var isDropTargeted = false
     @StateObject private var screenCapture: ScreenCaptureController
+    @StateObject private var screenshots: ScreenshotWatcher
     @State private var capture: CaptureRequest?
     /// The mode whose button is waiting for a picture of the screen.
     @State private var capturePending: CaptureMode?
@@ -33,6 +34,8 @@ struct ContentView: View {
         let id = UUID()
         let source: CaptureSource
         let mode: CaptureMode
+        /// The Photos asset when the picture came from an iPad screenshot.
+        var screenshotID: String? = nil
     }
 
     /// `initialSearch` lets previews and screenshot tests open the screen mid-search.
@@ -41,6 +44,7 @@ struct ContentView: View {
         self.log = log
         _pictureInPicture = StateObject(wrappedValue: PictureInPictureController(monitor: monitor))
         _screenCapture = StateObject(wrappedValue: ScreenCaptureController(log: log))
+        _screenshots = StateObject(wrappedValue: ScreenshotWatcher(log: log))
         _searchText = State(initialValue: initialSearch)
     }
 
@@ -63,32 +67,34 @@ struct ContentView: View {
                         guard capture?.id == request.id else { return }
                         monitor.saveCaptured(text: text)
                         screenCapture.noteCaptureUsed()
+                        if let id = request.screenshotID { screenshots.markUsed(id) }
                         showToast("文字をコピーしました：" + Self.toastPreview(text))
                     },
                     onImage: { data in
                         guard capture?.id == request.id else { return }
                         monitor.saveCaptured(pngData: data)
                         screenCapture.noteCaptureUsed()
+                        if let id = request.screenshotID { screenshots.markUsed(id) }
                         showToast("画像をコピーしました")
                     },
                     onClose: { if capture?.id == request.id { capture = nil } }
                 )
             }
-            // A shortcut delivers its screenshot here. Other sheets close so the picture can open.
+            // A shortcut delivers its screenshot here.
             .onReceive(CaptureInbox.shared.$pending) { pending in
                 guard let pending else { return }
                 CaptureInbox.shared.pending = nil
-                let wasPresenting = showSettings || showCaptureGuide || detailEntry != nil
-                showSettings = false
-                showCaptureGuide = false
-                detailEntry = nil
-                let request = CaptureRequest(source: pending, mode: .text)
-                if wasPresenting {
-                    // A new cover cannot open while another sheet is still closing.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { capture = request }
-                } else {
-                    capture = request
-                }
+                openFromOutside(CaptureRequest(source: pending, mode: .text))
+            }
+            // An iPad screenshot, picked up from Photos when that experiment is on.
+            .onReceive(screenshots.$delivered) { delivered in
+                guard let delivered else { return }
+                screenshots.delivered = nil
+                // A capture already on screen is not replaced by a newer screenshot.
+                guard capture == nil else { return }
+                openFromOutside(CaptureRequest(source: CaptureSource(image: delivered.image),
+                                               mode: CaptureSettings.screenshotMode(),
+                                               screenshotID: delivered.id))
             }
     }
 
@@ -123,10 +129,12 @@ struct ContentView: View {
             // Only leaving the screen stops it: a side window turns inactive whenever
             // another app is touched, and the system picker does the same.
             screenCapture.sceneDidChange(isActive: phase != .background)
+            screenshots.sceneDidChange(isActive: phase != .background)
         }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings) {
-            SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture)
+            SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture,
+                         screenCapture: screenCapture, screenshots: screenshots)
         }
         .sheet(item: $detailEntry) { entry in detail(entry) }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
@@ -263,7 +271,7 @@ struct ContentView: View {
             } else {
                 Button("記録を再開", systemImage: "play") { monitor.start() }
             }
-            if screenCapture.state == .running {
+            if screenCapture.state != .idle && screenCapture.state != .unsupported {
                 Button("画面の取り込みを止める", systemImage: "stop.circle") {
                     screenCapture.stop(reason: "メニューから停止")
                 }
@@ -710,6 +718,20 @@ struct ContentView: View {
             case .failure(.failed):
                 showToast("画面を取り込めませんでした")
             }
+        }
+    }
+
+    /// Opens a picture that arrived from outside the screen: a shortcut or a screenshot.
+    /// Other sheets close first, because a cover cannot open while a sheet is closing.
+    private func openFromOutside(_ request: CaptureRequest) {
+        let wasPresenting = showSettings || showCaptureGuide || detailEntry != nil
+        showSettings = false
+        showCaptureGuide = false
+        detailEntry = nil
+        if wasPresenting {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { capture = request }
+        } else {
+            capture = request
         }
     }
 
