@@ -216,6 +216,51 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         completion?(true)
     }
 
+    // MARK: Content made inside the app
+
+    /// Saves text read from a picture and puts it on the pasteboard, ready to paste.
+    func saveCaptured(text: String) {
+        guard !text.isEmpty else { return }
+        let now = Date()
+        admit(text, source: "切り取り", route: .capture, timestamp: now, count: pasteboard.changeCount)
+        record("切り取りの文字を保存", text: text, timestamp: now)
+        guard !isCopying && !isWriting && !isReading else { return }
+        readBeforeCopy()
+        store.resetImageAdmission()
+        isWriting = true
+        // The next read sees our own text and must not count it a second time.
+        admission.recordSelfCopy(text)
+        pasteboard.string = text
+        isWriting = false
+        if isRecording {
+            readIfChanged(count: pasteboard.changeCount, source: "自己コピー後の確認", detections: [])
+        }
+    }
+
+    /// Saves a cut-out picture (PNG data) and puts it on the pasteboard.
+    func saveCaptured(pngData data: Data) {
+        let now = Date()
+        admitImage(.data(data, typeIdentifier: "public.png"), route: .capture, timestamp: now,
+                   details: "切り取り; バイト数=\(data.count)")
+        guard !isCopying && !isWriting && !isReading, let hash = try? HistoryImageFiles.hash(data) else { return }
+        readBeforeCopy()
+        admission.discardPendingSelfCopy()
+        isWriting = true
+        pasteboard.setData(data, forPasteboardType: "public.png")
+        store.recordImageCopy(hash: hash, changeCount: pasteboard.changeCount)
+        isWriting = false
+        if isRecording {
+            readIfChanged(count: pasteboard.changeCount, source: "自己コピー後の確認", detections: [])
+        }
+    }
+
+    /// The original data of a saved picture, read off the main thread.
+    func imageData(_ image: HistoryImage, completion: @escaping (Data?) -> Void) {
+        store.readImage(image) { result in
+            if case .success(let data) = result { completion(data) } else { completion(nil) }
+        }
+    }
+
     func imageURL(_ image: HistoryImage, thumbnail: Bool) -> URL {
         store.imageFiles.url(for: thumbnail ? image.thumbnailFilename : image.filename)
     }

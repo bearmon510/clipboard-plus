@@ -57,6 +57,43 @@ final class ScreenSnapshotTests: XCTestCase {
         try save(render(EntryDetailView(entry: entry) {}, size: Self.narrow, style: .light), "detail-narrow-light")
     }
 
+    @MainActor
+    func testRenderCaptureScreens() throws {
+        let source = CaptureSource(image: Self.sampleScreenshot())
+        let chosen = CaptureView(source: source, initialSelection: CGRect(x: 0.08, y: 0.2, width: 0.6, height: 0.28),
+                                 onText: { _ in }, onImage: { _ in }, onClose: {})
+        try save(render(chosen, size: Self.wide, style: .light), "capture-wide-selected")
+        let untouched = CaptureView(source: source, onText: { _ in }, onImage: { _ in }, onClose: {})
+        try save(render(untouched, size: Self.narrow, style: .light), "capture-narrow-whole")
+        try save(render(CaptureGuideView(), size: Self.narrow, style: .light), "capture-guide-narrow-light")
+    }
+
+    /// A made-up page standing in for a screenshot of another app.
+    private static func sampleScreenshot() -> UIImage {
+        let size = CGSize(width: 1_024, height: 768)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            UIColor(white: 0.93, alpha: 1).setFill()
+            context.fill(CGRect(x: 0, y: 0, width: size.width, height: 64))
+            ("試験用のページ" as NSString).draw(at: CGPoint(x: 32, y: 18), withAttributes: [
+                .font: UIFont.systemFont(ofSize: 24, weight: .semibold), .foregroundColor: UIColor.black,
+            ])
+            let lines = ["クリップボードの使い方", "コピーした文章や画像は、自動で履歴に残ります。",
+                         "必要な部分だけを切り取って、文字として読み取れます。", "問い合わせ先：hello@example.com"]
+            for (index, line) in lines.enumerated() {
+                (line as NSString).draw(at: CGPoint(x: 96, y: 170 + CGFloat(index) * 52), withAttributes: [
+                    .font: UIFont.systemFont(ofSize: index == 0 ? 34 : 24, weight: index == 0 ? .bold : .regular),
+                    .foregroundColor: UIColor.darkGray,
+                ])
+            }
+            UIColor(red: 0.18, green: 0.42, blue: 0.94, alpha: 1).setFill()
+            context.fill(CGRect(x: 96, y: 460, width: 360, height: 200))
+        }
+    }
+
     // MARK: Sample data
 
     @MainActor

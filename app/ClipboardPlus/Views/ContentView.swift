@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -21,6 +22,8 @@ struct ContentView: View {
     @State private var copiedID: Int?
     @State private var copiedTask: Task<Void, Never>?
     @State private var isDropTargeted = false
+    @State private var captureSource: CaptureSource?
+    @State private var showCaptureGuide = false
 
     /// `initialSearch` lets previews and screenshot tests open the screen mid-search.
     init(monitor: ClipboardMonitor, log: MeasurementLog, initialSearch: String = "") {
@@ -37,6 +40,37 @@ struct ContentView: View {
     private var separatesPinned: Bool { filter == .all && query.isEmpty }
 
     var body: some View {
+        screen
+            .sheet(isPresented: $showCaptureGuide) { CaptureGuideView() }
+            .fullScreenCover(item: $captureSource) { source in
+                CaptureView(
+                    source: source,
+                    onText: { monitor.saveCaptured(text: $0) },
+                    onImage: { data in
+                        monitor.saveCaptured(pngData: data)
+                        showToast("切り取った画像を保存してコピーしました")
+                    },
+                    onClose: { captureSource = nil }
+                )
+            }
+            // A shortcut delivers its screenshot here. Other sheets close so the picture can open.
+            .onReceive(CaptureInbox.shared.$pending) { pending in
+                guard let pending else { return }
+                CaptureInbox.shared.pending = nil
+                let wasPresenting = showSettings || showCaptureGuide || detailEntry != nil
+                showSettings = false
+                showCaptureGuide = false
+                detailEntry = nil
+                if wasPresenting {
+                    // A new cover cannot open while another sheet is still closing.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { captureSource = pending }
+                } else {
+                    captureSource = pending
+                }
+            }
+    }
+
+    private var screen: some View {
         VStack(spacing: 0) {
             topBar
             statusStrip
@@ -173,6 +207,7 @@ struct ContentView: View {
 
     private var moreMenu: some View {
         Menu {
+            Button("画面の切り取り…", systemImage: "crop") { showCaptureGuide = true }
             Button("設定", systemImage: "gearshape") { showSettings = true }
             Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
                 confirmHistoryClear = true
@@ -424,6 +459,10 @@ struct ContentView: View {
         Button(entry.kind == .image ? "拡大表示" : "全文を表示", systemImage: "arrow.up.left.and.arrow.down.right") {
             detailEntry = entry
         }
+        if entry.kind == .image {
+            Button("文字を読み取る", systemImage: "text.viewfinder") { readText(of: entry) }
+            Button("切り取る…", systemImage: "crop") { openCapture(entry) }
+        }
         if entry.kind == .url, let url = URL(string: entry.text.trimmingCharacters(in: .whitespacesAndNewlines)) {
             Button("リンクを開く", systemImage: "safari") { openURL(url) }
         }
@@ -580,6 +619,45 @@ struct ContentView: View {
                 showCopied(entry.id)
             } else {
                 showToast("コピーできませんでした")
+            }
+        }
+    }
+
+    /// Opens a saved picture so that a part of it can be cut out or read.
+    private func openCapture(_ entry: HistoryEntry) {
+        guard let image = entry.image else { return }
+        monitor.imageData(image) { data in
+            guard let data, let picture = UIImage(data: data) else {
+                showToast("画像を読み込めませんでした")
+                return
+            }
+            captureSource = CaptureSource(image: picture)
+        }
+    }
+
+    /// Reads all the text in a saved picture, saves it as a new item and copies it.
+    private func readText(of entry: HistoryEntry) {
+        guard let image = entry.image else { return }
+        showToast("文字を読み取っています…")
+        monitor.imageData(image) { data in
+            guard let data, let picture = UIImage(data: data),
+                  let pixels = CaptureSource(image: picture).image.cgImage else {
+                showToast("画像を読み込めませんでした")
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Result { try TextRecognizer.text(in: pixels) }
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let text) where !text.isEmpty:
+                        monitor.saveCaptured(text: text)
+                        showToast("文字を読み取ってコピーしました")
+                    case .success:
+                        showToast("文字が見つかりませんでした")
+                    case .failure:
+                        showToast("文字を読み取れませんでした")
+                    }
+                }
             }
         }
     }

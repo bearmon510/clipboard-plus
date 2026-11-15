@@ -17,6 +17,8 @@ enum HistoryKind: String, Codable {
 
 enum HistorySource: String, Codable {
     case automatic, manual, drag
+    /// Made inside the app from a picture: a cut-out part, or text read from it.
+    case capture
 }
 
 enum HistoryCollectionCount {

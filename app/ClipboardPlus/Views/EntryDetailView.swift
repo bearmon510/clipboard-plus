@@ -117,6 +117,7 @@ struct EntryDetailView: View {
         case .automatic: return "自動"
         case .manual: return "ペースト"
         case .drag: return "ドラッグ"
+        case .capture: return "切り取り"
         }
     }
 }
