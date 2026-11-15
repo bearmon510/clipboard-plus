@@ -29,10 +29,11 @@ final class PhotoScreenshotLibrary: ScreenshotLibrary {
 
     func startObserving(onChange: @escaping @MainActor (Date) -> Void) {
         stopObserving()
-        let observer = ScreenshotPhotoObserver(worker: worker, onChange: onChange)
+        let session = UUID()
+        let observer = ScreenshotPhotoObserver(worker: worker, session: session, onChange: onChange)
         self.observer = observer
         PHPhotoLibrary.shared().register(observer)
-        worker.startTracking()
+        worker.startTracking(session: session)
     }
 
     func stopObserving() {
@@ -41,8 +42,17 @@ final class PhotoScreenshotLibrary: ScreenshotLibrary {
         worker.stopTracking()
     }
 
-    func latestScreenshot(since: Date, completion: @escaping @MainActor (ScreenshotAsset?) -> Void) {
-        worker.latestScreenshot(since: since, completion: completion)
+    func screenshots(since: Date, completion: @escaping @MainActor ([ScreenshotAsset]) -> Void) {
+        worker.screenshots(since: since, completion: completion)
+    }
+
+    // Shared with the request path so tests can inspect the actual options.
+    nonisolated static func imageRequestOptions() -> PHImageRequestOptions {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.isSynchronous = true
+        options.version = .current
+        return options
     }
 
     func loadImage(for asset: ScreenshotAsset, completion: @escaping @MainActor (Result<UIImage, Error>) -> Void) {
@@ -56,17 +66,18 @@ final class PhotoScreenshotLibrary: ScreenshotLibrary {
 
 private final class ScreenshotPhotoObserver: NSObject, PHPhotoLibraryChangeObserver {
     private let worker: ScreenshotPhotoWorker
+    private let session: UUID
     private let onChange: @MainActor (Date) -> Void
 
-    init(worker: ScreenshotPhotoWorker, onChange: @escaping @MainActor (Date) -> Void) {
+    init(worker: ScreenshotPhotoWorker, session: UUID, onChange: @escaping @MainActor (Date) -> Void) {
         self.worker = worker
+        self.session = session
         self.onChange = onChange
     }
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
         let date = Date()
-        worker.updateTracking(changeInstance)
-        DispatchQueue.main.async { [onChange] in onChange(date) }
+        worker.updateTracking(changeInstance, at: date, session: session, onChange: onChange)
     }
 }
 
@@ -79,38 +90,63 @@ private final class ScreenshotPhotoWorker {
     // Retain a fetch result so PhotoKit can report newly inserted screenshots
     // even before the first UIApplication notification or search has occurred.
     private var tracked: PHFetchResult<PHAsset>?
+    private var session: UUID?
+    private var inserted: [String: Date] = [:]
 
-    func startTracking() {
+    func startTracking(session: UUID) {
         queue.async { [self] in
+            self.session = session
+            inserted.removeAll()
             let options = PHFetchOptions()
             options.predicate = NSPredicate(format: "(mediaSubtype & %d) != 0", PHAssetMediaSubtype.photoScreenshot.rawValue)
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-            options.fetchLimit = 1
+            // Track the entire screenshot result. A limit of one can hide real
+            // insertions behind an old asset with a future creationDate.
+            options.wantsIncrementalChangeDetails = true
             tracked = PHAsset.fetchAssets(with: .image, options: options)
         }
     }
 
-    func stopTracking() { queue.async { [self] in tracked = nil } }
-
-    func updateTracking(_ change: PHChange) {
+    func stopTracking() {
         queue.async { [self] in
-            guard let tracked, let details = change.changeDetails(for: tracked) else { return }
-            self.tracked = details.fetchResultAfterChanges
+            session = nil
+            tracked = nil
+            inserted.removeAll()
         }
     }
 
-    func latestScreenshot(since: Date, completion: @escaping @MainActor (ScreenshotAsset?) -> Void) {
-        queue.async {
-            let options = PHFetchOptions()
-            options.predicate = NSPredicate(format: "(mediaSubtype & %d) != 0 AND creationDate >= %@",
-                                            PHAssetMediaSubtype.photoScreenshot.rawValue, since as NSDate)
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-            options.fetchLimit = 1
-            let asset = PHAsset.fetchAssets(with: .image, options: options).firstObject
-            let result = asset.flatMap { asset in
-                asset.creationDate.map { ScreenshotAsset(id: asset.localIdentifier, takenAt: $0) }
+    func updateTracking(_ change: PHChange, at date: Date, session: UUID,
+                        onChange: @escaping @MainActor (Date) -> Void) {
+        queue.async { [self] in
+            guard self.session == session, let tracked,
+                  let details = change.changeDetails(for: tracked) else { return }
+            self.tracked = details.fetchResultAfterChanges
+            // A full reload supplies no insertion evidence. Never infer it by
+            // comparing dates or by treating the replacement result as new.
+            guard details.hasIncrementalChanges else {
+                inserted.removeAll()
+                return
             }
-            DispatchQueue.main.async { completion(result) }
+            for asset in details.removedObjects { inserted.removeValue(forKey: asset.localIdentifier) }
+            for asset in details.insertedObjects {
+                if inserted[asset.localIdentifier] == nil { inserted[asset.localIdentifier] = date }
+            }
+            // Notify only after the insertion ledger and retained result agree.
+            DispatchQueue.main.async { onChange(date) }
+        }
+    }
+
+    func screenshots(since: Date, completion: @escaping @MainActor ([ScreenshotAsset]) -> Void) {
+        queue.async { [self] in
+            let fetched = PHAsset.fetchAssets(withLocalIdentifiers: Array(inserted.keys), options: nil)
+            var result: [ScreenshotAsset] = []
+            fetched.enumerateObjects { [self] asset, _, _ in
+                guard asset.mediaSubtypes.contains(.photoScreenshot),
+                      let date = asset.creationDate, date >= since,
+                      let insertedAt = inserted[asset.localIdentifier] else { return }
+                result.append(ScreenshotAsset(id: asset.localIdentifier, takenAt: date, insertedAt: insertedAt))
+            }
+            let candidates = result
+            DispatchQueue.main.async { completion(candidates) }
         }
     }
 
@@ -121,10 +157,7 @@ private final class ScreenshotPhotoWorker {
                 DispatchQueue.main.async { completion(.failure(ScreenshotLibraryError.imageUnavailable)) }
                 return
             }
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = false
-            options.isSynchronous = true
-            options.version = .original
+            let options = PhotoScreenshotLibrary.imageRequestOptions()
             imageManager.requestImageDataAndOrientation(for: photo, options: options) { [self] data, _, orientation, info in
                 // Explicitly enqueue decoding too: PhotoKit chooses its callback queue.
                 queue.async { [self] in

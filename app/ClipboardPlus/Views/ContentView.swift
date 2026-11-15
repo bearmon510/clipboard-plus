@@ -28,6 +28,8 @@ struct ContentView: View {
     /// The mode whose button is waiting for a picture of the screen.
     @State private var capturePending: CaptureMode?
     @State private var showCaptureGuide = false
+    /// A capture waiting for an open sheet to finish closing. Opened from the sheet's onDismiss.
+    @State private var queuedCapture: CaptureRequest?
 
     /// A still picture to choose from, and what to do with the chosen part.
     struct CaptureRequest: Identifiable {
@@ -56,7 +58,7 @@ struct ContentView: View {
 
     var body: some View {
         screen
-            .sheet(isPresented: $showCaptureGuide) { CaptureGuideView() }
+            .sheet(isPresented: $showCaptureGuide, onDismiss: presentQueuedCapture) { CaptureGuideView() }
             .fullScreenCover(item: $capture) { request in
                 CaptureView(
                     source: request.source,
@@ -89,9 +91,11 @@ struct ContentView: View {
             // An iPad screenshot, picked up from Photos when that experiment is on.
             .onReceive(screenshots.$delivered) { delivered in
                 guard let delivered else { return }
-                screenshots.delivered = nil
-                // A capture already on screen is not replaced by a newer screenshot.
-                guard capture == nil else { return }
+                // @Published announces a value before storing it, so clearing it right here
+                // would be overwritten. Clear it on the next turn, and only if it is unchanged.
+                DispatchQueue.main.async {
+                    if screenshots.delivered?.id == delivered.id { screenshots.delivered = nil }
+                }
                 openFromOutside(CaptureRequest(source: CaptureSource(image: delivered.image),
                                                mode: CaptureSettings.screenshotMode(),
                                                screenshotID: delivered.id))
@@ -120,6 +124,8 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
+            // A capture queued behind a sheet is dropped when the app leaves the screen.
+            if phase == .background { queuedCapture = nil }
             if phase == .active {
                 monitor.pendingDeletion { showUndo($0) }
                 // Marks the system permission screen going away, so that the first capture
@@ -132,11 +138,11 @@ struct ContentView: View {
             screenshots.sceneDidChange(isActive: phase != .background)
         }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
-        .sheet(isPresented: $showSettings) {
+        .sheet(isPresented: $showSettings, onDismiss: presentQueuedCapture) {
             SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture,
                          screenCapture: screenCapture, screenshots: screenshots)
         }
-        .sheet(item: $detailEntry) { entry in detail(entry) }
+        .sheet(item: $detailEntry, onDismiss: presentQueuedCapture) { entry in detail(entry) }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
             Button("ピン留めを残して消去", role: .destructive) {
                 monitor.deleteAllHistory(includePinned: false) { showUndo($0) }
@@ -708,6 +714,8 @@ struct ContentView: View {
             capturePending = nil
             switch result {
             case .success(let image):
+                // Something else may have opened while the screen was being taken in.
+                guard capture == nil, queuedCapture == nil else { return }
                 capture = CaptureRequest(source: CaptureSource(image: image), mode: mode)
             case .failure(.unsupported):
                 showCaptureGuide = true
@@ -722,17 +730,29 @@ struct ContentView: View {
     }
 
     /// Opens a picture that arrived from outside the screen: a shortcut or a screenshot.
-    /// Other sheets close first, because a cover cannot open while a sheet is closing.
+    /// Nothing replaces a capture already on screen or one being taken in. When a sheet is
+    /// open, the picture waits until that sheet has finished closing.
     private func openFromOutside(_ request: CaptureRequest) {
-        let wasPresenting = showSettings || showCaptureGuide || detailEntry != nil
+        guard capture == nil, capturePending == nil else { return }
+        let isPresenting = showSettings || showCaptureGuide || detailEntry != nil
+        guard isPresenting else {
+            queuedCapture = nil
+            capture = request
+            return
+        }
+        // Only the newest arrival waits; an older one is simply replaced.
+        queuedCapture = request
         showSettings = false
         showCaptureGuide = false
         detailEntry = nil
-        if wasPresenting {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { capture = request }
-        } else {
-            capture = request
-        }
+    }
+
+    /// Called when a sheet has finished closing.
+    private func presentQueuedCapture() {
+        guard let request = queuedCapture else { return }
+        queuedCapture = nil
+        guard capture == nil else { return }
+        capture = request
     }
 
     /// Opens a saved picture so that a part of it can be cut out or read.

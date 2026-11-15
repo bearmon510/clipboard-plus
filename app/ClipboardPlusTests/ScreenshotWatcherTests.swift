@@ -1,4 +1,5 @@
 import Combine
+import Photos
 import UIKit
 import XCTest
 @testable import ClipboardPlus
@@ -27,7 +28,7 @@ private final class FakeScreenshotLibrary: ScreenshotLibrary {
     var deferLoad = false
     var deferDelete = false
     var accessCompletion: (@MainActor (ScreenshotWatcher.Access) -> Void)?
-    var fetchCompletion: (@MainActor (ScreenshotAsset?) -> Void)?
+    var fetchCompletion: (@MainActor ([ScreenshotAsset]) -> Void)?
     var loadCompletion: (@MainActor (Result<UIImage, Error>) -> Void)?
     var deleteCompletion: (@MainActor (Result<Int, Error>) -> Void)?
     var loadError: Error?
@@ -40,13 +41,23 @@ private final class FakeScreenshotLibrary: ScreenshotLibrary {
     }
     func startObserving(onChange: @escaping @MainActor (Date) -> Void) {
         observations += 1
+        assets = assets.map { var asset = $0; asset.insertedAt = nil; return asset }
         self.onChange = onChange
     }
     func stopObserving() { observationStops += 1; onChange = nil }
-    func latestScreenshot(since: Date, completion: @escaping @MainActor (ScreenshotAsset?) -> Void) {
+    // Existing photos have no insertion evidence. Only inserts while observing do.
+    func insert(_ additions: [ScreenshotAsset], at date: Date, notify: Bool = false) {
+        assets.append(contentsOf: additions.map {
+            var asset = $0
+            asset.insertedAt = onChange == nil ? nil : date
+            return asset
+        })
+        if notify { onChange?(date) }
+    }
+    func screenshots(since: Date, completion: @escaping @MainActor ([ScreenshotAsset]) -> Void) {
         queries.append(since)
         if deferFetch { fetchCompletion = completion; return }
-        completion(assets.filter { !respectsWindow || $0.takenAt >= since }.max { $0.takenAt < $1.takenAt })
+        completion(assets.filter { !respectsWindow || $0.takenAt >= since })
     }
     func loadImage(for asset: ScreenshotAsset, completion: @escaping @MainActor (Result<UIImage, Error>) -> Void) {
         loads.append(asset.id)
@@ -96,7 +107,7 @@ final class ScreenshotWatcherTests: XCTestCase {
             center.post(name: UIApplication.userDidTakeScreenshotNotification, object: nil)
             XCTAssertTrue(library.queries.isEmpty)
             watcher.setEnabled(true)
-            library.assets = [ScreenshotAsset(id: "notification", takenAt: clock.date)]
+            library.insert([ScreenshotAsset(id: "notification", takenAt: clock.date)], at: clock.date)
             let done = expectation(description: "system notification delivered")
             let subscription = watcher.$delivered.compactMap { $0 }.sink { _ in done.fulfill() }
             defer { subscription.cancel() }
@@ -117,7 +128,7 @@ final class ScreenshotWatcherTests: XCTestCase {
         try withWatcher { watcher, library, clock, _, _ in
             watcher.setEnabled(true)
             library.deferLoad = true
-            library.assets = [ScreenshotAsset(id: "large-local-image", takenAt: clock.date)]
+            library.insert([ScreenshotAsset(id: "large-local-image", takenAt: clock.date)], at: clock.date)
             watcher.receive(.notification, at: clock.date)
             clock.advance(5)
             watcher.checkForScreenshot()
@@ -132,7 +143,7 @@ final class ScreenshotWatcherTests: XCTestCase {
             try withWatcher { watcher, library, clock, _, log in
                 watcher.setEnabled(true)
                 clock.advance(1)
-                library.assets = [ScreenshotAsset(id: "test-shot", takenAt: clock.date)]
+                library.insert([ScreenshotAsset(id: "test-shot", takenAt: clock.date)], at: clock.date)
                 library.deferLoad = true
                 var deliveries = 0
                 let subscription = watcher.$delivered.compactMap { $0 }.sink { _ in deliveries += 1 }
@@ -163,7 +174,7 @@ final class ScreenshotWatcherTests: XCTestCase {
                 watcher.setEnabled(true)
                 clock.advance(30)
                 library.respectsWindow = false // Controller also validates the adapter's result.
-                library.assets = [ScreenshotAsset(id: "old", takenAt: clock.date.addingTimeInterval(-age))]
+                library.insert([ScreenshotAsset(id: "old", takenAt: clock.date.addingTimeInterval(-age))], at: clock.date)
                 watcher.receive(.notification, at: clock.date)
                 XCTAssertEqual(library.queries.first, max(enabledAt, clock.date.addingTimeInterval(-15)))
                 XCTAssertNil(watcher.delivered)
@@ -181,18 +192,18 @@ final class ScreenshotWatcherTests: XCTestCase {
     }
 
     @MainActor
-    func testAcceptsExactFifteenSecondBoundaryAndChoosesNewest() throws {
+    func testFallbackAcceptsExactTenSecondBoundaryAndChoosesNewest() throws {
         try withWatcher { watcher, library, clock, _, _ in
             watcher.setEnabled(true)
             clock.advance(30)
-            library.assets = [ScreenshotAsset(id: "boundary", takenAt: clock.date.addingTimeInterval(-15)),
-                              ScreenshotAsset(id: "too-old", takenAt: clock.date.addingTimeInterval(-16))]
+            library.insert([ScreenshotAsset(id: "boundary", takenAt: clock.date.addingTimeInterval(-10)),
+                              ScreenshotAsset(id: "too-old", takenAt: clock.date.addingTimeInterval(-10.01))], at: clock.date)
             watcher.receive(.libraryChange, at: clock.date)
             XCTAssertEqual(watcher.delivered?.id, "boundary")
             watcher.delivered = nil
             clock.advance(1)
-            library.assets.append(ScreenshotAsset(id: "newest", takenAt: clock.date))
-            library.assets.append(ScreenshotAsset(id: "older", takenAt: clock.date.addingTimeInterval(-2)))
+            library.insert([ScreenshotAsset(id: "newest", takenAt: clock.date)], at: clock.date)
+            library.insert([ScreenshotAsset(id: "older", takenAt: clock.date.addingTimeInterval(-2))], at: clock.date)
             library.onChange?(clock.date)
             XCTAssertEqual(watcher.delivered?.id, "newest")
         }
@@ -211,7 +222,7 @@ final class ScreenshotWatcherTests: XCTestCase {
             clock.advance(0.02)
             watcher.checkForScreenshot()
             XCTAssertEqual(library.queries.count, 2)
-            library.assets = [ScreenshotAsset(id: "delayed", takenAt: clock.date)]
+            library.insert([ScreenshotAsset(id: "delayed", takenAt: clock.date)], at: clock.date)
             clock.advance(0.31)
             watcher.checkForScreenshot()
             XCTAssertEqual(watcher.delivered?.id, "delayed")
@@ -252,9 +263,9 @@ final class ScreenshotWatcherTests: XCTestCase {
             clock.advance(4)
             watcher.checkForScreenshot()
             watcher.receive(.libraryChange, at: clock.date)
-            old?(ScreenshotAsset(id: "late", takenAt: clock.date))
+            old?([ScreenshotAsset(id: "late", takenAt: clock.date, insertedAt: clock.date)])
             XCTAssertTrue(library.loads.isEmpty)
-            library.fetchCompletion?(ScreenshotAsset(id: "current", takenAt: clock.date))
+            library.fetchCompletion?([ScreenshotAsset(id: "current", takenAt: clock.date, insertedAt: clock.date)])
             XCTAssertEqual(watcher.delivered?.id, "current")
         }
     }
@@ -292,7 +303,7 @@ final class ScreenshotWatcherTests: XCTestCase {
     func testBackgroundStopsObserversAndRejectsLateImageThenResumes() throws {
         try withWatcher { watcher, library, clock, _, _ in
             watcher.setEnabled(true)
-            library.assets = [ScreenshotAsset(id: "in-flight", takenAt: clock.date)]
+            library.insert([ScreenshotAsset(id: "in-flight", takenAt: clock.date)], at: clock.date)
             library.deferLoad = true
             watcher.receive(.notification, at: clock.date)
             let oldChange = library.onChange
@@ -307,7 +318,8 @@ final class ScreenshotWatcherTests: XCTestCase {
             watcher.sceneDidChange(isActive: true)
             XCTAssertEqual(library.observations, 2)
             library.deferLoad = false
-            library.assets = [ScreenshotAsset(id: "new", takenAt: clock.date)]
+            library.insert([ScreenshotAsset(id: "new", takenAt: clock.date)], at: clock.date)
+            watcher.receive(.notification, at: clock.date)
             library.onChange?(clock.date)
             XCTAssertEqual(watcher.delivered?.id, "new")
         }
@@ -389,7 +401,7 @@ final class ScreenshotWatcherTests: XCTestCase {
     func testUnavailableImageRetriesThenReportsFailureReason() throws {
         try withWatcher { watcher, library, clock, _, log in
             watcher.setEnabled(true)
-            library.assets = [ScreenshotAsset(id: "cloud-only", takenAt: clock.date)]
+            library.insert([ScreenshotAsset(id: "cloud-only", takenAt: clock.date)], at: clock.date)
             library.loadError = ScreenshotLibraryError.imageUnavailable
             watcher.receive(.notification, at: clock.date)
             clock.advance(0.31)
@@ -399,6 +411,184 @@ final class ScreenshotWatcherTests: XCTestCase {
             watcher.checkForScreenshot()
             XCTAssertNil(watcher.delivered)
             XCTAssertTrue(log.lines.contains { $0.fileLine.contains("reason=image unavailable") })
+        }
+    }
+
+    func testPhotoImageRequestUsesEditedCurrentVersionWithoutNetwork() {
+        let options = PhotoScreenshotLibrary.imageRequestOptions()
+        XCTAssertEqual(options.version, PHImageRequestOptionsVersion.current)
+        XCTAssertFalse(options.isNetworkAccessAllowed)
+        XCTAssertTrue(options.isSynchronous)
+    }
+
+    @MainActor
+    func testExistingAssetsIncludingFutureDatesNeverDeliverOrStarveNewInsertion() throws {
+        try withWatcher { watcher, library, clock, _, _ in
+            library.assets = [
+                ScreenshotAsset(id: "existing", takenAt: clock.date),
+                ScreenshotAsset(id: "existing-near-future", takenAt: clock.date.addingTimeInterval(2)),
+                ScreenshotAsset(id: "existing-far-future", takenAt: clock.date.addingTimeInterval(3_600))
+            ]
+            watcher.setEnabled(true)
+            clock.advance(1)
+            // Even a metadata edit making an old photo look recent proves nothing.
+            library.assets[0] = ScreenshotAsset(id: "existing", takenAt: clock.date)
+            library.onChange?(clock.date)
+            XCTAssertNil(watcher.delivered)
+            XCTAssertTrue(library.loads.isEmpty)
+            clock.advance(0.31)
+            library.insert([ScreenshotAsset(id: "new-insertion", takenAt: clock.date)], at: clock.date, notify: true)
+            watcher.checkForScreenshot()
+            XCTAssertEqual(watcher.delivered?.id, "new-insertion")
+            XCTAssertEqual(library.loads, ["new-insertion"])
+        }
+    }
+
+    @MainActor
+    func testNotificationMatchingUsesInsertionTimeWithInclusiveFiveSecondBoundaries() throws {
+        for offset in [-5.01, -5.0, 0, 5.0, 5.01] {
+            try withWatcher { watcher, library, clock, _, _ in
+                watcher.setEnabled(true)
+                watcher.receive(.notification, at: clock.date)
+                clock.advance(20)
+                watcher.checkForScreenshot()
+                if offset < 0 {
+                    library.insert([ScreenshotAsset(id: "candidate", takenAt: clock.date)], at: clock.date, notify: true)
+                    XCTAssertNil(watcher.delivered)
+                    clock.advance(-offset)
+                    watcher.receive(.notification, at: clock.date)
+                } else {
+                    watcher.receive(.notification, at: clock.date)
+                    clock.advance(offset)
+                    library.insert([ScreenshotAsset(id: "candidate", takenAt: clock.date)], at: clock.date, notify: true)
+                    clock.advance(0.31)
+                    watcher.checkForScreenshot()
+                }
+                if abs(offset) <= 5 {
+                    XCTAssertEqual(watcher.delivered?.id, "candidate", "offset=\(offset)")
+                } else {
+                    XCTAssertNil(watcher.delivered, "offset=\(offset)")
+                    XCTAssertTrue(library.loads.isEmpty)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testRecentCreationDateCannotReplaceNotificationInsertionMatch() throws {
+        try withWatcher { watcher, library, clock, _, _ in
+            watcher.setEnabled(true)
+            clock.advance(20)
+            let notificationAt = clock.date
+            watcher.receive(.notification, at: notificationAt)
+            clock.advance(6)
+            // The creation date matches the notification, but insertion does not.
+            library.insert([ScreenshotAsset(id: "synced", takenAt: notificationAt)], at: clock.date, notify: true)
+            XCTAssertNil(watcher.delivered)
+            XCTAssertTrue(library.loads.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testWithoutNotificationsOnlyRecentlyCreatedInsertionsDeliver() throws {
+        for age in [0.0, 10.0, 10.01] {
+            try withWatcher { watcher, library, clock, _, log in
+                watcher.setEnabled(true)
+                clock.advance(30)
+                library.insert([ScreenshotAsset(id: "private-fallback", takenAt: clock.date.addingTimeInterval(-age))],
+                               at: clock.date, notify: true)
+                if age <= 10 {
+                    XCTAssertEqual(watcher.delivered?.id, "private-fallback")
+                    XCTAssertTrue(log.lines.contains { $0.fileLine.contains("route=insertionFallback") })
+                } else {
+                    XCTAssertNil(watcher.delivered)
+                    XCTAssertTrue(library.loads.isEmpty)
+                }
+                XCTAssertFalse(log.lines.contains { $0.fileLine.contains("private-fallback") })
+            }
+        }
+    }
+
+    @MainActor
+    func testFutureCreationDateLimitAppliesToBothDeliveryRoutes() throws {
+        for trigger in [ScreenshotTrigger.notification, .libraryChange] {
+            for future in [5.0, 5.01, 3_600] {
+                try withWatcher { watcher, library, clock, _, log in
+                    watcher.setEnabled(true)
+                    library.insert([ScreenshotAsset(id: "private-future", takenAt: clock.date.addingTimeInterval(future))],
+                                   at: clock.date)
+                    watcher.receive(trigger, at: clock.date)
+                    if future <= 5 {
+                        XCTAssertEqual(watcher.delivered?.id, "private-future")
+                        let route = trigger == .notification ? "notification" : "insertionFallback"
+                        XCTAssertTrue(log.lines.contains { $0.fileLine.contains("route=\(route)") })
+                    } else {
+                        XCTAssertNil(watcher.delivered)
+                        XCTAssertTrue(library.loads.isEmpty)
+                    }
+                    XCTAssertFalse(log.lines.contains { $0.fileLine.contains("private-future") })
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testFutureInsertionCannotStarveValidInsertion() throws {
+        try withWatcher { watcher, library, clock, _, _ in
+            watcher.setEnabled(true)
+            library.insert([
+                ScreenshotAsset(id: "future", takenAt: clock.date.addingTimeInterval(3_600)),
+                ScreenshotAsset(id: "valid", takenAt: clock.date)
+            ], at: clock.date, notify: true)
+            XCTAssertEqual(watcher.delivered?.id, "valid")
+            XCTAssertEqual(library.loads, ["valid"])
+        }
+    }
+
+    @MainActor
+    func testFirstNotificationDuringDecodingRevalidatesFallbackCandidate() throws {
+        for delay in [5.0, 5.01] {
+            try withWatcher { watcher, library, clock, _, log in
+                watcher.setEnabled(true)
+                library.deferLoad = true
+                library.insert([ScreenshotAsset(id: "decoding", takenAt: clock.date)], at: clock.date, notify: true)
+                XCTAssertEqual(library.loads, ["decoding"])
+                clock.advance(delay)
+                watcher.receive(.notification, at: clock.date)
+                library.loadCompletion?(.success(library.image))
+                if delay <= 5 {
+                    XCTAssertEqual(watcher.delivered?.id, "decoding")
+                    XCTAssertTrue(log.lines.contains { $0.fileLine.contains("route=notification") })
+                } else {
+                    XCTAssertNil(watcher.delivered)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testResumeDiscardsInsertionEvidenceAndKeepsNotificationRequirement() throws {
+        try withWatcher { watcher, library, clock, _, _ in
+            watcher.setEnabled(true)
+            library.insert([ScreenshotAsset(id: "before-background", takenAt: clock.date.addingTimeInterval(2))], at: clock.date)
+            watcher.receive(.notification, at: clock.date)
+            watcher.sceneDidChange(isActive: false)
+            clock.advance(1)
+            library.insert([ScreenshotAsset(id: "during-background", takenAt: clock.date)], at: clock.date)
+            clock.advance(1)
+            watcher.sceneDidChange(isActive: true)
+            let loadsBeforeResume = library.loads.count
+            library.onChange?(clock.date)
+            XCTAssertNil(watcher.delivered)
+            XCTAssertEqual(library.loads.count, loadsBeforeResume)
+            clock.advance(0.31)
+            library.insert([ScreenshotAsset(id: "after-resume", takenAt: clock.date)], at: clock.date, notify: true)
+            watcher.checkForScreenshot()
+            XCTAssertNil(watcher.delivered)
+            clock.advance(0.31)
+            watcher.receive(.notification, at: clock.date)
+            watcher.checkForScreenshot()
+            XCTAssertEqual(watcher.delivered?.id, "after-resume")
         }
     }
 }

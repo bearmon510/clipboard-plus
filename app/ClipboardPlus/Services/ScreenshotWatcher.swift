@@ -11,6 +11,8 @@ struct DeliveredScreenshot: Identifiable, Equatable {
 struct ScreenshotAsset: Equatable {
     let id: String
     let takenAt: Date
+    // Only the observer's incremental insertion establishes this timestamp.
+    var insertedAt: Date? = nil
 }
 
 enum ScreenshotTrigger: String {
@@ -34,7 +36,7 @@ protocol ScreenshotLibrary: AnyObject {
     func requestAccess(completion: @escaping @MainActor (ScreenshotWatcher.Access) -> Void)
     func startObserving(onChange: @escaping @MainActor (Date) -> Void)
     func stopObserving()
-    func latestScreenshot(since: Date, completion: @escaping @MainActor (ScreenshotAsset?) -> Void)
+    func screenshots(since: Date, completion: @escaping @MainActor ([ScreenshotAsset]) -> Void)
     func loadImage(for asset: ScreenshotAsset, completion: @escaping @MainActor (Result<UIImage, Error>) -> Void)
     func delete(_ ids: [String], completion: @escaping @MainActor (Result<Int, Error>) -> Void)
 }
@@ -59,6 +61,8 @@ final class ScreenshotWatcher: ObservableObject {
     private var isMonitoring = false
     private var enabledSince: Date?
     private var monitoringSince: Date?
+    private var notificationDates: [Date] = []
+    private var hasReceivedNotification = false
     private var seen: Set<String> = []
     private var used: Set<String>
     private var deleting = false
@@ -113,6 +117,7 @@ final class ScreenshotWatcher: ObservableObject {
     func setEnabled(_ on: Bool) {
         enableGeneration = UUID()
         guard on else {
+            hasReceivedNotification = false
             isEnabled = false
             defaults.set(false, forKey: "screenshotCaptureEnabled")
             enabledSince = nil
@@ -129,6 +134,7 @@ final class ScreenshotWatcher: ObservableObject {
             self.defaults.set(self.isEnabled, forKey: "screenshotCaptureEnabled")
             self.record("スクリーンショットの許可", details: "access=\(access)")
             if self.isEnabled {
+                self.hasReceivedNotification = false
                 self.enabledSince = self.now()
                 self.startMonitoring()
             } else {
@@ -155,6 +161,7 @@ final class ScreenshotWatcher: ObservableObject {
         guard isEnabled, sceneIsActive, !isMonitoring else { return }
         isMonitoring = true
         monitoringSince = now()
+        notificationDates.removeAll()
         generation = UUID()
         let token = generation
         notificationObserver = notificationCenter.addObserver(
@@ -196,6 +203,10 @@ final class ScreenshotWatcher: ObservableObject {
             return
         }
         record("スクリーンショットのきっかけ", details: "trigger=\(trigger.rawValue)")
+        if trigger == .notification {
+            hasReceivedNotification = true
+            notificationDates.append(date)
+        }
         if let search, !search.loading, now() >= search.deadline { checkForScreenshot() }
         if search != nil {
             // Do not move the deadline when the second notification arrives.
@@ -230,22 +241,31 @@ final class ScreenshotWatcher: ObservableObject {
         guard !search.busy, now() >= search.nextAttempt else { return }
         self.search?.busy = true
         let token = generation
-        library.latestScreenshot(since: search.since) { [weak self] asset in
+        library.screenshots(since: search.since) { [weak self] assets in
             guard let self, self.generation == token, let current = self.search, current.id == search.id else { return }
             guard self.now() < current.deadline else { self.checkForScreenshot(); return }
-            guard let asset else { self.retry(reason: "no matching screenshot"); return }
-            guard asset.takenAt >= current.since else { self.retry(reason: "outside time window"); return }
-            guard !self.seen.contains(asset.id) else { self.retry(reason: "already delivered"); return }
+            // Filter before choosing the newest: a future-dated or already seen
+            // asset must not starve other eligible insertions.
+            guard let asset = assets.filter({
+                !self.seen.contains($0.id) && self.deliveryRoute(for: $0, search: current) != nil
+            }).max(by: { $0.takenAt < $1.takenAt }) else {
+                self.retry(reason: "no matching insertion"); return
+            }
             self.record("スクリーンショットを発見", details: "elapsed_ms=\(self.elapsed(since: current.triggeredAt))")
             self.search?.loading = true
             self.library.loadImage(for: asset) { [weak self] result in
                 guard let self, self.generation == token, let current = self.search, current.id == search.id else { return }
                 switch result {
                 case .success(let image):
+                    // A first notification can arrive while decoding a fallback
+                    // candidate. Apply the stricter rule before exposing the image.
+                    guard let route = self.deliveryRoute(for: asset, search: current) else {
+                        self.retry(reason: "notification no longer matches insertion"); return
+                    }
                     guard self.seen.insert(asset.id).inserted else { self.retry(reason: "already delivered"); return }
                     let followup = current.followup
                     self.record("スクリーンショットを受け取り", details:
-                        "elapsed_ms=\(self.elapsed(since: current.triggeredAt)); pixels=\(image.cgImage?.width ?? 0)x\(image.cgImage?.height ?? 0)")
+                        "elapsed_ms=\(self.elapsed(since: current.triggeredAt)); route=\(route); pixels=\(image.cgImage?.width ?? 0)x\(image.cgImage?.height ?? 0)")
                     self.finishSearch()
                     self.delivered = DeliveredScreenshot(id: asset.id, image: image, takenAt: asset.takenAt)
                     if let followup { self.receive(followup.0, at: followup.1) }
@@ -256,6 +276,19 @@ final class ScreenshotWatcher: ObservableObject {
                 }
             }
         }
+    }
+
+    private func deliveryRoute(for asset: ScreenshotAsset, search: Search) -> String? {
+        guard let monitoringSince, let insertedAt = asset.insertedAt,
+              insertedAt >= monitoringSince, insertedAt <= now(),
+              asset.takenAt >= search.since,
+              asset.takenAt <= search.triggeredAt.addingTimeInterval(5),
+              asset.takenAt <= insertedAt.addingTimeInterval(5) else { return nil }
+        if hasReceivedNotification {
+            return notificationDates.contains { abs(insertedAt.timeIntervalSince($0)) <= 5 }
+                ? "notification" : nil
+        }
+        return asset.takenAt >= insertedAt.addingTimeInterval(-10) ? "insertionFallback" : nil
     }
 
     private func retry(reason: String) {
