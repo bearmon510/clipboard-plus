@@ -25,6 +25,10 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
     var latestDate: Date?
     var deferConversion = false
     var conversion: (@MainActor (ScreenCaptureFrameResult) -> Void)?
+    /// The controller under test. grant() tells it the app is active again, as happens when
+    /// the system permission screen closes, unless a test needs that moment to come later.
+    weak var controller: ScreenCaptureController?
+    var reactivatesOnGrant = true
 
     func requestPermission() { permissionRequests += 1 }
     func stop() {
@@ -35,6 +39,7 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
     func grant() {
         onEvent?(.permissionGranted(contentRect: CGRect(x: 0, y: 0, width: 100, height: 200),
                                     pointPixelScale: 2))
+        if reactivatesOnGrant { controller?.sceneDidActivate() }
     }
     func start(at date: Date) { onEvent?(.started(date)) }
     func frame(_ image: UIImage, at date: Date) {
@@ -76,6 +81,7 @@ final class ScreenCaptureControllerTests: XCTestCase {
         let clock = CaptureTestClock()
         let controller = ScreenCaptureController(log: log, now: { clock.date }, source: source,
                                                  schedulesTimers: false)
+        source.controller = controller
         defer {
             controller.stop(reason: "test cleanup")
             let done = expectation(description: "capture log drained")
@@ -514,6 +520,75 @@ final class ScreenCaptureControllerTests: XCTestCase {
             XCTAssertEqual(controller.state, .unsupported)
             XCTAssertEqual(source.permissionRequests, 0)
             XCTAssertEqual(source.stops, 0)
+        }
+    }
+
+    // MARK: The first capture after approval
+
+    @MainActor
+    func testFirstFrameWaitsUntilThePermissionScreenHasGone() throws {
+        try withController { controller, source, clock, log in
+            source.reactivatesOnGrant = false
+            var result: Result<UIImage, ScreenCaptureError>?
+            controller.requestFrame { result = $0 }
+            source.grant()
+            source.start(at: clock.date)
+            // The permission screen is still closing: frames now must not be used.
+            clock.advance(1.0)
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertNil(result)
+            // The app becomes active again as the screen goes away.
+            clock.advance(0.8)
+            controller.sceneDidActivate()
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertNil(result, "a frame from the moment of reactivation can still show the closing screen")
+            clock.advance(0.5)
+            let clean = UIImage()
+            source.frame(clean, at: clock.date)
+            guard case .success(let image)? = result else { return XCTFail("expected a frame, got \(String(describing: result))") }
+            XCTAssertTrue(image === clean)
+            XCTAssertTrue(log.lines.contains { $0.primaryText.contains("許可後に前面へ復帰") })
+        }
+    }
+
+    @MainActor
+    func testFirstFrameFallsBackToAFixedWaitWhenReactivationIsNeverSeen() throws {
+        try withController { controller, source, clock, _ in
+            source.reactivatesOnGrant = false
+            var result: Result<UIImage, ScreenCaptureError>?
+            controller.requestFrame { result = $0 }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(2.4)
+            source.frame(UIImage(), at: clock.date)
+            XCTAssertNil(result)
+            clock.advance(0.1)
+            let clean = UIImage()
+            source.frame(clean, at: clock.date)
+            guard case .success(let image)? = result else { return XCTFail("expected a frame, got \(String(describing: result))") }
+            XCTAssertTrue(image === clean)
+        }
+    }
+
+    @MainActor
+    func testLaterCapturesInTheSameSessionDoNotWaitAgain() throws {
+        try withController { controller, source, clock, _ in
+            var first: Result<UIImage, ScreenCaptureError>?
+            controller.requestFrame { first = $0 }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            guard case .success? = first else { return XCTFail("expected the first frame") }
+            // Switching to another app and back must not delay the next capture.
+            controller.sceneDidActivate()
+            clock.advance(0.05)
+            let next = UIImage()
+            source.frame(next, at: clock.date)
+            var second: Result<UIImage, ScreenCaptureError>?
+            controller.requestFrame { second = $0 }
+            guard case .success(let image)? = second else { return XCTFail("expected an immediate frame, got \(String(describing: second))") }
+            XCTAssertTrue(image === next)
         }
     }
 }

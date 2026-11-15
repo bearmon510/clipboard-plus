@@ -60,8 +60,18 @@ final class ScreenCaptureController: ObservableObject {
     private var frameValidity = UUID()
     private var frameVersion = UUID()
     private var sceneIsActive = true
+    /// When the person approved capture in this session. The first frames after it can still
+    /// show the system permission screen, so they are not used until that screen is gone.
+    private var grantedAt: Date?
+    /// When this app became active again after the approval, which happens as the system
+    /// permission screen goes away. Nil until then.
+    private var reactivatedAfterGrant: Date?
 
     private static let settlingInterval: TimeInterval = 0.6
+    /// How long after this app becomes active again the permission screen is assumed gone.
+    private static let afterReactivation: TimeInterval = 0.5
+    /// Used when the app is never seen becoming active again after the approval.
+    private static let afterGrantFallback: TimeInterval = 2.5
     private static let frameTimeout: TimeInterval = 8
     private static let idleTimeout: TimeInterval = 5 * 60
 
@@ -118,6 +128,29 @@ final class ScreenCaptureController: ObservableObject {
         if !isActive { stop(reason: "scene inactive") }
     }
 
+    /// Called each time the scene becomes active. After an approval, the first such moment
+    /// marks the system permission screen going away.
+    func sceneDidActivate() {
+        guard let grantedAt, reactivatedAfterGrant == nil else { return }
+        let date = now()
+        guard date >= grantedAt else { return }
+        reactivatedAfterGrant = date
+        record("許可後に前面へ復帰", details: "grant_ms=\(Int(date.timeIntervalSince(grantedAt) * 1000))")
+        deliverLatestFrameIfReady()
+    }
+
+    /// Frames older than this may still show the permission screen or the moment before it.
+    private var usableFrom: Date? {
+        guard let startedAt else { return nil }
+        var earliest = startedAt.addingTimeInterval(Self.settlingInterval)
+        if let grantedAt {
+            let afterPermission = reactivatedAfterGrant.map { $0.addingTimeInterval(Self.afterReactivation) }
+                ?? grantedAt.addingTimeInterval(Self.afterGrantFallback)
+            earliest = max(earliest, afterPermission)
+        }
+        return earliest
+    }
+
     func noteCaptureUsed() {
         guard state == .running else { return }
         lastUsedAt = now()
@@ -151,6 +184,8 @@ final class ScreenCaptureController: ObservableObject {
         case .permissionGranted(let rect, let scale):
             guard state == .requestingPermission else { return }
             state = .starting
+            grantedAt = now()
+            reactivatedAfterGrant = nil
             requestDeadline = now().addingTimeInterval(Self.frameTimeout)
             record("画面取り込みの許可", details: "contentRect=\(rect); pointPixelScale=\(scale)")
         case .started(let date):
@@ -161,9 +196,8 @@ final class ScreenCaptureController: ObservableObject {
             state = .running
             record("画面取り込みの開始成功")
         case .frameReceived(let date, let width, let height):
-            guard state == .running, let startedAt,
-                  date.timeIntervalSince(startedAt) >= Self.settlingInterval,
-                  width > 0, height > 0 else { return }
+            guard state == .running, let startedAt, let usableFrom = self.usableFrom,
+                  date >= usableFrom, width > 0, height > 0 else { return }
             if !hasUsableFrame {
                 let elapsed = max(0, date.timeIntervalSince(requestedAt ?? startedAt))
                 let streaming = max(0, date.timeIntervalSince(startedAt))
@@ -188,12 +222,12 @@ final class ScreenCaptureController: ObservableObject {
     }
 
     private func deliverLatestFrameIfReady() {
-        guard hasUsableFrame, !pending.isEmpty, !isConverting, let startedAt else { return }
+        guard hasUsableFrame, !pending.isEmpty, !isConverting, let usableFrom else { return }
         isConverting = true
         let token = generation
         let validity = frameValidity
         let version = frameVersion
-        source.convertLatestFrame(notBefore: startedAt.addingTimeInterval(Self.settlingInterval)) { [weak self] result in
+        source.convertLatestFrame(notBefore: usableFrom) { [weak self] result in
             guard let self, self.generation == token else { return }
             self.checkDeadlines()
             guard self.generation == token else { return }
@@ -234,6 +268,8 @@ final class ScreenCaptureController: ObservableObject {
         requestedAt = nil
         startedAt = nil
         lastUsedAt = nil
+        grantedAt = nil
+        reactivatedAfterGrant = nil
         state = .idle
         record("画面取り込みの停止", details: "reason=\(reason)")
         completeRequests(.failure(error))

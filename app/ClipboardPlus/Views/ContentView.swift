@@ -114,7 +114,12 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
-            if phase == .active { monitor.pendingDeletion { showUndo($0) } }
+            if phase == .active {
+                monitor.pendingDeletion { showUndo($0) }
+                // Marks the system permission screen going away, so that the first capture
+                // after approval shows the screen rather than the permission dialog.
+                screenCapture.sceneDidActivate()
+            }
             // Only leaving the screen stops it: a side window turns inactive whenever
             // another app is touched, and the system picker does the same.
             screenCapture.sceneDidChange(isActive: phase != .background)

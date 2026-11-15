@@ -13,25 +13,38 @@ struct HistoryCard<Actions: View>: View {
     @ViewBuilder let actions: () -> Actions
 
     @State private var freshness: Double = 0
+    @State private var isExpanded = false
+    /// Heights of the text as shown and of the same text with no line limit, to tell whether
+    /// four lines cut it off. Measured on screen, so the answer fits the card's real width.
+    @State private var shownHeight: CGFloat = 0
+    @State private var fullHeight: CGFloat = 0
+
+    /// The most text a card shows when opened in place. Longer texts open in full from the menu.
+    private static let expandedLimit = 3_000
 
     private var flavor: EntryFlavor { EntryFlavor.detect(entry) }
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous) }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            Button(action: onCopy) {
-                VStack(alignment: .leading, spacing: 10) {
-                    content
-                    meta
+            VStack(alignment: .leading, spacing: 0) {
+                Button(action: onCopy) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        content
+                        meta
+                    }
+                    .padding(12)
+                    // The expand button sits under the meta line, outside the copy button.
+                    .padding(.bottom, isExpandable ? -8 : 0)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .opacity(isCopied ? 0.25 : 1)
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-                .opacity(isCopied ? 0.25 : 1)
+                .buttonStyle(CardPressStyle())
+                .onDrag(dragProvider)
+                .accessibilityHint("タップでコピー。ドラッグでほかのアプリへ持ち出せます。")
+                if isExpandable { expandButton }
             }
-            .buttonStyle(CardPressStyle())
-            .onDrag(dragProvider)
-            .accessibilityHint("タップでコピー。ドラッグでほかのアプリへ持ち出せます。")
             menuButton
         }
         .background(Theme.card, in: shape)
@@ -66,14 +79,63 @@ struct HistoryCard<Actions: View>: View {
     private var textContent: some View {
         Text(highlightedText)
             .font(.body)
-            .lineLimit(4)
+            .lineLimit(isExpanded ? nil : 4)
             .multilineTextAlignment(.leading)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(heightReader { shownHeight = $0 })
+            .background(alignment: .topLeading) {
+                // The same text without a line limit, invisible, only to measure its height.
+                Text(highlightedText)
+                    .font(.body)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .hidden()
+                    .background(heightReader { fullHeight = $0 })
+                    .accessibilityHidden(true)
+            }
+    }
+
+    private func heightReader(_ update: @escaping (CGFloat) -> Void) -> some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onAppear { update(proxy.size.height) }
+                .onChange(of: proxy.size.height) { _, height in update(height) }
+        }
+    }
+
+    /// Whether the text is likely cut off at four lines, so that an expand button is worth showing.
+    private var isExpandable: Bool {
+        switch flavor {
+        case .image, .color: return false
+        case .link: if query.isEmpty && EntryLinks.parts(entry.text) != nil { return false }
+        case .text, .email, .phone: break
+        }
+        // Texts longer than the preview are always cut, whatever the width.
+        return isExpanded || entry.characterCount > EntryPreview.limit || fullHeight > shownHeight + 1
+    }
+
+    private var expandButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) { isExpanded.toggle() }
+        } label: {
+            HStack(spacing: 4) {
+                Text(isExpanded ? "たたむ" : "続きを表示")
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Theme.accent)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 40)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isExpanded ? "たたむ" : "続きを表示")
     }
 
     private var highlightedText: AttributedString {
         if entry.text.isEmpty { return AttributedString("（空文字）") }
-        let snippet = EntryPreview.snippet(entry.text, query: query)
+        let snippet = EntryPreview.snippet(entry.text, query: query,
+                                           limit: isExpanded ? Self.expandedLimit : EntryPreview.limit)
         var result = AttributedString()
         var cursor = snippet.text.startIndex
         for match in snippet.matches {
@@ -85,6 +147,9 @@ struct HistoryCard<Actions: View>: View {
             cursor = match.upperBound
         }
         result += AttributedString(String(snippet.text[cursor...]))
+        if isExpanded && entry.characterCount > Self.expandedLimit {
+            result += AttributedString("…（全文は「⋯」→「全文を表示」）")
+        }
         return result
     }
 
