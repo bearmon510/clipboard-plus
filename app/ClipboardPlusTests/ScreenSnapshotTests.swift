@@ -63,7 +63,8 @@ final class ScreenSnapshotTests: XCTestCase {
         // Mid-drag in a wide window: the selection and the magnifier at the finger.
         let dragging = CaptureView(source: source, mode: .text,
                                    previewSelection: CGRect(x: 0.08, y: 0.2, width: 0.6, height: 0.28),
-                                   previewTouch: CGPoint(x: 700, y: 520),
+                                   // The finger at the selection's bottom-right corner, over the last line.
+                                   previewTouch: CGPoint(x: 696, y: 352),
                                    onText: { _ in }, onImage: { _ in }, onClose: {})
         try save(render(dragging, size: Self.wide, style: .light), "capture-wide-dragging")
         // A narrow side window, where the magnifier matters most.

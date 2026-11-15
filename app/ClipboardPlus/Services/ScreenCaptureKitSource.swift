@@ -2,6 +2,7 @@
 import CoreImage
 import CoreMedia
 import CoreVideo
+import ImageIO
 import ScreenCaptureKit
 import UIKit
 
@@ -29,7 +30,7 @@ final class ScreenCaptureKitSource: ScreenCaptureSource {
     }
 
     func convertLatestFrame(notBefore: Date,
-                            completion: @escaping @MainActor (Result<UIImage, ScreenCaptureError>) -> Void) {
+                            completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void) {
         guard let session else { completion(.failure(.failed("capture stopped"))); return }
         session.frames.convert(notBefore: notBefore, completion: completion)
     }
@@ -52,9 +53,9 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
         self.event = event
         frames = ScreenCaptureFrameBuffer(context: context, conversionQueue: conversionQueue)
         super.init()
-        frames.onFrame = { [weak self] date, width, height in
+        frames.onEvent = { [weak self] event in
             guard let self, self.active else { return }
-            self.event(.frameReceived(at: date, width: width, height: height))
+            self.event(event)
         }
     }
 
@@ -94,8 +95,9 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
     private func begin(filter: SCContentFilter) {
         guard active, stream == nil else { return }
         let rect = filter.contentRect
-        let scale = CGFloat(filter.pointPixelScale)
-        event(.permissionGranted(contentRect: rect, pointPixelScale: scale))
+        let pointPixelScale = CGFloat(filter.pointPixelScale)
+        let scale = ScreenCaptureFrameBuffer.imageScale(pointPixelScale)
+        event(.permissionGranted(contentRect: rect, pointPixelScale: pointPixelScale))
         // The callback may synchronously stop this session.
         guard active else { return }
         let width = (rect.width * scale).rounded()
@@ -116,7 +118,7 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
         configuration.capturesAudio = false
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         self.stream = stream
-        let output = ScreenCaptureOutput(frames: frames)
+        let output = ScreenCaptureOutput(frames: frames, pointPixelScale: scale)
         self.output = output
         do {
             try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleQueue)
@@ -176,30 +178,46 @@ private final class ScreenCaptureKitSession: NSObject, SCContentSharingPickerObs
 @available(iOS 27.0, *)
 private final class ScreenCaptureOutput: NSObject, SCStreamOutput {
     private let frames: ScreenCaptureFrameBuffer
-    init(frames: ScreenCaptureFrameBuffer) {
+    private let pointPixelScale: CGFloat
+    init(frames: ScreenCaptureFrameBuffer, pointPixelScale: CGFloat) {
         self.frames = frames
+        self.pointPixelScale = pointPixelScale
         super.init()
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard type == .screen, CMSampleBufferIsValid(sampleBuffer),
-              CMSampleBufferDataIsReady(sampleBuffer),
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
-              let rawStatus = attachments.first?[.status] as? Int,
-              SCFrameStatus(rawValue: rawStatus) == .complete,
-              let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        frames.replace(with: pixels, at: Date())
+              let info = attachments.first,
+              let rawStatus = info[.status] as? Int,
+              let status = SCFrameStatus(rawValue: rawStatus) else { return }
+        // Status-only samples need not have ready image data (or a buffer).
+        let pixels = CMSampleBufferDataIsReady(sampleBuffer) ? CMSampleBufferGetImageBuffer(sampleBuffer) : nil
+        frames.receive(status: status, pixels: pixels,
+                       orientation: ScreenCaptureFrameBuffer.orientation(info[.videoOrientation]),
+                       pointPixelScale: pointPixelScale, at: Date())
     }
 }
 
 // The sample queue, conversion queue and main actor share this single slot.
 // Notifications carry no buffers and are coalesced if the main thread is busy.
-private final class ScreenCaptureFrameBuffer {
-    var onFrame: (@MainActor (Date, Int, Int) -> Void)?
+@available(iOS 27.0, *)
+final class ScreenCaptureFrameBuffer {
+    @MainActor var onEvent: (@MainActor (ScreenCaptureSourceEvent) -> Void)?
     private let lock = NSLock()
-    private var latest: (pixels: CVPixelBuffer, date: Date)?
+    private struct Frame {
+        let pixels: CVPixelBuffer
+        var date: Date
+        let orientation: CGImagePropertyOrientation
+        let scale: CGFloat
+    }
+    private var latest: Frame?
+    private var validity = UUID()
+    // Kept separately from the coalesced frame notification, so a temporary
+    // invalidation is still delivered even if a new complete frame follows it.
+    private var invalidationPending = false
     private var active = true
     private var notificationPending = false
     private let context: CIContext
@@ -210,10 +228,38 @@ private final class ScreenCaptureFrameBuffer {
         self.conversionQueue = conversionQueue
     }
 
-    func replace(with pixels: CVPixelBuffer, at date: Date) {
+    static func orientation(_ value: Any?) -> CGImagePropertyOrientation {
+        if let orientation = value as? CGImagePropertyOrientation { return orientation }
+        guard let rawValue = value as? UInt32 else { return .up }
+        return CGImagePropertyOrientation(rawValue: rawValue) ?? .up
+    }
+
+    static func imageScale(_ value: CGFloat) -> CGFloat {
+        value.isFinite && value > 0 ? value : 1
+    }
+
+    func receive(status: SCFrameStatus, pixels: CVPixelBuffer? = nil,
+                 orientation: CGImagePropertyOrientation = .up,
+                 pointPixelScale: CGFloat = 1, at date: Date) {
         lock.lock()
         guard active else { lock.unlock(); return }
-        latest = (pixels, date)
+        switch status {
+        case .complete:
+            guard let pixels else { lock.unlock(); return }
+            latest = Frame(pixels: pixels, date: date, orientation: orientation,
+                           scale: Self.imageScale(pointPixelScale))
+        case .idle:
+            guard latest != nil else { lock.unlock(); return }
+            // The retained complete frame still represents the display now.
+            latest?.date = date
+        case .blank, .suspended, .stopped:
+            latest = nil
+            validity = UUID()
+            invalidationPending = true
+        default:
+            lock.unlock()
+            return
+        }
         let shouldNotify = !notificationPending
         notificationPending = true
         lock.unlock()
@@ -221,12 +267,19 @@ private final class ScreenCaptureFrameBuffer {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
+            let active = self.active
+            let invalidated = self.invalidationPending
             let metadata = self.latest.map {
                 ($0.date, CVPixelBufferGetWidth($0.pixels), CVPixelBufferGetHeight($0.pixels))
             }
             self.notificationPending = false
+            self.invalidationPending = false
             self.lock.unlock()
-            if let metadata { self.onFrame?(metadata.0, metadata.1, metadata.2) }
+            guard active else { return }
+            if invalidated { self.onEvent?(.frameInvalidated) }
+            if let metadata {
+                self.onEvent?(.frameReceived(at: metadata.0, width: metadata.1, height: metadata.2))
+            }
         }
     }
 
@@ -238,22 +291,28 @@ private final class ScreenCaptureFrameBuffer {
     }
 
     func convert(notBefore: Date,
-                 completion: @escaping @MainActor (Result<UIImage, ScreenCaptureError>) -> Void) {
+                 completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void) {
         conversionQueue.async { [self] in
-            let result: Result<UIImage, ScreenCaptureError> = autoreleasepool {
-                lock.lock()
-                let frame = latest
-                lock.unlock()
+            lock.lock()
+            let frame = latest
+            let token = validity
+            lock.unlock()
+            let result: ScreenCaptureFrameResult = autoreleasepool {
                 guard let frame, frame.date >= notBefore else {
-                    return .failure(.failed("no usable frame"))
+                    return .unavailable
                 }
-                let image = CIImage(cvPixelBuffer: frame.pixels)
+                let image = CIImage(cvPixelBuffer: frame.pixels).oriented(frame.orientation)
                 guard let cgImage = context.createCGImage(image, from: image.extent) else {
                     return .failure(.failed("CGImage conversion failed"))
                 }
-                return .success(UIImage(cgImage: cgImage, scale: 1, orientation: .up))
+                return .success(UIImage(cgImage: cgImage, scale: frame.scale, orientation: .up))
             }
-            DispatchQueue.main.async { completion(result) }
+            DispatchQueue.main.async { [self] in
+                lock.lock()
+                let stillValid = active && validity == token
+                lock.unlock()
+                completion(stillValid ? result : .unavailable)
+            }
         }
     }
 }

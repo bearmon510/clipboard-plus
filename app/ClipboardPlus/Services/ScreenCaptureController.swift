@@ -15,8 +15,17 @@ enum ScreenCaptureSourceEvent {
     case permissionGranted(contentRect: CGRect, pointPixelScale: CGFloat)
     case started(Date)
     case frameReceived(at: Date, width: Int, height: Int)
+    case frameInvalidated
     case declined
     case failed(domain: String, code: Int)
+}
+
+// A frame can become unavailable while conversion is queued/in progress. This
+// is a retryable source condition, not a failure of the public request.
+enum ScreenCaptureFrameResult {
+    case success(UIImage)
+    case unavailable
+    case failure(ScreenCaptureError)
 }
 
 @MainActor
@@ -25,7 +34,7 @@ protocol ScreenCaptureSource: AnyObject {
     var onEvent: (@MainActor (ScreenCaptureSourceEvent) -> Void)? { get set }
     func requestPermission()
     func convertLatestFrame(notBefore: Date,
-                            completion: @escaping @MainActor (Result<UIImage, ScreenCaptureError>) -> Void)
+                            completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void)
     func stop()
 }
 
@@ -48,6 +57,8 @@ final class ScreenCaptureController: ObservableObject {
     private var requestDeadline: Date?
     private var hasUsableFrame = false
     private var isConverting = false
+    private var frameValidity = UUID()
+    private var frameVersion = UUID()
     private var sceneIsActive = true
 
     private static let settlingInterval: TimeInterval = 0.6
@@ -78,7 +89,9 @@ final class ScreenCaptureController: ObservableObject {
         guard sceneIsActive else { completion(.failure(.failed("scene inactive"))); return }
         checkDeadlines()
         pending.append(completion)
-        if requestDeadline == nil { requestDeadline = now().addingTimeInterval(Self.frameTimeout) }
+        if requestDeadline == nil, state == .starting || state == .running {
+            requestDeadline = now().addingTimeInterval(Self.frameTimeout)
+        }
         if state == .idle {
             generation = UUID()
             let token = generation
@@ -138,6 +151,7 @@ final class ScreenCaptureController: ObservableObject {
         case .permissionGranted(let rect, let scale):
             guard state == .requestingPermission else { return }
             state = .starting
+            requestDeadline = now().addingTimeInterval(Self.frameTimeout)
             record("画面取り込みの許可", details: "contentRect=\(rect); pointPixelScale=\(scale)")
         case .started(let date):
             guard state == .starting else { return }
@@ -157,7 +171,11 @@ final class ScreenCaptureController: ObservableObject {
                     "request_ms=\(Int(elapsed * 1000)); start_ms=\(Int(streaming * 1000)); pixels=\(width)x\(height)")
             }
             hasUsableFrame = true
+            frameVersion = UUID()
             deliverLatestFrameIfReady()
+        case .frameInvalidated:
+            hasUsableFrame = false
+            frameValidity = UUID()
         case .declined:
             record("画面取り込みの許可取り消し")
             finishSession(reason: "picker cancelled", error: .declined)
@@ -173,14 +191,23 @@ final class ScreenCaptureController: ObservableObject {
         guard hasUsableFrame, !pending.isEmpty, !isConverting, let startedAt else { return }
         isConverting = true
         let token = generation
+        let validity = frameValidity
+        let version = frameVersion
         source.convertLatestFrame(notBefore: startedAt.addingTimeInterval(Self.settlingInterval)) { [weak self] result in
             guard let self, self.generation == token else { return }
             self.checkDeadlines()
             guard self.generation == token else { return }
             self.isConverting = false
+            guard self.frameValidity == validity else {
+                self.deliverLatestFrameIfReady()
+                return
+            }
             switch result {
-            case .success:
-                self.completeRequests(result)
+            case .success(let image):
+                self.completeRequests(.success(image))
+            case .unavailable:
+                if self.frameVersion == version { self.hasUsableFrame = false }
+                self.deliverLatestFrameIfReady()
             case .failure(let error):
                 self.finishSession(reason: "frame conversion failed", error: error)
             }
@@ -226,7 +253,7 @@ private final class UnsupportedScreenCaptureSource: ScreenCaptureSource {
     func requestPermission() {}
     func stop() {}
     func convertLatestFrame(notBefore: Date,
-                            completion: @escaping @MainActor (Result<UIImage, ScreenCaptureError>) -> Void) {
+                            completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void) {
         completion(.failure(.unsupported))
     }
 }

@@ -32,8 +32,12 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 /// Geometry for choosing a part of a picture by dragging. All functions are pure.
 /// A "unit" rectangle is in the picture's own space, 0...1 on both axes, origin top-left.
 enum CropGeometry {
-    /// A selection smaller than this, in points on screen, counts as a stray tap.
-    static let minimumSelectionSide: CGFloat = 12
+    /// A drag shorter than this, in points on screen, is a stray tap rather than a choice.
+    static let minimumDragDistance: CGFloat = 10
+    /// The smallest part of the picture worth acting on, in picture pixels. A single line of
+    /// text shrunk into a narrow window is only a few points tall on screen, so the size is
+    /// judged on the picture, not on the screen.
+    static let minimumSelectionPixels: CGFloat = 6
 
     /// Where an aspect-fit picture sits inside a container.
     static func fittedFrame(imageSize: CGSize, in container: CGSize) -> CGRect {
@@ -52,9 +56,15 @@ enum CropGeometry {
                       width: abs(first.x - second.x), height: abs(first.y - second.y))
     }
 
-    /// Whether a selection on screen is big enough to act on.
-    static func isMeaningful(_ rect: CGRect) -> Bool {
-        rect.width >= minimumSelectionSide && rect.height >= minimumSelectionSide
+    /// Whether a drag from `start` to `end` is a real choice rather than a slip of the finger.
+    static func isDeliberateDrag(from start: CGPoint, to end: CGPoint) -> Bool {
+        hypot(end.x - start.x, end.y - start.y) >= minimumDragDistance
+    }
+
+    /// Whether a chosen part, in unit space, covers enough of the picture to act on.
+    static func isMeaningful(_ unit: CGRect, imageWidth: Int, imageHeight: Int) -> Bool {
+        unit.width * CGFloat(imageWidth) >= minimumSelectionPixels
+            && unit.height * CGFloat(imageHeight) >= minimumSelectionPixels
     }
 
     static func unit(_ rect: CGRect, in frame: CGRect) -> CGRect {

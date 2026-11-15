@@ -1,6 +1,12 @@
 import UIKit
 import XCTest
 @testable import ClipboardPlus
+#if canImport(ScreenCaptureKit)
+import CoreImage
+import CoreVideo
+import ImageIO
+import ScreenCaptureKit
+#endif
 
 @MainActor
 private final class CaptureTestClock {
@@ -18,7 +24,7 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
     var latest: UIImage?
     var latestDate: Date?
     var deferConversion = false
-    var conversion: (@MainActor (Result<UIImage, ScreenCaptureError>) -> Void)?
+    var conversion: (@MainActor (ScreenCaptureFrameResult) -> Void)?
 
     func requestPermission() { permissionRequests += 1 }
     func stop() {
@@ -36,11 +42,21 @@ private final class FakeScreenCaptureSource: ScreenCaptureSource {
         latestDate = date
         onEvent?(.frameReceived(at: date, width: 200, height: 400))
     }
+    func idle(at date: Date) {
+        guard latest != nil else { return }
+        latestDate = date
+        onEvent?(.frameReceived(at: date, width: 200, height: 400))
+    }
+    func invalidateFrame() {
+        latest = nil
+        latestDate = nil
+        onEvent?(.frameInvalidated)
+    }
     func convertLatestFrame(notBefore: Date,
-                            completion: @escaping @MainActor (Result<UIImage, ScreenCaptureError>) -> Void) {
+                            completion: @escaping @MainActor (ScreenCaptureFrameResult) -> Void) {
         conversions += 1
         guard let latest, let latestDate, latestDate >= notBefore else {
-            completion(.failure(.failed("no usable frame")))
+            completion(.unavailable)
             return
         }
         if deferConversion { conversion = completion }
@@ -144,17 +160,145 @@ final class ScreenCaptureControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testPermissionAndStartWaitsAlsoTimeOut() throws {
-        for grant in [false, true] {
-            try withController { controller, source, clock, _ in
-                var failure: ScreenCaptureError?
-                controller.requestFrame { if case .failure(let error) = $0 { failure = error } }
-                if grant { source.grant() }
-                clock.advance(8)
-                controller.checkDeadlines()
-                XCTAssertEqual(failure, .timeout)
-                XCTAssertEqual(source.stops, 1)
+    func testPermissionWaitHasNoDeadlineAndStartWaitTimesOutFromGrant() throws {
+        try withController { controller, source, clock, _ in
+            var errors: [ScreenCaptureError] = []
+            controller.requestFrame { if case .failure(let error) = $0 { errors.append(error) } }
+            clock.advance(121)
+            controller.checkDeadlines()
+            controller.requestFrame { if case .failure(let error) = $0 { errors.append(error) } }
+            clock.advance(300)
+            controller.checkDeadlines()
+            XCTAssertTrue(errors.isEmpty)
+            XCTAssertEqual(controller.state, .requestingPermission)
+            XCTAssertEqual(source.permissionRequests, 1)
+            XCTAssertEqual(source.stops, 0)
+            source.grant()
+            clock.advance(7.99)
+            controller.checkDeadlines()
+            XCTAssertTrue(errors.isEmpty)
+            clock.advance(0.01)
+            controller.checkDeadlines()
+            XCTAssertEqual(errors, [.timeout, .timeout])
+            XCTAssertEqual(source.stops, 1)
+        }
+    }
+
+    @MainActor
+    func testLongPermissionWaitCanStillSucceed() throws {
+        try withController { controller, source, clock, _ in
+            var received: UIImage?
+            controller.requestFrame {
+                if case .failure(let error) = $0 { XCTFail("\(error)") }
+                if case .success(let image) = $0 { received = image }
             }
+            clock.advance(60)
+            controller.checkDeadlines()
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(1)
+            let image = UIImage()
+            source.frame(image, at: clock.date)
+            XCTAssertTrue(received === image)
+        }
+    }
+
+    @MainActor
+    func testEarlyCompleteFollowedOnlyByIdleSucceeds() throws {
+        try withController { controller, source, clock, _ in
+            var received: UIImage?
+            controller.requestFrame {
+                if case .failure(let error) = $0 { XCTFail("\(error)") }
+                if case .success(let image) = $0 { received = image }
+            }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(0.1)
+            let image = UIImage()
+            source.frame(image, at: clock.date)
+            clock.advance(0.4)
+            source.idle(at: clock.date)
+            XCTAssertNil(received)
+            XCTAssertEqual(source.conversions, 0)
+            clock.advance(0.2)
+            source.idle(at: clock.date)
+            XCTAssertTrue(received === image)
+            XCTAssertEqual(source.conversions, 1)
+        }
+    }
+
+    @MainActor
+    func testInvalidationWaitsForNewCompleteInsteadOfReturningOldImage() throws {
+        try withController { controller, source, clock, _ in
+            controller.requestFrame { if case .failure(let error) = $0 { XCTFail("\(error)") } }
+            source.grant()
+            source.start(at: clock.date)
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            source.invalidateFrame()
+            var received: UIImage?
+            controller.requestFrame {
+                if case .failure(let error) = $0 { XCTFail("\(error)") }
+                if case .success(let image) = $0 { received = image }
+            }
+            clock.advance(1)
+            source.idle(at: clock.date)
+            XCTAssertNil(received)
+            XCTAssertEqual(source.conversions, 1)
+            let next = UIImage()
+            source.frame(next, at: clock.date)
+            XCTAssertTrue(received === next)
+            XCTAssertEqual(source.conversions, 2)
+        }
+    }
+
+    @MainActor
+    func testInvalidationDuringConversionDiscardsLateImageAndRetriesNewFrame() throws {
+        try withController { controller, source, clock, _ in
+            var received: UIImage?
+            var completions = 0
+            controller.requestFrame {
+                completions += 1
+                if case .failure(let error) = $0 { XCTFail("\(error)") }
+                if case .success(let image) = $0 { received = image }
+            }
+            source.grant()
+            source.start(at: clock.date)
+            source.deferConversion = true
+            clock.advance(1)
+            let old = UIImage()
+            source.frame(old, at: clock.date)
+            let oldConversion = source.conversion
+            source.invalidateFrame()
+            clock.advance(1)
+            let next = UIImage()
+            source.frame(next, at: clock.date)
+            oldConversion?(.success(old))
+            XCTAssertEqual(completions, 0)
+            XCTAssertEqual(source.conversions, 2)
+            source.conversion?(.success(next))
+            XCTAssertEqual(completions, 1)
+            XCTAssertTrue(received === next)
+        }
+    }
+
+    @MainActor
+    func testUnavailableConversionWaitsForNextFrameWithinOriginalDeadline() throws {
+        try withController { controller, source, clock, _ in
+            var results: [Result<UIImage, ScreenCaptureError>] = []
+            controller.requestFrame { results.append($0) }
+            source.grant()
+            source.start(at: clock.date)
+            source.deferConversion = true
+            clock.advance(1)
+            source.frame(UIImage(), at: clock.date)
+            source.conversion?(.unavailable)
+            XCTAssertTrue(results.isEmpty)
+            XCTAssertEqual(controller.state, .running)
+            clock.advance(7)
+            controller.checkDeadlines()
+            XCTAssertEqual(results.count, 1)
+            guard case .failure(.timeout)? = results.first else { return XCTFail("Expected timeout") }
         }
     }
 
@@ -373,3 +517,180 @@ final class ScreenCaptureControllerTests: XCTestCase {
         }
     }
 }
+
+#if canImport(ScreenCaptureKit)
+@available(iOS 27.0, *)
+final class ScreenCaptureFrameBufferTests: XCTestCase {
+    private func makePixels() throws -> CVPixelBuffer {
+        var pixels: CVPixelBuffer?
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, 12, 8,
+                                        kCVPixelFormatType_32BGRA, nil, &pixels)
+        XCTAssertEqual(status, kCVReturnSuccess)
+        let buffer = try XCTUnwrap(pixels)
+        XCTAssertEqual(CVPixelBufferLockBaseAddress(buffer, []), kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer))
+        memset(base, 0, CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer))
+        return buffer
+    }
+
+    private func makeBuffer(queue: DispatchQueue = DispatchQueue(label: "test.screen-conversion")) -> ScreenCaptureFrameBuffer {
+        ScreenCaptureFrameBuffer(context: CIContext(options: [.useSoftwareRenderer: true]),
+                                 conversionQueue: queue)
+    }
+
+    @MainActor
+    private func convert(_ frames: ScreenCaptureFrameBuffer, notBefore: Date) throws -> UIImage? {
+        let done = expectation(description: "frame converted")
+        var result: ScreenCaptureFrameResult?
+        frames.convert(notBefore: notBefore) {
+            result = $0
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        switch try XCTUnwrap(result) {
+        case .success(let image): return image
+        case .unavailable: return nil
+        case .failure(let error):
+            XCTFail("Unexpected conversion failure: \(error)")
+            return nil
+        }
+    }
+
+    func testVideoOrientationUsesImageIOValuesIncludingMirrorsAndDefaultsToUp() {
+        let orientations: [CGImagePropertyOrientation] = [
+            .up, .upMirrored, .down, .downMirrored,
+            .leftMirrored, .right, .rightMirrored, .left
+        ]
+        for (index, orientation) in orientations.enumerated() {
+            // CMSampleBuffer attachments bridge CFNumber to NSNumber.
+            XCTAssertEqual(ScreenCaptureFrameBuffer.orientation(NSNumber(value: index + 1)), orientation)
+            XCTAssertEqual(ScreenCaptureFrameBuffer.orientation(UInt32(index + 1)), orientation)
+            XCTAssertEqual(ScreenCaptureFrameBuffer.orientation(orientation), orientation)
+        }
+        let invalidValues: [Any?] = [nil, 0, 9, -1, "right"]
+        for value in invalidValues {
+            XCTAssertEqual(ScreenCaptureFrameBuffer.orientation(value), .up)
+        }
+    }
+
+    @MainActor
+    func testConversionAppliesOrientationToPixelsAndPreservesPointScale() throws {
+        let pixels = try makePixels()
+        let frames = makeBuffer()
+        defer { frames.clear() }
+        let date = Date(timeIntervalSince1970: 100)
+        frames.receive(status: .complete, pixels: pixels, orientation: .right,
+                       pointPixelScale: 2, at: date)
+        let image = try XCTUnwrap(convert(frames, notBefore: date))
+        XCTAssertEqual(image.imageOrientation, .up)
+        XCTAssertEqual(image.cgImage?.width, 8)
+        XCTAssertEqual(image.cgImage?.height, 12)
+        XCTAssertEqual(image.scale, 2)
+        XCTAssertEqual(image.size, CGSize(width: 4, height: 6))
+    }
+
+    @MainActor
+    func testImageScaleUsesPointPixelScaleOrOneForInvalidValues() throws {
+        let pixels = try makePixels()
+        let frames = makeBuffer()
+        defer { frames.clear() }
+        let date = Date(timeIntervalSince1970: 100)
+        let cases: [(CGFloat, CGFloat)] = [(2, 2), (3, 3), (0, 1), (-1, 1),
+                                          (.nan, 1), (.infinity, 1), (-.infinity, 1)]
+        for (scale, expected) in cases {
+            frames.receive(status: .complete, pixels: pixels, pointPixelScale: scale, at: date)
+            let image = try XCTUnwrap(convert(frames, notBefore: date))
+            XCTAssertEqual(image.scale, expected)
+            XCTAssertEqual(image.size, CGSize(width: 12 / expected, height: 8 / expected))
+        }
+    }
+
+    @MainActor
+    func testIdleRefreshesEarlyCompleteWithoutLosingOrientationOrScale() throws {
+        let frames = makeBuffer()
+        defer { frames.clear() }
+        let start = Date(timeIntervalSince1970: 100)
+        let threshold = start.addingTimeInterval(0.6)
+        frames.receive(status: .complete, pixels: try makePixels(), orientation: .left,
+                       pointPixelScale: 2, at: start.addingTimeInterval(0.1))
+        XCTAssertNil(try convert(frames, notBefore: threshold))
+        frames.receive(status: .idle, at: start.addingTimeInterval(0.7))
+        let image = try XCTUnwrap(convert(frames, notBefore: threshold))
+        XCTAssertEqual(image.cgImage?.width, 8)
+        XCTAssertEqual(image.cgImage?.height, 12)
+        XCTAssertEqual(image.scale, 2)
+    }
+
+    @MainActor
+    func testInvalidStatusesDiscardPixelsAndIdleCannotReviveThem() throws {
+        let date = Date(timeIntervalSince1970: 100)
+        let invalidStatuses: [SCFrameStatus] = [.blank, .suspended, .stopped]
+        for status in invalidStatuses {
+            let frames = makeBuffer()
+            defer { frames.clear() }
+            let pixels = try makePixels()
+            frames.receive(status: .complete, pixels: pixels, at: date)
+            XCTAssertNotNil(try convert(frames, notBefore: date))
+            frames.receive(status: status, at: date.addingTimeInterval(1))
+            frames.receive(status: .idle, at: date.addingTimeInterval(2))
+            XCTAssertNil(try convert(frames, notBefore: date))
+            frames.receive(status: .complete, pixels: pixels, at: date.addingTimeInterval(3))
+            XCTAssertNotNil(try convert(frames, notBefore: date))
+        }
+    }
+
+    @MainActor
+    func testIdleWithoutCompleteDoesNotInventFrame() throws {
+        let frames = makeBuffer()
+        defer { frames.clear() }
+        let date = Date(timeIntervalSince1970: 100)
+        frames.receive(status: .idle, at: date)
+        XCTAssertNil(try convert(frames, notBefore: date))
+    }
+
+    @MainActor
+    func testInvalidationAfterConversionBeforeDeliveryDiscardsImage() throws {
+        let queue = DispatchQueue(label: "test.screen-conversion-race")
+        let frames = makeBuffer(queue: queue)
+        defer { frames.clear() }
+        let date = Date(timeIntervalSince1970: 100)
+        frames.receive(status: .complete, pixels: try makePixels(), at: date)
+        let done = expectation(description: "invalidated conversion")
+        frames.convert(notBefore: date) {
+            if case .unavailable = $0 {} else { XCTFail("Expected unavailable frame") }
+            done.fulfill()
+        }
+        // Finish conversion while the main queue's delivery is still blocked
+        // by this test, then invalidate the pixels before delivery can run.
+        queue.sync {}
+        frames.receive(status: .blank, at: date.addingTimeInterval(1))
+        wait(for: [done], timeout: 5)
+    }
+
+    @MainActor
+    func testCoalescingPreservesInvalidationBeforeReplacementFrame() throws {
+        let frames = makeBuffer()
+        defer { frames.clear() }
+        let date = Date(timeIntervalSince1970: 100)
+        let pixels = try makePixels()
+        frames.receive(status: .complete, pixels: pixels, at: date)
+        _ = try convert(frames, notBefore: date) // Drain the first notification.
+        let done = expectation(description: "invalidation then replacement")
+        done.expectedFulfillmentCount = 2
+        var events: [String] = []
+        frames.onEvent = {
+            switch $0 {
+            case .frameInvalidated: events.append("invalidated")
+            case .frameReceived: events.append("frame")
+            default: XCTFail("Unexpected event")
+            }
+            done.fulfill()
+        }
+        frames.receive(status: .suspended, at: date.addingTimeInterval(1))
+        frames.receive(status: .complete, pixels: pixels, at: date.addingTimeInterval(2))
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(events, ["invalidated", "frame"])
+    }
+}
+#endif

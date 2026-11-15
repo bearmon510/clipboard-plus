@@ -20,11 +20,20 @@ final class CaptureTests: XCTestCase {
         XCTAssertEqual(CropGeometry.rect(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 500, y: 500), within: bounds), bounds)
     }
 
-    func testTinySelectionsCountAsStrayTaps() {
-        XCTAssertFalse(CropGeometry.isMeaningful(.zero))
-        XCTAssertFalse(CropGeometry.isMeaningful(CGRect(x: 0, y: 0, width: 200, height: 11)))
-        XCTAssertFalse(CropGeometry.isMeaningful(CGRect(x: 0, y: 0, width: 11, height: 200)))
-        XCTAssertTrue(CropGeometry.isMeaningful(CGRect(x: 0, y: 0, width: 12, height: 12)))
+    func testStrayTapsAreJudgedByHowFarTheFingerMoved() {
+        XCTAssertFalse(CropGeometry.isDeliberateDrag(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 106, y: 106)))
+        XCTAssertTrue(CropGeometry.isDeliberateDrag(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 110, y: 100)))
+        // A wide, flat drag over one line of text is deliberate even though it is only a few points tall.
+        XCTAssertTrue(CropGeometry.isDeliberateDrag(from: CGPoint(x: 20, y: 300), to: CGPoint(x: 260, y: 308)))
+    }
+
+    func testSelectionSizeIsJudgedOnThePictureNotTheScreen() {
+        // One line of text, 8 points tall on a narrow window, is about 48 pixels on a 2732-wide screenshot.
+        let line = CGRect(x: 0.1, y: 0.4, width: 0.5, height: 0.024)
+        XCTAssertTrue(CropGeometry.isMeaningful(line, imageWidth: 2_732, imageHeight: 2_048))
+        XCTAssertFalse(CropGeometry.isMeaningful(CGRect(x: 0.1, y: 0.4, width: 0.5, height: 0.001), imageWidth: 2_732, imageHeight: 2_048))
+        XCTAssertFalse(CropGeometry.isMeaningful(.zero, imageWidth: 2_732, imageHeight: 2_048))
+        XCTAssertFalse(CropGeometry.isMeaningful(line, imageWidth: 0, imageHeight: 0))
     }
 
     func testUnitAndViewRectsAreInverse() {

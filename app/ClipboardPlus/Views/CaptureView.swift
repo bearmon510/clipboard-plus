@@ -115,16 +115,18 @@ struct CaptureView: View {
         let scale = CropGeometry.magnification(displayedWidth: frame.width, imagePointWidth: source.image.size.width)
         let origin = CropGeometry.magnifiedOrigin(touch: touch, frame: frame, magnification: scale, diameter: diameter)
         let center = CropGeometry.magnifierCenter(for: touch, in: container, diameter: diameter, gap: 36)
-        return ZStack(alignment: .topLeading) {
-            Color.black
-            Image(uiImage: source.image)
-                .resizable()
-                .frame(width: frame.width * scale, height: frame.height * scale)
-                .offset(x: origin.x, y: origin.y)
-            crosshair.frame(width: diameter, height: diameter)
-        }
-        .frame(width: diameter, height: diameter)
-        .clipShape(Circle())
+        // The lens is a fixed-size base. The enlarged picture hangs from its top-left corner,
+        // so that the picture's own size never moves the lens or what it shows.
+        return Color.black
+            .frame(width: diameter, height: diameter)
+            .overlay(alignment: .topLeading) {
+                Image(uiImage: source.image)
+                    .resizable()
+                    .frame(width: frame.width * scale, height: frame.height * scale)
+                    .offset(x: origin.x, y: origin.y)
+            }
+            .overlay { crosshair }
+            .clipShape(Circle())
         .overlay(Circle().strokeBorder(Color.white, lineWidth: 3))
         .shadow(color: Color.black.opacity(0.4), radius: 8, y: 2)
         .position(center)
@@ -152,12 +154,15 @@ struct CaptureView: View {
                 guard phase == .choosing else { return }
                 touch = nil
                 let rect = CropGeometry.rect(from: value.startLocation, to: value.location, within: frame)
+                let unit = CropGeometry.unit(rect, in: frame)
+                let pixels = source.image.cgImage
                 // A stray tap does nothing, so that a slip of the finger never closes the screen.
-                guard CropGeometry.isMeaningful(rect) else {
+                guard CropGeometry.isDeliberateDrag(from: value.startLocation, to: value.location),
+                      CropGeometry.isMeaningful(unit, imageWidth: pixels?.width ?? 0, imageHeight: pixels?.height ?? 0) else {
                     selection = nil
                     return
                 }
-                selection = CropGeometry.unit(rect, in: frame)
+                selection = unit
                 finish()
             }
     }

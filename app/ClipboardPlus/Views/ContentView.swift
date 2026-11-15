@@ -57,17 +57,21 @@ struct ContentView: View {
                 CaptureView(
                     source: request.source,
                     mode: request.mode,
+                    // Each callback checks that its request is still the one on screen, so that
+                    // a slow text reading never saves into, or closes, a newer capture.
                     onText: { text in
+                        guard capture?.id == request.id else { return }
                         monitor.saveCaptured(text: text)
                         screenCapture.noteCaptureUsed()
                         showToast("文字をコピーしました：" + Self.toastPreview(text))
                     },
                     onImage: { data in
+                        guard capture?.id == request.id else { return }
                         monitor.saveCaptured(pngData: data)
                         screenCapture.noteCaptureUsed()
                         showToast("画像をコピーしました")
                     },
-                    onClose: { capture = nil }
+                    onClose: { if capture?.id == request.id { capture = nil } }
                 )
             }
             // A shortcut delivers its screenshot here. Other sheets close so the picture can open.
