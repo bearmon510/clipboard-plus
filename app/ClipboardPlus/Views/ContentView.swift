@@ -143,7 +143,6 @@ struct ContentView: View {
                 queuedCapture = nil
                 queuedDirectMode = nil
             }
-            if phase == .active { startQueuedDirectCapture() }
             if phase == .active {
                 monitor.pendingDeletion { showUndo($0) }
                 // Marks the system permission screen going away, so that the first capture
@@ -154,6 +153,8 @@ struct ContentView: View {
             // another app is touched, and the system picker does the same.
             screenCapture.sceneDidChange(isActive: phase != .background)
             screenshots.sceneDidChange(isActive: phase != .background)
+            // After the capture side has heard that the scene is active, or it would refuse.
+            if phase == .active { startQueuedDirectCapture() }
         }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings, onDismiss: presentQueuedCapture) {

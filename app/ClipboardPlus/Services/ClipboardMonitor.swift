@@ -256,13 +256,16 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     /// Suppress pasteboard reads for the whole async operation, including timer/scene callbacks.
     /// Nested and concurrent intents share the counter; one completion cannot resume another's reads.
-    func performShortcut<T>(_ name: String, operation: @MainActor () async throws -> T) async throws -> T {
+    /// `needsHistory` is false for work that stands on its own, such as reading text from a
+    /// picture without saving it, so that a storage failure does not stop it.
+    func performShortcut<T>(_ name: String, needsHistory: Bool = true,
+                            operation: @MainActor () async throws -> T) async throws -> T {
         shortcutOperationCount += 1
         defer { shortcutOperationCount -= 1 }
         let start = ProcessInfo.processInfo.systemUptime
         record("インテントの開始", details: "インテント=\(name)")
         do {
-            _ = try await historyForShortcuts()
+            if needsHistory { _ = try await historyForShortcuts() }
             try Task.checkCancellation()
             let value = try await operation()
             await finishShortcutLog(name, start: start, succeeded: true)
@@ -333,8 +336,14 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         // The next read sees our own text and must not count it a second time.
         admission.recordSelfCopy(text)
         pasteboard.string = text
+        if shortcutOperationCount > 0 {
+            // Reads are paused while an intent runs, so there is no readback to consume the mark.
+            // Without this, a later external copy of the same text would be taken for our own.
+            lastObservedChangeCount = pasteboard.changeCount
+            admission.discardPendingSelfCopy()
+        }
         isWriting = false
-        if isRecording {
+        if isRecording && shortcutOperationCount == 0 {
             readIfChanged(count: pasteboard.changeCount, source: "自己コピー後の確認", detections: [])
         }
     }

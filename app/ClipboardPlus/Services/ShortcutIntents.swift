@@ -50,7 +50,7 @@ struct ReadTextIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<String> {
         let monitor = ClipboardMonitor.shared
-        let text = try await monitor.performShortcut("ReadTextIntent") {
+        let text = try await monitor.performShortcut("ReadTextIntent", needsHistory: copyAndSave) {
             let text = try await ShortcutImageReader.lines(in: picture).joined(separator: "\n")
             if copyAndSave { try await monitor.saveFromShortcut(text: text, pngData: nil, copyToClipboard: true) }
             return text
@@ -76,7 +76,7 @@ struct ReadTextLinesIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<[String]> {
         let monitor = ClipboardMonitor.shared
-        let lines = try await monitor.performShortcut("ReadTextLinesIntent") {
+        let lines = try await monitor.performShortcut("ReadTextLinesIntent", needsHistory: copyAndSave) {
             let lines = try await ShortcutImageReader.lines(in: picture)
             if copyAndSave {
                 try await monitor.saveFromShortcut(text: lines.joined(separator: "\n"), pngData: nil, copyToClipboard: true)
