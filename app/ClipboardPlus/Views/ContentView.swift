@@ -4,7 +4,9 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
     @ObservedObject var monitor: ClipboardMonitor
-    @ObservedObject var log: MeasurementLog
+    /// Not observed as a whole: every log line would otherwise redraw this screen.
+    let log: MeasurementLog
+    @State private var logHasError = false
     @StateObject private var pictureInPicture: PictureInPictureController
     @AppStorage("pinnedSectionCollapsed") private var pinnedCollapsed = false
     @State private var showSettings = false
@@ -28,12 +30,11 @@ struct ContentView: View {
         _searchText = State(initialValue: initialSearch)
     }
 
-    private var visibleEntries: [HistoryEntry] {
-        HistoryFilter.entries(monitor.entries, filter: filter, search: searchText)
-    }
+    /// The search term without surrounding spaces, as used for filtering and highlighting.
+    private var query: String { HistoryFilter.normalized(searchText) }
 
     /// Pinned items get their own section only in the plain, unfiltered list.
-    private var separatesPinned: Bool { filter == .all && searchText.isEmpty }
+    private var separatesPinned: Bool { filter == .all && query.isEmpty }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -59,6 +60,7 @@ struct ContentView: View {
             updateScene(phase)
             if phase == .active { monitor.pendingDeletion { showUndo($0) } }
         }
+        .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings) {
             SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture)
         }
@@ -205,7 +207,7 @@ struct ContentView: View {
             if monitor.pendingSaveCount > 0 {
                 statusRow("保存待ち \(monitor.pendingSaveCount)件", symbol: "clock", tint: Color.secondary)
             }
-            if log.errorMessage != nil {
+            if logHasError {
                 statusRow("計測ログにエラーがあります。設定の「開発者向け」で確認できます。",
                           symbol: "exclamationmark.triangle.fill", tint: Color.red)
             }
@@ -314,21 +316,27 @@ struct ContentView: View {
         GeometryReader { proxy in
             // The periodic refresh keeps labels such as "3分前" current.
             TimelineView(.periodic(from: .now, by: 20)) { context in
-                ScrollView {
-                    if visibleEntries.isEmpty {
-                        emptyState
-                    } else {
-                        sectionList(now: context.date, columnCount: EntryColumns.count(forWidth: proxy.size.width))
-                    }
-                }
-                .scrollDismissesKeyboard(.immediately)
+                historyScroll(HistoryFilter.entries(monitor.entries, filter: filter, search: query),
+                              now: context.date, columnCount: EntryColumns.count(forWidth: proxy.size.width))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func sectionList(now: Date, columnCount: Int) -> some View {
-        let sections = EntrySections.make(visibleEntries, separatesPinned: separatesPinned, now: now)
+    /// Takes the filtered entries as a parameter so that they are filtered once per redraw.
+    private func historyScroll(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
+        ScrollView {
+            if entries.isEmpty {
+                emptyState
+            } else {
+                sectionList(entries, now: now, columnCount: columnCount)
+            }
+        }
+        .scrollDismissesKeyboard(.immediately)
+    }
+
+    private func sectionList(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
+        let sections = EntrySections.make(entries, separatesPinned: separatesPinned, now: now)
         return LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(sections) { section in
                 sectionHeader(section)
@@ -370,7 +378,7 @@ struct ContentView: View {
             thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) },
             timeLabel: EntryTime.label(for: entry.lastCollectedAt, now: now,
                                        includesDay: section != .today && section != .yesterday),
-            query: searchText,
+            query: query,
             isCopied: copiedID == entry.id,
             onCopy: { copy(entry) },
             dragProvider: { monitor.rowProvider(entry) },

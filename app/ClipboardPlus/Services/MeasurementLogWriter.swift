@@ -4,9 +4,16 @@ final class MeasurementLogWriter {
     private let queue = DispatchQueue(label: "clipboardplus.measurement-log")
     private var fileURL: URL?
     private var pending = PendingLogLines()
+    private let maximumFileBytes: Int
+    private let trimmedFileBytes: Int
+    private var didTrim = false
 
-    init(fileURL: URL? = nil) {
+    /// The log is a diagnostic aid, so it must not grow without bound in daily use.
+    /// Once per launch, a file above `maximumFileBytes` keeps only its newest `trimmedFileBytes`.
+    init(fileURL: URL? = nil, maximumFileBytes: Int = 4_000_000, trimmedFileBytes: Int = 1_000_000) {
         self.fileURL = fileURL
+        self.maximumFileBytes = maximumFileBytes
+        self.trimmedFileBytes = trimmedFileBytes
     }
 
     func append(_ record: LogRecord, attemptWrite: Bool = true, completion: @escaping @MainActor (Error?) -> Void) {
@@ -79,9 +86,24 @@ final class MeasurementLogWriter {
         return fileURL
     }
 
+    private func trimIfNeeded(_ url: URL) {
+        guard !didTrim else { return }
+        didTrim = true
+        // Trimming is best effort. A failure leaves the file as it was.
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > maximumFileBytes,
+              let data = try? Data(contentsOf: url) else { return }
+        var tail = data.suffix(max(0, trimmedFileBytes))
+        // Start at a line boundary so the first kept line is whole.
+        if let newline = tail.firstIndex(of: 0x0A) {
+            tail = tail[tail.index(after: newline)...]
+        }
+        try? Data(tail).write(to: url, options: .atomic)
+    }
+
     private func writePending(synchronize: Bool) -> Error? {
         do {
             let url = try requireFileURL()
+            trimIfNeeded(url)
             try pending.persist { data in
                 let handle = try FileHandle(forUpdating: url)
                 do {

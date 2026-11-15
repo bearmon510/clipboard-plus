@@ -33,10 +33,16 @@ enum HistoryFilter: Hashable, CaseIterable {
         }
     }
 
+    /// A search term typed with a stray space before or after it still means the same term.
+    static func normalized(_ search: String) -> String {
+        search.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func entries(_ entries: [HistoryEntry], filter: HistoryFilter, search: String) -> [HistoryEntry] {
-        entries.filter {
+        let query = normalized(search)
+        return entries.filter {
             filter.includes($0) &&
-            (search.isEmpty || ($0.kind != .image && $0.text.range(of: search, options: .caseInsensitive) != nil))
+            (query.isEmpty || ($0.kind != .image && $0.text.range(of: query, options: .caseInsensitive) != nil))
         }
     }
 }

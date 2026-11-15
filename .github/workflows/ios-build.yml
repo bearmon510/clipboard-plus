@@ -1,9 +1,13 @@
 name: iOS build and tests
 
+# Runs only when the app or this workflow changes. Pushes that touch documents alone
+# used to spend a macOS build each time.
 on:
   push:
     branches: [main]
+    paths: ['app/**', '.github/workflows/ios-build.yml']
   pull_request:
+    paths: ['app/**', '.github/workflows/ios-build.yml']
   workflow_dispatch:
 
 permissions:

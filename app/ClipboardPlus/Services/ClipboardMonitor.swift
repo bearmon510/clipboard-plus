@@ -29,7 +29,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var savedCount = 0
     @Published private(set) var imageUsage = HistoryImageUsage()
     @Published private(set) var imageNotice: String?
-    private(set) var resumedAtLaunch = false
 
     let log: MeasurementLog
 
@@ -86,7 +85,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             cleanupTimer = cleanup
         }
         if defaults.bool(forKey: "isRecording") {
-            resumedAtLaunch = true
             start(resuming: true)
         }
     }
@@ -514,9 +512,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let detectedAt = Date()
         let count = pasteboard.changeCount
         // Use the collection timer itself: a separate timer cannot prove it is running.
+        // Every 10 seconds served the PiP experiment; in daily use that filled the log,
+        // so the proof of life is now written when entering the background and every 10 minutes.
         if sceneState == "background" {
             let uptime = ProcessInfo.processInfo.systemUptime
-            if lastBackgroundPollUptime.map({ uptime - $0 >= 10 }) ?? true {
+            if lastBackgroundPollUptime.map({ uptime - $0 >= 600 }) ?? true {
                 lastBackgroundPollUptime = uptime
                 record("裏での定期確認", count: count, timestamp: detectedAt)
             }

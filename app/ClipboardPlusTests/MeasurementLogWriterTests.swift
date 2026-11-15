@@ -35,6 +35,44 @@ final class MeasurementLogWriterTests: XCTestCase {
         wait(for: [done], timeout: 5)
     }
 
+    func testLargeLogKeepsOnlyItsNewestWholeLinesAtFirstWrite() throws {
+        let file = try temporaryDirectory().appendingPathComponent("log.tsv")
+        let old = (1...40).map { "old line \($0)\n" }.joined()
+        try old.write(to: file, atomically: true, encoding: .utf8)
+        let writer = MeasurementLogWriter(fileURL: file, maximumFileBytes: 100, trimmedFileBytes: 60)
+        let value = records(["読み取り成功"])[0]
+        let done = expectation(description: "flushed")
+        writer.append(value) { XCTAssertNil($0) }
+        writer.flush { error in
+            XCTAssertNil(error)
+            let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+            let lines = text.split(separator: "\n").map(String.init)
+            XCTAssertEqual(lines.last, value.fileLine)
+            XCTAssertEqual(lines.dropLast().last, "old line 40")
+            // The cut falls on a line boundary and removes the oldest lines.
+            XCTAssertTrue(lines.dropLast().allSatisfy { $0.hasPrefix("old line ") })
+            XCTAssertFalse(text.contains("old line 1\n"))
+            XCTAssertLessThan(lines.count, 10)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+    }
+
+    func testSmallLogIsNotTrimmed() throws {
+        let file = try temporaryDirectory().appendingPathComponent("log.tsv")
+        try "kept line\n".write(to: file, atomically: true, encoding: .utf8)
+        let writer = MeasurementLogWriter(fileURL: file, maximumFileBytes: 100, trimmedFileBytes: 60)
+        let value = records(["読み取り成功"])[0]
+        let done = expectation(description: "flushed")
+        writer.append(value) { XCTAssertNil($0) }
+        writer.flush { error in
+            XCTAssertNil(error)
+            XCTAssertEqual(try? String(contentsOf: file, encoding: .utf8), "kept line\n" + value.fileLine + "\n")
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+    }
+
     func testFailedAppendAndFailureRowAreRetriedWithNextAppend() throws {
         let parent = try temporaryDirectory().appendingPathComponent("unavailable")
         let file = parent.appendingPathComponent("log.tsv")

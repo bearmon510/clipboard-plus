@@ -8,6 +8,8 @@ final class MeasurementLog: ObservableObject {
     @Published private(set) var isPerformingFileOperation = false
     @Published var includeTextPreview = false
 
+    static let maximumLinesInMemory = 2_000
+
     private let writer: MeasurementLogWriter
     private var sequence = LogEventSequence()
 
@@ -78,6 +80,10 @@ final class MeasurementLog: ObservableObject {
     private func enqueue(_ event: MeasurementEvent, attemptWrite: Bool) {
         let record = sequence.makeRecord(event, formatter: LogLineFormatter(includeTextPreview: includeTextPreview))
         lines.append(record)
+        // The on-screen list keeps recent lines only. The file holds the rest.
+        if lines.count > Self.maximumLinesInMemory + 200 {
+            lines.removeFirst(lines.count - Self.maximumLinesInMemory)
+        }
         writer.append(record, attemptWrite: attemptWrite) { error in
             if let error {
                 self.recordFailure("ログ書き込みの失敗", operation: "追記", error: error, context: event)

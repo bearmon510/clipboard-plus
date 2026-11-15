@@ -161,4 +161,12 @@ final class EntryPresentationTests: XCTestCase {
         XCTAssertEqual(HistoryFilter.entries(entries, filter: .links, search: "EXAMPLE").map(\.id), [2])
         XCTAssertTrue(HistoryFilter.entries(entries, filter: .texts, search: "example").isEmpty)
     }
+
+    func testSearchIgnoresSpacesAroundTheTerm() {
+        let now = Date()
+        let entries = [entry(1, "needle がある", at: now), entry(2, "別の文章", at: now)]
+        XCTAssertEqual(HistoryFilter.entries(entries, filter: .all, search: " needle　\n").map(\.id), [1])
+        XCTAssertEqual(HistoryFilter.entries(entries, filter: .all, search: "   ").map(\.id), [1, 2])
+        XCTAssertEqual(HistoryFilter.normalized("  a b  "), "a b")
+    }
 }
