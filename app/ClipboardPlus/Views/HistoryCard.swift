@@ -20,7 +20,8 @@ struct HistoryCard<Actions: View>: View {
     @State private var fullHeight: CGFloat = 0
 
     /// The most text a card shows when opened in place. Longer texts open in full from the menu.
-    private static let expandedLimit = 3_000
+    /// (A computed value, because a generic type cannot hold a static stored property.)
+    private static var expandedLimit: Int { 3_000 }
 
     private var flavor: EntryFlavor { EntryFlavor.detect(entry) }
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous) }
