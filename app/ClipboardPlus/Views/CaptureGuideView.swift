@@ -12,18 +12,39 @@ struct CaptureGuideView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     section(
-                        title: "基本の使い方",
+                        title: "スクリーンショットから（おすすめ）",
+                        symbol: "camera.viewfinder",
+                        lead: "撮った瞬間の画面から切り取ります。録画の表示は出ません。設定の「切り取り」で「スクリーンショットで切り取りを開く」をオンにします。",
+                        steps: [
+                            "clipboard+をSlide Overや小窓で画面に出しておきます。",
+                            "iPadでスクリーンショットを撮ります。clipboard+に切り取りの画面が開きます。",
+                            "ほしい範囲をドラッグします。指の上に拡大鏡が出ます。指を離すとコピーされます。",
+                            "使ったスクリーンショットは写真に残ります。設定の「切り取り」からまとめて削除できます。",
+                        ]
+                    )
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("スクリーンショットを撮りやすくする", systemImage: "hand.tap").font(.subheadline.weight(.semibold))
+                        Text("「設定」→「アクセシビリティ」→「タッチ」→「AssistiveTouch」をオンにし、「カスタムアクション」の「シングルタップ」に「スクリーンショット」を選びます。画面に浮かぶボタンを1回押すだけで撮れます。")
+                        Text("iPadの「設定」で、スクリーンショットをフルスクリーンでプレビューする設定をオフにすると、撮ってすぐ切り取りに移れます。")
+                        Text("画面の隅からのスワイプにスクリーンショットを割り当てる方法もあります（「設定」の「マルチタスクとジェスチャ」）。")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+                    section(
+                        title: "画面を直接取り込む",
                         symbol: "text.viewfinder",
-                        lead: "clipboard+をSlide Overや小窓で横に置いて使います。iPadOS 27以降で使えます。",
+                        lead: "写真へのアクセスを使わない方法です。iPadOS 27以降で使えます。",
                         steps: [
                             "上の「文字」か「画像」を押します。最初の1回は、画面の取り込みを許可する画面が出ます。「画面全体」を選んでください。",
-                            "その時点の画面が止まって表示されます。ほしい範囲をドラッグします。指の上に拡大鏡が出ます。",
-                            "指を離すとコピーされます。そのまま隣のアプリに貼り付けられます。",
+                            "その時点の画面が止まって表示されます。範囲を選んで指を離すとコピーされます。",
                         ]
                     )
                     VStack(alignment: .leading, spacing: 6) {
                         Label("知っておくこと", systemImage: "info.circle").font(.subheadline.weight(.semibold))
-                        Text("画面を取り込んでいる間は、ボタンに緑の点が付きます。clipboard+を隠すか、最後の切り取りから5分たつと止まります。メニューから止めることもできます。")
+                        Text("画面を直接取り込んでいる間は、ボタンに緑の点が付き、録画中の表示が出ます。clipboard+を隠すか、最後の切り取りから5分たつと止まります。メニューから止めることもできます。")
                         Text("取り込んだ画面は保存せず、外へ送りません。文字の読み取りもiPadの中で行います。")
                         Text("Slide Overで重ねているときは、clipboard+の下に隠れた部分は写りません。反対側へ動かしてから切り取ってください。")
                     }
@@ -32,17 +53,6 @@ struct CaptureGuideView: View {
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
-                    section(
-                        title: "スクリーンショットで開く（試験）",
-                        symbol: "camera.viewfinder",
-                        lead: "録画の表示を出さずに、撮った瞬間の画面から切り取ります。設定の「切り取り」で「スクリーンショットで切り取りを開く」をオンにします。",
-                        steps: [
-                            "clipboard+を小窓やSlide Overで画面に出しておきます。",
-                            "iPadでスクリーンショットを撮ります。画面の隅からのスワイプをスクリーンショットに割り当てておくと、指1本で撮れます（「設定」の「マルチタスクとジェスチャ」にある、隅からのスワイプの項目）。",
-                            "スクリーンショットのプレビューを閉じると、clipboard+に切り取りの画面が開いています。範囲を選んで指を離します。",
-                            "使ったスクリーンショットは写真に残ります。設定の「切り取り」からまとめて削除できます。",
-                        ]
-                    )
                     section(
                         title: "保存した画像から",
                         symbol: "photo.on.rectangle",

@@ -119,6 +119,9 @@ struct ContentView: View {
             monitor.receiveDropped(providers, receivedAt: Date())
         }
         .onAppear {
+            // The instant (burst) capture asked for permission every time on device, so
+            // anyone who chose it in 0.9.0 goes back to continuous capture.
+            screenCapture.setStrategy(.continuous)
             updateScene(scenePhase)
             monitor.pendingDeletion { showUndo($0) }
         }

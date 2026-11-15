@@ -1,8 +1,9 @@
 import SwiftUI
 import UIKit
 
-/// Settings for the capture mode, including the two 0.9.0 experiments: taking the screen only
-/// for an instant, and opening the capture mode from an iPad screenshot.
+/// Settings for the capture mode: opening it from an iPad screenshot, and how direct capture behaves.
+/// The 0.9.0 "instant" capture was dropped after device testing, because iPadOS asked for
+/// permission every time.
 struct CaptureSettingsSection: View {
     @ObservedObject var screenCapture: ScreenCaptureController
     @ObservedObject var screenshots: ScreenshotWatcher
@@ -12,28 +13,11 @@ struct CaptureSettingsSection: View {
 
     var body: some View {
         Section {
-            if screenCapture.isSupported {
-                Picker("画面の取り込み方", selection: Binding(
-                    get: { screenCapture.strategy },
-                    set: { screenCapture.setStrategy($0) }
-                )) {
-                    Text("続ける（標準）").tag(ScreenCaptureStrategy.continuous)
-                    Text("一瞬だけ（試験）").tag(ScreenCaptureStrategy.burst)
-                }
-                .pickerStyle(.menu)
-                .frame(minHeight: 44)
-                Text(screenCapture.strategy == .continuous
-                     ? "最初の切り取りで許可した後、最後の切り取りから5分たつか、clipboard+を隠すまで画面を取り込み続けます。その間は許可を求めません。"
-                     : "許可を保ったまま、切り取る瞬間だけ画面を取り込みます。録画中の表示が出る時間が短くなります。iPadOSがこの使い方を認めない場合は、毎回許可を求めることがあります。")
-                    .font(.footnote)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
             Toggle(isOn: Binding(
                 get: { screenshots.isEnabled },
                 set: { screenshots.setEnabled($0) }
             )) {
-                Text("スクリーンショットで切り取りを開く（試験）")
+                Text("スクリーンショットで切り取りを開く")
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(minHeight: 44)
@@ -47,9 +31,14 @@ struct CaptureSettingsSection: View {
                 .pickerStyle(.segmented)
                 .frame(minHeight: 44)
             }
-            Text("iPadでスクリーンショットを撮ると、clipboard+がそれを拾って切り取りの画面を開きます。録画の表示は出ません。clipboard+を小窓やSlide Overで画面に出しておく必要があります。写真ライブラリの「すべての写真」へのアクセスが要ります。")
+            Text("iPadでスクリーンショットを撮ると、clipboard+がそれを拾って切り取りの画面を開きます。録画の表示は出ません。clipboard+を小窓やSlide Overで画面に出しておく必要があります。写真ライブラリの「すべての写真」へのアクセスが要ります。AssistiveTouchの1回タップにスクリーンショットを割り当てると、指1本で始められます。")
                 .font(.footnote)
                 .fixedSize(horizontal: false, vertical: true)
+            if screenCapture.isSupported {
+                Text("上の「文字」「画像」のボタンは、画面を直接取り込みます。最初の切り取りで許可した後、最後の切り取りから5分たつか、clipboard+を隠すまで取り込みを続けます。その間は許可を求めません。")
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if screenshots.usedCount > 0 {
                 Button(role: .destructive) {
