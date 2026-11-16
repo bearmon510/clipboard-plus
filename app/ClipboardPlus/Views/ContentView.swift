@@ -159,7 +159,9 @@ struct ContentView: View {
             if phase == .active { startQueuedDirectCapture() }
         }
         .onChange(of: directCaptureEnabled) { _, enabled in
-            if !enabled { screenCapture.stop(reason: "開発者向けの設定でオフ") }
+            guard !enabled else { return }
+            queuedDirectMode = nil
+            screenCapture.stop(reason: "開発者向けの設定でオフ")
         }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings, onDismiss: presentQueuedCapture) {
@@ -818,6 +820,10 @@ struct ContentView: View {
     }
 
     private func startQueuedDirectCapture() {
+        guard directCaptureEnabled else {
+            queuedDirectMode = nil
+            return
+        }
         guard let mode = queuedDirectMode, scenePhase == .active else { return }
         guard !(showSettings || showCaptureGuide || detailEntry != nil) else { return }
         queuedDirectMode = nil

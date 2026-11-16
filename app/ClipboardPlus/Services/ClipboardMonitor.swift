@@ -558,7 +558,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 self.store.collectFile(input, source: route, at: receivedAt, before: before, after: after, details: measured)
             case .failure(let error):
                 self.pendingSaveCount -= 1
-                self.store.resetFileAdmission()
+                // Only an automatic read owns the pasteboard's admission marks. A failed drop or
+                // manual paste must not clear the mark of a copy made from the history meanwhile.
+                if before != nil { self.store.resetFileAdmission() }
                 let failure = error as? HistoryFileError ?? .unavailable
                 self.fileNotice = failure.message
                 self.record("ファイル保存の見送り", details: "\(measured); 理由=\(failure)")
