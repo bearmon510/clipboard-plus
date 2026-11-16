@@ -196,7 +196,9 @@ final class FileMonitorTests: XCTestCase {
     }
 
     @MainActor
-    func testDuplicateAndSelfCopyAreCountedCorrectlyAndShortcutEntityContainsFile() async throws {
+    // Synchronous on purpose: drain() uses wait(for:), which in an async test blocks the main
+    // queue completions it is waiting for.
+    func testDuplicateAndSelfCopyAreCountedCorrectlyAndShortcutEntityContainsFile() throws {
         let root = try ImageTestSupport.directory(self)
         let board = FilePasteboard()
         let monitor = try fixture(root, board: board)
@@ -212,7 +214,7 @@ final class FileMonitorTests: XCTestCase {
         XCTAssertEqual(entry.collectionCount, 2)
         let copied = expectation(description: "file copied")
         monitor.copy(entry) { succeeded in XCTAssertTrue(succeeded); copied.fulfill() }
-        await fulfillment(of: [copied], timeout: 5)
+        wait(for: [copied], timeout: 5)
         drain(monitor)
         XCTAssertEqual(monitor.entries, [entry])
         XCTAssertEqual(board.itemProviders.first?.suggestedName, "秘密の名前.pdf")
@@ -225,7 +227,12 @@ final class FileMonitorTests: XCTestCase {
         XCTAssertEqual(entity.file?.filename, file.originalFilename)
         XCTAssertEqual(entity.file?.data, FileTestSupport.bytes)
         XCTAssertEqual(HistoryFilterOption.files.filter, .files)
-        try await monitor.copyForShortcut(entry)
+        let shortcutCopied = expectation(description: "shortcut copy finished")
+        Task { @MainActor in
+            do { try await monitor.copyForShortcut(entry) } catch { XCTFail("shortcut copy failed: \(error)") }
+            shortcutCopied.fulfill()
+        }
+        wait(for: [shortcutCopied], timeout: 10)
         drain(monitor)
         XCTAssertEqual(monitor.entries, [entry])
         board.external([original])
