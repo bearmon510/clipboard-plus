@@ -25,7 +25,7 @@ struct PinOrderView: View {
                 }
             }
             .environment(\.editMode, .constant(.active))
-            .navigationTitle("ピン留めの並べ替え")
+            .navigationTitle("並べ替え")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
