@@ -121,6 +121,11 @@ enum HistoryFileTypes {
             .components(separatedBy: "/").last ?? ""
         let clean = String(String.UnicodeScalarView(name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
         if !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, clean != ".", clean != ".." {
+            // Shorten the stem, not the extension: a text file is recognised by its extension.
+            let ext = (clean as NSString).pathExtension
+            if clean.count > 240, !ext.isEmpty, ext.count < 40 {
+                return String((clean as NSString).deletingPathExtension.prefix(239 - ext.count)) + "." + ext
+            }
             return String(clean.prefix(240))
         }
         return "ファイル" + (UTType(typeIdentifier)?.preferredFilenameExtension.map { "." + $0 } ?? "")
