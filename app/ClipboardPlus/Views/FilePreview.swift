@@ -64,7 +64,7 @@ private struct QuickLookView: UIViewControllerRepresentable {
 
         func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
 
-        func previewItem(at index: Int, for controller: QLPreviewController) -> QLPreviewItem { item }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { item }
     }
 
     /// Quick Look reads the type from the stored name's extension and shows the original name.
