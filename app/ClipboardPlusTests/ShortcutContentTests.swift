@@ -7,7 +7,7 @@ final class ShortcutContentTests: XCTestCase {
                        collected: Double = 10, pinned: Bool = false, image: HistoryImage? = nil) -> HistoryEntry {
         HistoryEntry(id: id, kind: kind, text: text, savedAt: Date(timeIntervalSince1970: 1),
                      lastCollectedAt: Date(timeIntervalSince1970: collected), collectionCount: 1,
-                     isPinned: pinned, source: .manual, image: image)
+                     isTemplate: pinned, source: .manual, image: image)
     }
 
     func testLinesUseReadingOrderMergeSameRowAndRemoveWhitespaceOnlyLines() throws {
@@ -52,7 +52,7 @@ final class ShortcutContentTests: XCTestCase {
         let entries = [entry(1, collected: 30), entry(2, kind: .url, collected: 20, pinned: true),
                        entry(3, kind: .image, collected: 30, pinned: true), entry(4, collected: 10)]
         let expected: [(HistoryFilterOption, [Int])] = [
-            (.all, [3, 1, 2, 4]), (.pinned, [3, 2]), (.texts, [1, 4]), (.links, [2]), (.images, [3])
+            (.all, [1, 4]), (.templates, [2, 3]), (.texts, [1, 4]), (.links, []), (.images, [])
         ]
         for (option, ids) in expected {
             XCTAssertEqual(ShortcutContent.entries(entries, filter: option.filter).map(\.id), ids)
@@ -65,7 +65,7 @@ final class ShortcutContentTests: XCTestCase {
                        entry(2, kind: .url, text: "https://example.com/HELLO"),
                        entry(3, kind: .image, text: "Hello"), entry(4, text: "else")]
         for query in [" hello \n", "日本語", "HEL", "", " \t\n", "not found"] {
-            let expected = HistoryFilter.entries(entries, filter: .all, search: query).map(\.id).sorted(by: >)
+            let expected = ShortcutContent.entries(entries, filter: .all, search: query).map(\.id).sorted(by: >)
             XCTAssertEqual(ShortcutContent.entries(entries, search: query).map(\.id), expected)
         }
         XCTAssertEqual(ShortcutContent.entries(entries, search: "hello").map(\.id), [2, 1])
@@ -79,10 +79,10 @@ final class ShortcutContentTests: XCTestCase {
         XCTAssertEqual(entity.text, item.text)
         XCTAssertEqual(entity.kind, "文章")
         XCTAssertEqual(entity.savedAt, item.savedAt)
-        XCTAssertTrue(entity.isPinned)
+        XCTAssertTrue(entity.isTemplate)
         XCTAssertNil(entity.picture)
         XCTAssertEqual(entity.displayTitle, "先頭の行")
-        XCTAssertTrue(entity.displaySubtitle.contains("ピン留め"))
+        XCTAssertTrue(entity.displaySubtitle.contains("テンプレート"))
         XCTAssertTrue(entity.displaySubtitle.contains(item.savedAt.formatted(date: .abbreviated, time: .shortened)))
         XCTAssertEqual(String(localized: entity.displayRepresentation.title), entity.displayTitle)
         XCTAssertEqual(ShortcutContent.title(entry(8, text: String(repeating: "あ", count: 61))),
@@ -98,7 +98,7 @@ final class ShortcutContentTests: XCTestCase {
         XCTAssertEqual(entity.kind, "画像")
         XCTAssertEqual(entity.text, "")
         XCTAssertEqual(entity.picture?.data, file.data)
-        XCTAssertFalse(entity.isPinned)
-        XCTAssertFalse(entity.displaySubtitle.contains("ピン留め"))
+        XCTAssertFalse(entity.isTemplate)
+        XCTAssertFalse(entity.displaySubtitle.contains("テンプレート"))
     }
 }

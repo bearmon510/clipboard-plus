@@ -1,15 +1,15 @@
 import Foundation
 
 protocol HistoryPersistence: AnyObject {
-    func createWritten(text: String, title: String?) throws -> HistoryEntry
-    func setTitle(_ title: String?, id: Int) throws
-    func editText(id: Int, text: String, title: String?) throws -> HistoryEntry
-    func reorderPins(_ orderedIDs: [Int]) throws
+    func createTemplate(text: String, title: String?, tag: String?) throws -> HistoryEntry
+    func renameTag(_ tag: String?, to newTag: String?) throws
+    func updateTemplate(id: Int, text: String?, title: String?, tag: String?) throws -> HistoryEntry
+    func reorderTemplates(_ orderedIDs: [Int]) throws
     func collect(_ text: String, source: HistorySource, at date: Date?) throws -> HistoryEntry
     func fetchAll() throws -> [HistoryEntry]
-    func togglePin(id: Int) throws -> HistoryEntry?
+    func moveToTemplates(id: Int) throws -> HistoryEntry
     func delete(id: Int) throws -> HistoryDeletion?
-    func deleteAll(includePinned: Bool) throws -> HistoryDeletion?
+    func deleteAll() throws -> HistoryDeletion?
     func undo(_ deletion: HistoryDeletion) throws -> Bool
     func purgeExpired() throws -> Bool
     func purgeHistory(olderThan retention: HistoryRetention) throws -> Int
@@ -25,10 +25,11 @@ protocol HistoryPersistence: AnyObject {
 }
 
 extension HistoryPersistence {
-    func createWritten(text: String, title: String?) throws -> HistoryEntry { throw HistoryEditError.failed }
-    func setTitle(_ title: String?, id: Int) throws { throw HistoryEditError.failed }
-    func editText(id: Int, text: String, title: String?) throws -> HistoryEntry { throw HistoryEditError.failed }
-    func reorderPins(_ orderedIDs: [Int]) throws { throw HistoryEditError.failed }
+    func moveToTemplates(id: Int) throws -> HistoryEntry { throw HistoryEditError.failed }
+    func createTemplate(text: String, title: String?, tag: String?) throws -> HistoryEntry { throw HistoryEditError.failed }
+    func renameTag(_ tag: String?, to newTag: String?) throws { throw HistoryEditError.failed }
+    func updateTemplate(id: Int, text: String?, title: String?, tag: String?) throws -> HistoryEntry { throw HistoryEditError.failed }
+    func reorderTemplates(_ orderedIDs: [Int]) throws { throw HistoryEditError.failed }
     func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry {
         throw HistoryImageError.unavailable
     }
@@ -301,9 +302,9 @@ final class HistoryStore {
         }, completion: completion)
     }
 
-    func deleteAll(includePinned: Bool, completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
+    func deleteAll(completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
-            let deletion = try database.deleteAll(includePinned: includePinned)
+            let deletion = try database.deleteAll()
             self.emit(.replace(try database.fetchAll()))
             return deletion
         }, completion: completion)
@@ -321,40 +322,40 @@ final class HistoryStore {
         perform({ try $0.latestDeletion() }, completion: completion)
     }
 
-    func createWritten(text: String, title: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
+    func moveToTemplates(id: Int, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
         perform({ database in
-            let entry = try database.createWritten(text: text, title: title)
+            let entry = try database.moveToTemplates(id: id)
             self.emit(.replace(try database.fetchAll()))
             return entry
         }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
     }
 
-    func setTitle(_ title: String?, id: Int, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+    func createTemplate(text: String, title: String?, tag: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
         perform({ database in
-            try database.setTitle(title, id: id)
-            self.emit(.replace(try database.fetchAll()))
-        }, completion: completion)
-    }
-
-    func editText(id: Int, text: String, title: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
-        perform({ database in
-            let entry = try database.editText(id: id, text: text, title: title)
+            let entry = try database.createTemplate(text: text, title: title, tag: tag)
             self.emit(.replace(try database.fetchAll()))
             return entry
         }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
     }
 
-    func reorderPins(_ orderedIDs: [Int], completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+    func updateTemplate(id: Int, text: String?, title: String?, tag: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
         perform({ database in
-            try database.reorderPins(orderedIDs)
+            let entry = try database.updateTemplate(id: id, text: text, title: title, tag: tag)
+            self.emit(.replace(try database.fetchAll()))
+            return entry
+        }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
+    }
+
+    func reorderTemplates(_ orderedIDs: [Int], completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        perform({ database in
+            try database.reorderTemplates(orderedIDs)
             self.emit(.replace(try database.fetchAll()))
         }, completion: completion)
     }
 
-    func togglePin(id: Int, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+    func renameTag(_ tag: String?, to newTag: String?, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
-            _ = try database.togglePin(id: id)
-            // A pin-order overflow can renumber other pins in the same transaction.
+            try database.renameTag(tag, to: newTag)
             self.emit(.replace(try database.fetchAll()))
         }, completion: completion)
     }
@@ -589,11 +590,11 @@ enum HistoryList {
             $0.lastCollectedAt == entry.lastCollectedAt ? $0.id < entry.id : $0.lastCollectedAt < entry.lastCollectedAt
         } ?? entries.endIndex
         entries.insert(entry, at: index)
-        var unpinned = 0
+        var historyCount = 0
         entries.removeAll {
-            if $0.isPinned { return false }
-            unpinned += 1
-            return unpinned > 1_000
+            if $0.isTemplate { return false }
+            historyCount += 1
+            return historyCount > 1_000
         }
     }
 }

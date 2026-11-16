@@ -97,11 +97,10 @@ enum EntryTime {
 }
 
 enum EntrySectionKind: Hashable {
-    case pinned, today, yesterday, thisWeek, earlier
+    case today, yesterday, thisWeek, earlier
 
     var title: String {
         switch self {
-        case .pinned: return "ピン留め"
         case .today: return "今日"
         case .yesterday: return "昨日"
         case .thisWeek: return "過去7日間"
@@ -117,8 +116,8 @@ struct EntrySection: Identifiable, Equatable {
 }
 
 enum EntrySections {
-    /// Groups newest-first entries by day, preserving that order except for explicit pin order.
-    static func make(_ entries: [HistoryEntry], separatesPinned: Bool, now: Date,
+    /// Groups newest-first entries by day, preserving the history order.
+    static func make(_ entries: [HistoryEntry], now: Date,
                      calendar: Calendar = .current) -> [EntrySection] {
         let startOfToday = calendar.startOfDay(for: now)
         let startOfYesterday = calendar.date(byAdding: .day, value: -1, to: startOfToday)
@@ -126,11 +125,9 @@ enum EntrySections {
         let startOfWeek = calendar.date(byAdding: .day, value: -6, to: startOfToday)
             ?? startOfToday.addingTimeInterval(-6 * 86_400)
         var buckets: [EntrySectionKind: [HistoryEntry]] = [:]
-        for entry in entries {
+        for entry in entries where !entry.isTemplate {
             let kind: EntrySectionKind
-            if separatesPinned && entry.isPinned {
-                kind = .pinned
-            } else if entry.lastCollectedAt >= startOfToday {
+            if entry.lastCollectedAt >= startOfToday {
                 kind = .today
             } else if entry.lastCollectedAt >= startOfYesterday {
                 kind = .yesterday
@@ -141,9 +138,9 @@ enum EntrySections {
             }
             buckets[kind, default: []].append(entry)
         }
-        let order: [EntrySectionKind] = [.pinned, .today, .yesterday, .thisWeek, .earlier]
+        let order: [EntrySectionKind] = [.today, .yesterday, .thisWeek, .earlier]
         return order.compactMap { kind in
-            buckets[kind].map { EntrySection(kind: kind, entries: kind == .pinned ? HistoryEntry.orderedPins($0) : $0) }
+            buckets[kind].map { EntrySection(kind: kind, entries: $0) }
         }
     }
 }

@@ -14,19 +14,19 @@ enum HistoryDatabaseError: Error {
 }
 
 final class HistoryDatabase: HistoryPersistence {
-    static let schemaVersion = 4
+    static let schemaVersion = 5
     static let undoInterval: TimeInterval = 5
     private var connection: OpaquePointer?
     private let now: () -> Date
-    private let columns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source, image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type, file_hash, file_name, original_filename, file_bytes, file_type, title, pin_order"
-    private let unpinnedLimit: Int
+    private let columns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source, image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type, file_hash, file_name, original_filename, file_bytes, file_type, title, pin_order, tag"
+    private let historyLimit: Int
     private let imageByteLimit: Int
     private var removals: [HistoryEntry] = []
 
-    init(url: URL, now: @escaping () -> Date = Date.init, unpinnedLimit: Int = 1_000,
+    init(url: URL, now: @escaping () -> Date = Date.init, historyLimit: Int = 1_000,
          imageByteLimit: Int = HistoryImageFiles.maximumTotalByteCount) throws {
         self.now = now
-        self.unpinnedLimit = max(0, unpinnedLimit)
+        self.historyLimit = max(0, historyLimit)
         self.imageByteLimit = max(0, imageByteLimit)
         let result = sqlite3_open(url.path, &connection)
         guard result == SQLITE_OK else {
@@ -87,11 +87,29 @@ final class HistoryDatabase: HistoryPersistence {
                     try execute("ALTER TABLE history ADD COLUMN title TEXT")
                     try execute("ALTER TABLE history ADD COLUMN pin_order INTEGER")
                     // Include undo-pending pins so undo preserves their previous display order.
-                    let pins = try rows("SELECT \(columns) FROM history WHERE pinned = 1 ORDER BY collected_at DESC, id DESC")
-                    for (order, entry) in pins.enumerated() {
+                    let legacyTemplates = try rows("SELECT \(columns.replacingOccurrences(of: ", tag", with: ", NULL AS tag")) FROM history WHERE pinned = 1 ORDER BY collected_at DESC, id DESC")
+                    for (order, entry) in legacyTemplates.enumerated() {
                         try execute("UPDATE history SET pin_order = ? WHERE id = ?", [.integer(order), .integer(entry.id)])
                     }
                     try execute("PRAGMA user_version = 4")
+                }
+            }
+            if version < 5 {
+                try transaction {
+                    try execute("ALTER TABLE history ADD COLUMN tag TEXT")
+                    // Include pending deletions without changing their undo token or expiry.
+                    let templates = try rows("SELECT \(columns) FROM history WHERE pinned = 1 ORDER BY pin_order IS NULL, pin_order, collected_at DESC, id DESC")
+                    for (order, entry) in templates.enumerated() {
+                        try execute("UPDATE history SET pin_order = ?, tag = NULL WHERE id = ?", [.integer(order), .integer(entry.id)])
+                    }
+                    for name in ["history_active_text", "history_active_image", "history_active_file"] {
+                        try execute("DROP INDEX IF EXISTS \(name)")
+                    }
+                    // The discriminator separates history and template uniqueness domains.
+                    try execute("CREATE UNIQUE INDEX history_active_text ON history(text, pinned) WHERE deletion_id IS NULL AND kind NOT IN ('image', 'file')")
+                    try execute("CREATE UNIQUE INDEX history_active_image ON history(image_hash, pinned) WHERE deletion_id IS NULL AND kind = 'image'")
+                    try execute("CREATE UNIQUE INDEX history_active_file ON history(file_hash, pinned) WHERE deletion_id IS NULL AND kind = 'file'")
+                    try execute("PRAGMA user_version = 5")
                 }
             }
             try purgeExpired()
@@ -120,7 +138,7 @@ final class HistoryDatabase: HistoryPersistence {
         let timestamp = date ?? now()
         return try transaction {
             try purgeExpired()
-            let existing = try rows("SELECT \(columns) FROM history WHERE kind NOT IN ('image', 'file') AND text = ? AND deletion_id IS NULL", [.text(text)]).first
+            let existing = try rows("SELECT \(columns) FROM history WHERE kind NOT IN ('image', 'file') AND text = ? AND pinned = 0 AND deletion_id IS NULL", [.text(text)]).first
             let id: Int
             if let existing {
                 id = existing.id
@@ -145,7 +163,7 @@ final class HistoryDatabase: HistoryPersistence {
         let timestamp = date ?? now()
         return try transaction {
             try purgeExpired()
-            let existing = try rows("SELECT \(columns) FROM history WHERE kind = 'image' AND image_hash = ? AND deletion_id IS NULL",
+            let existing = try rows("SELECT \(columns) FROM history WHERE kind = 'image' AND image_hash = ? AND pinned = 0 AND deletion_id IS NULL",
                                     [.text(image.hash)]).first
             let id: Int
             if let existing {
@@ -176,7 +194,7 @@ final class HistoryDatabase: HistoryPersistence {
         let timestamp = date ?? now()
         return try transaction {
             try purgeExpired()
-            let existing = try rows("SELECT \(columns) FROM history WHERE kind = 'file' AND file_hash = ? AND deletion_id IS NULL",
+            let existing = try rows("SELECT \(columns) FROM history WHERE kind = 'file' AND file_hash = ? AND pinned = 0 AND deletion_id IS NULL",
                                     [.text(file.hash)]).first
             let id: Int
             if let existing {
@@ -203,63 +221,75 @@ final class HistoryDatabase: HistoryPersistence {
     }
 
     @discardableResult
-    func togglePin(id: Int) throws -> HistoryEntry? {
-        try transaction {
-            guard let existing = try rows("SELECT \(columns) FROM history WHERE id = ? AND deletion_id IS NULL", [.integer(id)]).first else { return nil }
-            let order: Int
-            if existing.isPinned { order = 0 } else { order = try nextPinOrder() }
-            try execute("UPDATE history SET pin_order = CASE WHEN pinned = 1 THEN NULL ELSE ? END, pinned = 1 - pinned WHERE id = ? AND deletion_id IS NULL",
-                        [.integer(order), .integer(id)])
-            try enforceLimit()
-            return try rows("SELECT \(columns) FROM history WHERE id = ? AND deletion_id IS NULL", [.integer(id)]).first
-        }
-    }
-
-    func createWritten(text: String, title: String?) throws -> HistoryEntry {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
-        return try transaction {
-            if let existing = try activeText(text) {
-                if !existing.isPinned {
-                    try execute("UPDATE history SET pinned = 1, pin_order = ? WHERE id = ?",
-                                [.integer(try nextPinOrder()), .integer(existing.id)])
-                }
-                if title != nil { try writeTitle(title, id: existing.id) }
-                return try activeEntry(existing.id)
-            }
-            let date = now().timeIntervalSince1970
-            try execute("""
-                INSERT INTO history(kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order)
-                VALUES (?, ?, ?, ?, 1, 1, 'written', ?, ?)
-                """, [.text(HistoryKind.classify(text).rawValue), .text(text), .real(date), .real(date),
-                      titleValue(title), .integer(try nextPinOrder())])
-            return try activeEntry(Int(sqlite3_last_insert_rowid(connection)))
-        }
-    }
-
-    func setTitle(_ title: String?, id: Int) throws {
-        try writeTitle(title, id: id)
-    }
-
-    func editText(id: Int, text: String, title: String?) throws -> HistoryEntry {
+    func moveToTemplates(id: Int) throws -> HistoryEntry {
         try transaction {
             let entry = try activeEntry(id)
-            guard entry.kind == .text || entry.kind == .url else { throw HistoryEditError.unsupportedKind }
-            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
-            if let duplicate = try activeText(text), duplicate.id != id { throw HistoryEditError.duplicate }
-            try execute("UPDATE history SET text = ?, kind = ?, title = ? WHERE id = ? AND deletion_id IS NULL",
-                        [.text(text), .text(HistoryKind.classify(text).rawValue), titleValue(title), .integer(id)])
+            if try equalTemplate(to: entry) != nil { throw HistoryEditError.duplicate }
+            try execute("UPDATE history SET pinned = 1, tag = NULL, pin_order = ? WHERE id = ?",
+                        [.integer(try nextTemplateOrder(tag: nil)), .integer(id)])
             return try activeEntry(id)
         }
     }
 
-    func reorderPins(_ orderedIDs: [Int]) throws {
+    func createTemplate(text: String, title: String?, tag: String? = nil) throws -> HistoryEntry {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
+        return try transaction {
+            if try activeTemplateText(text) != nil { throw HistoryEditError.duplicate }
+            let tag = HistoryEntry.normalizedTag(tag)
+            let date = now().timeIntervalSince1970
+            try execute("""
+                INSERT INTO history(kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order, tag)
+                VALUES (?, ?, ?, ?, 1, 1, 'written', ?, ?, ?)
+                """, [.text(HistoryKind.classify(text).rawValue), .text(text), .real(date), .real(date),
+                      titleValue(title), .integer(try nextTemplateOrder(tag: tag)), tagValue(tag)])
+            return try activeEntry(Int(sqlite3_last_insert_rowid(connection)))
+        }
+    }
+
+    func updateTemplate(id: Int, text: String?, title: String?, tag: String?) throws -> HistoryEntry {
         try transaction {
-            let pins = HistoryEntry.orderedPins(try fetchAll().filter { $0.isPinned })
-            let pinnedIDs = Set(pins.map(\.id))
+            let entry = try activeEntry(id)
+            guard entry.isTemplate else { throw HistoryEditError.unsupportedKind }
+            if let text {
+                guard entry.kind == .text || entry.kind == .url else { throw HistoryEditError.unsupportedKind }
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
+                if let duplicate = try activeTemplateText(text), duplicate.id != id { throw HistoryEditError.duplicate }
+            }
+            let tag = HistoryEntry.normalizedTag(tag)
+            let order: Int?
+            if tag == entry.tag { order = entry.templateOrder }
+            else { order = try nextTemplateOrder(tag: tag) }
+            try execute("UPDATE history SET text = ?, kind = ?, title = ?, tag = ?, pin_order = ? WHERE id = ?",
+                        [.text(text ?? entry.text), .text(text.map { HistoryKind.classify($0).rawValue } ?? entry.kind.rawValue),
+                         titleValue(title), tagValue(tag), order.map { .integer($0) } ?? .null, .integer(id)])
+            return try activeEntry(id)
+        }
+    }
+
+    func reorderTemplates(_ orderedIDs: [Int]) throws {
+        try transaction {
+            let templates = try fetchAll().filter(\.isTemplate)
+            let byID = Dictionary(uniqueKeysWithValues: templates.map { ($0.id, $0) })
             var seen = Set<Int>()
-            let order = (orderedIDs + pins.map(\.id)).filter { pinnedIDs.contains($0) && seen.insert($0).inserted }
-            for (offset, id) in order.enumerated() {
-                try execute("UPDATE history SET pin_order = ? WHERE id = ?", [.integer(offset), .integer(id)])
+            let selected = orderedIDs.compactMap { byID[$0] }.filter { seen.insert($0.id).inserted }
+            guard let first = selected.first, selected.allSatisfy({ $0.tag == first.tag }) else { return }
+            // Only supplied rows change; callers pass one group's IDs.
+            for (offset, entry) in selected.enumerated() {
+                try execute("UPDATE history SET pin_order = ? WHERE id = ?", [.integer(offset), .integer(entry.id)])
+            }
+        }
+    }
+
+    func renameTag(_ tag: String?, to newTag: String?) throws {
+        try transaction {
+            let oldTag = HistoryEntry.normalizedTag(tag)
+            let newTag = HistoryEntry.normalizedTag(newTag)
+            guard oldTag != newTag else { return }
+            let moved = HistoryEntry.orderedTemplates(try fetchAll().filter { $0.isTemplate && $0.tag == oldTag })
+            for entry in moved {
+                let order = try nextTemplateOrder(tag: newTag)
+                try execute("UPDATE history SET tag = ?, pin_order = ? WHERE id = ?",
+                            [tagValue(newTag), .integer(order), .integer(entry.id)])
             }
         }
     }
@@ -271,35 +301,45 @@ final class HistoryDatabase: HistoryPersistence {
         return entry
     }
 
-    private func activeText(_ text: String) throws -> HistoryEntry? {
-        try rows("SELECT \(columns) FROM history WHERE kind IN ('text', 'url') AND text = ? AND deletion_id IS NULL", [.text(text)]).first
+    private func activeTemplateText(_ text: String) throws -> HistoryEntry? {
+        try rows("SELECT \(columns) FROM history WHERE kind IN ('text', 'url') AND text = ? AND pinned = 1 AND deletion_id IS NULL", [.text(text)]).first
+    }
+
+    private func equalTemplate(to entry: HistoryEntry) throws -> HistoryEntry? {
+        let predicate = entry.kind == .image ? "kind = 'image' AND image_hash = ?"
+            : entry.kind == .file ? "kind = 'file' AND file_hash = ?" : "kind IN ('text', 'url') AND text = ?"
+        return try rows("SELECT \(columns) FROM history WHERE \(predicate) AND pinned = 1 AND deletion_id IS NULL",
+                        [.text(entry.image?.hash ?? entry.file?.hash ?? entry.text)]).first
     }
 
     private func titleValue(_ title: String?) -> Value {
         HistoryEntry.normalizedTitle(title).map { .text($0) } ?? .null
     }
 
-    private func writeTitle(_ title: String?, id: Int) throws {
-        try execute("UPDATE history SET title = ? WHERE id = ? AND deletion_id IS NULL", [titleValue(title), .integer(id)])
+    private func tagValue(_ tag: String?) -> Value {
+        HistoryEntry.normalizedTag(tag).map { .text($0) } ?? .null
     }
 
-    private func nextPinOrder() throws -> Int {
-        let pins = HistoryEntry.orderedPins(try fetchAll().filter { $0.isPinned })
-        guard let minimum = pins.compactMap(\.pinOrder).min() else { return 0 }
-        if minimum > Int.min { return minimum - 1 }
-        // Imported orders may span the full integer range. Renumber before subtracting.
-        for (offset, entry) in pins.enumerated() {
+    private func nextTemplateOrder(tag: String?) throws -> Int {
+        let templates = HistoryEntry.orderedTemplates(try fetchAll().filter { $0.isTemplate && $0.tag == tag })
+        guard !templates.isEmpty else { return 0 }
+        if templates.allSatisfy({ $0.templateOrder != nil }),
+           let maximum = templates.compactMap(\.templateOrder).max(), maximum < Int.max {
+            return maximum + 1
+        }
+        // Normalize missing/overflowing orders before appending, so the new row is last.
+        for (offset, entry) in templates.enumerated() {
             try execute("UPDATE history SET pin_order = ? WHERE id = ?", [.integer(offset), .integer(entry.id)])
         }
-        return -1
+        return templates.count
     }
 
     func delete(id: Int) throws -> HistoryDeletion? {
         try markDeleted(predicate: "id = ?", bindings: [.integer(id)])
     }
 
-    func deleteAll(includePinned: Bool) throws -> HistoryDeletion? {
-        try markDeleted(predicate: includePinned ? "1 = 1" : "pinned = 0", bindings: [])
+    func deleteAll() throws -> HistoryDeletion? {
+        try markDeleted(predicate: "pinned = 0", bindings: [])
     }
 
     @discardableResult
@@ -312,18 +352,18 @@ final class HistoryDatabase: HistoryPersistence {
                 let predicate = old.kind == .image ? "kind = 'image' AND image_hash = ?"
                     : old.kind == .file ? "kind = 'file' AND file_hash = ?" : "kind NOT IN ('image', 'file') AND text = ?"
                 let key = old.image?.hash ?? old.file?.hash ?? old.text
-                let active = try rows("SELECT \(columns) FROM history WHERE \(predicate) AND deletion_id IS NULL", [.text(key)]).first
+                let active = try rows("SELECT \(columns) FROM history WHERE \(predicate) AND pinned = ? AND deletion_id IS NULL", [.text(key), .integer(old.isTemplate ? 1 : 0)]).first
                 if let active {
                     // A fresh collection during the undo window must survive restoration.
                     let latest = active.lastCollectedAt >= old.lastCollectedAt ? active : old
                     try execute("""
-                        UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ?, title = ?, pin_order = ? WHERE id = ?
+                        UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ?, title = ?, pin_order = ?, tag = ? WHERE id = ?
                         """, [.real(min(old.savedAt, active.savedAt).timeIntervalSince1970),
                               .real(latest.lastCollectedAt.timeIntervalSince1970),
                               .integer(HistoryCollectionCount.adding(old.collectionCount, active.collectionCount)),
-                              .integer(old.isPinned || active.isPinned ? 1 : 0), .text(latest.source.rawValue),
+                              .integer(old.isTemplate ? 1 : 0), .text(latest.source.rawValue),
                               titleValue(old.title ?? active.title),
-                              (old.isPinned ? old.pinOrder : active.pinOrder).map { .integer($0) } ?? .null, .integer(old.id)])
+                              old.templateOrder.map { .integer($0) } ?? .null, tagValue(old.tag ?? active.tag), .integer(old.id)])
                     try removeRows(predicate: "id = ?", bindings: [.integer(active.id)])
                 }
                 try execute("UPDATE history SET deletion_id = NULL, delete_after = NULL WHERE id = ?", [.integer(old.id)])
@@ -399,18 +439,18 @@ final class HistoryDatabase: HistoryPersistence {
             for entry in plan.writes {
                 if existingIDs.contains(entry.id) {
                     try execute("""
-                        UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ?, title = ?, pin_order = ? WHERE id = ?
+                        UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ?, title = ?, pin_order = ?, tag = ? WHERE id = ?
                         """, [.real(entry.savedAt.timeIntervalSince1970), .real(entry.lastCollectedAt.timeIntervalSince1970),
-                              .integer(entry.collectionCount), .integer(entry.isPinned ? 1 : 0),
-                              .text(entry.source.rawValue), titleValue(entry.title), entry.pinOrder.map { .integer($0) } ?? .null, .integer(entry.id)])
+                              .integer(entry.collectionCount), .integer(entry.isTemplate ? 1 : 0),
+                              .text(entry.source.rawValue), titleValue(entry.title), entry.templateOrder.map { .integer($0) } ?? .null, tagValue(entry.tag), .integer(entry.id)])
                 } else {
                     try execute("""
-                        INSERT INTO history(id, kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO history(id, kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order, tag)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, [.integer(entry.id), .text(entry.kind.rawValue), .text(entry.text),
                               .real(entry.savedAt.timeIntervalSince1970), .real(entry.lastCollectedAt.timeIntervalSince1970),
-                              .integer(entry.collectionCount), .integer(entry.isPinned ? 1 : 0), .text(entry.source.rawValue),
-                              titleValue(entry.title), entry.pinOrder.map { .integer($0) } ?? .null])
+                              .integer(entry.collectionCount), .integer(entry.isTemplate ? 1 : 0), .text(entry.source.rawValue),
+                              titleValue(entry.title), entry.templateOrder.map { .integer($0) } ?? .null, tagValue(entry.tag)])
                     if let file = entry.file {
                         try execute("""
                             UPDATE history SET file_hash = ?, file_name = ?, original_filename = ?, file_bytes = ?, file_type = ? WHERE id = ?
@@ -445,7 +485,7 @@ final class HistoryDatabase: HistoryPersistence {
         guard try step(statement) == SQLITE_ROW else { throw HistoryDatabaseError.invalidRow }
         return try HistoryRestorePlan(existing: fetchAll(), incoming: entries,
                                       lastID: Int(sqlite3_column_int64(statement, 0)),
-                                      unpinnedLimit: unpinnedLimit, imageByteLimit: imageByteLimit,
+                                      historyLimit: historyLimit, imageByteLimit: imageByteLimit,
                                       retentionCutoff: retentionCutoff)
     }
 
@@ -467,7 +507,7 @@ final class HistoryDatabase: HistoryPersistence {
                 SELECT id FROM history WHERE deletion_id IS NULL AND pinned = 0
                 ORDER BY collected_at DESC, id DESC LIMIT -1 OFFSET ?
             )
-            """, bindings: [.integer(unpinnedLimit)])
+            """, bindings: [.integer(historyLimit)])
         let images = try rows("SELECT \(columns) FROM history WHERE deletion_id IS NULL AND pinned = 0 AND kind IN ('image', 'file') ORDER BY collected_at ASC, id ASC")
         var total = images.reduce(0) { $0 + $1.attachmentByteCount }
         for entry in images where total > imageByteLimit {
@@ -542,7 +582,7 @@ final class HistoryDatabase: HistoryPersistence {
                 id: Int(sqlite3_column_int64(statement, 0)), kind: kind, text: string(statement, 2),
                 savedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
                 lastCollectedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
-                collectionCount: Int(sqlite3_column_int64(statement, 5)), isPinned: sqlite3_column_int(statement, 6) != 0, source: source,
+                collectionCount: Int(sqlite3_column_int64(statement, 5)), isTemplate: sqlite3_column_int(statement, 6) != 0, source: source,
                 image: kind == .image ? HistoryImage(
                     hash: string(statement, 8), filename: string(statement, 9), thumbnailFilename: string(statement, 10),
                     byteCount: Int(sqlite3_column_int64(statement, 11)), pixelWidth: Int(sqlite3_column_int64(statement, 12)),
@@ -553,7 +593,8 @@ final class HistoryDatabase: HistoryPersistence {
                     byteCount: Int(sqlite3_column_int64(statement, 18)), typeIdentifier: string(statement, 19)
                 ) : nil,
                 title: sqlite3_column_type(statement, 20) == SQLITE_NULL ? nil : string(statement, 20),
-                pinOrder: sqlite3_column_type(statement, 21) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(statement, 21))
+                templateOrder: sqlite3_column_type(statement, 21) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(statement, 21)),
+                tag: sqlite3_column_type(statement, 22) == SQLITE_NULL ? nil : string(statement, 22)
             ))
         }
         return result

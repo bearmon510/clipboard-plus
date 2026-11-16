@@ -25,78 +25,87 @@ struct HistoryRestorePlan {
     let counts: RestoreCounts
 
     init(existing: [HistoryEntry], incoming: [HistoryEntry], lastID: Int,
-         unpinnedLimit: Int, imageByteLimit: Int, retentionCutoff: Date? = nil) throws {
+         historyLimit: Int, imageByteLimit: Int, retentionCutoff: Date? = nil) throws {
         var counts = RestoreCounts()
-        var byKey = Dictionary(uniqueKeysWithValues: existing.map { (Self.key($0), $0) })
-        var writes: [HistoryEntry] = []
+        let existingByKey = Dictionary(uniqueKeysWithValues: existing.map { (Self.key($0), $0) })
+        var byKey = existingByKey
         var nextID = lastID
-        let existingPins = HistoryEntry.orderedPins(existing.filter { $0.isPinned })
-        let incomingPins = HistoryEntry.orderedPins(incoming.filter { $0.isPinned }.sorted {
-            $0.lastCollectedAt == $1.lastCollectedAt ? $0.id > $1.id : $0.lastCollectedAt > $1.lastCollectedAt
-        })
-        var pinOrders: [Data: Int] = [:]
-        // Existing pins lead; imported pins retain their relative order after them.
-        // Dense orders also make arbitrary Int.min/Int.max values in archives safe.
-        for entry in existingPins + incomingPins where pinOrders[Self.key(entry)] == nil {
-            pinOrders[Self.key(entry)] = pinOrders.count
-        }
         for entry in incoming {
             let key = Self.key(entry)
             if let old = byKey[key] {
-                // Equal timestamps retain the current source, making repeated restores stable.
-                let merged = HistoryEntry(
+                // Equal timestamps retain the device source, making repeat restores stable.
+                byKey[key] = HistoryEntry(
                     id: old.id, kind: old.kind, text: old.text, savedAt: min(old.savedAt, entry.savedAt),
                     lastCollectedAt: max(old.lastCollectedAt, entry.lastCollectedAt),
                     collectionCount: HistoryCollectionCount.clamped(max(old.collectionCount, entry.collectionCount)),
-                    isPinned: old.isPinned || entry.isPinned,
+                    isTemplate: old.isTemplate,
                     source: entry.lastCollectedAt > old.lastCollectedAt ? entry.source : old.source, image: old.image, file: old.file,
-                    title: HistoryEntry.normalizedTitle(old.title) ?? HistoryEntry.normalizedTitle(entry.title), pinOrder: pinOrders[key])
-                if merged == old { counts.unchanged += 1 } else { counts.updated += 1; writes.append(merged) }
-                byKey[key] = merged
+                    title: HistoryEntry.normalizedTitle(old.title) ?? HistoryEntry.normalizedTitle(entry.title),
+                    templateOrder: old.templateOrder, tag: old.tag ?? entry.tag)
             } else {
                 guard nextID < Int.max else { throw BackupError.unavailable }
                 nextID += 1
-                let added = HistoryEntry(id: nextID, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
+                byKey[key] = HistoryEntry(id: nextID, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
                                          lastCollectedAt: entry.lastCollectedAt,
                                          collectionCount: HistoryCollectionCount.clamped(entry.collectionCount),
-                                         isPinned: entry.isPinned, source: entry.source, image: entry.image, file: entry.file,
-                                         title: HistoryEntry.normalizedTitle(entry.title), pinOrder: pinOrders[key])
-                byKey[key] = added
-                writes.append(added)
-                counts.added += 1
+                                         isTemplate: entry.isTemplate, source: entry.source, image: entry.image, file: entry.file,
+                                         title: HistoryEntry.normalizedTitle(entry.title), templateOrder: entry.templateOrder, tag: entry.tag)
+            }
+        }
+        // Keep each device group first; append incoming/moved templates in archive order.
+        // Legacy nil orders use the historical newest-first fallback.
+        let incomingTemplates = incoming.filter(\.isTemplate).sorted {
+            switch ($0.templateOrder, $1.templateOrder) {
+            case let (a?, b?): return a == b ? $0.id < $1.id : a < b
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return $0.lastCollectedAt == $1.lastCollectedAt ? $0.id > $1.id : $0.lastCollectedAt > $1.lastCollectedAt
+            }
+        }
+        let existingTemplates = HistoryEntry.orderedTemplates(existing.filter(\.isTemplate))
+        for group in TemplateGroups.make(Array(byKey.values), search: "") {
+            var seen = Set<Data>()
+            let device = existingTemplates.filter { $0.tag == group.tag && byKey[Self.key($0)]?.tag == group.tag }
+            let candidates = device + incomingTemplates + existingTemplates
+            var order = 0
+            for candidate in candidates {
+                let key = Self.key(candidate)
+                guard let value = byKey[key], value.tag == group.tag, seen.insert(key).inserted else { continue }
+                byKey[key] = HistoryEntry(id: value.id, kind: value.kind, text: value.text, savedAt: value.savedAt,
+                                         lastCollectedAt: value.lastCollectedAt, collectionCount: value.collectionCount,
+                                         isTemplate: true, source: value.source, image: value.image, file: value.file,
+                                         title: value.title, templateOrder: order, tag: value.tag)
+                order += 1
             }
         }
         let incomingKeys = Set(incoming.map { Self.key($0) })
-        for old in existingPins where !incomingKeys.contains(Self.key(old)) {
-            guard old.pinOrder != pinOrders[Self.key(old)] else { continue }
-            let reordered = HistoryEntry(id: old.id, kind: old.kind, text: old.text, savedAt: old.savedAt,
-                                         lastCollectedAt: old.lastCollectedAt, collectionCount: old.collectionCount,
-                                         isPinned: true, source: old.source, image: old.image, file: old.file,
-                                         title: old.displayTitle, pinOrder: pinOrders[Self.key(old)])
-            byKey[Self.key(old)] = reordered
-            writes.append(reordered)
-            counts.updated += 1
+        var writes: [HistoryEntry] = []
+        for (key, value) in byKey {
+            if let old = existingByKey[key] {
+                if value != old { writes.append(value); counts.updated += 1 }
+                else if incomingKeys.contains(key) { counts.unchanged += 1 }
+            } else { writes.append(value); counts.added += 1 }
         }
-        // Age is evaluated after merging (newer collection dates and pins win),
-        // before either cap. Each removed row belongs to exactly one category.
+        writes.sort { $0.id < $1.id }
+        // Apply age and size limits only to history, after merging timestamps.
         let retained = byKey.values.filter {
             guard let retentionCutoff else { return true }
-            return $0.isPinned || $0.lastCollectedAt >= retentionCutoff
+            return $0.isTemplate || $0.lastCollectedAt >= retentionCutoff
         }
         counts.removedByRetention = byKey.count - retained.count
         let ordered = retained.sorted {
             $0.lastCollectedAt == $1.lastCollectedAt
                 ? Self.key($0).lexicographicallyPrecedes(Self.key($1)) : $0.lastCollectedAt > $1.lastCollectedAt
         }
-        var unpinned = 0
+        var historyCount = 0
         var survivors = ordered.filter {
-            if $0.isPinned { return true }
-            unpinned += 1
-            return unpinned <= unpinnedLimit
+            if $0.isTemplate { return true }
+            historyCount += 1
+            return historyCount <= historyLimit
         }
-        var bytes: Int64 = survivors.reduce(0) { $0 + ($1.isPinned ? 0 : Int64($1.attachmentByteCount)) }
+        var bytes: Int64 = survivors.reduce(0) { $0 + ($1.isTemplate ? 0 : Int64($1.attachmentByteCount)) }
         var removed = Set<Int>()
-        for entry in survivors.reversed() where !entry.isPinned && (entry.kind == .image || entry.kind == .file) && bytes > Int64(imageByteLimit) {
+        for entry in survivors.reversed() where !entry.isTemplate && (entry.kind == .image || entry.kind == .file) && bytes > Int64(imageByteLimit) {
             bytes -= Int64(entry.attachmentByteCount)
             removed.insert(entry.id)
         }
@@ -110,8 +119,9 @@ struct HistoryRestorePlan {
 
     private static func key(_ entry: HistoryEntry) -> Data {
         // Swift String equality normalizes Unicode; SQLite BINARY equality does not.
-        if let file = entry.file { return Data("file:\(file.hash)".utf8) }
-        return Data((entry.kind == .image ? "image:\(entry.image!.hash)" : "text:\(entry.text)").utf8)
+        let domain = entry.isTemplate ? "template:" : "history:"
+        if let file = entry.file { return Data("\(domain)file:\(file.hash)".utf8) }
+        return Data((domain + (entry.kind == .image ? "image:\(entry.image!.hash)" : "text:\(entry.text)")).utf8)
     }
 }
 

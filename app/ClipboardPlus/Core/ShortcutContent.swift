@@ -22,6 +22,10 @@ enum ShortcutError: Error, LocalizedError, CustomLocalizedStringResourceConverti
     var errorDescription: String? { String(localized: localizedStringResource) }
 }
 
+enum ShortcutHistoryFilter: Equatable {
+    case all, templates, texts, links, images, files
+}
+
 /// Pure transformations, also used by the entity query and the intents.
 enum ShortcutContent {
     static func lines(_ recognized: [RecognizedLine]) throws -> [String] {
@@ -43,19 +47,33 @@ enum ShortcutContent {
 
     static func limit(_ value: Int) -> Int { min(50, max(1, value)) }
 
-    static func entries(_ entries: [HistoryEntry], filter: HistoryFilter = .all,
+    static func entries(_ entries: [HistoryEntry], filter: ShortcutHistoryFilter? = nil,
                         search: String = "", limit: Int = 50) -> [HistoryEntry] {
         Array(matchingEntries(entries, filter: filter, search: search).prefix(Self.limit(limit)))
     }
 
-    static func matchingEntries(_ entries: [HistoryEntry], filter: HistoryFilter = .all,
+    static func matchingEntries(_ entries: [HistoryEntry], filter: ShortcutHistoryFilter? = nil,
                                 search: String) -> [HistoryEntry] {
         let query = HistoryFilter.normalized(search)
         let ordered = entries.sorted {
             if $0.lastCollectedAt != $1.lastCollectedAt { return $0.lastCollectedAt > $1.lastCollectedAt }
             return $0.id > $1.id
         }
-        let matches = HistoryFilter.entries(ordered, filter: filter, search: search)
+        let selected = ordered.filter { entry in
+            guard let filter else { return true }
+            if filter == .templates { return entry.isTemplate }
+            guard !entry.isTemplate else { return false }
+            switch filter {
+            case .all: return true
+            case .templates: return false
+            case .texts: return entry.kind == .text
+            case .links: return entry.kind == .url
+            case .images: return entry.kind == .image
+            case .files: return entry.kind == .file
+            }
+        }
+        let filtered = selected.filter { HistoryFilter.matches($0, query: query, includesTag: $0.isTemplate) }
+        let matches = filter == .templates ? TemplateGroups.make(filtered, search: "").flatMap(\.entries) : filtered
         guard !query.isEmpty else { return matches }
         let exact: (HistoryEntry) -> Bool = { $0.displayTitle?.compare(query, options: .caseInsensitive) == .orderedSame }
         return matches.filter(exact) + matches.filter { !exact($0) }

@@ -8,7 +8,7 @@ final class HistoryBackupTests: XCTestCase {
                       count: Int = 3, pin: Bool = false, source: HistorySource = .drag) -> HistoryEntry {
         HistoryEntry(id: 1, kind: HistoryKind.classify(value), text: value,
                      savedAt: Date(timeIntervalSince1970: saved), lastCollectedAt: Date(timeIntervalSince1970: collected),
-                     collectionCount: count, isPinned: pin, source: source)
+                     collectionCount: count, isTemplate: pin, source: source)
     }
 
     private func semantic(_ entry: HistoryEntry) -> HistoryEntry {
@@ -18,7 +18,7 @@ final class HistoryBackupTests: XCTestCase {
         }
         return HistoryEntry(id: 0, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
                             lastCollectedAt: entry.lastCollectedAt, collectionCount: entry.collectionCount,
-                            isPinned: entry.isPinned, source: entry.source, image: image)
+                            isTemplate: entry.isTemplate, source: entry.source, image: image)
     }
 
     private func directoryContents(_ url: URL) throws -> [String: Data] {
@@ -39,12 +39,12 @@ final class HistoryBackupTests: XCTestCase {
         let source = try HistoryDatabase(url: root.appendingPathComponent("source.sqlite"))
         let first = try source.collect("文章\n\0原文", source: .automatic, at: Date(timeIntervalSince1970: 10.125))
         try source.collect(first.text, source: .drag, at: Date(timeIntervalSince1970: 30.375))
-        try source.togglePin(id: first.id)
+        try source.moveToTemplates(id: first.id)
         try source.collect("https://example.com/path", source: .manual, at: Date(timeIntervalSince1970: 15.5))
         let image = try ImageTestSupport.prepare(originals)
         let imageEntry = try source.collectImage(image, source: .manual, at: Date(timeIntervalSince1970: 12.25))
         try source.collectImage(image, source: .automatic, at: Date(timeIntervalSince1970: 40.75))
-        try source.togglePin(id: imageEntry.id)
+        try source.moveToTemplates(id: imageEntry.id)
         let entries = try source.fetchAll()
         let url = try write(entries, files: originals, root: root)
         let files = HistoryImageFiles(directory: root.appendingPathComponent("restored"))
@@ -72,15 +72,15 @@ final class HistoryBackupTests: XCTestCase {
         XCTAssertEqual(try directoryContents(files.directory), beforeFiles)
     }
 
-    func testMergeRulesEarlierSavedLaterCollectedMaximumCountPinUnionAndSourceTie() throws {
+    func testMergeRulesEarlierSavedLaterCollectedMaximumCountAndSourceTie() throws {
         let root = try ImageTestSupport.directory(self)
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"))
-        let old = [text("later", saved: 20, collected: 30, count: 8, source: .manual),
+        let old = [text("later", saved: 20, collected: 30, count: 8, pin: true, source: .manual),
                    text("earlier", saved: 5, collected: 50, pin: true, source: .automatic),
                    text("tie", source: .manual)]
         _ = try database.mergeBackup(old) { _ in }
         let incoming = [text("later", saved: 10, collected: 40, count: 4, pin: true, source: .drag),
-                        text("earlier", saved: 10, collected: 40, count: 9, source: .drag),
+                        text("earlier", saved: 10, collected: 40, count: 9, pin: true, source: .drag),
                         text("tie", source: .drag)]
         XCTAssertEqual(try database.estimateBackup(incoming), RestoreCounts(updated: 2, unchanged: 1))
         _ = try database.mergeBackup(incoming) { _ in }
@@ -97,10 +97,11 @@ final class HistoryBackupTests: XCTestCase {
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"))
         let image = try ImageTestSupport.prepare(files)
         let existing = try database.collectImage(image, source: .manual, at: Date(timeIntervalSince1970: 10))
+        try database.moveToTemplates(id: existing.id)
         let sameBytes = try ImageTestSupport.prepare(files)
         let incoming = HistoryEntry(id: 2, kind: .image, text: "", savedAt: Date(timeIntervalSince1970: 5),
                                     lastCollectedAt: Date(timeIntervalSince1970: 20), collectionCount: 6,
-                                    isPinned: true, source: .drag, image: sameBytes)
+                                    isTemplate: true, source: .drag, image: sameBytes)
         let result = try database.mergeBackup([text("é"), text("e\u{301}"), incoming]) { _ in }
         XCTAssertEqual(result, RestoreCounts(added: 2, updated: 1))
         let rows = try database.fetchAll()
@@ -112,7 +113,7 @@ final class HistoryBackupTests: XCTestCase {
         XCTAssertEqual(merged.lastCollectedAt, incoming.lastCollectedAt)
         XCTAssertEqual(merged.collectionCount, 6)
         XCTAssertEqual(merged.source, .drag)
-        XCTAssertTrue(merged.isPinned)
+        XCTAssertTrue(merged.isTemplate)
     }
 
     private func replaceManifest(in data: Data, _ change: (inout [String: Any]) -> Void) throws -> Data {
@@ -223,16 +224,16 @@ final class HistoryBackupTests: XCTestCase {
     func testFilePlacementFailureRollsBackSQLRemovalJournalAndAllPlacedFiles() throws {
         let root = try ImageTestSupport.directory(self)
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
-        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), unpinnedLimit: 1)
+        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), historyLimit: 1)
         let preserved = try database.collectImage(ImageTestSupport.prepare(files, color: .blue), source: .manual,
                                                   at: Date(timeIntervalSince1970: 0))
-        try database.togglePin(id: preserved.id)
+        try database.moveToTemplates(id: preserved.id)
         try database.collect("keep", source: .manual, at: Date(timeIntervalSince1970: 1))
         let originalFiles = HistoryImageFiles(directory: root.appendingPathComponent("originals"))
         let image = try ImageTestSupport.prepare(originalFiles)
         let incoming = HistoryEntry(id: 1, kind: .image, text: "", savedAt: Date(timeIntervalSince1970: 20),
                                     lastCollectedAt: Date(timeIntervalSince1970: 20), collectionCount: 4,
-                                    isPinned: false, source: .manual, image: image)
+                                    isTemplate: false, source: .manual, image: image)
         let url = try write([text("new"), incoming], files: originalFiles, root: root)
         let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
         let before = try database.fetchAll()
@@ -276,13 +277,13 @@ final class HistoryBackupTests: XCTestCase {
         let red = try ImageTestSupport.prepare(files)
         let blue = try ImageTestSupport.prepare(files, color: .blue)
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"),
-                                           unpinnedLimit: 3, imageByteLimit: max(red.byteCount, blue.byteCount))
+                                           historyLimit: 3, imageByteLimit: max(red.byteCount, blue.byteCount))
         let old = try database.collect("old", source: .manual, at: Date(timeIntervalSince1970: 1))
         let pinned = text("pinned", saved: 1, collected: 1, pin: true)
         func imageEntry(_ image: HistoryImage, time: Double) -> HistoryEntry {
             HistoryEntry(id: 0, kind: .image, text: "", savedAt: Date(timeIntervalSince1970: time),
                          lastCollectedAt: Date(timeIntervalSince1970: time), collectionCount: 1,
-                         isPinned: false, source: .manual, image: image)
+                         isTemplate: false, source: .manual, image: image)
         }
         let incoming = [pinned, text("new", saved: 2, collected: 2), imageEntry(red, time: 3), imageEntry(blue, time: 4)]
         let estimate = try database.estimateBackup(incoming)
@@ -293,7 +294,7 @@ final class HistoryBackupTests: XCTestCase {
         XCTAssertEqual(removed.count, estimate.removedByLimit)
         XCTAssertTrue(removed.contains { $0.id == old.id })
         XCTAssertEqual(removed.compactMap { $0.image?.hash }, [red.hash])
-        XCTAssertTrue(try database.fetchAll().contains { $0.text == "pinned" && $0.isPinned })
+        XCTAssertTrue(try database.fetchAll().contains { $0.text == "pinned" && $0.isTemplate })
     }
 
     func testCreateAndValidationCancellationRemovePartialFiles() throws {
@@ -301,7 +302,7 @@ final class HistoryBackupTests: XCTestCase {
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
         let image = try ImageTestSupport.prepare(files)
         let entry = HistoryEntry(id: 1, kind: .image, text: "", savedAt: Date(), lastCollectedAt: Date(),
-                                 collectionCount: 1, isPinned: false, source: .drag, image: image)
+                                 collectionCount: 1, isTemplate: false, source: .drag, image: image)
         let entries = [entry, text("later")]
         let url = root.appendingPathComponent("cancel.clipboardplus")
         let createToken = BackupCancellation()
@@ -327,7 +328,7 @@ final class HistoryBackupTests: XCTestCase {
 
     func testRepeatedRestoreAtTiedLimitDoesNotDisplaceSurvivingItems() throws {
         let root = try ImageTestSupport.directory(self)
-        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), unpinnedLimit: 1)
+        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), historyLimit: 1)
         let incoming = [text("a"), text("b"), text("c")]
         let estimate = try database.estimateBackup(incoming)
         XCTAssertEqual(estimate.removedByLimit, 2)
@@ -342,7 +343,7 @@ final class HistoryBackupTests: XCTestCase {
         let sourceFiles = HistoryImageFiles(directory: root.appendingPathComponent("source"))
         let image = try ImageTestSupport.prepare(sourceFiles)
         let entry = HistoryEntry(id: 1, kind: .image, text: "", savedAt: Date(), lastCollectedAt: Date(),
-                                 collectionCount: 1, isPinned: false, source: .drag, image: image)
+                                 collectionCount: 1, isTemplate: false, source: .drag, image: image)
         let url = try write([entry, text("next")], files: sourceFiles, root: root)
         let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
         let database = try HistoryDatabase(url: root.appendingPathComponent("target.sqlite"))
@@ -367,6 +368,9 @@ final class HistoryBackupTests: XCTestCase {
         XCTAssertEqual(admission.receive("private original"), .add)
         admission.recordExport("old JSON export")
         XCTAssertEqual(admission.receive("old JSON export"), .skip(reason: "このアプリが書き出した内容"))
-        XCTAssertEqual(admission.receive("CLIPPLUS\0\0\0\0\0\0\0\u{1}payload"), .skip(reason: "このアプリが書き出した内容"))
+        for version in 1...4 {
+            let header = "CLIPPLUS" + String(repeating: "\0", count: 7) + String(UnicodeScalar(version)!)
+            XCTAssertEqual(admission.receive(header + "payload"), .skip(reason: "このアプリが書き出した内容"))
+        }
     }
 }

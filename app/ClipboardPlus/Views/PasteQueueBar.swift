@@ -119,6 +119,6 @@ struct PasteQueueBar: View {
     }
 
     private func preview(_ entry: HistoryEntry) -> String {
-        entry.displayTitle ?? PinOrderView.summary(entry)
+        entry.displayTitle ?? TemplateOrderView.summary(entry)
     }
 }

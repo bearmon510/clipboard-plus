@@ -183,6 +183,28 @@ struct CopyHistoryEntryIntent: AppIntent {
     }
 }
 
+struct CopyTemplateIntent: AppIntent {
+    static let title: LocalizedStringResource = "テンプレートをコピー"
+    static let description: IntentDescription? = IntentDescription("名前で選んだテンプレートをクリップボードにコピーします。")
+    static let openAppWhenRun = false
+
+    @Parameter(title: "テンプレート") var entry: TemplateEntryEntity
+
+    static var parameterSummary: some ParameterSummary { Summary("\(\.$entry)をコピー") }
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        let monitor = ClipboardMonitor.shared
+        try await monitor.performShortcut("CopyTemplateIntent") {
+            guard let current = monitor.entries.first(where: { $0.id == entry.id && $0.isTemplate }) else {
+                throw ShortcutError.missingEntry
+            }
+            try await monitor.copyForShortcut(current)
+        }
+        return .result()
+    }
+}
+
 /// A parameterless action for the built-in shortcut; no history picker is needed.
 struct CopyLatestHistoryIntent: AppIntent {
     static let title: LocalizedStringResource = "最新の履歴をコピー"
@@ -193,7 +215,7 @@ struct CopyLatestHistoryIntent: AppIntent {
     func perform() async throws -> some IntentResult {
         let monitor = ClipboardMonitor.shared
         try await monitor.performShortcut("CopyLatestHistoryIntent") {
-            guard let entry = ShortcutContent.entries(monitor.entries, limit: 1).first else { throw ShortcutError.emptyHistory }
+            guard let entry = ShortcutContent.entries(monitor.entries, filter: .all, limit: 1).first else { throw ShortcutError.emptyHistory }
             try await monitor.copyForShortcut(entry)
         }
         return .result()
@@ -205,6 +227,9 @@ struct ClipboardPlusShortcuts: AppShortcutsProvider {
     // since 0.11.0, so it is not offered here. Cutting out starts from the user's own shortcut:
     // "スクリーンショットを撮る" followed by CaptureRegionIntent.
     static var appShortcuts: [AppShortcut] {
+        AppShortcut(intent: CopyTemplateIntent(),
+                    phrases: ["\(.applicationName)でテンプレートをコピー"],
+                    shortTitle: "テンプレートをコピー", systemImageName: "square.stack")
         AppShortcut(intent: CopyLatestHistoryIntent(),
                     phrases: ["\(.applicationName)で最新の履歴をコピー"],
                     shortTitle: "最新の履歴をコピー", systemImageName: "doc.on.clipboard")

@@ -1,14 +1,16 @@
 import SwiftUI
 
-/// Puts the pinned items in the order the user wants. A list of its own, because the cards
-/// themselves drag out to other apps.
-struct PinOrderView: View {
+/// Puts the templates of one tag in the order the user wants, which is also the order of 順に貼る.
+/// A list of its own, because the cards themselves drag out to other apps.
+struct TemplateOrderView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var items: [HistoryEntry]
+    let title: String
     let onSave: ([Int]) -> Void
 
-    init(pinned: [HistoryEntry], onSave: @escaping ([Int]) -> Void) {
-        _items = State(initialValue: pinned)
+    init(title: String, items: [HistoryEntry], onSave: @escaping ([Int]) -> Void) {
+        _items = State(initialValue: items)
+        self.title = title
         self.onSave = onSave
     }
 
@@ -21,11 +23,11 @@ struct PinOrderView: View {
                     }
                     .onMove { items.move(fromOffsets: $0, toOffset: $1) }
                 } footer: {
-                    Text("右端のつまみをドラッグして並べ替えます。上にあるものほど先に並びます。")
+                    Text("右端のつまみをドラッグして並べ替えます。「順に貼る」もこの順で貼ります。")
                 }
             }
             .environment(\.editMode, .constant(.active))
-            .navigationTitle("並べ替え")
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

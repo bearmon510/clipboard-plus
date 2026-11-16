@@ -41,7 +41,7 @@ final class HistoryRetentionTests: XCTestCase {
         let old = try database.collect("expired", source: .manual, at: cutoff.addingTimeInterval(-1))
         let url = try database.collect("https://example.com/expired", source: .manual, at: cutoff.addingTimeInterval(-1))
         let pin = try database.collect("pin", source: .manual, at: cutoff.addingTimeInterval(-1))
-        try database.togglePin(id: pin.id)
+        try database.moveToTemplates(id: pin.id)
         let boundary = try database.collect("boundary", source: .manual, at: cutoff)
         let fresh = try database.collect("fresh", source: .manual, at: now)
         let recollected = try database.collect("recollected", source: .manual, at: cutoff.addingTimeInterval(-1))
@@ -68,7 +68,7 @@ final class HistoryRetentionTests: XCTestCase {
             try database.collect("expired text", source: .manual, at: old)
             try database.collectImage(oldImage, source: .manual, at: old)
             let pin = try database.collectImage(pinnedImage, source: .manual, at: old)
-            try database.togglePin(id: pin.id)
+            try database.moveToTemplates(id: pin.id)
             try database.collectImage(recentImage, source: .manual, at: now)
         }
         var entries: [HistoryEntry] = []
@@ -205,7 +205,7 @@ final class HistoryRetentionTests: XCTestCase {
         let root = try ImageTestSupport.directory(self)
         let now = Date(timeIntervalSince1970: 100 * day)
         let cutoff = now.addingTimeInterval(-day)
-        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), now: { now }, unpinnedLimit: 2)
+        let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), now: { now }, historyLimit: 2)
         let old = cutoff.addingTimeInterval(-1)
         try database.collect("newer wins", source: .automatic, at: now)
         let undo = try database.collect("undo", source: .manual, at: old)
@@ -227,7 +227,7 @@ final class HistoryRetentionTests: XCTestCase {
         let actual = try database.mergeBackup(incoming, retentionCutoff: cutoff) { _ in }
         XCTAssertEqual(actual, estimate)
         let removals = database.takeRemovals()
-        XCTAssertEqual(removals.filter { !$0.isPinned && $0.lastCollectedAt < cutoff }.count, estimate.removedByRetention)
+        XCTAssertEqual(removals.filter { !$0.isTemplate && $0.lastCollectedAt < cutoff }.count, estimate.removedByRetention)
         XCTAssertEqual(removals.count, estimate.removedByRetention + estimate.removedByLimit)
         XCTAssertEqual(Set(try database.fetchAll().map(\.text)), ["pin", "recent", "newest"])
         XCTAssertNotNil(try database.latestDeletion())
@@ -258,16 +258,13 @@ final class HistoryRetentionTests: XCTestCase {
             if case .automaticallyDeleted(let count, _) = event { deleted.append(count) }
             if case .imageUsage(let value) = event { usage = value }
         }
-        // Pin the old image through startup, then unpin it before restoring so
-        // the restore itself is responsible for deleting its row and files.
         do {
             let database = try HistoryDatabase(url: url, now: { now })
-            let entry = try database.collectImage(targetImage, source: .manual, at: old)
-            try database.togglePin(id: entry.id)
+            try database.collectImage(targetImage, source: .manual, at: now)
         }
         complete { store.load(completion: $0) }
-        let pinID = try XCTUnwrap(replacement.first?.id)
-        complete { store.togglePin(id: pinID, completion: $0) }
+        // Age the row after startup so restore itself performs the deletion.
+        try ImageTestSupport.sql("UPDATE history SET saved_at = \(old.timeIntervalSince1970), collected_at = \(old.timeIntervalSince1970)", at: url)
         var prepared: ValidatedBackup?
         var estimate: RestoreCounts?
         let validated = expectation(description: "age estimate")
@@ -437,6 +434,6 @@ final class HistoryRetentionTests: XCTestCase {
 
     private func text(_ value: String, at date: Date, pinned: Bool = false) -> HistoryEntry {
         HistoryEntry(id: 0, kind: .text, text: value, savedAt: date, lastCollectedAt: date,
-                     collectionCount: 1, isPinned: pinned, source: .manual)
+                     collectionCount: 1, isTemplate: pinned, source: .manual)
     }
 }

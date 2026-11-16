@@ -1,53 +1,45 @@
 import Foundation
 
-enum HistoryFilter: Hashable, CaseIterable {
-    case all, pinned, texts, links, images, files
-
-    var title: String {
-        switch self {
-        case .all: return "すべて"
-        case .pinned: return "ピン留め"
-        case .texts: return "文章"
-        case .links: return "リンク"
-        case .images: return "画像"
-        case .files: return "ファイル"
-        }
-    }
-
-    var symbolName: String? {
-        switch self {
-        case .all: return nil
-        case .pinned: return "pin"
-        case .texts: return "text.alignleft"
-        case .links: return "link"
-        case .images: return "photo"
-        case .files: return "doc"
-        }
-    }
-
-    private func includes(_ entry: HistoryEntry) -> Bool {
-        switch self {
-        case .all: return true
-        case .pinned: return entry.isPinned
-        case .texts: return entry.kind == .text
-        case .links: return entry.kind == .url
-        case .images: return entry.kind == .image
-        case .files: return entry.kind == .file
-        }
-    }
-
-    /// A search term typed with a stray space before or after it still means the same term.
+enum HistoryFilter {
     static func normalized(_ search: String) -> String {
         search.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func entries(_ entries: [HistoryEntry], filter: HistoryFilter, search: String) -> [HistoryEntry] {
+    static func history(_ entries: [HistoryEntry], search: String) -> [HistoryEntry] {
         let query = normalized(search)
-        let matches = entries.filter {
-            filter.includes($0) &&
-            (query.isEmpty || $0.displayTitle?.range(of: query, options: .caseInsensitive) != nil ||
-             ($0.kind != .image && ($0.file?.originalFilename ?? $0.text).range(of: query, options: .caseInsensitive) != nil))
+        return entries.filter { !$0.isTemplate && matches($0, query: query) }
+    }
+
+    static func matches(_ entry: HistoryEntry, query: String, includesTag: Bool = false) -> Bool {
+        query.isEmpty || entry.displayTitle?.range(of: query, options: .caseInsensitive) != nil ||
+            (includesTag && entry.tag?.range(of: query, options: .caseInsensitive) != nil) ||
+            (entry.kind != .image && (entry.file?.originalFilename ?? entry.text).range(of: query, options: .caseInsensitive) != nil)
+    }
+}
+
+struct TemplateGroup: Identifiable, Equatable {
+    let tag: String?
+    let entries: [HistoryEntry]
+    var id: String { tag ?? "" }
+    var title: String { tag ?? "その他" }
+}
+
+enum TemplateGroups {
+    static func make(_ entries: [HistoryEntry], search: String) -> [TemplateGroup] {
+        let query = HistoryFilter.normalized(search)
+        let matches = entries.filter { $0.isTemplate && HistoryFilter.matches($0, query: query, includesTag: true) }
+        let grouped = Dictionary(grouping: matches, by: { $0.tag })
+        let keys: [String?] = tags(matches).map { Optional($0) } + [nil]
+        return keys.compactMap { tag in
+            guard let values = grouped[tag], !values.isEmpty else { return nil }
+            return TemplateGroup(tag: tag, entries: HistoryEntry.orderedTemplates(values))
         }
-        return filter == .pinned ? HistoryEntry.orderedPins(matches) : matches
+    }
+
+    static func tags(_ entries: [HistoryEntry]) -> [String] {
+        Set(entries.filter(\.isTemplate).compactMap(\.tag)).sorted {
+            let result = $0.localizedStandardCompare($1)
+            return result == .orderedSame ? $0 < $1 : result == .orderedAscending
+        }
     }
 }

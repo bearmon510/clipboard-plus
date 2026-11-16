@@ -87,6 +87,40 @@ final class FileMonitorTests: XCTestCase {
     }
 
     @MainActor
+    func testFileTemplateSelfCopyLeavesHistoryEmptyAndExternalEqualFileCreatesHistory() throws {
+        let root = try ImageTestSupport.directory(self)
+        let board = FilePasteboard()
+        let monitor = try fixture(root, board: board)
+        let incoming = try provider(in: root)
+        XCTAssertTrue(monitor.receiveDropped([incoming], receivedAt: Date()))
+        drain(monitor)
+        let history = try XCTUnwrap(monitor.entries.first)
+        let moved = expectation(description: "file template published")
+        monitor.moveToTemplates(history) { result in
+            do { XCTAssertTrue(monitor.entries.contains(try result.get())) }
+            catch { XCTFail("\(error)") }
+            moved.fulfill()
+        }
+        wait(for: [moved], timeout: 5)
+        let template = try XCTUnwrap(monitor.entries.first)
+        XCTAssertTrue(template.isTemplate)
+        monitor.start()
+        defer { monitor.stop() }
+        let copied = expectation(description: "file template copied")
+        monitor.copy(template) { success in XCTAssertTrue(success); copied.fulfill() }
+        wait(for: [copied], timeout: 5)
+        drain(monitor)
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries, [template])
+        board.external([incoming])
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.filter { !$0.isTemplate }.count, 1)
+        XCTAssertEqual(monitor.entries.first { $0.id == template.id }, template)
+    }
+
+    @MainActor
     func testFakeClipboardCollectsPDFZIPVideoAndLogsTypesWithoutFilenameOrBytes() throws {
         let root = try ImageTestSupport.directory(self)
         let board = FilePasteboard()
@@ -337,7 +371,7 @@ final class FileMonitorTests: XCTestCase {
         XCTAssertTrue(row.registeredTypeIdentifiers.contains("com.adobe.pdf"))
         XCTAssertFalse(monitor.receiveDropped([row], receivedAt: Date()))
         let removed = expectation(description: "history removed")
-        monitor.deleteAllHistory(includePinned: true) { _ in removed.fulfill() }
+        monitor.deleteAllHistory() { _ in removed.fulfill() }
         wait(for: [removed], timeout: 5)
         // Force expiry through SQL, then run maintenance through the foreground transition.
         try ImageTestSupport.sql("UPDATE history SET delete_after = 0", at: root.appendingPathComponent("history.sqlite"))

@@ -40,7 +40,7 @@ final class HistoryDatabaseTests: XCTestCase {
         let (_, url, clock) = try fixture()
         var database: HistoryDatabase? = try HistoryDatabase(url: url, now: { clock.date })
         let entry = try database!.collect("https://example.com/path", source: .manual)
-        try database!.togglePin(id: entry.id)
+        try database!.moveToTemplates(id: entry.id)
         clock.advance()
         try database!.collect(entry.text, source: .drag)
         let expected = try database!.fetchAll()
@@ -48,13 +48,13 @@ final class HistoryDatabaseTests: XCTestCase {
         let reopened = try HistoryDatabase(url: url, now: { clock.date })
         XCTAssertEqual(try reopened.fetchAll(), expected)
         XCTAssertEqual(expected.first?.source, .drag)
-        XCTAssertEqual(expected.first?.isPinned, true)
+        XCTAssertEqual(expected.first?.isTemplate, false)
+        XCTAssertEqual(expected.last?.isTemplate, true)
     }
 
     func testExactDuplicateUpdatesCountTimeAndOrderKeepingIdentity() throws {
         let (database, _, clock) = try fixture()
         let a = try database.collect("A", source: .automatic)
-        try database.togglePin(id: a.id)
         clock.advance()
         let b = try database.collect("B", source: .automatic)
         clock.advance()
@@ -63,7 +63,7 @@ final class HistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(updated.savedAt, a.savedAt)
         XCTAssertEqual(updated.lastCollectedAt, clock.date)
         XCTAssertEqual(updated.collectionCount, 2)
-        XCTAssertTrue(updated.isPinned)
+        XCTAssertFalse(updated.isTemplate)
         XCTAssertEqual(updated.source, .manual)
         XCTAssertEqual(try database.fetchAll().map(\.id), [a.id, b.id])
     }
@@ -131,19 +131,22 @@ final class HistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(try database.fetchAll().first?.lastCollectedAt, clock.date)
     }
 
-    func testTogglePinDoesNotChangeCollectionMetadata() throws {
+    func testMoveToTemplatesDoesNotChangeCollectionMetadata() throws {
         let (database, _, _) = try fixture()
         let entry = try database.collect("A", source: .drag)
-        try database.togglePin(id: entry.id)
-        XCTAssertEqual(try database.fetchAll().first?.isPinned, true)
-        try database.togglePin(id: entry.id)
-        XCTAssertEqual(try database.fetchAll(), [entry])
+        let moved = try database.moveToTemplates(id: entry.id)
+        XCTAssertTrue(moved.isTemplate)
+        XCTAssertEqual(moved.id, entry.id)
+        XCTAssertEqual(moved.savedAt, entry.savedAt)
+        XCTAssertEqual(moved.lastCollectedAt, entry.lastCollectedAt)
+        XCTAssertEqual(moved.collectionCount, entry.collectionCount)
+        XCTAssertEqual(moved.source, entry.source)
     }
 
     func testSingleDeleteAndUndoRestoreOriginalMetadataAndOrder() throws {
         let (database, _, clock) = try fixture()
         let entry = try database.collect("A", source: .manual)
-        try database.togglePin(id: entry.id)
+        try database.moveToTemplates(id: entry.id)
         clock.advance()
         try database.collect("B", source: .automatic)
         let before = try database.fetchAll()
@@ -159,27 +162,21 @@ final class HistoryDatabaseTests: XCTestCase {
     func testClearExcludingPinnedAndUndo() throws {
         let (database, _, _) = try fixture()
         let pinned = try database.collect("pin", source: .automatic)
-        try database.togglePin(id: pinned.id)
+        try database.moveToTemplates(id: pinned.id)
         try database.collect("ordinary", source: .manual)
         let before = try database.fetchAll()
-        let deletion = try XCTUnwrap(database.deleteAll(includePinned: false))
+        let deletion = try XCTUnwrap(database.deleteAll())
         XCTAssertEqual(deletion.count, 1)
         XCTAssertEqual(try database.fetchAll().map(\.id), [pinned.id])
         XCTAssertTrue(try database.undo(deletion))
         XCTAssertEqual(try database.fetchAll(), before)
     }
 
-    func testClearIncludingPinnedAndUndo() throws {
+    func testClearOnlyTemplatesIsANoOp() throws {
         let (database, _, _) = try fixture()
-        let pinned = try database.collect("pin", source: .automatic)
-        try database.togglePin(id: pinned.id)
-        try database.collect("ordinary", source: .drag)
-        let before = try database.fetchAll()
-        let deletion = try XCTUnwrap(database.deleteAll(includePinned: true))
-        XCTAssertEqual(deletion.count, 2)
-        XCTAssertTrue(try database.fetchAll().isEmpty)
-        XCTAssertTrue(try database.undo(deletion))
-        XCTAssertEqual(try database.fetchAll(), before)
+        let entry = try database.createTemplate(text: "template", title: nil)
+        XCTAssertNil(try database.deleteAll())
+        XCTAssertEqual(try database.fetchAll(), [entry])
     }
 
     func testExpiryPermanentlyDeletesRowsAtDeadline() throws {
@@ -197,7 +194,7 @@ final class HistoryDatabaseTests: XCTestCase {
     func testReopenCleansExpiredDeletion() throws {
         let (database, url, clock) = try fixture()
         try database.collect("A", source: .automatic)
-        let deletion = try XCTUnwrap(database.deleteAll(includePinned: true))
+        let deletion = try XCTUnwrap(database.deleteAll())
         clock.advance(6)
         let reopened = try HistoryDatabase(url: url, now: { clock.date })
         XCTAssertFalse(try reopened.undo(deletion))
@@ -218,7 +215,6 @@ final class HistoryDatabaseTests: XCTestCase {
     func testUndoMergesRecollectedTextWithoutLosingNewCollection() throws {
         let (database, _, clock) = try fixture()
         let original = try database.collect("A", source: .automatic)
-        try database.togglePin(id: original.id)
         let deletion = try XCTUnwrap(database.delete(id: original.id))
         clock.advance()
         try database.collect("A", source: .drag)
@@ -229,27 +225,25 @@ final class HistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(restored.savedAt, original.savedAt)
         XCTAssertEqual(restored.lastCollectedAt, clock.date)
         XCTAssertEqual(restored.collectionCount, 2)
-        XCTAssertTrue(restored.isPinned)
+        XCTAssertFalse(restored.isTemplate)
         XCTAssertEqual(restored.source, .drag)
     }
 
     func testLimitKeepsThousandNewestUnpinnedAndEveryPinnedItem() throws {
         let (database, _, clock) = try fixture()
         let pinned = try database.collect("pinned", source: .manual)
-        try database.togglePin(id: pinned.id)
+        try database.moveToTemplates(id: pinned.id)
         for index in 0..<1_002 {
             clock.advance()
             try database.collect("item \(index)", source: .automatic)
         }
         let entries = try database.fetchAll()
         XCTAssertEqual(entries.count, 1_001)
-        XCTAssertEqual(entries.filter { !$0.isPinned }.count, 1_000)
+        XCTAssertEqual(entries.filter { !$0.isTemplate }.count, 1_000)
         XCTAssertEqual(entries.last?.id, pinned.id)
         XCTAssertFalse(entries.contains { $0.text == "item 0" || $0.text == "item 1" })
         XCTAssertEqual(entries.first?.text, "item 1001")
-        try database.togglePin(id: pinned.id)
-        XCTAssertEqual(try database.fetchAll().count, 1_000)
-        XCTAssertFalse(try database.fetchAll().contains { $0.id == pinned.id })
+        XCTAssertTrue(try database.fetchAll().contains { $0.id == pinned.id && $0.isTemplate })
     }
 
     func testLimitUsesLastCollectionTimeAfterDuplicate() throws {
@@ -282,7 +276,7 @@ final class HistoryDatabaseTests: XCTestCase {
     func testEmptyDeletionDoesNotCreateUndo() throws {
         let (database, _, _) = try fixture()
         XCTAssertNil(try database.delete(id: 42))
-        XCTAssertNil(try database.deleteAll(includePinned: true))
+        XCTAssertNil(try database.deleteAll())
         XCTAssertNil(try database.latestDeletion())
     }
 
@@ -302,7 +296,7 @@ final class HistoryDatabaseTests: XCTestCase {
     func testJSONIncludesVersionTimestampAndEveryEntryField() throws {
         let (database, _, clock) = try fixture()
         let first = try database.collect("https://example.com/path", source: .automatic)
-        try database.togglePin(id: first.id)
+        try database.moveToTemplates(id: first.id)
         clock.advance()
         try database.collect(first.text, source: .drag)
         try database.collect("文章\n\"引用\"😀", source: .manual)
@@ -311,16 +305,16 @@ final class HistoryDatabaseTests: XCTestCase {
         let entries = try database.fetchAll()
         let data = try HistoryExport.data(entries: entries, exportedAt: clock.date)
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(root["formatVersion"] as? Int, 4)
+        XCTAssertEqual(root["formatVersion"] as? Int, 5)
         XCTAssertEqual(root["exportedAt"] as? String, "1970-01-01T00:16:41.000Z")
         let rows = try XCTUnwrap(root["entries"] as? [[String: Any]])
-        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.count, 3)
         for (row, entry) in zip(rows, entries) {
             XCTAssertEqual(row["id"] as? Int, entry.id)
             XCTAssertEqual(row["text"] as? String, entry.text)
             XCTAssertEqual(row["kind"] as? String, entry.kind.rawValue)
             XCTAssertEqual(row["collectionCount"] as? Int, entry.collectionCount)
-            XCTAssertEqual(row["isPinned"] as? Bool, entry.isPinned)
+            XCTAssertEqual(row["isTemplate"] as? Bool, entry.isTemplate)
             XCTAssertEqual(row["source"] as? String, entry.source.rawValue)
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

@@ -22,7 +22,7 @@ final class BackupStoreTests: XCTestCase {
         let imageDirectory = root.appendingPathComponent("images")
         let worker = DispatchQueue(label: "test.backup")
         var entries: [HistoryEntry] = []
-        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, unpinnedLimit: 1) },
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, historyLimit: 1) },
                                  imageDirectory: imageDirectory, backupQueue: worker) { event in
             if case .saved(let entry, _) = event { entries.append(entry) }
         }
@@ -79,7 +79,7 @@ final class BackupStoreTests: XCTestCase {
         _ = try HistoryBackup.write(entries: source.fetchAll(), files: originalFiles, to: url, cancellation: BackupCancellation())
         let databaseURL = root.appendingPathComponent("target.sqlite")
         var replacement: [HistoryEntry] = []
-        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, unpinnedLimit: 2) },
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, historyLimit: 2) },
                                  imageDirectory: root.appendingPathComponent("targetImages")) { event in
             if case .replace(let entries) = event { replacement = entries }
         }
@@ -127,7 +127,7 @@ final class BackupStoreTests: XCTestCase {
         let root = try ImageTestSupport.directory(self)
         let worker = DispatchQueue(label: "test.cancel.backup")
         let databaseURL = root.appendingPathComponent("history.sqlite")
-        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, unpinnedLimit: 1) },
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, historyLimit: 1) },
                                  imageDirectory: root.appendingPathComponent("images"), backupQueue: worker) { _ in }
         store.collectImage(.data(ImageTestSupport.png(), typeIdentifier: "public.png"), source: .manual, at: Date())
         drain(store)

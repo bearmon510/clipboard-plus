@@ -9,13 +9,17 @@ struct ContentView: View {
     let log: MeasurementLog
     @State private var logHasError = false
     @StateObject private var pictureInPicture: PictureInPictureController
-    @AppStorage("pinnedSectionCollapsed") private var pinnedCollapsed = false
     /// Hidden behind the developer settings since 0.11.0; see `CaptureSettings.directCaptureKey`.
     @AppStorage(CaptureSettings.directCaptureKey) private var directCaptureEnabled = false
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
     @State private var searchText: String
-    @State private var filter = HistoryFilter.all
+    @State private var pane: Pane
+    /// Template groups the user opened, by group id.
+    @State private var openTags: Set<String> = []
+    @State private var reorderGroup: TemplateGroup?
+    @State private var renamingGroup: TemplateGroup?
+    @State private var tagDraft = ""
     @State private var detailEntry: HistoryEntry?
     @State private var toast: String?
     @State private var toastTask: Task<Void, Never>?
@@ -34,9 +38,8 @@ struct ContentView: View {
     @State private var queuedCapture: CaptureRequest?
     /// A direct capture asked for from outside, waiting for the app to be active and uncovered.
     @State private var queuedDirectMode: CaptureMode?
-    /// The writing sheet: a new pinned text, or a change to an item's name and text.
+    /// The writing sheet: a new template, or a change to a template.
     @State private var editor: EntryEditorView.Mode?
-    @State private var showPinOrder = false
 
     /// A still picture to choose from, and what to do with the chosen part.
     struct CaptureRequest: Identifiable {
@@ -47,38 +50,38 @@ struct ContentView: View {
         var screenshotID: String? = nil
     }
 
-    /// `initialSearch` lets previews and screenshot tests open the screen mid-search.
-    init(monitor: ClipboardMonitor, log: MeasurementLog, initialSearch: String = "") {
+    /// `initialSearch`, `initialPane` and `initialOpenTags` let previews and screenshot tests
+    /// open the screen mid-search, on the templates, or with a group open.
+    init(monitor: ClipboardMonitor, log: MeasurementLog, initialSearch: String = "", initialPane: Pane = .history,
+         initialOpenTags: Set<String> = []) {
         self.monitor = monitor
         self.log = log
         _pictureInPicture = StateObject(wrappedValue: PictureInPictureController(monitor: monitor))
         _screenCapture = StateObject(wrappedValue: ScreenCaptureController(log: log))
         _screenshots = StateObject(wrappedValue: ScreenshotWatcher(log: log))
         _searchText = State(initialValue: initialSearch)
+        _pane = State(initialValue: initialPane)
+        _openTags = State(initialValue: initialOpenTags)
     }
 
     /// The search term without surrounding spaces, as used for filtering and highlighting.
     private var query: String { HistoryFilter.normalized(searchText) }
 
-    /// Pinned items get their own section, in the user's order, in the plain list and under the
-    /// ピン留め filter. While searching, everything follows the history order.
-    private var separatesPinned: Bool { (filter == .all || filter == .pinned) && query.isEmpty }
-
-    private var pinnedEntries: [HistoryEntry] {
-        HistoryFilter.entries(monitor.entries, filter: .pinned, search: "")
-    }
-
     /// Any sheet over the history. A capture from outside waits for it to close.
     private var isPresentingSheet: Bool {
-        showSettings || showCaptureGuide || detailEntry != nil || editor != nil || showPinOrder
+        showSettings || showCaptureGuide || detailEntry != nil || editor != nil
+            || reorderGroup != nil || renamingGroup != nil
     }
+
+    private var hasHistory: Bool { monitor.entries.contains { !$0.isTemplate } }
 
     private func closeSheets() {
         showSettings = false
         showCaptureGuide = false
         detailEntry = nil
         editor = nil
-        showPinOrder = false
+        reorderGroup = nil
+        renamingGroup = nil
     }
 
     var body: some View {
@@ -140,7 +143,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar
             statusStrip
-            filterBar
+            paneBar
             history
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -180,8 +183,7 @@ struct ContentView: View {
             if phase == .active { startQueuedDirectCapture() }
         }
         // The badge belongs to the list the user tapped in, so it goes with that list.
-        .onChange(of: filter) { _, _ in clearCopied() }
-        .onChange(of: separatesPinned) { _, _ in clearCopied() }
+        .onChange(of: pane) { _, _ in clearCopied() }
         .onChange(of: directCaptureEnabled) { _, enabled in
             guard !enabled else { return }
             queuedDirectMode = nil
@@ -194,21 +196,32 @@ struct ContentView: View {
         }
         .sheet(item: $detailEntry, onDismiss: presentQueuedCapture) { entry in detail(entry) }
         .sheet(item: $editor, onDismiss: presentQueuedCapture) { mode in
-            EntryEditorView(monitor: monitor, mode: mode) { showToast($0) }
+            EntryEditorView(monitor: monitor, mode: mode, tags: TemplateGroups.tags(monitor.entries)) {
+                showToast($0)
+            }
         }
-        .sheet(isPresented: $showPinOrder, onDismiss: presentQueuedCapture) {
-            PinOrderView(pinned: pinnedEntries) { monitor.reorderPins($0) }
+        .sheet(item: $reorderGroup, onDismiss: presentQueuedCapture) { group in
+            TemplateOrderView(title: group.title, items: group.entries) { monitor.reorderTemplates($0) }
+        }
+        .alert(renamingGroup?.tag == nil ? "タグを付ける" : "タグ名を変更",
+               isPresented: Binding(get: { renamingGroup != nil }, set: { if !$0 { renamingGroup = nil } })) {
+            TextField("タグ名", text: $tagDraft)
+            Button("キャンセル", role: .cancel) { renamingGroup = nil }
+            Button("決定") {
+                if let group = renamingGroup { renameTag(group) }
+            }
+        } message: {
+            Text(renamingGroup?.tag == nil
+                 ? "「その他」のテンプレートすべてに、このタグを付けます。"
+                 : "このタグのテンプレートすべてのタグが変わります。空にすると「その他」に移ります。")
         }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
-            Button("ピン留めを残して消去", role: .destructive) {
-                monitor.deleteAllHistory(includePinned: false) { showUndo($0) }
-            }
-            Button("ピン留めも含めてすべて消去", role: .destructive) {
-                monitor.deleteAllHistory(includePinned: true) { showUndo($0) }
+            Button("履歴を全消去", role: .destructive) {
+                monitor.deleteAllHistory { showUndo($0) }
             }
             Button("キャンセル", role: .cancel) {}
         } message: {
-            Text("5秒間は「元に戻す」で取り消せます。")
+            Text("テンプレートは消えません。5秒間は「元に戻す」で取り消せます。")
         }
     }
 
@@ -238,7 +251,7 @@ struct ContentView: View {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            TextField("検索", text: $searchText)
+            TextField(pane == .history ? "履歴を検索" : "テンプレートを検索", text: $searchText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
@@ -340,16 +353,13 @@ struct ContentView: View {
                     screenCapture.stop(reason: "メニューから停止")
                 }
             }
-            Button("文章を書いてピン留め", systemImage: "square.and.pencil") { editor = .create }
-            if pinnedEntries.count > 1 {
-                Button("ピン留めを並べ替え", systemImage: "arrow.up.arrow.down") { showPinOrder = true }
-            }
+            Button("テンプレートを書く", systemImage: "square.and.pencil") { editor = .create(tag: nil) }
             Button("切り取りの使い方", systemImage: "questionmark.circle") { showCaptureGuide = true }
             Button("設定", systemImage: "gearshape") { showSettings = true }
             Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
                 confirmHistoryClear = true
             }
-            .disabled(monitor.entries.isEmpty)
+            .disabled(!hasHistory)
         } label: {
             Image(systemName: "ellipsis.circle")
                 .font(.title3)
@@ -425,54 +435,43 @@ struct ContentView: View {
         .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    // MARK: Filters
+    // MARK: Pane switch
 
-    private var filterBar: some View {
-        HStack(spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(HistoryFilter.allCases, id: \.self) { value in
-                        filterChip(value)
-                    }
-                }
-                .padding(.leading, 12)
-                .padding(.trailing, 18)
-            }
-            // Fades the chips out at the edge instead of cutting them off.
-            .mask(HStack(spacing: 0) {
-                Rectangle()
-                LinearGradient(colors: [Color.black, Color.clear], startPoint: .leading, endPoint: .trailing)
-                    .frame(width: 18)
-            })
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("表示する履歴")
-            pasteButton.padding(.trailing, 12)
-        }
-        .padding(.top, 2)
-        .padding(.bottom, 2)
+    /// 履歴 and テンプレート. The kind filters went away in 0.13.0; search narrows instead.
+    enum Pane: String, CaseIterable, Identifiable {
+        case history, templates
+        var id: String { rawValue }
+        var title: String { self == .history ? "履歴" : "テンプレート" }
     }
 
-    private func filterChip(_ value: HistoryFilter) -> some View {
-        let selected = filter == value
-        return Button {
-            filter = value
-        } label: {
-            HStack(spacing: 4) {
-                if let symbol = value.symbolName {
-                    Image(systemName: selected && value == .pinned ? "pin.fill" : symbol)
-                        .font(.caption.weight(.semibold))
+    private var paneBar: some View {
+        HStack(spacing: 8) {
+            Picker("表示", selection: $pane) {
+                ForEach(Pane.allCases) { value in
+                    Text(value.title).tag(value)
                 }
-                Text(value.title).font(.subheadline.weight(selected ? .semibold : .regular))
             }
-            .foregroundStyle(selected ? Color.white : Color.primary)
-            .padding(.horizontal, 12)
-            .frame(height: 32)
-            .background(selected ? Theme.accent : Theme.field, in: Capsule())
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 340)
+            Spacer(minLength: 0)
+            if pane == .history {
+                pasteButton
+            } else {
+                Button {
+                    editor = .create(tag: nil)
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 36, height: 28)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .accessibilityLabel("テンプレートを書く")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .padding(.bottom, 6)
     }
 
     private var pasteButton: some View {
@@ -485,80 +484,108 @@ struct ContentView: View {
         .accessibilityLabel("今のクリップボードの内容を保存")
     }
 
-    // MARK: History
+    // MARK: Lists
 
     private var history: some View {
         GeometryReader { proxy in
             // The periodic refresh keeps labels such as "3分前" current.
             TimelineView(.periodic(from: .now, by: 20)) { context in
-                historyScroll(HistoryFilter.entries(monitor.entries, filter: filter, search: query),
-                              now: context.date, columnCount: EntryColumns.count(forWidth: proxy.size.width))
+                let columnCount = EntryColumns.count(forWidth: proxy.size.width)
+                ScrollView {
+                    if pane == .history {
+                        historyList(HistoryFilter.history(monitor.entries, search: query),
+                                    now: context.date, columnCount: columnCount)
+                    } else {
+                        templateList(TemplateGroups.make(monitor.entries, search: query), columnCount: columnCount)
+                    }
+                }
+                .scrollDismissesKeyboard(.immediately)
+                // A fresh list for each pane. In 0.12.0, a card that moved to another list while
+                // its コピーしました badge was showing left the list unresponsive on device.
+                .id(pane)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Takes the filtered entries as a parameter so that they are filtered once per redraw.
-    private func historyScroll(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
-        ScrollView {
-            if entries.isEmpty {
-                emptyState
-            } else {
-                sectionList(entries, now: now, columnCount: columnCount)
+    /// Keeps the last card clear of the undo bar and the sequential paste bar.
+    private var bottomClearance: CGFloat { monitor.pasteQueue.entryIDs.isEmpty ? 96 : 220 }
+
+    @ViewBuilder
+    private func historyList(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
+        if entries.isEmpty {
+            historyEmptyState
+        } else {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(EntrySections.make(entries, now: now)) { section in
+                    sectionTitle(section.kind.title, count: section.entries.count)
+                    cards(section.entries, columnCount: columnCount) { entry in
+                        card(entry, timeLabel: EntryTime.label(
+                            for: entry.lastCollectedAt, now: now,
+                            includesDay: section.kind != .today && section.kind != .yesterday))
+                    }
+                }
             }
+            .padding(.horizontal, 12)
+            .padding(.bottom, bottomClearance)
         }
-        .scrollDismissesKeyboard(.immediately)
-        // A fresh list for each filter and for the start of a search. A pinned card moves
-        // between the ピン留め section and a day section on these switches, and moving it while
-        // its コピーしました badge was showing left the list unresponsive on device (0.12.0).
-        .id("\(filter)|\(separatesPinned)")
     }
 
-    private func sectionList(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
-        let sections = EntrySections.make(entries, separatesPinned: separatesPinned, now: now)
-        return LazyVStack(alignment: .leading, spacing: 0) {
-            ForEach(sections) { section in
-                sectionHeader(section)
-                if !(section.kind == .pinned && pinnedCollapsed) {
-                    if columnCount == 1 {
-                        // One column stays fully lazy, which matters with a long history.
-                        ForEach(section.entries) { entry in
-                            card(entry, section: section.kind, now: now).padding(.bottom, 10)
+    @ViewBuilder
+    private func templateList(_ groups: [TemplateGroup], columnCount: Int) -> some View {
+        if groups.isEmpty {
+            templateEmptyState
+        } else {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                ForEach(groups) { group in
+                    let open = isOpen(group, groupCount: groups.count)
+                    templateHeader(group, isOpen: open)
+                    if open {
+                        cards(group.entries, columnCount: columnCount) { entry in
+                            card(entry, timeLabel: "")
                         }
-                    } else {
-                        columns(section, count: columnCount, now: now).padding(.bottom, 10)
+                        .padding(.leading, 8)
                     }
                 }
             }
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .padding(.bottom, bottomClearance)
         }
-        .padding(.horizontal, 12)
-        // Keeps the last card clear of the undo bar and the sequential paste bar.
-        .padding(.bottom, monitor.pasteQueue.entryIDs.isEmpty ? 96 : 220)
     }
 
-    /// Cards of different heights pack tightly when each column is its own stack.
-    private func columns(_ section: EntrySection, count: Int, now: Date) -> some View {
-        let groups = EntryColumns.split(section.entries, into: count)
-        return HStack(alignment: .top, spacing: 10) {
-            ForEach(groups.indices, id: \.self) { index in
-                LazyVStack(spacing: 10) {
-                    ForEach(groups[index]) { entry in
-                        card(entry, section: section.kind, now: now)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .top)
+    /// One column stays fully lazy, which matters with a long history. Wider windows use columns,
+    /// each its own stack, so that cards of different heights pack tightly.
+    @ViewBuilder
+    private func cards<Card: View>(_ entries: [HistoryEntry], columnCount: Int,
+                                   @ViewBuilder card: @escaping (HistoryEntry) -> Card) -> some View {
+        if columnCount == 1 {
+            ForEach(entries) { entry in
+                card(entry).padding(.bottom, 10)
             }
+        } else {
+            let groups = EntryColumns.split(entries, into: columnCount)
+            HStack(alignment: .top, spacing: 10) {
+                ForEach(groups.indices, id: \.self) { index in
+                    LazyVStack(spacing: 10) {
+                        ForEach(groups[index]) { entry in
+                            card(entry)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .top)
+                }
+            }
+            .padding(.bottom, 10)
         }
     }
 
-    private func card(_ entry: HistoryEntry, section: EntrySectionKind, now: Date) -> some View {
+    private func card(_ entry: HistoryEntry, timeLabel: String) -> some View {
         let queue = monitor.pasteQueue
         let place = queue.entryIDs.firstIndex(of: entry.id)
         return HistoryCard(
             entry: entry,
             thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) },
-            timeLabel: EntryTime.label(for: entry.lastCollectedAt, now: now,
-                                       includesDay: section != .today && section != .yesterday),
+            timeLabel: timeLabel,
             query: query,
             isCopied: copiedID == entry.id,
             onCopy: { copy(entry) },
@@ -569,57 +596,105 @@ struct ContentView: View {
         )
     }
 
-    @ViewBuilder private func sectionHeader(_ section: EntrySection) -> some View {
-        if section.kind == .pinned {
-            HStack(alignment: .bottom, spacing: 0) {
-                Button {
-                    pinnedCollapsed.toggle()
-                } label: {
-                    sectionTitle(section, chevron: pinnedCollapsed ? "chevron.right" : "chevron.down")
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint(pinnedCollapsed ? "ピン留めを表示します" : "ピン留めをたたみます")
-                if section.entries.count > 1 {
-                    pinnedAction("arrow.up.arrow.down", label: "ピン留めを並べ替え") { showPinOrder = true }
-                }
-                pinnedAction("plus", label: "文章を書いてピン留めに追加") { editor = .create }
-            }
-        } else {
-            sectionTitle(section, chevron: nil)
-        }
-    }
-
-    private func pinnedAction(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.accent)
-                .frame(width: 44, height: 40)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .padding(.bottom, -2)
-        .accessibilityLabel(label)
-    }
-
-    private func sectionTitle(_ section: EntrySection, chevron: String?) -> some View {
+    private func sectionTitle(_ title: String, count: Int) -> some View {
         HStack(spacing: 6) {
-            if section.kind == .pinned {
-                Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Color.orange)
-            }
-            Text(section.kind.title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
-            Text("\(section.entries.count)").font(.caption.weight(.medium)).foregroundStyle(.tertiary)
+            Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            Text("\(count)").font(.caption.weight(.medium)).foregroundStyle(.tertiary)
             Spacer(minLength: 0)
-            if let chevron {
-                Image(systemName: chevron).font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
-            }
         }
         .padding(.horizontal, 4)
         .padding(.top, 12)
         .frame(minHeight: 36, alignment: .bottom)
         .padding(.bottom, 8)
-        .contentShape(Rectangle())
     }
+
+    // MARK: Template groups
+
+    /// Groups start closed. A lone group, and every group while searching, is open.
+    private func isOpen(_ group: TemplateGroup, groupCount: Int) -> Bool {
+        groupCount == 1 || !query.isEmpty || openTags.contains(group.id)
+    }
+
+    private func templateHeader(_ group: TemplateGroup, isOpen: Bool) -> some View {
+        let pastable = group.entries.filter { $0.kind == .text || $0.kind == .url }
+        return HStack(spacing: 2) {
+            Button {
+                if openTags.contains(group.id) { openTags.remove(group.id) } else { openTags.insert(group.id) }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: group.tag == nil ? "tray" : "tag")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 22)
+                    Text(group.title)
+                        .font(.headline)
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                    Text("\(group.entries.count)")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 4)
+                    Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.leading, 14)
+                .padding(.trailing, 6)
+                .frame(minHeight: 54)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(isOpen ? "たたみます" : "開いて中身を表示します")
+            if pastable.count > 1 {
+                Button {
+                    monitor.pasteInOrder(pastable)
+                } label: {
+                    Label("順に貼る", systemImage: "list.number")
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .accessibilityHint("中の文章とリンクを、この順で連続貼り付けに並べて始めます")
+            }
+            Menu {
+                Button("このタグで書く", systemImage: "square.and.pencil") { editor = .create(tag: group.tag) }
+                if group.entries.count > 1 {
+                    Button("並べ替え", systemImage: "arrow.up.arrow.down") { reorderGroup = group }
+                }
+                Button(group.tag == nil ? "タグを付ける…" : "タグ名を変更…", systemImage: "tag") {
+                    tagDraft = group.tag ?? ""
+                    renamingGroup = group
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("「\(group.title)」の操作")
+        }
+        .padding(.trailing, 2)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+            .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            .allowsHitTesting(false))
+    }
+
+    private func renameTag(_ group: TemplateGroup) {
+        let newTag = HistoryEntry.normalizedTag(tagDraft)
+        monitor.renameTag(group.tag, to: newTag)
+        // Keeps the renamed group open if it was. The id matches TemplateGroup.id.
+        if openTags.contains(group.id) {
+            openTags.remove(group.id)
+            openTags.insert(newTag ?? "")
+        }
+        renamingGroup = nil
+    }
+
+    // MARK: Item actions
 
     @ViewBuilder private func rowActions(_ entry: HistoryEntry) -> some View {
         Button("コピー", systemImage: "doc.on.doc") { copy(entry) }
@@ -639,11 +714,12 @@ struct ContentView: View {
         if entry.kind == .url, let url = URL(string: entry.text.trimmingCharacters(in: .whitespacesAndNewlines)) {
             Button("リンクを開く", systemImage: "safari") { openURL(url) }
         }
-        Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
-            monitor.togglePin(entry)
+        if entry.isTemplate {
+            Button("編集…", systemImage: "pencil") { editor = .edit(entry) }
+        } else {
+            Button("テンプレートに移動", systemImage: "square.stack") { moveToTemplates(entry) }
         }
         if entry.kind == .text || entry.kind == .url {
-            Button("編集…", systemImage: "pencil") { editor = .edit(entry) }
             if monitor.pasteQueue.entryIDs.contains(entry.id) {
                 Button("連続貼り付けから外す", systemImage: "minus.circle") {
                     monitor.removeFromPasteQueue(id: entry.id)
@@ -651,14 +727,19 @@ struct ContentView: View {
             } else {
                 Button("連続貼り付けに追加", systemImage: "text.badge.plus") { monitor.enqueueForPaste(entry) }
             }
-        } else {
-            Button(entry.displayTitle == nil ? "名前を付ける…" : "名前を変更…", systemImage: "tag") {
-                editor = .edit(entry)
-            }
         }
         Divider()
         Button("削除", systemImage: "trash", role: .destructive) {
             monitor.delete(entry) { showUndo($0) }
+        }
+    }
+
+    private func moveToTemplates(_ entry: HistoryEntry) {
+        monitor.moveToTemplates(entry) { result in
+            switch result {
+            case .success: showToast("テンプレートの「その他」に移動しました")
+            case .failure(let error): showToast(error.message)
+            }
         }
     }
 
@@ -674,8 +755,8 @@ struct ContentView: View {
 
     // MARK: Empty states
 
-    @ViewBuilder private var emptyState: some View {
-        if monitor.entries.isEmpty {
+    @ViewBuilder private var historyEmptyState: some View {
+        if query.isEmpty {
             VStack(spacing: 14) {
                 emptySymbol("doc.on.clipboard")
                 Text("コピーすると、ここに並びます").font(.title3.weight(.semibold))
@@ -689,15 +770,21 @@ struct ContentView: View {
             .padding(.top, 48)
             .frame(maxWidth: 440)
             .frame(maxWidth: .infinity)
-        } else if filter == .pinned && query.isEmpty {
+        } else {
+            notFound
+        }
+    }
+
+    @ViewBuilder private var templateEmptyState: some View {
+        if query.isEmpty {
             VStack(spacing: 14) {
-                emptySymbol("pin")
-                Text("ピン留めはまだありません").font(.title3.weight(.semibold))
-                Text("よく使う文を書いておくと、押すだけでコピーできます。履歴のメニューからピン留めすることもできます。ピン留めは自動では消えません。")
+                emptySymbol("square.stack")
+                Text("テンプレートはまだありません").font(.title3.weight(.semibold))
+                Text("よく使う文を書いておくと、押すだけでコピーできます。タグを付けると、同じタグのものがまとまります。履歴のカードのメニューから「テンプレートに移動」することもできます。テンプレートは自動では消えません。")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("文章を書いて追加", systemImage: "square.and.pencil") { editor = .create }
+                Button("テンプレートを書く", systemImage: "square.and.pencil") { editor = .create(tag: nil) }
                     .buttonStyle(.borderedProminent)
                     .frame(minHeight: 44)
             }
@@ -706,20 +793,21 @@ struct ContentView: View {
             .frame(maxWidth: 440)
             .frame(maxWidth: .infinity)
         } else {
-            VStack(spacing: 14) {
-                emptySymbol("magnifyingglass")
-                Text("見つかりませんでした").font(.title3.weight(.semibold))
-                Button("条件をクリア") {
-                    searchText = ""
-                    filter = .all
-                }
+            notFound
+        }
+    }
+
+    private var notFound: some View {
+        VStack(spacing: 14) {
+            emptySymbol("magnifyingglass")
+            Text("見つかりませんでした").font(.title3.weight(.semibold))
+            Button("検索をクリア") { searchText = "" }
                 .buttonStyle(.bordered)
                 .frame(minHeight: 44)
-            }
-            .padding(.horizontal, 28)
-            .padding(.top, 48)
-            .frame(maxWidth: .infinity)
         }
+        .padding(.horizontal, 28)
+        .padding(.top, 48)
+        .frame(maxWidth: .infinity)
     }
 
     private func emptySymbol(_ name: String) -> some View {

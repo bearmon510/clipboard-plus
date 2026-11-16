@@ -39,28 +39,55 @@ struct HistoryEntry: Identifiable, Codable, Equatable {
     let savedAt: Date
     let lastCollectedAt: Date
     let collectionCount: Int
-    let isPinned: Bool
+    let isTemplate: Bool
     let source: HistorySource
     let image: HistoryImage?
     let file: HistoryFile?
     let title: String?
-    let pinOrder: Int?
+    let templateOrder: Int?
+    let tag: String?
 
     init(id: Int, kind: HistoryKind, text: String, savedAt: Date, lastCollectedAt: Date,
-         collectionCount: Int, isPinned: Bool, source: HistorySource, image: HistoryImage? = nil, file: HistoryFile? = nil,
-         title: String? = nil, pinOrder: Int? = nil) {
+         collectionCount: Int, isTemplate: Bool, source: HistorySource, image: HistoryImage? = nil, file: HistoryFile? = nil,
+         title: String? = nil, templateOrder: Int? = nil, tag: String? = nil) {
         self.id = id
         self.kind = kind
         self.text = text
         self.savedAt = savedAt
         self.lastCollectedAt = lastCollectedAt
         self.collectionCount = collectionCount
-        self.isPinned = isPinned
+        self.isTemplate = isTemplate
         self.source = source
         self.image = image
         self.file = file
         self.title = title
-        self.pinOrder = pinOrder
+        self.templateOrder = templateOrder
+        self.tag = Self.normalizedTag(tag)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, text, savedAt, lastCollectedAt, collectionCount, isTemplate, source, image, file, title, templateOrder, tag
+    }
+    private enum LegacyKeys: String, CodingKey { case isPinned, pinOrder }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let legacy = try decoder.container(keyedBy: LegacyKeys.self)
+        self.init(id: try values.decode(Int.self, forKey: .id),
+                  kind: try values.decode(HistoryKind.self, forKey: .kind),
+                  text: try values.decode(String.self, forKey: .text),
+                  savedAt: try values.decode(Date.self, forKey: .savedAt),
+                  lastCollectedAt: try values.decode(Date.self, forKey: .lastCollectedAt),
+                  collectionCount: try values.decode(Int.self, forKey: .collectionCount),
+                  isTemplate: try values.decodeIfPresent(Bool.self, forKey: .isTemplate)
+                    ?? legacy.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false,
+                  source: try values.decode(HistorySource.self, forKey: .source),
+                  image: try values.decodeIfPresent(HistoryImage.self, forKey: .image),
+                  file: try values.decodeIfPresent(HistoryFile.self, forKey: .file),
+                  title: try values.decodeIfPresent(String.self, forKey: .title),
+                  templateOrder: try values.decodeIfPresent(Int.self, forKey: .templateOrder)
+                    ?? legacy.decodeIfPresent(Int.self, forKey: .pinOrder),
+                  tag: try values.decodeIfPresent(String.self, forKey: .tag))
     }
 
     var attachmentFilenames: Set<String> { (image?.filenames ?? []).union(file?.filenames ?? []) }
@@ -76,7 +103,7 @@ enum HistoryEditError: Error, Equatable {
     var message: String {
         switch self {
         case .empty: return "本文を入力してください"
-        case .duplicate: return "同じ内容の項目がすでにあります"
+        case .duplicate: return "同じ内容のテンプレートがすでにあります"
         case .unsupportedKind: return "文章とリンクだけを書き直せます"
         case .failed: return "履歴の変更を保存できませんでした"
         }
@@ -95,19 +122,24 @@ extension HistoryEntry {
         return trimmed.isEmpty ? nil : String(trimmed.prefix(100)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Preserve input order for equal or absent pin orders, including legacy JSON.
-    static func orderedPins(_ entries: [HistoryEntry]) -> [HistoryEntry] {
-        entries.enumerated().sorted { lhs, rhs in
-            switch (lhs.element.pinOrder, rhs.element.pinOrder) {
+    static func normalizedTag(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let capped = String(trimmed.prefix(30)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return capped.isEmpty ? nil : capped
+    }
+
+    /// A stable ID tie-breaker orders legacy templates without an explicit order.
+    static func orderedTemplates(_ entries: [HistoryEntry]) -> [HistoryEntry] {
+        entries.sorted { lhs, rhs in
+            switch (lhs.templateOrder, rhs.templateOrder) {
             case let (a?, b?) where a != b: return a < b
             case (_?, nil): return true
             case (nil, _?): return false
-            default: return lhs.offset < rhs.offset
+            default: return lhs.id < rhs.id
             }
-        }.map(\.element)
+        }
     }
-
-    var needsTemplateBackupFormat: Bool { title != nil || pinOrder != nil || source == .written }
 }
 
 struct HistoryExport: Codable {
@@ -124,7 +156,7 @@ struct HistoryExport: Codable {
             var container = encoder.singleValueContainer()
             try container.encode(formatter.string(from: date))
         }
-        let version = entries.contains { $0.needsTemplateBackupFormat } ? 4 : (entries.contains { $0.kind == .file } ? 3 : 2)
+        let version = 5
         return try encoder.encode(HistoryExport(formatVersion: version, exportedAt: exportedAt, entries: entries))
     }
 }

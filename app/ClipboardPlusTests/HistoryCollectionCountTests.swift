@@ -57,7 +57,7 @@ final class HistoryCollectionCountTests: XCTestCase {
             func incoming(_ count: Int) -> HistoryEntry {
                 HistoryEntry(id: 1, kind: isImage ? .image : .text, text: isImage ? "" : "same original",
                              savedAt: Date(timeIntervalSince1970: 10), lastCollectedAt: Date(timeIntervalSince1970: 20),
-                             collectionCount: count, isPinned: false, source: .manual, image: isImage ? image : nil)
+                             collectionCount: count, isTemplate: false, source: .manual, image: isImage ? image : nil)
             }
             // The persistence boundary remains defensive even without archive validation.
             _ = try database.mergeBackup([incoming(Int.max)]) { _ in }

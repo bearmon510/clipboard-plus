@@ -16,7 +16,7 @@ enum FileTestSupport {
 
     static func entry(_ file: HistoryFile, id: Int = 1, at date: Date = Date(timeIntervalSince1970: 100)) -> HistoryEntry {
         HistoryEntry(id: id, kind: .file, text: "", savedAt: date, lastCollectedAt: date,
-                     collectionCount: 1, isPinned: false, source: .manual, file: file)
+                     collectionCount: 1, isTemplate: false, source: .manual, file: file)
     }
 }
 
@@ -117,7 +117,7 @@ final class FileHistoryTests: XCTestCase {
             PRAGMA user_version = 2;
             """, at: url)
         let database = try HistoryDatabase(url: url, now: { Date(timeIntervalSince1970: 1000) })
-        XCTAssertEqual(try database.readSchemaVersion(), 4)
+        XCTAssertEqual(try database.readSchemaVersion(), 5)
         XCTAssertEqual(try database.fetchAll().first?.id, 7)
         XCTAssertNotNil(try database.latestDeletion())
         let file = try FileTestSupport.input(in: root).file
@@ -140,10 +140,9 @@ final class FileHistoryTests: XCTestCase {
         let root = try ImageTestSupport.directory(self)
         let file = try FileTestSupport.input(in: root, name: "Report.PDF").file
         let entry = FileTestSupport.entry(file)
-        XCTAssertEqual(HistoryFilter.files.title, "ファイル")
-        XCTAssertEqual(HistoryFilter.entries([entry], filter: .files, search: " report "), [entry])
-        XCTAssertTrue(HistoryFilter.entries([entry], filter: .texts, search: "").isEmpty)
-        XCTAssertTrue(HistoryFilter.entries([entry], filter: .files, search: "unmatched").isEmpty)
+        XCTAssertEqual(ShortcutContent.entries([entry], filter: .files, search: " report "), [entry])
+        XCTAssertTrue(ShortcutContent.entries([entry], filter: .texts, search: "").isEmpty)
+        XCTAssertTrue(ShortcutContent.entries([entry], filter: .files, search: "unmatched").isEmpty)
         XCTAssertEqual(ShortcutContent.title(entry), "Report.PDF")
         XCTAssertEqual(file.symbolName, "doc.richtext")
         XCTAssertFalse(file.typeDescription.isEmpty)
@@ -188,7 +187,7 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertEqual(usage, HistoryFileUsage(count: 1, byteCount: file.byteCount))
         var deletion: HistoryDeletion?
         let deleted = expectation(description: "deleted")
-        store.deleteAll(includePinned: true) { result in
+        store.deleteAll() { result in
             switch result {
             case .success(let value): deletion = value
             case .failure(let error): XCTFail("\(error)")
@@ -209,7 +208,7 @@ final class FileHistoryTests: XCTestCase {
         wait(for: [undone], timeout: 5)
         XCTAssertEqual(entries, [entry])
         let deletedAgain = expectation(description: "deleted again")
-        store.deleteAll(includePinned: true) { _ in deletedAgain.fulfill() }
+        store.deleteAll() { _ in deletedAgain.fulfill() }
         wait(for: [deletedAgain], timeout: 5)
         now.addTimeInterval(6)
         drain(store)
@@ -235,7 +234,7 @@ final class FileHistoryTests: XCTestCase {
         let source = try HistoryDatabase(url: root.appendingPathComponent("source.sqlite"))
         let first = try source.collectFile(file, source: .drag, at: Date(timeIntervalSince1970: 20))
         try source.collectFile(file, source: .automatic, at: Date(timeIntervalSince1970: 30))
-        try source.togglePin(id: first.id)
+        try source.moveToTemplates(id: first.id)
         try source.collect("文章", source: .manual)
         try source.collectImage(ImageTestSupport.prepare(originals), source: .manual, at: nil)
         let url = root.appendingPathComponent("backup.clipboardplus")
@@ -244,9 +243,9 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertEqual(try header.read(upToCount: 8), HistoryBackup.magic)
         let version = try HistoryBackup.readNumber(from: header)
         try header.close()
-        XCTAssertEqual(version, 3)
-        // Version 0.11 accepts only formats 1...2, before attempting JSON decoding.
-        XCTAssertFalse((UInt64(1)...UInt64(2)).contains(version))
+        XCTAssertEqual(version, 4)
+        // Version 0.12 accepts only formats 1...3, before attempting JSON decoding.
+        XCTAssertFalse((UInt64(1)...UInt64(3)).contains(version))
         let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
         let target = try HistoryDatabase(url: root.appendingPathComponent("target.sqlite"))
         let files = HistoryImageFiles(directory: root.appendingPathComponent("restored"))
@@ -257,7 +256,7 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertEqual(restored.originalFilename, file.originalFilename)
         XCTAssertEqual(restored.typeIdentifier, file.typeIdentifier)
         XCTAssertEqual(entry.collectionCount, 2)
-        XCTAssertTrue(entry.isPinned)
+        XCTAssertTrue(entry.isTemplate)
         XCTAssertEqual(try Data(contentsOf: files.url(for: restored.filename)), FileTestSupport.bytes)
         let second = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
         XCTAssertEqual(try HistoryRestore.apply(second, database: target, files: files, cancellation: BackupCancellation()), RestoreCounts(unchanged: 3))
@@ -363,7 +362,7 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertThrowsError(try BackupManifest(formatVersion: 1, createdAt: Date(), itemCount: 1,
                                                entries: [entry]).validate())
         let json = try HistoryExport.data(entries: [entry], exportedAt: Date())
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: json) as? [String: Any])?["formatVersion"] as? Int, 3)
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: json) as? [String: Any])?["formatVersion"] as? Int, 5)
     }
 
     @MainActor
@@ -394,7 +393,7 @@ final class FileHistoryTests: XCTestCase {
             completed.fulfill()
         }
         let deleted = expectation(description: "deleted while backup queued")
-        store.deleteAll(includePinned: true) { _ in deleted.fulfill() }
+        store.deleteAll() { _ in deleted.fulfill() }
         wait(for: [deleted], timeout: 5)
         now.addTimeInterval(6)
         drain(store)

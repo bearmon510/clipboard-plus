@@ -89,6 +89,48 @@ final class ClipboardMonitorCopyTests: XCTestCase {
     }
 
     @MainActor
+    func testTemplateSelfCopiesDoNotCreateOrBumpHistoryButExternalCopiesDo() throws {
+        let root = try ImageTestSupport.directory(self)
+        let url = root.appendingPathComponent("history.sqlite")
+        let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
+        let image = try ImageTestSupport.prepare(files)
+        let db = try HistoryDatabase(url: url)
+        let textTemplate = try db.createTemplate(text: "定型文", title: "名前", tag: "仕事")
+        let imageHistory = try db.collectImage(image, source: .manual, at: nil)
+        let imageTemplate = try db.moveToTemplates(id: imageHistory.id)
+        let board = TestClipboardPasteboard()
+        let monitor = try self.monitor(root: root, pasteboard: board) { try HistoryDatabase(url: url) }
+        drain(monitor)
+        monitor.start()
+        defer { monitor.stop() }
+        for template in [textTemplate, imageTemplate] {
+            for _ in 0..<2 {
+                let before = monitor.entries
+                let copied = expectation(description: "template copied")
+                monitor.copy(template) { success in XCTAssertTrue(success); copied.fulfill() }
+                wait(for: [copied], timeout: 5)
+                monitor.pollPasteboard()
+                drain(monitor)
+                XCTAssertEqual(monitor.entries, before)
+            }
+        }
+        board.writeExternally(textTemplate.text, types: ["public.utf8-plain-text"])
+        monitor.pollPasteboard()
+        drain(monitor)
+        let textHistory = try XCTUnwrap(monitor.entries.first { !$0.isTemplate && $0.kind == .text })
+        XCTAssertEqual(textHistory.collectionCount, 1)
+        monitor.copy(textTemplate)
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.first { $0.id == textHistory.id }, textHistory)
+        board.setData(try files.read(image), forPasteboardType: image.typeIdentifier)
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.filter { !$0.isTemplate }.count, 2)
+        XCTAssertEqual(monitor.entries.first { $0.id == textTemplate.id }, textTemplate)
+        XCTAssertEqual(monitor.entries.first { $0.id == imageTemplate.id }, imageTemplate)
+    }
+
+    @MainActor
     func testImageCopyCollectsExternalChangesWhileReadIsWaitingAndBeforeWrite() throws {
         let root = try ImageTestSupport.directory(self)
         let url = root.appendingPathComponent("history.sqlite")

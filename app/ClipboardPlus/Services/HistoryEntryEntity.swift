@@ -10,7 +10,7 @@ struct HistoryEntryEntity: AppEntity {
     @Property(title: "文章") var text: String
     @Property(title: "種類") var kind: String
     @Property(title: "保存日時") var savedAt: Date
-    @Property(title: "ピン留め") var isPinned: Bool
+    @Property(title: "テンプレート") var isTemplate: Bool
     @Property(title: "画像") var picture: IntentFile?
 
     @Property(title: "ファイル") var file: IntentFile?
@@ -19,7 +19,7 @@ struct HistoryEntryEntity: AppEntity {
     let displayTitle: String
 
     var displaySubtitle: String {
-        (fileSizeDescription.map { $0 + "・" } ?? "") + "\(kind)・\(savedAt.formatted(date: .abbreviated, time: .shortened))" + (isPinned ? "・ピン留め" : "")
+        (fileSizeDescription.map { $0 + "・" } ?? "") + "\(kind)・\(savedAt.formatted(date: .abbreviated, time: .shortened))" + (isTemplate ? "・テンプレート" : "")
     }
 
     var displayRepresentation: DisplayRepresentation {
@@ -35,7 +35,7 @@ struct HistoryEntryEntity: AppEntity {
         self.text = entry.text
         self.kind = ShortcutContent.kindTitle(entry.kind)
         self.savedAt = entry.savedAt
-        self.isPinned = entry.isPinned
+        self.isTemplate = entry.isTemplate
         self.picture = picture
         self.file = file
     }
@@ -91,21 +91,66 @@ struct HistoryEntryQuery: EntityStringQuery {
 }
 
 enum HistoryFilterOption: String, AppEnum {
-    case all, pinned, texts, links, images, files
+    case all, texts, links, images, files
+    case templates = "pinned"
 
     static let typeDisplayRepresentation: TypeDisplayRepresentation = "履歴の種類"
     static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [
-        .all: "すべて", .pinned: "ピン留め", .texts: "文章", .links: "リンク", .images: "画像", .files: "ファイル"
+        .all: "すべて", .templates: "テンプレート", .texts: "文章", .links: "リンク", .images: "画像", .files: "ファイル"
     ]
 
-    var filter: HistoryFilter {
+    var filter: ShortcutHistoryFilter {
         switch self {
         case .all: return .all
-        case .pinned: return .pinned
+        case .templates: return .templates
         case .texts: return .texts
         case .links: return .links
         case .images: return .images
         case .files: return .files
+        }
+    }
+}
+
+struct TemplateEntryEntity: AppEntity {
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "テンプレート"
+    static let defaultQuery = TemplateEntryQuery()
+    let id: Int
+    let title: String
+
+    var displayRepresentation: DisplayRepresentation { DisplayRepresentation(title: "\(title)") }
+
+    init(entry: HistoryEntry) {
+        id = entry.id
+        title = ShortcutContent.title(entry)
+    }
+}
+
+struct TemplateEntryQuery: EntityStringQuery {
+    @MainActor
+    func entities(for identifiers: [Int]) async throws -> [TemplateEntryEntity] {
+        let monitor = ClipboardMonitor.shared
+        return try await monitor.performShortcut("TemplateEntryQuery.entities(for:)") {
+            let byID = Dictionary(uniqueKeysWithValues: monitor.entries.filter(\.isTemplate).map { ($0.id, $0) })
+            return identifiers.compactMap { byID[$0] }.map { TemplateEntryEntity(entry: $0) }
+        }
+    }
+
+    @MainActor
+    func suggestedEntities() async throws -> [TemplateEntryEntity] {
+        try await entities(matching: "")
+    }
+
+    @MainActor
+    func entities(matching string: String) async throws -> [TemplateEntryEntity] {
+        try await entities(matching: string, monitor: .shared)
+    }
+
+    @MainActor
+    func entities(matching string: String, monitor: ClipboardMonitor) async throws -> [TemplateEntryEntity] {
+        try await monitor.performShortcut("TemplateEntryQuery.entities(matching:)") {
+            ShortcutContent.matchingEntries(monitor.entries, filter: .templates, search: string).map {
+                TemplateEntryEntity(entry: $0)
+            }
         }
     }
 }

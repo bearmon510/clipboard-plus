@@ -625,34 +625,46 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         return saved
     }
 
-    func createWritten(text: String, title: String?, completion: @escaping (Result<HistoryEntry, HistoryEditError>) -> Void) {
-        store.createWritten(text: text, title: title) { result in
-            self.recordEdit("文章の作成", result: result)
+    func moveToTemplates(_ entry: HistoryEntry, completion: @escaping (Result<HistoryEntry, HistoryEditError>) -> Void) {
+        store.moveToTemplates(id: entry.id) { result in
+            self.recordEdit("テンプレートに移動", result: result)
             completion(result)
         }
     }
 
-    func setTitle(_ title: String?, for entry: HistoryEntry, completion: ((Bool) -> Void)? = nil) {
-        store.setTitle(title, id: entry.id) { result in
-            let succeeded = (try? result.get()) != nil
-            if !succeeded { self.reportStorageFailure() }
-            self.record("名前の変更", historyNumber: entry.id, details: "成功=\(succeeded)")
-            completion?(succeeded)
-        }
-    }
-
-    func editText(_ entry: HistoryEntry, text: String, title: String?, completion: @escaping (Result<HistoryEntry, HistoryEditError>) -> Void) {
-        store.editText(id: entry.id, text: text, title: title) { result in
-            self.recordEdit("本文の編集", result: result)
+    func createTemplate(text: String, title: String?, tag: String?, completion: @escaping (Result<HistoryEntry, HistoryEditError>) -> Void) {
+        store.createTemplate(text: text, title: title, tag: tag) { result in
+            self.recordEdit("テンプレートの作成", result: result)
             completion(result)
         }
     }
 
-    func reorderPins(_ orderedIDs: [Int]) {
-        store.reorderPins(orderedIDs) { result in
+    func updateTemplate(_ entry: HistoryEntry, text: String?, title: String?, tag: String?, completion: @escaping (Result<HistoryEntry, HistoryEditError>) -> Void) {
+        store.updateTemplate(id: entry.id, text: text, title: title, tag: tag) { result in
+            self.recordEdit("テンプレートの編集", result: result)
+            completion(result)
+        }
+    }
+
+    func reorderTemplates(_ orderedIDs: [Int]) {
+        store.reorderTemplates(orderedIDs) { result in
             if case .failure = result { self.reportStorageFailure() }
-            self.record("ピン留めの並べ替え", details: "件数=\(orderedIDs.count); 成功=\((try? result.get()) != nil)")
+            self.record("テンプレートの並べ替え", details: "件数=\(orderedIDs.count); 成功=\((try? result.get()) != nil)")
         }
+    }
+
+    func renameTag(_ tag: String?, to newTag: String?) {
+        store.renameTag(tag, to: newTag) { result in
+            if case .failure = result { self.reportStorageFailure() }
+            self.record("タグ名の変更", details: "成功=\((try? result.get()) != nil)")
+        }
+    }
+
+    func pasteInOrder(_ entries: [HistoryEntry]) {
+        pasteEngine.stop()
+        for entry in entries { enqueueForPaste(entry) }
+        self.record("順に貼る", details: "件数=\(pasteQueue.entryIDs.count)")
+        pasteEngine.start()
     }
 
     private func recordEdit(_ operation: String, result: Result<HistoryEntry, HistoryEditError>) {
@@ -706,11 +718,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
-    func deleteAllHistory(includePinned: Bool, completion: @escaping (HistoryDeletion?) -> Void) {
-        store.deleteAll(includePinned: includePinned) { result in
+    func deleteAllHistory(completion: @escaping (HistoryDeletion?) -> Void) {
+        store.deleteAll() { result in
             switch result {
             case .success(let deletion):
-                self.record("削除", details: "履歴全消去=\(deletion?.count ?? 0)件; ピン留めを含む=\(includePinned)")
+                self.record("削除", details: "履歴全消去=\(deletion?.count ?? 0)件")
                 completion(deletion)
             case .failure: self.reportStorageFailure(); completion(nil)
             }
@@ -734,12 +746,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             case .success(let deletion): completion(deletion)
             case .failure: self.reportStorageFailure(); completion(nil)
             }
-        }
-    }
-
-    func togglePin(_ entry: HistoryEntry) {
-        store.togglePin(id: entry.id) { result in
-            if case .failure = result { self.reportStorageFailure() }
         }
     }
 

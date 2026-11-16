@@ -240,7 +240,8 @@ struct HistoryCard<Actions: View>: View {
                 .foregroundStyle(tint)
                 .accessibilityHidden(true)
             Text(metaText).lineLimit(1)
-            if entry.collectionCount > 1 {
+            // A template is not collected, so its count says nothing useful.
+            if entry.collectionCount > 1 && !entry.isTemplate {
                 Text("×\(entry.collectionCount)")
                     .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 6)
@@ -258,12 +259,6 @@ struct HistoryCard<Actions: View>: View {
                     .background(isQueueCurrent ? Theme.accent : Theme.accent.opacity(0.15), in: Capsule())
                     .accessibilityLabel(isQueueCurrent ? "連続貼り付けの\(queueNumber)番目、コピー中"
                                                        : "連続貼り付けの\(queueNumber)番目")
-            }
-            if entry.isPinned {
-                Image(systemName: "pin.fill")
-                    .font(.caption2)
-                    .foregroundStyle(Color.orange)
-                    .accessibilityLabel("ピン留め")
             }
         }
         .font(.caption)
@@ -283,7 +278,8 @@ struct HistoryCard<Actions: View>: View {
         } else if entry.characterCount > EntryPreview.limit {
             parts.append("\(entry.characterCount.formatted())文字")
         }
-        parts.append(timeLabel)
+        // Templates pass no time: when they were made does not help to choose one.
+        if !timeLabel.isEmpty { parts.append(timeLabel) }
         return parts.joined(separator: "・")
     }
 

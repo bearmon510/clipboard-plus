@@ -1,44 +1,51 @@
 import SwiftUI
 
-/// Writes a new pinned text, or changes the name and text of an item. Pictures and files
-/// keep their contents, so for them only the name can change.
+/// Writes a new template, or changes a template's name, tag and text. Pictures and files keep
+/// their contents, so for them only the name and the tag can change.
 struct EntryEditorView: View {
     enum Mode: Identifiable {
-        case create
+        /// A new template, with the tag of the group it was started from.
+        case create(tag: String?)
         case edit(HistoryEntry)
 
         var id: String {
             switch self {
-            case .create: return "create"
+            case .create(let tag): return "create-\(tag ?? "")"
             case .edit(let entry): return "edit-\(entry.id)"
             }
         }
     }
 
-    private enum Field { case title, text }
+    private enum Field { case title, tag, text }
 
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var monitor: ClipboardMonitor
     let mode: Mode
+    /// Tags already in use, offered so that the same tag is spelled the same way.
+    let tags: [String]
     /// Receives a short message for the toast after a successful save.
     let onSaved: (String) -> Void
 
     @State private var title: String
+    @State private var tag: String
     @State private var text: String
     @State private var error: String?
     @State private var isSaving = false
     @FocusState private var focus: Field?
 
-    init(monitor: ClipboardMonitor, mode: Mode, onSaved: @escaping (String) -> Void) {
+    init(monitor: ClipboardMonitor, mode: Mode, tags: [String], onSaved: @escaping (String) -> Void) {
         self.monitor = monitor
         self.mode = mode
+        self.tags = tags
         self.onSaved = onSaved
         switch mode {
-        case .create:
+        case .create(let tag):
             _title = State(initialValue: "")
+            _tag = State(initialValue: tag ?? "")
             _text = State(initialValue: "")
         case .edit(let entry):
             _title = State(initialValue: entry.title ?? "")
+            _tag = State(initialValue: entry.tag ?? "")
             _text = State(initialValue: entry.text)
         }
     }
@@ -54,37 +61,59 @@ struct EntryEditorView: View {
         !isSaving && (!editsText || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
-    private var navigationTitle: String {
-        guard let entry else { return "ピン留めに追加" }
-        return editsText ? "編集" : (entry.displayTitle == nil ? "名前を付ける" : "名前を変更")
+    private static func optional(_ value: String) -> String? {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("例：署名、住所", text: $title)
+                    TextField("例：署名、自宅の住所", text: $title)
                         .focused($focus, equals: .title)
-                        .submitLabel(editsText ? .next : .done)
-                        .onSubmit {
-                            if editsText { focus = .text } else { save() }
-                        }
+                        .submitLabel(.next)
+                        .onSubmit { focus = .tag }
                 } header: {
                     Text("名前")
                 } footer: {
                     Text("付けておくと、検索やショートカット、Siriで名前から探せます。なくてもかまいません。")
                 }
+                Section {
+                    HStack(spacing: 8) {
+                        TextField("例：住所セット", text: $tag)
+                            .focused($focus, equals: .tag)
+                            .submitLabel(editsText ? .next : .done)
+                            .onSubmit {
+                                if editsText { focus = .text } else { save() }
+                            }
+                        if !tags.isEmpty || !tag.isEmpty {
+                            Menu {
+                                ForEach(tags, id: \.self) { value in
+                                    Button(value) { tag = value }
+                                }
+                                if !tag.isEmpty {
+                                    Divider()
+                                    Button("タグを外す", systemImage: "xmark") { tag = "" }
+                                }
+                            } label: {
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(width: 36, height: 32)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityLabel("使っているタグから選ぶ")
+                        }
+                    }
+                } header: {
+                    Text("タグ")
+                } footer: {
+                    Text("同じタグのものがひとつにまとまります。なければ「その他」に入ります。")
+                }
                 if editsText {
-                    Section {
+                    Section("本文") {
                         TextEditor(text: $text)
                             .focused($focus, equals: .text)
                             .frame(minHeight: 180)
-                    } header: {
-                        Text("本文")
-                    } footer: {
-                        if entry == nil {
-                            Text("ピン留めに入ります。ピンを外すか削除するまで、自動では消えません。")
-                        }
                     }
                 } else if let entry {
                     Section {
@@ -92,7 +121,7 @@ struct EntryEditorView: View {
                               systemImage: entry.file?.symbolName ?? "photo")
                             .lineLimit(2)
                     } footer: {
-                        Text("画像とファイルは、名前だけを変えられます。")
+                        Text("画像とファイルは、名前とタグだけを変えられます。")
                     }
                 }
                 if let error {
@@ -102,7 +131,7 @@ struct EntryEditorView: View {
                     }
                 }
             }
-            .navigationTitle(navigationTitle)
+            .navigationTitle(entry == nil ? "テンプレートを書く" : "テンプレートの編集")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -126,32 +155,18 @@ struct EntryEditorView: View {
 
     private func save() {
         guard canSave else { return }
-        let name: String? = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : title
         error = nil
+        isSaving = true
+        let name = Self.optional(title)
+        let group = Self.optional(tag)
         switch mode {
         case .create:
-            isSaving = true
-            monitor.createWritten(text: text, title: name) { result in
-                finish(result, message: "ピン留めに追加しました")
+            monitor.createTemplate(text: text, title: name, tag: group) { result in
+                finish(result, message: "テンプレートに追加しました")
             }
         case .edit(let entry):
-            if editsText {
-                isSaving = true
-                monitor.editText(entry, text: text, title: name) { result in
-                    finish(result, message: "保存しました")
-                }
-            } else {
-                isSaving = true
-                // The sheet stays until the name is stored, so that a failure can be shown here.
-                monitor.setTitle(name, for: entry) { succeeded in
-                    isSaving = false
-                    if succeeded {
-                        onSaved(name == nil ? "名前を外しました" : "名前を付けました")
-                        dismiss()
-                    } else {
-                        error = HistoryEditError.failed.message
-                    }
-                }
+            monitor.updateTemplate(entry, text: editsText ? text : nil, title: name, tag: group) { result in
+                finish(result, message: "保存しました")
             }
         }
     }

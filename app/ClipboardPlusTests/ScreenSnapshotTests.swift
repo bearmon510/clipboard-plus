@@ -32,6 +32,15 @@ final class ScreenSnapshotTests: XCTestCase {
         try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.wide, style: .light), "main-wide-light")
         try save(render(ContentView(monitor: monitor, log: monitor.log, initialSearch: "apple"), size: Self.narrow, style: .light),
                  "search-narrow-light")
+        // The template groups: all closed, then one open, then a search that opens every match.
+        try save(render(ContentView(monitor: monitor, log: monitor.log, initialPane: .templates),
+                        size: Self.narrow, style: .light), "templates-narrow-light")
+        try save(render(ContentView(monitor: monitor, log: monitor.log, initialPane: .templates, initialOpenTags: ["メール"]),
+                        size: Self.narrow, style: .dark), "templates-open-narrow-dark")
+        try save(render(ContentView(monitor: monitor, log: monitor.log, initialPane: .templates, initialOpenTags: ["メール", ""]),
+                        size: Self.wide, style: .light), "templates-open-wide-light")
+        try save(render(ContentView(monitor: monitor, log: monitor.log, initialSearch: "住所", initialPane: .templates),
+                        size: Self.narrow, style: .light), "templates-search-narrow-light")
     }
 
     @MainActor
@@ -51,18 +60,25 @@ final class ScreenSnapshotTests: XCTestCase {
         let monitor = try makeMonitor(populated: true)
         monitor.start()
         defer { monitor.stop() }
-        let pinned = HistoryFilter.entries(monitor.entries, filter: .pinned, search: "")
-        for entry in pinned where entry.kind == .text || entry.kind == .url {
+        let groups = TemplateGroups.make(monitor.entries, search: "")
+        let mail = try XCTUnwrap(groups.first { $0.tag == "メール" })
+        for entry in mail.entries where entry.kind == .text || entry.kind == .url {
             monitor.enqueueForPaste(entry)
         }
-        try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.narrow, style: .light), "queue-narrow-light")
+        try save(render(ContentView(monitor: monitor, log: monitor.log, initialPane: .templates, initialOpenTags: ["メール"]),
+                        size: Self.narrow, style: .light), "queue-narrow-light")
         try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.wide, style: .dark), "queue-wide-dark")
-        let editing = try XCTUnwrap(pinned.first)
-        try save(render(EntryEditorView(monitor: monitor, mode: .edit(editing)) { _ in }, size: Self.narrow, style: .light),
-                 "editor-narrow-light")
-        try save(render(EntryEditorView(monitor: monitor, mode: .create) { _ in }, size: Self.narrow, style: .dark),
-                 "editor-create-narrow-dark")
-        try save(render(PinOrderView(pinned: pinned) { _ in }, size: Self.narrow, style: .light), "pin-order-narrow-light")
+        let tags = TemplateGroups.tags(monitor.entries)
+        let editing = try XCTUnwrap(mail.entries.first)
+        try save(render(EntryEditorView(monitor: monitor, mode: .edit(editing), tags: tags) { _ in },
+                        size: Self.narrow, style: .light), "editor-narrow-light")
+        try save(render(EntryEditorView(monitor: monitor, mode: .create(tag: "メール"), tags: tags) { _ in },
+                        size: Self.narrow, style: .dark), "editor-create-narrow-dark")
+        let picture = try XCTUnwrap(monitor.entries.first { $0.isTemplate && $0.kind == .image })
+        try save(render(EntryEditorView(monitor: monitor, mode: .edit(picture), tags: tags) { _ in },
+                        size: Self.narrow, style: .light), "editor-image-narrow-light")
+        try save(render(TemplateOrderView(title: mail.title, items: mail.entries) { _ in }, size: Self.narrow, style: .light),
+                 "template-order-narrow-light")
     }
 
     @MainActor
@@ -71,7 +87,7 @@ final class ScreenSnapshotTests: XCTestCase {
         let entry = HistoryEntry(
             id: 1, kind: .url, text: "https://developer.apple.com/documentation/swiftui/lazyvgrid",
             savedAt: now.addingTimeInterval(-86_400 * 3), lastCollectedAt: now.addingTimeInterval(-600),
-            collectionCount: 4, isPinned: false, source: .automatic
+            collectionCount: 4, isTemplate: false, source: .automatic
         )
         try save(render(EntryDetailView(entry: entry) {}, size: Self.narrow, style: .light), "detail-narrow-light")
     }
@@ -169,13 +185,21 @@ final class ScreenSnapshotTests: XCTestCase {
         try database.collect("03-1234-5678", source: .automatic, at: ago(day + 3_600))
         try database.collect("https://www.apple.com/jp/ipad-air/", source: .automatic, at: ago(day + 1_800))
 
+        // Templates: two tags, and a group without one (その他) that holds a picture.
         let greeting = try database.collect("いつもお世話になっております。試験 太郎です。", source: .manual, at: ago(5 * day))
+        let closing = try database.collect("引き続きよろしくお願いいたします。", source: .manual, at: ago(5 * day))
         let address = try database.collect("〒100-0001 東京都千代田区千代田1-1 試験ビル 3階", source: .manual, at: ago(4 * day))
-        try database.togglePin(id: greeting.id)
-        try database.togglePin(id: address.id)
-        try database.setTitle("あいさつ", id: greeting.id)
-        try database.setTitle("住所", id: address.id)
-        _ = try database.createWritten(text: "電話：03-0000-0000\nメール：hello@example.com", title: "連絡先")
+        for (entry, title, tag) in [(greeting, "あいさつ", "メール"), (closing, "結び", "メール"), (address, "住所", "住所セット")] {
+            let moved = try database.moveToTemplates(id: entry.id)
+            _ = try database.updateTemplate(id: moved.id, text: nil, title: title, tag: tag)
+        }
+        _ = try database.createTemplate(text: "電話：03-0000-0000\nメール：hello@example.com", title: "連絡先", tag: "住所セット")
+        _ = try database.createTemplate(text: "https://example.com/forms/contact", title: "問い合わせフォーム", tag: nil)
+        let logo = try files.prepare(Self.samplePicture(width: 360), typeIdentifier: "public.png",
+                                     hash: HistoryImageFiles.hash(Self.samplePicture(width: 360)))
+        let logoEntry = try database.collectImage(logo, source: .manual, at: ago(6 * day))
+        let movedLogo = try database.moveToTemplates(id: logoEntry.id)
+        _ = try database.updateTemplate(id: movedLogo.id, text: nil, title: "ロゴ", tag: nil)
 
         try database.collect(String(repeating: "長い文章の例です。同じ文が続きます。", count: 30), source: .automatic, at: ago(3 * 3_600))
         try database.collect("#2E6BF0", source: .automatic, at: ago(2 * 3_600))
@@ -198,8 +222,8 @@ final class ScreenSnapshotTests: XCTestCase {
         try database.collect("さっきコピーした一文。Apple の資料を読みながらメモしています。", source: .automatic, at: ago(20))
     }
 
-    private static func samplePicture() -> Data {
-        let size = CGSize(width: 480, height: 300)
+    private static func samplePicture(width: CGFloat = 480) -> Data {
+        let size = CGSize(width: width, height: 300)
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         return UIGraphicsImageRenderer(size: size, format: format).pngData { context in

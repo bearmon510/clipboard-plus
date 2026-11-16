@@ -44,7 +44,7 @@ final class ImageStoreTests: XCTestCase {
         drain(store)
         let pinned = try XCTUnwrap(entries.first)
         let pinDone = expectation(description: "pin saved")
-        store.togglePin(id: pinned.id) { result in
+        store.moveToTemplates(id: pinned.id) { result in
             if case .failure(let error) = result { XCTFail("\(error)") }
             pinDone.fulfill()
         }
@@ -58,7 +58,7 @@ final class ImageStoreTests: XCTestCase {
         store.collectImage(.data(green, typeIdentifier: "public.png"), source: .manual, at: Date(timeIntervalSince1970: 4))
         drain(store)
         XCTAssertEqual(entries.count, 2)
-        XCTAssertTrue(entries.contains { $0.id == pinned.id && $0.isPinned })
+        XCTAssertTrue(entries.contains { $0.id == pinned.id && $0.isTemplate })
         XCTAssertFalse(entries.contains { $0.image?.hash == removed.hash })
         XCTAssertTrue(try filenames(directory).isDisjoint(with: removed.filenames))
         XCTAssertEqual(try filenames(directory), Set(entries.flatMap { $0.image?.filenames ?? [] }))
@@ -281,7 +281,7 @@ final class ImageStoreTests: XCTestCase {
         let directory = root.appendingPathComponent("images")
         let url = root.appendingPathComponent("history.sqlite")
         var entries: [HistoryEntry] = []
-        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) }, imageDirectory: directory) { event in
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, historyLimit: 1) }, imageDirectory: directory) { event in
             if case .saved(let entry, _) = event { HistoryList.upsert(entry, into: &entries) }
             if case .remove(let id) = event { entries.removeAll { $0.id == id } }
         }
@@ -299,7 +299,7 @@ final class ImageStoreTests: XCTestCase {
         let url = root.appendingPathComponent("history.sqlite")
         var now = Date(timeIntervalSince1970: 100)
         var entries: [HistoryEntry] = []
-        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, unpinnedLimit: 1) },
+        let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: url, historyLimit: 1) },
                                  imageDirectory: directory, now: { now }) { event in
             if case .saved(let entry, _) = event { HistoryList.upsert(entry, into: &entries) }
             if case .remove(let id) = event { entries.removeAll { $0.id == id } }

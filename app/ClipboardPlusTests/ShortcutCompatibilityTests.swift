@@ -22,7 +22,7 @@ final class ShortcutCompatibilityTests: XCTestCase {
 
         let export = try HistoryExport.data(entries: expected, exportedAt: Date())
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: export) as? [String: Any])
-        XCTAssertEqual(json["formatVersion"] as? Int, 2)
+        XCTAssertEqual(json["formatVersion"] as? Int, 5)
         let records = try XCTUnwrap(json["entries"] as? [[String: Any]])
         XCTAssertTrue(records.allSatisfy { ["automatic", "manual", "drag", "capture"].contains($0["source"] as? String ?? "") })
 

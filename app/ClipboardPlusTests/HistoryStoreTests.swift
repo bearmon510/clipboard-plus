@@ -29,9 +29,9 @@ final class HistoryStoreTests: XCTestCase {
             return try database.fetchAll()
         }
 
-        func togglePin(id: Int) throws -> HistoryEntry? {
+        func moveToTemplates(id: Int) throws -> HistoryEntry {
             XCTAssertFalse(Thread.isMainThread)
-            return try database.togglePin(id: id)
+            return try database.moveToTemplates(id: id)
         }
 
         func delete(id: Int) throws -> HistoryDeletion? {
@@ -39,9 +39,9 @@ final class HistoryStoreTests: XCTestCase {
             return try database.delete(id: id)
         }
 
-        func deleteAll(includePinned: Bool) throws -> HistoryDeletion? {
+        func deleteAll() throws -> HistoryDeletion? {
             XCTAssertFalse(Thread.isMainThread)
-            return try database.deleteAll(includePinned: includePinned)
+            return try database.deleteAll()
         }
 
         func undo(_ deletion: HistoryDeletion) throws -> Bool {
@@ -268,7 +268,7 @@ final class HistoryStoreTests: XCTestCase {
         let monitor = ClipboardMonitor(defaults: defaults, log: log,
                                        makeDatabase: { try DatabaseSpy(url: url, now: { now }) }, schedulesMaintenance: false)
         monitor.saveManually(["A"], receivedAt: now)
-        monitor.deleteAllHistory(includePinned: true) { value in
+        monitor.deleteAllHistory() { value in
             guard let deletion = value else {
                 XCTFail("Expected a deletion"); done.fulfill(); return
             }
@@ -294,7 +294,7 @@ final class HistoryStoreTests: XCTestCase {
             if case .saved = event { saved += 1 }
         }
         store.collect("A", source: .automatic, at: Date())
-        store.deleteAll(includePinned: true) { result in
+        store.deleteAll() { result in
             if case .success = result { XCTFail("Clear must wait for older collections") }
             XCTAssertEqual(saved, 0)
             store.maintain { result in
@@ -334,22 +334,22 @@ final class HistoryStoreTests: XCTestCase {
         wait(for: [done], timeout: 5)
     }
 
-    func testIncrementalListKeepsLimitPinsAndDatabaseTieOrder() {
+    func testIncrementalListKeepsLimitTemplatesAndDatabaseTieOrder() {
         var entries: [HistoryEntry] = []
         let date = Date(timeIntervalSince1970: 100)
         for id in 0...1_002 {
             let entry = HistoryEntry(id: id, kind: .text, text: "item \(id)", savedAt: date,
-                                     lastCollectedAt: date, collectionCount: 1, isPinned: id == 0, source: .automatic)
+                                     lastCollectedAt: date, collectionCount: 1, isTemplate: id == 0, source: .automatic)
             HistoryList.upsert(entry, into: &entries)
         }
         XCTAssertEqual(entries.count, 1_001)
         XCTAssertEqual(entries.first?.id, 1_002)
         XCTAssertEqual(entries.last?.id, 0)
         XCTAssertFalse(entries.contains { $0.id == 1 || $0.id == 2 })
-        let unpinned = HistoryEntry(id: 0, kind: .text, text: "item 0", savedAt: date,
-                                    lastCollectedAt: date, collectionCount: 1, isPinned: false, source: .automatic)
-        HistoryList.upsert(unpinned, into: &entries)
-        XCTAssertEqual(entries.count, 1_000)
-        XCTAssertFalse(entries.contains { $0.id == 0 })
+        let template = HistoryEntry(id: 0, kind: .text, text: "item 0", savedAt: date,
+                                    lastCollectedAt: date, collectionCount: 1, isTemplate: true, source: .automatic, tag: "仕事")
+        HistoryList.upsert(template, into: &entries)
+        XCTAssertEqual(entries.count, 1_001)
+        XCTAssertEqual(entries.last, template)
     }
 }

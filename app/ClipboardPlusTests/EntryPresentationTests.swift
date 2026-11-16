@@ -14,7 +14,7 @@ final class EntryPresentationTests: XCTestCase {
 
     private func entry(_ id: Int, _ text: String = "text", kind: HistoryKind = .text, at date: Date, pinned: Bool = false) -> HistoryEntry {
         HistoryEntry(id: id, kind: kind, text: text, savedAt: date, lastCollectedAt: date,
-                     collectionCount: 1, isPinned: pinned, source: .automatic)
+                     collectionCount: 1, isTemplate: pinned, source: .automatic)
     }
 
     // MARK: Flavor
@@ -82,25 +82,18 @@ final class EntryPresentationTests: XCTestCase {
             entry(4, at: date(2026, 11, 9, 0, 0)),
             entry(5, at: date(2026, 11, 8, 23, 59)),
         ]
-        let sections = EntrySections.make(entries, separatesPinned: true, now: now, calendar: calendar)
+        let sections = EntrySections.make(entries, now: now, calendar: calendar)
         XCTAssertEqual(sections.map(\.kind), [.today, .yesterday, .thisWeek, .earlier])
         XCTAssertEqual(sections.map { $0.entries.map(\.id) }, [[1, 2], [3], [4], [5]])
     }
 
-    func testPinnedItemsFormTheirOwnSectionOnlyWhenAsked() {
+    func testTemplatesDoNotAppearInDateSections() {
         let now = date(2026, 11, 15, 14, 30)
-        let entries = [
-            entry(1, at: date(2026, 11, 15, 14, 0)),
-            entry(2, at: date(2026, 11, 1, 8, 0), pinned: true),
-            entry(3, at: date(2026, 11, 15, 9, 0), pinned: true),
-        ]
-        let separated = EntrySections.make(entries, separatesPinned: true, now: now, calendar: calendar)
-        XCTAssertEqual(separated.map(\.kind), [.pinned, .today])
-        XCTAssertEqual(separated.first?.entries.map(\.id), [2, 3])
-        let merged = EntrySections.make(entries, separatesPinned: false, now: now, calendar: calendar)
-        XCTAssertEqual(merged.map(\.kind), [.today, .earlier])
-        XCTAssertEqual(merged.first?.entries.map(\.id), [1, 3])
-        XCTAssertTrue(EntrySections.make([], separatesPinned: true, now: now, calendar: calendar).isEmpty)
+        let values = [entry(1, at: now), entry(2, at: now, pinned: true)]
+        let sections = EntrySections.make(values, now: now, calendar: calendar)
+        XCTAssertEqual(sections.map(\.kind), [.today])
+        XCTAssertEqual(sections.first?.entries.map(\.id), [1])
+        XCTAssertTrue(EntrySections.make([], now: now, calendar: calendar).isEmpty)
     }
 
     // MARK: Columns
@@ -150,24 +143,24 @@ final class EntryPresentationTests: XCTestCase {
 
     // MARK: Filters
 
-    func testNewFiltersSelectTextsAndLinks() {
+    func testShortcutFiltersSelectTextsAndLinks() {
         let now = Date()
         let entries = [
             entry(1, "メモ", at: now),
             entry(2, "https://example.com", kind: .url, at: now),
             entry(3, "", kind: .image, at: now),
         ]
-        XCTAssertEqual(HistoryFilter.entries(entries, filter: .texts, search: "").map(\.id), [1])
-        XCTAssertEqual(HistoryFilter.entries(entries, filter: .links, search: "").map(\.id), [2])
-        XCTAssertEqual(HistoryFilter.entries(entries, filter: .links, search: "EXAMPLE").map(\.id), [2])
-        XCTAssertTrue(HistoryFilter.entries(entries, filter: .texts, search: "example").isEmpty)
+        XCTAssertEqual(ShortcutContent.entries(entries, filter: .texts, search: "").map(\.id), [1])
+        XCTAssertEqual(ShortcutContent.entries(entries, filter: .links, search: "").map(\.id), [2])
+        XCTAssertEqual(ShortcutContent.entries(entries, filter: .links, search: "EXAMPLE").map(\.id), [2])
+        XCTAssertTrue(ShortcutContent.entries(entries, filter: .texts, search: "example").isEmpty)
     }
 
     func testSearchIgnoresSpacesAroundTheTerm() {
         let now = Date()
         let entries = [entry(1, "needle がある", at: now), entry(2, "別の文章", at: now)]
-        XCTAssertEqual(HistoryFilter.entries(entries, filter: .all, search: " needle　\n").map(\.id), [1])
-        XCTAssertEqual(HistoryFilter.entries(entries, filter: .all, search: "   ").map(\.id), [1, 2])
+        XCTAssertEqual(HistoryFilter.history(entries, search: " needle　\n").map(\.id), [1])
+        XCTAssertEqual(HistoryFilter.history(entries, search: "   ").map(\.id), [1, 2])
         XCTAssertEqual(HistoryFilter.normalized("  a b  "), "a b")
     }
 }
