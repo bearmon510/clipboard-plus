@@ -179,6 +179,9 @@ struct ContentView: View {
             // After the capture side has heard that the scene is active, or it would refuse.
             if phase == .active { startQueuedDirectCapture() }
         }
+        // The badge belongs to the list the user tapped in, so it goes with that list.
+        .onChange(of: filter) { _, _ in clearCopied() }
+        .onChange(of: separatesPinned) { _, _ in clearCopied() }
         .onChange(of: directCaptureEnabled) { _, enabled in
             guard !enabled else { return }
             queuedDirectMode = nil
@@ -505,6 +508,10 @@ struct ContentView: View {
             }
         }
         .scrollDismissesKeyboard(.immediately)
+        // A fresh list for each filter and for the start of a search. A pinned card moves
+        // between the ピン留め section and a day section on these switches, and moving it while
+        // its コピーしました badge was showing left the list unresponsive on device (0.12.0).
+        .id("\(filter)|\(separatesPinned)")
     }
 
     private func sectionList(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
@@ -966,6 +973,16 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// Removes the コピーしました badge at once, without its fade, so that no animation is
+    /// left running in a list that is being replaced.
+    private func clearCopied() {
+        copiedTask?.cancel()
+        copiedTask = nil
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { copiedID = nil }
     }
 
     private func showCopied(_ id: Int) {

@@ -11,7 +11,7 @@ settings:
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
     # The real Bundle ID is passed from a GitHub secret at archive time.
     APP_BUNDLE_ID: example.clipboardplus
-    MARKETING_VERSION: "0.12.0"
+    MARKETING_VERSION: "0.12.1"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   ClipboardPlus:
