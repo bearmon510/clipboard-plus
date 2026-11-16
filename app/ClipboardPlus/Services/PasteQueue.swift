@@ -26,8 +26,13 @@ final class PasteQueue {
 
     private final class Write {
         let index: Int
+        /// The text the provider hands out, to notice when the item is edited meanwhile.
+        let text: String
         var changeCount: Int?
-        init(index: Int) { self.index = index }
+        init(index: Int, text: String) {
+            self.index = index
+            self.text = text
+        }
     }
 
     init(entry: @escaping (Int) -> HistoryEntry?, write: @escaping (NSItemProvider) -> Int?,
@@ -52,6 +57,9 @@ final class PasteQueue {
 
     func remove(id: Int) {
         guard let removed = state.entryIDs.firstIndex(of: id) else { return }
+        // An outside copy made since the last check pauses the queue first, so that writing
+        // the next item never replaces it.
+        observePasteboard()
         let current = state.currentIndex
         state.entryIDs.remove(at: removed)
         guard !state.entryIDs.isEmpty else { stop(); return }
@@ -75,6 +83,15 @@ final class PasteQueue {
         guard !state.entryIDs.isEmpty else { return }
         let valid = Set(entries.filter { $0.kind == .text || $0.kind == .url }.map(\.id))
         for id in state.entryIDs where !valid.contains(id) { remove(id: id) }
+        // An edit of the item on the clipboard changes what the next paste must deliver.
+        guard state.isRunning, !state.isPaused, let ticket = currentWrite,
+              let index = state.currentIndex, state.entryIDs.indices.contains(index),
+              let value = entries.first(where: { $0.id == state.entryIDs[index] }),
+              value.text != ticket.text else { return }
+        observePasteboard()
+        guard state.isRunning, !state.isPaused else { return }
+        log("連続貼り付けの入れ直し", nil, "理由=編集; index=\(index)")
+        writeCurrent()
     }
 
     func start() {
@@ -146,7 +163,7 @@ final class PasteQueue {
         guard scene() != "background" else { pause(reason: "バックグラウンド"); return }
         let id = state.entryIDs[index]
         guard let value = entry(id), value.kind == .text || value.kind == .url else { remove(id: id); return }
-        let ticket = Write(index: index)
+        let ticket = Write(index: index, text: value.text)
         currentWrite = ticket
         let provider = NSItemProvider()
         // Leave suggestedName nil: a named text provider would be classified as a file.

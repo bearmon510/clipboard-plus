@@ -141,9 +141,17 @@ struct EntryEditorView: View {
                     finish(result, message: "保存しました")
                 }
             } else {
-                monitor.setTitle(name, for: entry)
-                onSaved(name == nil ? "名前を外しました" : "名前を付けました")
-                dismiss()
+                isSaving = true
+                // The sheet stays until the name is stored, so that a failure can be shown here.
+                monitor.setTitle(name, for: entry) { succeeded in
+                    isSaving = false
+                    if succeeded {
+                        onSaved(name == nil ? "名前を外しました" : "名前を付けました")
+                        dismiss()
+                    } else {
+                        error = HistoryEditError.failed.message
+                    }
+                }
             }
         }
     }

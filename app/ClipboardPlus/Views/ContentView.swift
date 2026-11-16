@@ -557,7 +557,7 @@ struct ContentView: View {
             onCopy: { copy(entry) },
             dragProvider: { monitor.rowProvider(entry) },
             queueNumber: place.map { $0 + 1 },
-            isQueueCurrent: place != nil && queue.isRunning && queue.currentIndex == place,
+            isQueueCurrent: place != nil && queue.isRunning && !queue.isPaused && queue.currentIndex == place,
             actions: { rowActions(entry) }
         )
     }

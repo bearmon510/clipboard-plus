@@ -632,10 +632,12 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
-    func setTitle(_ title: String?, for entry: HistoryEntry) {
+    func setTitle(_ title: String?, for entry: HistoryEntry, completion: ((Bool) -> Void)? = nil) {
         store.setTitle(title, id: entry.id) { result in
-            if case .failure = result { self.reportStorageFailure() }
-            self.record("名前の変更", historyNumber: entry.id, details: "成功=\((try? result.get()) != nil)")
+            let succeeded = (try? result.get()) != nil
+            if !succeeded { self.reportStorageFailure() }
+            self.record("名前の変更", historyNumber: entry.id, details: "成功=\(succeeded)")
+            completion?(succeeded)
         }
     }
 
