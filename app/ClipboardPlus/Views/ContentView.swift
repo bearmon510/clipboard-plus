@@ -34,6 +34,9 @@ struct ContentView: View {
     @State private var queuedCapture: CaptureRequest?
     /// A direct capture asked for from outside, waiting for the app to be active and uncovered.
     @State private var queuedDirectMode: CaptureMode?
+    /// The writing sheet: a new pinned text, or a change to an item's name and text.
+    @State private var editor: EntryEditorView.Mode?
+    @State private var showPinOrder = false
 
     /// A still picture to choose from, and what to do with the chosen part.
     struct CaptureRequest: Identifiable {
@@ -57,8 +60,26 @@ struct ContentView: View {
     /// The search term without surrounding spaces, as used for filtering and highlighting.
     private var query: String { HistoryFilter.normalized(searchText) }
 
-    /// Pinned items get their own section only in the plain, unfiltered list.
-    private var separatesPinned: Bool { filter == .all && query.isEmpty }
+    /// Pinned items get their own section, in the user's order, in the plain list and under the
+    /// ピン留め filter. While searching, everything follows the history order.
+    private var separatesPinned: Bool { (filter == .all || filter == .pinned) && query.isEmpty }
+
+    private var pinnedEntries: [HistoryEntry] {
+        HistoryFilter.entries(monitor.entries, filter: .pinned, search: "")
+    }
+
+    /// Any sheet over the history. A capture from outside waits for it to close.
+    private var isPresentingSheet: Bool {
+        showSettings || showCaptureGuide || detailEntry != nil || editor != nil || showPinOrder
+    }
+
+    private func closeSheets() {
+        showSettings = false
+        showCaptureGuide = false
+        detailEntry = nil
+        editor = nil
+        showPinOrder = false
+    }
 
     var body: some View {
         screen
@@ -169,6 +190,12 @@ struct ContentView: View {
                          screenCapture: screenCapture, screenshots: screenshots)
         }
         .sheet(item: $detailEntry, onDismiss: presentQueuedCapture) { entry in detail(entry) }
+        .sheet(item: $editor, onDismiss: presentQueuedCapture) { mode in
+            EntryEditorView(monitor: monitor, mode: mode) { showToast($0) }
+        }
+        .sheet(isPresented: $showPinOrder, onDismiss: presentQueuedCapture) {
+            PinOrderView(pinned: pinnedEntries) { monitor.reorderPins($0) }
+        }
         .confirmationDialog("履歴を全消去しますか？", isPresented: $confirmHistoryClear, titleVisibility: .visible) {
             Button("ピン留めを残して消去", role: .destructive) {
                 monitor.deleteAllHistory(includePinned: false) { showUndo($0) }
@@ -309,6 +336,10 @@ struct ContentView: View {
                 Button("画面の取り込みを止める", systemImage: "stop.circle") {
                     screenCapture.stop(reason: "メニューから停止")
                 }
+            }
+            Button("文章を書いてピン留め", systemImage: "square.and.pencil") { editor = .create }
+            if pinnedEntries.count > 1 {
+                Button("ピン留めを並べ替え", systemImage: "arrow.up.arrow.down") { showPinOrder = true }
             }
             Button("切り取りの使い方", systemImage: "questionmark.circle") { showCaptureGuide = true }
             Button("設定", systemImage: "gearshape") { showSettings = true }
@@ -494,8 +525,8 @@ struct ContentView: View {
             }
         }
         .padding(.horizontal, 12)
-        // Keeps the last card clear of the undo bar.
-        .padding(.bottom, 96)
+        // Keeps the last card clear of the undo bar and the sequential paste bar.
+        .padding(.bottom, monitor.pasteQueue.entryIDs.isEmpty ? 96 : 220)
     }
 
     /// Cards of different heights pack tightly when each column is its own stack.
@@ -514,7 +545,9 @@ struct ContentView: View {
     }
 
     private func card(_ entry: HistoryEntry, section: EntrySectionKind, now: Date) -> some View {
-        HistoryCard(
+        let queue = monitor.pasteQueue
+        let place = queue.entryIDs.firstIndex(of: entry.id)
+        return HistoryCard(
             entry: entry,
             thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) },
             timeLabel: EntryTime.label(for: entry.lastCollectedAt, now: now,
@@ -523,22 +556,43 @@ struct ContentView: View {
             isCopied: copiedID == entry.id,
             onCopy: { copy(entry) },
             dragProvider: { monitor.rowProvider(entry) },
+            queueNumber: place.map { $0 + 1 },
+            isQueueCurrent: place != nil && queue.isRunning && queue.currentIndex == place,
             actions: { rowActions(entry) }
         )
     }
 
     @ViewBuilder private func sectionHeader(_ section: EntrySection) -> some View {
         if section.kind == .pinned {
-            Button {
-                pinnedCollapsed.toggle()
-            } label: {
-                sectionTitle(section, chevron: pinnedCollapsed ? "chevron.right" : "chevron.down")
+            HStack(alignment: .bottom, spacing: 0) {
+                Button {
+                    pinnedCollapsed.toggle()
+                } label: {
+                    sectionTitle(section, chevron: pinnedCollapsed ? "chevron.right" : "chevron.down")
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(pinnedCollapsed ? "ピン留めを表示します" : "ピン留めをたたみます")
+                if section.entries.count > 1 {
+                    pinnedAction("arrow.up.arrow.down", label: "ピン留めを並べ替え") { showPinOrder = true }
+                }
+                pinnedAction("plus", label: "文章を書いてピン留めに追加") { editor = .create }
             }
-            .buttonStyle(.plain)
-            .accessibilityHint(pinnedCollapsed ? "ピン留めを表示します" : "ピン留めをたたみます")
         } else {
             sectionTitle(section, chevron: nil)
         }
+    }
+
+    private func pinnedAction(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.accent)
+                .frame(width: 44, height: 40)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.bottom, -2)
+        .accessibilityLabel(label)
     }
 
     private func sectionTitle(_ section: EntrySection, chevron: String?) -> some View {
@@ -581,6 +635,20 @@ struct ContentView: View {
         Button(entry.isPinned ? "ピン留めを解除" : "ピン留め", systemImage: entry.isPinned ? "pin.slash" : "pin") {
             monitor.togglePin(entry)
         }
+        if entry.kind == .text || entry.kind == .url {
+            Button("編集…", systemImage: "pencil") { editor = .edit(entry) }
+            if monitor.pasteQueue.entryIDs.contains(entry.id) {
+                Button("連続貼り付けから外す", systemImage: "minus.circle") {
+                    monitor.removeFromPasteQueue(id: entry.id)
+                }
+            } else {
+                Button("連続貼り付けに追加", systemImage: "text.badge.plus") { monitor.enqueueForPaste(entry) }
+            }
+        } else {
+            Button(entry.displayTitle == nil ? "名前を付ける…" : "名前を変更…", systemImage: "tag") {
+                editor = .edit(entry)
+            }
+        }
         Divider()
         Button("削除", systemImage: "trash", role: .destructive) {
             monitor.delete(entry) { showUndo($0) }
@@ -609,6 +677,22 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 captureTip
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 48)
+            .frame(maxWidth: 440)
+            .frame(maxWidth: .infinity)
+        } else if filter == .pinned && query.isEmpty {
+            VStack(spacing: 14) {
+                emptySymbol("pin")
+                Text("ピン留めはまだありません").font(.title3.weight(.semibold))
+                Text("よく使う文を書いておくと、押すだけでコピーできます。履歴のメニューからピン留めすることもできます。ピン留めは自動では消えません。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("文章を書いて追加", systemImage: "square.and.pencil") { editor = .create }
+                    .buttonStyle(.borderedProminent)
+                    .frame(minHeight: 44)
             }
             .padding(.horizontal, 28)
             .padding(.top, 48)
@@ -673,6 +757,18 @@ struct ContentView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
+            if !monitor.pasteQueue.entryIDs.isEmpty {
+                let queue = monitor.pasteQueue
+                PasteQueueBar(
+                    state: queue,
+                    entries: queue.entryIDs.compactMap { id in monitor.entries.first { $0.id == id } },
+                    onStart: { monitor.startPasteQueue() },
+                    onNext: { monitor.advancePasteQueue() },
+                    onBack: { monitor.rewindPasteQueue() },
+                    onStop: { monitor.stopPasteQueue() }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             if let deletion {
                 undoBar(deletion)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -682,6 +778,7 @@ struct ContentView: View {
         .padding(.bottom, 10)
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: toast)
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: deletion)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: monitor.pasteQueue.entryIDs.isEmpty)
     }
 
     private func undoBar(_ deletion: HistoryDeletion) -> some View {
@@ -768,8 +865,7 @@ struct ContentView: View {
     /// open, the picture waits until that sheet has finished closing.
     private func openFromOutside(_ request: CaptureRequest) {
         guard capture == nil, capturePending == nil else { return }
-        let isPresenting = showSettings || showCaptureGuide || detailEntry != nil
-        guard isPresenting else {
+        guard isPresentingSheet else {
             queuedCapture = nil
             capture = request
             return
@@ -777,9 +873,7 @@ struct ContentView: View {
         // Only the newest arrival waits; an older one is simply replaced.
         queuedCapture = request
         queuedDirectMode = nil
-        showSettings = false
-        showCaptureGuide = false
-        detailEntry = nil
+        closeSheets()
     }
 
     /// Called when a sheet has finished closing.
@@ -804,10 +898,8 @@ struct ContentView: View {
         }
         queuedCapture = nil
         queuedDirectMode = mode
-        if showSettings || showCaptureGuide || detailEntry != nil {
-            showSettings = false
-            showCaptureGuide = false
-            detailEntry = nil
+        if isPresentingSheet {
+            closeSheets()
             return
         }
         startQueuedDirectCapture()
@@ -815,7 +907,7 @@ struct ContentView: View {
 
     /// Explains the screenshot shortcut instead, unless something else already covers the screen.
     private func openFromOutsideGuide() {
-        guard !(showSettings || detailEntry != nil) else { return }
+        guard !isPresentingSheet else { return }
         showCaptureGuide = true
     }
 
@@ -825,7 +917,7 @@ struct ContentView: View {
             return
         }
         guard let mode = queuedDirectMode, scenePhase == .active else { return }
-        guard !(showSettings || showCaptureGuide || detailEntry != nil) else { return }
+        guard !isPresentingSheet else { return }
         queuedDirectMode = nil
         guard capture == nil else { return }
         startCapture(mode)

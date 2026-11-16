@@ -25,7 +25,7 @@ struct EntryDetailView: View {
                 .padding(16)
             }
             .background(Theme.page)
-            .navigationTitle("内容")
+            .navigationTitle(entry.displayTitle ?? "内容")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

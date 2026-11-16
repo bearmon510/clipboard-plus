@@ -47,6 +47,25 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
+    func testRenderTemplatesAndPasteQueue() throws {
+        let monitor = try makeMonitor(populated: true)
+        monitor.start()
+        defer { monitor.stop() }
+        let pinned = HistoryFilter.entries(monitor.entries, filter: .pinned, search: "")
+        for entry in pinned where entry.kind == .text || entry.kind == .url {
+            monitor.enqueueForPaste(entry)
+        }
+        try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.narrow, style: .light), "queue-narrow-light")
+        try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.wide, style: .dark), "queue-wide-dark")
+        let editing = try XCTUnwrap(pinned.first)
+        try save(render(EntryEditorView(monitor: monitor, mode: .edit(editing)) { _ in }, size: Self.narrow, style: .light),
+                 "editor-narrow-light")
+        try save(render(EntryEditorView(monitor: monitor, mode: .create) { _ in }, size: Self.narrow, style: .dark),
+                 "editor-create-narrow-dark")
+        try save(render(PinOrderView(pinned: pinned) { _ in }, size: Self.narrow, style: .light), "pin-order-narrow-light")
+    }
+
+    @MainActor
     func testRenderDetailScreen() throws {
         let now = Date()
         let entry = HistoryEntry(
@@ -154,6 +173,9 @@ final class ScreenSnapshotTests: XCTestCase {
         let address = try database.collect("〒100-0001 東京都千代田区千代田1-1 試験ビル 3階", source: .manual, at: ago(4 * day))
         try database.togglePin(id: greeting.id)
         try database.togglePin(id: address.id)
+        try database.setTitle("あいさつ", id: greeting.id)
+        try database.setTitle("住所", id: address.id)
+        _ = try database.createWritten(text: "電話：03-0000-0000\nメール：hello@example.com", title: "連絡先")
 
         try database.collect(String(repeating: "長い文章の例です。同じ文が続きます。", count: 30), source: .automatic, at: ago(3 * 3_600))
         try database.collect("#2E6BF0", source: .automatic, at: ago(2 * 3_600))
