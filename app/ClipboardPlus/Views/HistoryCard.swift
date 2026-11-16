@@ -36,8 +36,9 @@ struct HistoryCard<Actions: View>: View {
                 Button(action: onCopy) {
                     VStack(alignment: .leading, spacing: 10) {
                         if let title = entry.displayTitle {
-                            // The name the user gave it, such as 署名 or 住所.
-                            Label(title, systemImage: "tag.fill")
+                            // The name the user gave it, such as 署名 or 住所. No tag icon: the tag
+                            // is the group the card sits in, not this name.
+                            Text(title)
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(Theme.accent)
                                 .lineLimit(1)

@@ -203,6 +203,20 @@ final class TemplateHistoryTests: XCTestCase {
         XCTAssertEqual(try db.fetchAll().filter { $0.id != a.id }, snapshot.filter { $0.id != a.id })
     }
 
+    /// A search can hide part of a group. Reordering the rest leaves the hidden rows in place.
+    func testReorderKeepsRowsTheCallerLeftOut() throws {
+        let (db, _) = try fixture()
+        let c = try db.createTemplate(text: "C", title: nil, tag: "組")
+        let a = try db.createTemplate(text: "A", title: nil, tag: "組")
+        let b = try db.createTemplate(text: "B", title: nil, tag: "組")
+        func group() throws -> [HistoryEntry] { TemplateGroups.make(try db.fetchAll(), search: "").first?.entries ?? [] }
+        try db.reorderTemplates([a.id, b.id])
+        XCTAssertEqual(try group().map(\.id), [c.id, a.id, b.id])
+        try db.reorderTemplates([b.id, a.id])
+        XCTAssertEqual(try group().map(\.id), [c.id, b.id, a.id])
+        XCTAssertEqual(try group().map(\.templateOrder), [0, 1, 2])
+    }
+
     private func entry(_ id: Int, tag: String? = nil, order: Int? = nil, title: String? = nil,
                        template: Bool = true, kind: HistoryKind = .text, file: HistoryFile? = nil) -> HistoryEntry {
         HistoryEntry(id: id, kind: kind, text: kind == .text ? "本文\(id)" : "", savedAt: Date(timeIntervalSince1970: 1),

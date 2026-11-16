@@ -10,7 +10,9 @@ struct HistoryEntryEntity: AppEntity {
     @Property(title: "文章") var text: String
     @Property(title: "種類") var kind: String
     @Property(title: "保存日時") var savedAt: Date
-    @Property(title: "テンプレート") var isTemplate: Bool
+    /// Named isPinned from the time of pins. Saved shortcuts refer to the property by this name,
+    /// so it keeps the name now that it tells templates apart.
+    @Property(title: "テンプレート") var isPinned: Bool
     @Property(title: "画像") var picture: IntentFile?
 
     @Property(title: "ファイル") var file: IntentFile?
@@ -19,7 +21,7 @@ struct HistoryEntryEntity: AppEntity {
     let displayTitle: String
 
     var displaySubtitle: String {
-        (fileSizeDescription.map { $0 + "・" } ?? "") + "\(kind)・\(savedAt.formatted(date: .abbreviated, time: .shortened))" + (isTemplate ? "・テンプレート" : "")
+        (fileSizeDescription.map { $0 + "・" } ?? "") + "\(kind)・\(savedAt.formatted(date: .abbreviated, time: .shortened))" + (isPinned ? "・テンプレート" : "")
     }
 
     var displayRepresentation: DisplayRepresentation {
@@ -35,7 +37,7 @@ struct HistoryEntryEntity: AppEntity {
         self.text = entry.text
         self.kind = ShortcutContent.kindTitle(entry.kind)
         self.savedAt = entry.savedAt
-        self.isTemplate = entry.isTemplate
+        self.isPinned = entry.isTemplate
         self.picture = picture
         self.file = file
     }

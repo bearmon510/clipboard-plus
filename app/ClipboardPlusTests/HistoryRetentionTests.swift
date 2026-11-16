@@ -377,19 +377,24 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertTrue(monitor.entries.isEmpty)
     }
 
-    func testRestoreNewerTimestampAndMergedPinProtectExpiredExistingRows() throws {
+    /// A newer collection time rescues an expired history row. A template in the backup no longer
+    /// merges into the history row with the same text (0.12 pins did): it arrives as its own
+    /// template, and the expired history row goes.
+    func testRestoreNewerTimestampProtectsExpiredRowAndTemplateStaysApart() throws {
         let root = try ImageTestSupport.directory(self)
         let now = Date(timeIntervalSince1970: 100 * day)
         let old = now.addingTimeInterval(-31 * day)
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), now: { now })
         try database.collect("rescued by collection", source: .manual, at: old)
-        try database.collect("rescued by pin", source: .manual, at: old)
-        let incoming = [text("rescued by collection", at: now), text("rescued by pin", at: old, pinned: true)]
+        try database.collect("kept as a template", source: .manual, at: old)
+        let incoming = [text("rescued by collection", at: now), text("kept as a template", at: old, pinned: true)]
         let cutoff = HistoryRetention.thirtyDays.cutoff(relativeTo: now)
         let estimate = try database.estimateBackup(incoming, retentionCutoff: cutoff)
-        XCTAssertEqual(estimate, RestoreCounts(updated: 2))
+        XCTAssertEqual(estimate, RestoreCounts(added: 1, updated: 1, removedByRetention: 1))
         XCTAssertEqual(try database.mergeBackup(incoming, retentionCutoff: cutoff) { _ in }, estimate)
-        XCTAssertEqual(try database.fetchAll().count, 2)
+        let rows = try database.fetchAll()
+        XCTAssertEqual(rows.filter { !$0.isTemplate }.map(\.text), ["rescued by collection"])
+        XCTAssertEqual(rows.filter(\.isTemplate).map(\.text), ["kept as a template"])
         XCTAssertEqual(try database.purgeHistory(olderThan: .thirtyDays), 0)
     }
 

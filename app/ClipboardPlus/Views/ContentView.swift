@@ -17,6 +17,9 @@ struct ContentView: View {
     @State private var pane: Pane
     /// Template groups the user opened, by group id.
     @State private var openTags: Set<String> = []
+    /// Groups the user closed while they would otherwise show open: a lone group, or any group
+    /// during a search.
+    @State private var closedTags: Set<String> = []
     @State private var reorderGroup: TemplateGroup?
     @State private var renamingGroup: TemplateGroup?
     @State private var tagDraft = ""
@@ -539,7 +542,7 @@ struct ContentView: View {
             LazyVStack(alignment: .leading, spacing: 10) {
                 ForEach(groups) { group in
                     let open = isOpen(group, groupCount: groups.count)
-                    templateHeader(group, isOpen: open)
+                    templateHeader(group, isOpen: open, groupCount: groups.count)
                     if open {
                         cards(group.entries, columnCount: columnCount) { entry in
                             card(entry, timeLabel: "")
@@ -610,18 +613,35 @@ struct ContentView: View {
 
     // MARK: Template groups
 
-    /// Groups start closed. A lone group, and every group while searching, is open.
+    /// Groups start closed. A lone group, and every group while searching, starts open.
+    /// Either way, tapping the header opens or closes it.
+    private func startsOpen(groupCount: Int) -> Bool { groupCount == 1 || !query.isEmpty }
+
     private func isOpen(_ group: TemplateGroup, groupCount: Int) -> Bool {
-        groupCount == 1 || !query.isEmpty || openTags.contains(group.id)
+        startsOpen(groupCount: groupCount) ? !closedTags.contains(group.id) : openTags.contains(group.id)
     }
 
-    private func templateHeader(_ group: TemplateGroup, isOpen: Bool) -> some View {
+    private func toggle(_ group: TemplateGroup, groupCount: Int) {
+        if startsOpen(groupCount: groupCount) {
+            if closedTags.contains(group.id) { closedTags.remove(group.id) } else { closedTags.insert(group.id) }
+        } else {
+            if openTags.contains(group.id) { openTags.remove(group.id) } else { openTags.insert(group.id) }
+        }
+    }
+
+    private func templateHeader(_ group: TemplateGroup, isOpen: Bool, groupCount: Int) -> some View {
         let pastable = group.entries.filter { $0.kind == .text || $0.kind == .url }
         return HStack(spacing: 2) {
             Button {
-                if openTags.contains(group.id) { openTags.remove(group.id) } else { openTags.insert(group.id) }
+                toggle(group, groupCount: groupCount)
             } label: {
                 HStack(spacing: 8) {
+                    // On the left, so it stays in one place whether or not 順に貼る is shown.
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                        .frame(width: 12)
                     Image(systemName: group.tag == nil ? "tray" : "tag")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Theme.accent)
@@ -630,15 +650,13 @@ struct ContentView: View {
                         .font(.headline)
                         .foregroundStyle(Color.primary)
                         .lineLimit(1)
+                        .layoutPriority(1)
                     Text("\(group.entries.count)")
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(.tertiary)
                     Spacer(minLength: 4)
-                    Image(systemName: isOpen ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
                 }
-                .padding(.leading, 14)
+                .padding(.leading, 12)
                 .padding(.trailing, 6)
                 .frame(minHeight: 54)
                 .contentShape(Rectangle())
@@ -660,8 +678,11 @@ struct ContentView: View {
             }
             Menu {
                 Button("このタグで書く", systemImage: "square.and.pencil") { editor = .create(tag: group.tag) }
-                if group.entries.count > 1 {
-                    Button("並べ替え", systemImage: "arrow.up.arrow.down") { reorderGroup = group }
+                // The whole group, even while a search hides part of it.
+                let whole = query.isEmpty ? group
+                    : TemplateGroups.make(monitor.entries, search: "").first(where: { $0.id == group.id }) ?? group
+                if whole.entries.count > 1 {
+                    Button("並べ替え", systemImage: "arrow.up.arrow.down") { reorderGroup = whole }
                 }
                 Button(group.tag == nil ? "タグを付ける…" : "タグ名を変更…", systemImage: "tag") {
                     tagDraft = group.tag ?? ""
@@ -686,11 +707,10 @@ struct ContentView: View {
     private func renameTag(_ group: TemplateGroup) {
         let newTag = HistoryEntry.normalizedTag(tagDraft)
         monitor.renameTag(group.tag, to: newTag)
-        // Keeps the renamed group open if it was. The id matches TemplateGroup.id.
-        if openTags.contains(group.id) {
-            openTags.remove(group.id)
-            openTags.insert(newTag ?? "")
-        }
+        // Keeps the renamed group open or closed as it was. The id matches TemplateGroup.id.
+        let newID = newTag ?? ""
+        if openTags.remove(group.id) != nil { openTags.insert(newID) }
+        if closedTags.remove(group.id) != nil { closedTags.insert(newID) }
         renamingGroup = nil
     }
 

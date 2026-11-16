@@ -131,7 +131,8 @@ struct EntryEditorView: View {
                     }
                 }
             }
-            .navigationTitle(entry == nil ? "テンプレートを書く" : "テンプレートの編集")
+            // Short, so a narrow window shows it whole between the two buttons.
+            .navigationTitle(entry == nil ? "新規作成" : "編集")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

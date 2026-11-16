@@ -273,8 +273,12 @@ final class HistoryDatabase: HistoryPersistence {
             var seen = Set<Int>()
             let selected = orderedIDs.compactMap { byID[$0] }.filter { seen.insert($0.id).inserted }
             guard let first = selected.first, selected.allSatisfy({ $0.tag == first.tag }) else { return }
-            // Only supplied rows change; callers pass one group's IDs.
-            for (offset, entry) in selected.enumerated() {
+            // The supplied rows trade places among themselves; rows the caller left out, such as
+            // ones hidden by a search, stay where they are. The group is then numbered from 0.
+            var reordered = selected.makeIterator()
+            let group = HistoryEntry.orderedTemplates(templates.filter { $0.tag == first.tag })
+            let arranged = group.map { entry in (seen.contains(entry.id) ? reordered.next() : nil) ?? entry }
+            for (offset, entry) in arranged.enumerated() where entry.templateOrder != offset {
                 try execute("UPDATE history SET pin_order = ? WHERE id = ?", [.integer(offset), .integer(entry.id)])
             }
         }
