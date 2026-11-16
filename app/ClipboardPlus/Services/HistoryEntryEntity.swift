@@ -27,15 +27,17 @@ struct HistoryEntryEntity: AppEntity {
     }
 
     init(entry: HistoryEntry, picture: IntentFile? = nil, file: IntentFile? = nil) {
+        // Plain stored values first: assigning a @Property goes through self, which needs
+        // every stored property to be set already.
         id = entry.id
         displayTitle = ShortcutContent.title(entry)
+        fileSizeDescription = entry.file?.sizeDescription
         self.text = entry.text
         self.kind = ShortcutContent.kindTitle(entry.kind)
         self.savedAt = entry.savedAt
         self.isPinned = entry.isPinned
         self.picture = picture
         self.file = file
-        fileSizeDescription = entry.file?.sizeDescription
     }
 
     @MainActor
