@@ -139,6 +139,33 @@ final class FileMonitorTests: XCTestCase {
     }
 
     @MainActor
+    func testNamedTextFileStaysFileWhileEditorTextStaysText() throws {
+        let root = try ImageTestSupport.directory(self)
+        let board = FilePasteboard()
+        let monitor = try fixture(root, board: board)
+        monitor.start()
+        defer { monitor.stop() }
+        let body = Data("名前,点数\n山田,80\n".utf8)
+        board.external([try provider(in: root, type: "public.comma-separated-values-text", name: "成績.csv", bytes: body)],
+                       text: "名前,点数\n山田,80\n")
+        monitor.pollPasteboard()
+        drain(monitor)
+        let file = try XCTUnwrap(monitor.entries.first?.file)
+        XCTAssertEqual(file.originalFilename, "成績.csv")
+        XCTAssertEqual(file.typeIdentifier, "public.comma-separated-values-text")
+        XCTAssertEqual(try Data(contentsOf: monitor.fileURL(file)), body)
+        let logs = monitor.log.lines.map(\.fileLine).joined()
+        XCTAssertTrue(logs.contains(".csv"))
+        XCTAssertFalse(logs.contains("成績"))
+        board.external([try provider(in: root, type: "public.utf8-plain-text", name: nil, bytes: Data("選んだ文章".utf8))],
+                       text: "選んだ文章")
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.first?.text, "選んだ文章")
+        XCTAssertEqual(monitor.fileUsage.count, 1)
+    }
+
+    @MainActor
     func testFakeClipboardRejectsDynamicAndInternalTypesWithoutLoadingThem() throws {
         let root = try ImageTestSupport.directory(self)
         let board = FilePasteboard()

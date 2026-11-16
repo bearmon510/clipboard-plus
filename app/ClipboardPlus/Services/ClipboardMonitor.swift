@@ -504,8 +504,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             record("ファイル保存の見送り", details: "\(measured); 理由=秘密の印またはバックアップ")
             return
         }
-        if let type = HistoryFileTypes.preferred(in: types), !HistoryImageLoader.hasImage(provider) {
-            receiveFile(provider, type: type, route: route, receivedAt: receivedAt, details: measured)
+        if !HistoryImageLoader.hasImage(provider),
+           let type = HistoryFileTypes.namedTextFile(types: types, suggestedName: provider.suggestedName)
+            ?? HistoryFileTypes.preferred(in: types) {
+            let named = "名前=\(HistoryFileTypes.nameDiagnostic(provider.suggestedName))"
+            receiveFile(provider, type: type, route: route, receivedAt: receivedAt, details: "\(measured); \(named)")
             return
         }
         record("ファイル判定の見送り", details: "\(measured); 理由=\(HistoryFileTypes.rejectionReason(types))")
@@ -905,12 +908,18 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             if before != after { record("読み取り中の変更", count: after, details: details) }
             return
         }
-        let fileDetails = "取得元=\(source); pasteboard.types=\(types); provider.types=\(providers.map { $0.registeredTypeIdentifiers })"
-        if !pasteboard.hasStrings, let type = HistoryFileTypes.preferred(in: offered) {
+        let fileDetails = "取得元=\(source); pasteboard.types=\(types); provider.types=\(providers.map { $0.registeredTypeIdentifiers }); 名前=\(providers.map { HistoryFileTypes.nameDiagnostic($0.suggestedName) })"
+        // A named text file, such as a .txt or .csv copied in Files, stays a file even though
+        // the pasteboard also offers its contents as a string.
+        let textFile = providers.lazy.compactMap { provider in
+            HistoryFileTypes.namedTextFile(types: provider.registeredTypeIdentifiers, suggestedName: provider.suggestedName)
+                .map { (provider: provider, type: $0) }
+        }.first
+        if let type = textFile?.type ?? (pasteboard.hasStrings ? nil : HistoryFileTypes.preferred(in: offered)) {
             admission.discardPendingSelfCopy()
             store.resetImageAdmission()
             detections.forEach { log.append($0) }
-            if let provider = providers.first(where: { $0.registeredTypeIdentifiers.contains(type) }) {
+            if let provider = textFile?.provider ?? providers.first(where: { $0.registeredTypeIdentifiers.contains(type) }) {
                 receiveFile(provider, type: type, route: .automatic, receivedAt: Date(), before: before, details: fileDetails)
             } else {
                 store.resetFileAdmission()

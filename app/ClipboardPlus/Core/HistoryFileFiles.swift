@@ -22,6 +22,7 @@ struct HistoryFile: Codable, Equatable {
         if type.conforms(to: .audio) { return "waveform" }
         if type.conforms(to: .movie) || type.conforms(to: .video) { return "film" }
         if type.conforms(to: .compositeContent) { return "doc.text" }
+        if type.conforms(to: .text) { return "doc.plaintext" }
         return "doc"
     }
 }
@@ -45,16 +46,48 @@ enum HistoryFileError: Error {
 }
 
 enum HistoryFileTypes {
-    static func isFile(_ identifier: String) -> Bool {
+    /// Types a stored file may have. Text-based files (.txt, .csv, .html…) are included, but
+    /// only a filename brings them in as files; see namedTextFile(types:suggestedName:).
+    static func isStorable(_ identifier: String) -> Bool {
         guard !identifier.hasPrefix("dyn."),
               !["com.apple.uikit.", "com.apple.pasteboard.", "com.apple.private.",
                 "com.apple.notes.", "com.apple.flat-rtfd", "com.apple.rtfd",
                 "example.clipboardplus."].contains(where: { identifier.hasPrefix($0) }),
               let type = UTType(identifier),
               type.conforms(to: .data) || type.conforms(to: .content),
-              !type.conforms(to: .text), !type.conforms(to: .url), !type.conforms(to: .image),
+              !type.conforms(to: .url), !type.conforms(to: .image),
               !type.conforms(to: .directory) else { return false }
         return true
+    }
+
+    /// A non-text type marks a copy as a file even without a filename.
+    static func isFile(_ identifier: String) -> Bool {
+        isStorable(identifier) && UTType(identifier)?.conforms(to: .text) == false
+    }
+
+    /// A text-based file, such as a .txt or .csv copied in Files, stays a file. Its name must
+    /// carry a text extension; text copied from an editor or a link has no such name.
+    /// Returns the offered type to load, preferring the one the extension names.
+    static func namedTextFile(types: [String], suggestedName: String?) -> String? {
+        guard let suggestedName, !ClipboardPrivacy.hasPrivateMarker(in: types),
+              HistoryImageFiles.imageTypes(in: types).isEmpty,
+              !types.contains(where: { id in
+                  guard let type = UTType(id) else { return false }
+                  return type.conforms(to: .url) && !type.conforms(to: .fileURL)
+              }) else { return nil }
+        let ext = (suggestedName as NSString).pathExtension
+        guard !ext.isEmpty, let named = UTType(filenameExtension: ext), named.conforms(to: .text) else { return nil }
+        let text = types.compactMap { id in isStorable(id) ? UTType(id) : nil }.filter { $0.conforms(to: .text) }
+        let match = text.first { $0 == named } ?? text.first { named.conforms(to: $0) }
+            ?? text.first { $0.conforms(to: named) } ?? text.first
+        return match?.identifier
+    }
+
+    /// Only the extension goes to the measurement log, never the name.
+    static func nameDiagnostic(_ name: String?) -> String {
+        guard let name else { return "名前なし" }
+        let ext = (name as NSString).pathExtension
+        return ext.isEmpty ? "拡張子なし" : "." + ext
     }
 
     /// A text/URL representation vetoes files even if loading the text fails.
@@ -119,7 +152,7 @@ final class HistoryFileFiles {
     /// Run off the main thread, inside loadFileRepresentation's callback. Memory is bounded
     /// to one 64 KiB chunk; actual bytes are checked even if the provider reports a false size.
     static func stage(_ source: URL, typeIdentifier: String, suggestedName: String?) throws -> HistoryFileInput {
-        guard HistoryFileTypes.isFile(typeIdentifier) else { throw HistoryFileError.unsupportedType }
+        guard HistoryFileTypes.isStorable(typeIdentifier) else { throw HistoryFileError.unsupportedType }
         let scoped = source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
         let values = try source.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey])

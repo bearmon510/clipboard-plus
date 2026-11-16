@@ -92,7 +92,7 @@ struct BackupManifest: Codable {
             } else if entry.kind == .file {
                 guard formatVersion >= 2, let file = entry.file, entry.image == nil, entry.text.isEmpty,
                       file.byteCount >= 0, file.byteCount <= HistoryFileFiles.maximumByteCount,
-                      HistoryFileTypes.isFile(file.typeIdentifier),
+                      HistoryFileTypes.isStorable(file.typeIdentifier),
                       HistoryFileTypes.filename(file.originalFilename, typeIdentifier: file.typeIdentifier) == file.originalFilename,
                       file.hash.utf8.count == 64,
                       file.hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),

@@ -171,9 +171,13 @@ struct CaptureView: View {
 
     private var topBar: some View {
         VStack(spacing: 10) {
+            // The choice sits in the middle: the window's own buttons occupy the top-left corner.
+            // An empty slot as wide as the close button keeps it centred without overlapping.
             HStack(spacing: 10) {
+                Color.clear.frame(width: 44, height: 44)
+                Spacer(minLength: 0)
                 modePicker
-                Spacer(minLength: 8)
+                Spacer(minLength: 0)
                 Button {
                     onClose()
                 } label: {

@@ -40,6 +40,30 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertEqual(HistoryFileTypes.preferred(in: ["public.file-url", "com.adobe.pdf"]), "com.adobe.pdf")
     }
 
+    func testNamedTextFilesStayFilesButEditorTextAndLinksDoNot() throws {
+        XCTAssertEqual(HistoryFileTypes.namedTextFile(types: ["public.plain-text"], suggestedName: "メモ.txt"), "public.plain-text")
+        XCTAssertEqual(HistoryFileTypes.namedTextFile(types: ["public.utf8-plain-text", "public.comma-separated-values-text"],
+                                                      suggestedName: "表.csv"), "public.comma-separated-values-text")
+        XCTAssertEqual(HistoryFileTypes.namedTextFile(types: ["public.html"], suggestedName: "page.html"), "public.html")
+        XCTAssertEqual(HistoryFileTypes.namedTextFile(types: ["public.file-url", "public.utf8-plain-text"],
+                                                      suggestedName: "notes.txt"), "public.utf8-plain-text")
+        XCTAssertNil(HistoryFileTypes.namedTextFile(types: ["public.utf8-plain-text"], suggestedName: nil))
+        XCTAssertNil(HistoryFileTypes.namedTextFile(types: ["public.utf8-plain-text"], suggestedName: "見出し"))
+        XCTAssertNil(HistoryFileTypes.namedTextFile(types: ["public.utf8-plain-text"], suggestedName: "資料.pdf"))
+        XCTAssertNil(HistoryFileTypes.namedTextFile(types: ["public.url", "public.utf8-plain-text"], suggestedName: "readme.txt"))
+        XCTAssertNil(HistoryFileTypes.namedTextFile(types: ["public.png", "public.utf8-plain-text"], suggestedName: "readme.txt"))
+        XCTAssertNil(HistoryFileTypes.namedTextFile(types: ["public.utf8-plain-text", "org.nspasteboard.ConcealedType"],
+                                                    suggestedName: "pw.txt"))
+        XCTAssertTrue(HistoryFileTypes.isStorable("public.plain-text"))
+        XCTAssertFalse(HistoryFileTypes.isFile("public.plain-text"))
+        XCTAssertEqual(HistoryFileTypes.nameDiagnostic("秘密.csv"), ".csv")
+        let root = try ImageTestSupport.directory(self)
+        let csv = try FileTestSupport.input(in: root, bytes: Data("a,b\n1,2\n".utf8), name: "表.csv",
+                                            type: "public.comma-separated-values-text")
+        XCTAssertEqual(csv.file.originalFilename, "表.csv")
+        XCTAssertEqual(csv.file.symbolName, "doc.plaintext")
+    }
+
     func testStreamingHashFilenameFallbackAndEmptyFiles() throws {
         let root = try ImageTestSupport.directory(self)
         let input = try FileTestSupport.input(in: root, name: nil)
