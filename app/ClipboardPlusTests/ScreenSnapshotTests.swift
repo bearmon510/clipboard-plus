@@ -160,6 +160,15 @@ final class ScreenSnapshotTests: XCTestCase {
         try database.collect("hello@example.com", source: .automatic, at: ago(50 * 60))
         let image = try files.prepare(Self.samplePicture(), typeIdentifier: "public.png", hash: HistoryImageFiles.hash(Self.samplePicture()))
         try database.collectImage(image, source: .automatic, at: ago(25 * 60))
+        // Only the card is drawn, so the file itself need not exist.
+        try database.collectFile(HistoryFile(hash: String(repeating: "a", count: 64),
+                                             filename: "sample-report.pdf", originalFilename: "11月の打ち合わせ資料.pdf",
+                                             byteCount: 2_480_000, typeIdentifier: "com.adobe.pdf"),
+                                 source: .automatic, at: ago(18 * 60))
+        try database.collectFile(HistoryFile(hash: String(repeating: "b", count: 64),
+                                             filename: "sample-archive.zip", originalFilename: "写真のまとめ.zip",
+                                             byteCount: 31_200_000, typeIdentifier: "public.zip-archive"),
+                                 source: .automatic, at: ago(2 * day + 600))
         try database.collect("https://developer.apple.com/documentation/swiftui/lazyvgrid", source: .automatic, at: ago(12 * 60))
         try database.collect("何度もコピーした文章", source: .automatic, at: ago(8 * 60))
         try database.collect("何度もコピーした文章", source: .automatic, at: ago(4 * 60))

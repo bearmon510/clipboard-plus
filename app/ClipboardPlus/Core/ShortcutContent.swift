@@ -57,6 +57,7 @@ enum ShortcutContent {
     }
 
     static func title(_ entry: HistoryEntry) -> String {
+        if let file = entry.file { return file.displayName }
         if entry.kind == .image {
             if let image = entry.image { return "画像 \(image.pixelWidth)×\(image.pixelHeight)" }
             return "画像"
@@ -72,6 +73,7 @@ enum ShortcutContent {
         case .text: return "文章"
         case .url: return "リンク"
         case .image: return "画像"
+        case .file: return "ファイル"
         }
     }
 }

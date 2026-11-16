@@ -1,7 +1,7 @@
 import Foundation
 
 enum HistoryFilter: Hashable, CaseIterable {
-    case all, pinned, texts, links, images
+    case all, pinned, texts, links, images, files
 
     var title: String {
         switch self {
@@ -10,6 +10,7 @@ enum HistoryFilter: Hashable, CaseIterable {
         case .texts: return "文章"
         case .links: return "リンク"
         case .images: return "画像"
+        case .files: return "ファイル"
         }
     }
 
@@ -20,6 +21,7 @@ enum HistoryFilter: Hashable, CaseIterable {
         case .texts: return "text.alignleft"
         case .links: return "link"
         case .images: return "photo"
+        case .files: return "doc"
         }
     }
 
@@ -30,6 +32,7 @@ enum HistoryFilter: Hashable, CaseIterable {
         case .texts: return entry.kind == .text
         case .links: return entry.kind == .url
         case .images: return entry.kind == .image
+        case .files: return entry.kind == .file
         }
     }
 
@@ -42,7 +45,7 @@ enum HistoryFilter: Hashable, CaseIterable {
         let query = normalized(search)
         return entries.filter {
             filter.includes($0) &&
-            (query.isEmpty || ($0.kind != .image && $0.text.range(of: query, options: .caseInsensitive) != nil))
+            (query.isEmpty || ($0.kind != .image && ($0.file?.originalFilename ?? $0.text).range(of: query, options: .caseInsensitive) != nil))
         }
     }
 }

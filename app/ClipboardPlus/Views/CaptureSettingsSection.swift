@@ -34,11 +34,6 @@ struct CaptureSettingsSection: View {
             Text("iPadでスクリーンショットを撮ると、clipboard+がそれを拾って切り取りの画面を開きます。録画の表示は出ません。clipboard+を小窓やSlide Overで画面に出しておく必要があります。写真ライブラリの「すべての写真」へのアクセスが要ります。AssistiveTouchの1回タップにスクリーンショットを割り当てると、指1本で始められます。")
                 .font(.footnote)
                 .fixedSize(horizontal: false, vertical: true)
-            if screenCapture.isSupported {
-                Text("上の「文字」「画像」のボタンは、画面を直接取り込みます。最初の切り取りで許可した後、最後の切り取りから5分たつか、clipboard+を隠すまで取り込みを続けます。その間は許可を求めません。")
-                    .font(.footnote)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
 
             if screenshots.usedCount > 0 {
                 Button(role: .destructive) {
@@ -107,6 +102,9 @@ struct CaptureSettingsSection: View {
 enum CaptureSettings {
     /// Which mode the capture screen starts in when opened from a screenshot.
     static let screenshotModeKey = "screenshotCaptureMode"
+    /// Taking the screen directly (ScreenCaptureKit) is hidden since 0.11.0, like PiP: the
+    /// shortcut with a screenshot became the main route. Off unless turned on for development.
+    static let directCaptureKey = "directCaptureEnabled"
 
     static func screenshotMode(_ defaults: UserDefaults = .standard) -> CaptureMode {
         defaults.string(forKey: screenshotModeKey).flatMap(CaptureMode.init(rawValue:)) ?? .text

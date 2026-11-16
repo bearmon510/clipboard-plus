@@ -11,6 +11,8 @@ protocol HistoryPersistence: AnyObject {
     func purgeHistory(olderThan retention: HistoryRetention) throws -> Int
     func latestDeletion() throws -> HistoryDeletion?
     func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry
+    func collectFile(_ file: HistoryFile, source: HistorySource, at date: Date?) throws -> HistoryEntry
+    func fileUsage() throws -> HistoryFileUsage
     func takeRemovals() -> [HistoryEntry]
     func referencedImageFiles() throws -> Set<String>?
     func imageUsage() throws -> HistoryImageUsage
@@ -22,6 +24,10 @@ extension HistoryPersistence {
     func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry {
         throw HistoryImageError.unavailable
     }
+    func collectFile(_ file: HistoryFile, source: HistorySource, at date: Date?) throws -> HistoryEntry {
+        throw HistoryFileError.unavailable
+    }
+    func fileUsage() throws -> HistoryFileUsage { HistoryFileUsage() }
     func takeRemovals() -> [HistoryEntry] { [] }
     func referencedImageFiles() throws -> Set<String>? { nil }
     func imageUsage() throws -> HistoryImageUsage { HistoryImageUsage() }
@@ -45,6 +51,10 @@ final class HistoryStore {
         case imageSkipped(String)
         case imageRejected(message: String, details: String)
         case imageUsage(HistoryImageUsage)
+        case fileProcessed(HistoryFile, details: String)
+        case fileSkipped(String)
+        case fileRejected(message: String, details: String)
+        case fileUsage(HistoryFileUsage)
         case cleanupFailed
         case automaticallyDeleted(count: Int, retention: HistoryRetention)
     }
@@ -54,6 +64,8 @@ final class HistoryStore {
         let source: HistorySource
         let date: Date
         var image: HistoryImage? = nil
+        var file: HistoryFile? = nil
+        var filenames: Set<String> { (image?.filenames ?? []).union(file?.filenames ?? []) }
         var failed = false
     }
 
@@ -65,6 +77,8 @@ final class HistoryStore {
     private let now: () -> Date
     private var database: HistoryPersistence?
     let imageFiles: HistoryImageFiles
+    let fileFiles: HistoryFileFiles
+    private var fileAdmission = ImageAdmission()
     private var imageAdmission = ImageAdmission()
     private var didCleanFiles = false
     private var didScheduleBackupCleanup = false
@@ -90,14 +104,57 @@ final class HistoryStore {
         self.backupQueue = backupQueue
         self.backupTemporaryFiles = backupTemporaryFiles
         self.imageFiles = HistoryImageFiles(directory: imageDirectory)
+        // One attachment directory/journal keeps deletion, undo, drag and backup protection atomic.
+        self.fileFiles = HistoryFileFiles(directory: imageDirectory)
     }
 
     deinit {
         // Keep the connection's final release on the same queue as its operations.
         if let database { queue.async { withExtendedLifetime(database) {} } }
-        let abandoned = Set(pending.flatMap { $0.image?.filenames ?? [] }).union(unusedFiles)
+        let abandoned = Set(pending.flatMap { $0.filenames }).union(unusedFiles)
         let files = imageFiles
         queue.async { try? files.remove(abandoned) }
+    }
+
+    func resetFileAdmission() { queue.async { self.fileAdmission.reset() } }
+
+    func recordFileCopy(hash: String, changeCount: Int) {
+        queue.async { self.fileAdmission.recordSelfCopy(hash: hash, changeCount: changeCount) }
+    }
+
+    func collectFile(_ input: HistoryFileInput, source: HistorySource, at date: Date,
+                     before: Int? = nil, after: Int? = nil, details: String = "") {
+        queue.async {
+            let file = input.file
+            let measured = "\(details); 形式=\(file.typeIdentifier); バイト数=\(file.byteCount); hash=\(file.hash.prefix(8))"
+            if source == .automatic, let before, let after,
+               case .skip(let reason) = self.fileAdmission.receive(hash: file.hash, before: before, after: after) {
+                self.emit(.fileSkipped("\(measured); 理由=\(reason)"))
+                return
+            }
+            do {
+                let prepared = try self.fileFiles.prepare(input)
+                self.emit(.fileProcessed(prepared, details: measured))
+                self.pending.append(PendingCollection(text: "", source: source, date: date, file: prepared))
+            } catch {
+                if source == .automatic { self.fileAdmission.reset() }
+                self.emit(.fileRejected(message: HistoryFileError.fileWrite.message, details: "\(measured); 理由=保存先への移動失敗"))
+                return
+            }
+            try? self.savePending()
+        }
+    }
+
+    /// Snapshot creation is ordered before deletion on the store queue. The lease is held by
+    /// the outbound NSItemProvider, so even a delayed paste survives removal of its history.
+    func snapshotFile(_ file: HistoryFile, completion: @escaping @MainActor (Result<HistoryFileInput, Error>) -> Void) {
+        queue.async {
+            let result = Result {
+                try HistoryFileFiles.stage(self.fileFiles.url(for: file), typeIdentifier: file.typeIdentifier,
+                                           suggestedName: file.originalFilename)
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 
     func resetImageAdmission() { queue.async { self.imageAdmission.reset() } }
@@ -286,7 +343,7 @@ final class HistoryStore {
                 let entries = try database.fetchAll()
                 let createdAt = self.now()
                 let token = UUID()
-                self.backupProtections[token] = Set(entries.flatMap { $0.image?.filenames ?? [] })
+                self.backupProtections[token] = Set(entries.flatMap { $0.attachmentFilenames })
                 self.backupQueue.async {
                     let result = Result {
                         let url = try self.backupTemporaryFiles.makeExportURL()
@@ -412,6 +469,8 @@ final class HistoryStore {
                 database = try requireDatabase()
                 if let image = item.image {
                     entry = try database.collectImage(image, source: item.source, at: item.date)
+                } else if let file = item.file {
+                    entry = try database.collectFile(file, source: item.source, at: item.date)
                 } else {
                     entry = try database.collect(item.text, source: item.source, at: item.date)
                 }
@@ -424,6 +483,9 @@ final class HistoryStore {
             pending.removeFirst()
             if let image = item.image, image.filename != entry.image?.filename {
                 unusedFiles.formUnion(image.filenames)
+            }
+            if let file = item.file, file.filename != entry.file?.filename {
+                unusedFiles.formUnion(file.filenames)
             }
             emit(.saved(entry, retried: item.failed))
             finishChanges(database)
@@ -442,7 +504,7 @@ final class HistoryStore {
         }
         if !didCleanFiles {
             if let referenced = try opened.referencedImageFiles() {
-                let pendingFiles = Set(pending.flatMap { $0.image?.filenames ?? [] })
+                let pendingFiles = Set(pending.flatMap { $0.filenames })
                 try imageFiles.cleanUnreferenced(keeping: referenced.union(pendingFiles))
             }
             didCleanFiles = true
@@ -455,11 +517,11 @@ final class HistoryStore {
         dragProtectedUntil = dragProtectedUntil.filter { $0.value > date }
         for entry in database.takeRemovals() {
             emit(.remove(entry.id))
-            unusedFiles.formUnion(entry.image?.filenames ?? [])
+            unusedFiles.formUnion(entry.attachmentFilenames)
         }
         do {
             if !unusedFiles.isEmpty, let referenced = try database.referencedImageFiles() {
-                let pendingFiles = Set(pending.flatMap { $0.image?.filenames ?? [] })
+                let pendingFiles = Set(pending.flatMap { $0.filenames })
                 // Protected removals stay queued until a later maintenance pass.
                 let disposable = unusedFiles.subtracting(referenced).subtracting(pendingFiles)
                     .subtracting(dragProtectedUntil.keys)
@@ -468,6 +530,7 @@ final class HistoryStore {
                 unusedFiles.subtract(disposable)
             }
             emit(.imageUsage(try database.imageUsage()))
+            emit(.fileUsage(try database.fileUsage()))
         } catch { emit(.cleanupFailed) }
     }
 

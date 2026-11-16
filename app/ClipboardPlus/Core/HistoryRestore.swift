@@ -39,7 +39,7 @@ struct HistoryRestorePlan {
                     lastCollectedAt: max(old.lastCollectedAt, entry.lastCollectedAt),
                     collectionCount: HistoryCollectionCount.clamped(max(old.collectionCount, entry.collectionCount)),
                     isPinned: old.isPinned || entry.isPinned,
-                    source: entry.lastCollectedAt > old.lastCollectedAt ? entry.source : old.source, image: old.image)
+                    source: entry.lastCollectedAt > old.lastCollectedAt ? entry.source : old.source, image: old.image, file: old.file)
                 if merged == old { counts.unchanged += 1 } else { counts.updated += 1; writes.append(merged) }
                 byKey[key] = merged
             } else {
@@ -48,7 +48,7 @@ struct HistoryRestorePlan {
                 let added = HistoryEntry(id: nextID, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
                                          lastCollectedAt: entry.lastCollectedAt,
                                          collectionCount: HistoryCollectionCount.clamped(entry.collectionCount),
-                                         isPinned: entry.isPinned, source: entry.source, image: entry.image)
+                                         isPinned: entry.isPinned, source: entry.source, image: entry.image, file: entry.file)
                 byKey[key] = added
                 writes.append(added)
                 counts.added += 1
@@ -71,10 +71,10 @@ struct HistoryRestorePlan {
             unpinned += 1
             return unpinned <= unpinnedLimit
         }
-        var bytes: Int64 = survivors.reduce(0) { $0 + ($1.isPinned ? 0 : Int64($1.image?.byteCount ?? 0)) }
+        var bytes: Int64 = survivors.reduce(0) { $0 + ($1.isPinned ? 0 : Int64($1.attachmentByteCount)) }
         var removed = Set<Int>()
-        for entry in survivors.reversed() where !entry.isPinned && entry.kind == .image && bytes > Int64(imageByteLimit) {
-            bytes -= Int64(entry.image?.byteCount ?? 0)
+        for entry in survivors.reversed() where !entry.isPinned && (entry.kind == .image || entry.kind == .file) && bytes > Int64(imageByteLimit) {
+            bytes -= Int64(entry.attachmentByteCount)
             removed.insert(entry.id)
         }
         survivors.removeAll { removed.contains($0.id) }
@@ -87,7 +87,8 @@ struct HistoryRestorePlan {
 
     private static func key(_ entry: HistoryEntry) -> Data {
         // Swift String equality normalizes Unicode; SQLite BINARY equality does not.
-        Data((entry.kind == .image ? "image:\(entry.image!.hash)" : "text:\(entry.text)").utf8)
+        if let file = entry.file { return Data("file:\(file.hash)".utf8) }
+        return Data((entry.kind == .image ? "image:\(entry.image!.hash)" : "text:\(entry.text)").utf8)
     }
 }
 
@@ -105,13 +106,13 @@ enum HistoryRestore {
         do {
             try cancellation.check()
             return try database.mergeBackup(backup.entries, retentionCutoff: retentionCutoff) { survivors in
-                let needed = Set(survivors.compactMap { $0.image?.filename })
+                let needed = Set(survivors.flatMap { $0.attachmentFilenames })
                 progress(BackupProgress(completed: 0, total: backup.entries.count))
                 for (index, entry) in backup.entries.enumerated() {
                     try cancellation.check()
-                    if let image = entry.image, needed.contains(image.filename) {
+                    if !entry.attachmentFilenames.isDisjoint(with: needed) {
                         try FileManager.default.createDirectory(at: files.directory, withIntermediateDirectories: true)
-                        for filename in [image.filename, image.thumbnailFilename] {
+                        for filename in entry.attachmentFilenames.sorted() {
                             let destination = files.url(for: filename)
                             guard !FileManager.default.fileExists(atPath: destination.path) else { throw BackupError.unavailable }
                             // Register before moving, so an injected failure after a move is compensated too.

@@ -9,6 +9,7 @@ struct SettingsView: View {
     let screenshots: ScreenshotWatcher
     @State private var showLogs = false
     @State private var showDeveloperSettings = false
+    @AppStorage(CaptureSettings.directCaptureKey) private var directCaptureEnabled = false
     @State private var export: ExportSnapshot?
     @State private var exportedURL: URL?
     @State private var shareError: String?
@@ -51,7 +52,8 @@ struct SettingsView: View {
                         .font(.footnote)
                         .fixedSize(horizontal: false, vertical: true)
                     Text("画像 \(monitor.imageUsage.count)件 · \(ByteCountFormatter.string(fromByteCount: Int64(monitor.imageUsage.byteCount), countStyle: .decimal))")
-                    Text("画像は1件20MBまで。ピン留め以外の画像の実体は合計500MBまでで、古いものから削除します。件数の上限は文章と画像の合計です。使用量はピン留めと取り消し待ちの実体を含み、縮小画像は含みません。")
+                    Text("ファイル \(monitor.fileUsage.count)件 · \(ByteCountFormatter.string(fromByteCount: Int64(monitor.fileUsage.byteCount), countStyle: .decimal))")
+                    Text("画像は1件20MB、ファイルは1件50MBまで。ピン留め以外の画像とファイルの実体は合わせて500MBまでで、古いものから削除します。件数の上限はすべての種類の合計です。使用量はピン留めと取り消し待ちの実体を含み、縮小画像は含みません。")
                     Text("履歴は端末内に保存します。ピン留めしていない項目は1,000件までで、最後に収集した時刻の古いものから削除します。ピン留めした項目は自動では削除しません。")
                     Text("手動の削除後は5秒間取り消せます。取り消し待ちの項目は書き出しに含めません。")
                 }
@@ -106,6 +108,15 @@ struct SettingsView: View {
                             Text("この端末ではPiPを使えません。").font(.footnote)
                         }
                         Text("オンかつ記録中なら、離れたときにPiPで収集を続けられます。小窓には状態だけを表示し、電池を使います。")
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Toggle(isOn: $directCaptureEnabled) {
+                            Text("画面を直接取り込んで切り取る（試験的）")
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(minHeight: 44)
+                        .disabled(!screenCapture.isSupported)
+                        Text("オンにすると、上に「文字」「画像」のボタンが出ます。画面の録画で今の画面を取り込みます。最初に許可が要り、最後の切り取りから5分たつか、clipboard+を隠すまで取り込みを続けます。")
                             .font(.footnote)
                             .fixedSize(horizontal: false, vertical: true)
                         Button("計測ログ", systemImage: "doc.text") { showLogs = true }

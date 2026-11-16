@@ -13,17 +13,20 @@ struct HistoryEntryEntity: AppEntity {
     @Property(title: "ピン留め") var isPinned: Bool
     @Property(title: "画像") var picture: IntentFile?
 
+    @Property(title: "ファイル") var file: IntentFile?
+
+    let fileSizeDescription: String?
     let displayTitle: String
 
     var displaySubtitle: String {
-        "\(kind)・\(savedAt.formatted(date: .abbreviated, time: .shortened))" + (isPinned ? "・ピン留め" : "")
+        (fileSizeDescription.map { $0 + "・" } ?? "") + "\(kind)・\(savedAt.formatted(date: .abbreviated, time: .shortened))" + (isPinned ? "・ピン留め" : "")
     }
 
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(title: "\(displayTitle)", subtitle: "\(displaySubtitle)")
     }
 
-    init(entry: HistoryEntry, picture: IntentFile? = nil) {
+    init(entry: HistoryEntry, picture: IntentFile? = nil, file: IntentFile? = nil) {
         id = entry.id
         displayTitle = ShortcutContent.title(entry)
         self.text = entry.text
@@ -31,6 +34,8 @@ struct HistoryEntryEntity: AppEntity {
         self.savedAt = entry.savedAt
         self.isPinned = entry.isPinned
         self.picture = picture
+        self.file = file
+        fileSizeDescription = entry.file?.sizeDescription
     }
 
     @MainActor
@@ -43,7 +48,10 @@ struct HistoryEntryEntity: AppEntity {
                            filename: "clipboardplus-\(entry.id).\(UTType(image.typeIdentifier)?.preferredFilenameExtension ?? "image")",
                            type: UTType(image.typeIdentifier))
             }
-            return HistoryEntryEntity(entry: entry, picture: picture)
+            let file = entry.file.map {
+                IntentFile(fileURL: monitor.fileURL($0), filename: $0.originalFilename, type: UTType($0.typeIdentifier))
+            }
+            return HistoryEntryEntity(entry: entry, picture: picture, file: file)
         }
     }
 }
@@ -77,11 +85,11 @@ struct HistoryEntryQuery: EntityStringQuery {
 }
 
 enum HistoryFilterOption: String, AppEnum {
-    case all, pinned, texts, links, images
+    case all, pinned, texts, links, images, files
 
     static let typeDisplayRepresentation: TypeDisplayRepresentation = "履歴の種類"
     static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [
-        .all: "すべて", .pinned: "ピン留め", .texts: "文章", .links: "リンク", .images: "画像"
+        .all: "すべて", .pinned: "ピン留め", .texts: "文章", .links: "リンク", .images: "画像", .files: "ファイル"
     ]
 
     var filter: HistoryFilter {
@@ -91,6 +99,7 @@ enum HistoryFilterOption: String, AppEnum {
         case .texts: return .texts
         case .links: return .links
         case .images: return .images
+        case .files: return .files
         }
     }
 }

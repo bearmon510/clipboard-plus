@@ -71,7 +71,7 @@ final class ImageHistoryTests: XCTestCase {
         let url = directory.appendingPathComponent("history.sqlite")
         try ImageTestSupport.sql(ImageTestSupport.versionOneSQL, at: url)
         let database = try HistoryDatabase(url: url, now: { Date(timeIntervalSince1970: 1000) })
-        XCTAssertEqual(try database.readSchemaVersion(), 2)
+        XCTAssertEqual(try database.readSchemaVersion(), HistoryDatabase.schemaVersion)
         let row = try XCTUnwrap(database.fetchAll().first)
         XCTAssertEqual(row.id, 7)
         XCTAssertEqual(row.text, "https://example.com")

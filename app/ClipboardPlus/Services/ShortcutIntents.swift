@@ -201,13 +201,10 @@ struct CopyLatestHistoryIntent: AppIntent {
 }
 
 struct ClipboardPlusShortcuts: AppShortcutsProvider {
+    // Taking the screen directly (StartCaptureIntent) is hidden behind the developer settings
+    // since 0.11.0, so it is not offered here. Cutting out starts from the user's own shortcut:
+    // "スクリーンショットを撮る" followed by CaptureRegionIntent.
     static var appShortcuts: [AppShortcut] {
-        AppShortcut(intent: StartCaptureIntent(mode: .text),
-                    phrases: ["\(.applicationName)で文字を切り取る"],
-                    shortTitle: "文字を切り取る", systemImageName: "text.viewfinder")
-        AppShortcut(intent: StartCaptureIntent(mode: .image),
-                    phrases: ["\(.applicationName)で画像を切り取る"],
-                    shortTitle: "画像を切り取る", systemImageName: "crop")
         AppShortcut(intent: CopyLatestHistoryIntent(),
                     phrases: ["\(.applicationName)で最新の履歴をコピー"],
                     shortTitle: "最新の履歴をコピー", systemImageName: "doc.on.clipboard")

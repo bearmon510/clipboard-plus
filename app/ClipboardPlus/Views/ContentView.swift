@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var logHasError = false
     @StateObject private var pictureInPicture: PictureInPictureController
     @AppStorage("pinnedSectionCollapsed") private var pinnedCollapsed = false
+    /// Hidden behind the developer settings since 0.11.0; see `CaptureSettings.directCaptureKey`.
+    @AppStorage(CaptureSettings.directCaptureKey) private var directCaptureEnabled = false
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
     @State private var searchText: String
@@ -156,6 +158,9 @@ struct ContentView: View {
             // After the capture side has heard that the scene is active, or it would refuse.
             if phase == .active { startQueuedDirectCapture() }
         }
+        .onChange(of: directCaptureEnabled) { _, enabled in
+            if !enabled { screenCapture.stop(reason: "開発者向けの設定でオフ") }
+        }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings, onDismiss: presentQueuedCapture) {
             SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture,
@@ -182,8 +187,10 @@ struct ContentView: View {
             // Priority lets the field take the width first; the spacer only fills a wide window.
             searchField.frame(maxWidth: 560).layoutPriority(1)
             Spacer(minLength: 4)
-            captureButton(.text)
-            captureButton(.image)
+            if directCaptureEnabled {
+                captureButton(.text)
+                captureButton(.image)
+            }
             // PiP is set aside. Its button appears only when turned on under 開発者向け.
             if pictureInPicture.isSupported && pictureInPicture.isEnabled { pictureInPictureButton }
             moreMenu
@@ -332,6 +339,9 @@ struct ContentView: View {
             }
             if let message = monitor.imageNotice {
                 statusRow(message, symbol: "photo", tint: Color.red)
+            }
+            if let message = monitor.fileNotice {
+                statusRow(message, symbol: "doc", tint: Color.red)
             }
             if monitor.pendingSaveCount > 0 {
                 statusRow("保存待ち \(monitor.pendingSaveCount)件", symbol: "clock", tint: Color.secondary)
@@ -550,8 +560,13 @@ struct ContentView: View {
 
     @ViewBuilder private func rowActions(_ entry: HistoryEntry) -> some View {
         Button("コピー", systemImage: "doc.on.doc") { copy(entry) }
-        Button(entry.kind == .image ? "拡大表示" : "全文を表示", systemImage: "arrow.up.left.and.arrow.down.right") {
-            detailEntry = entry
+        switch entry.kind {
+        case .image:
+            Button("拡大表示", systemImage: "arrow.up.left.and.arrow.down.right") { detailEntry = entry }
+        case .file:
+            Button("プレビュー", systemImage: "eye") { detailEntry = entry }
+        case .text, .url:
+            Button("全文を表示", systemImage: "arrow.up.left.and.arrow.down.right") { detailEntry = entry }
         }
         if entry.kind == .image {
             Button("全体の文字を読み取る", systemImage: "doc.text.viewfinder") { readText(of: entry) }
@@ -573,6 +588,8 @@ struct ContentView: View {
     @ViewBuilder private func detail(_ entry: HistoryEntry) -> some View {
         if let image = entry.image {
             HistoryImagePreview(image: image, url: monitor.imageURL(image, thumbnail: false))
+        } else if let file = entry.file {
+            FilePreview(file: file, url: monitor.fileURL(file)) { copy(entry) }
         } else {
             EntryDetailView(entry: entry) { copy(entry) }
         }
@@ -585,7 +602,7 @@ struct ContentView: View {
             VStack(spacing: 14) {
                 emptySymbol("doc.on.clipboard")
                 Text("コピーすると、ここに並びます").font(.title3.weight(.semibold))
-                Text("ほかのアプリで文章や画像をコピーしてみてください。ここへドラッグしても保存できます。")
+                Text("ほかのアプリで文章や画像、ファイルをコピーしてみてください。ここへドラッグしても保存できます。")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -623,14 +640,10 @@ struct ContentView: View {
 
     private var captureTip: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 14) {
-                ForEach(CaptureMode.allCases) { mode in
-                    Label(mode.title, systemImage: mode.symbolName)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Theme.accent)
-                }
-            }
-            Text("上の「文字」「画像」で、画面の一部を選んでコピーできます。選んだ範囲の文字を読み取るか、画像として取り込みます。")
+            Label("スクリーンショットから切り取る", systemImage: "camera.viewfinder")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.accent)
+            Text("「ショートカット」でスクリーンショットを撮り、clipboard+の「画面を切り取る」に渡すと、範囲を選んで文字か画像をコピーできます。AssistiveTouchに割り当てると、1回押すだけで始められます。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -782,6 +795,11 @@ struct ContentView: View {
     /// come to the front, so this waits until it is active and no sheet covers it.
     private func startFromOutside(_ mode: CaptureMode) {
         guard capture == nil, capturePending == nil else { return }
+        // A shortcut or control made in 0.10.0 may still ask for the hidden direct capture.
+        guard directCaptureEnabled else {
+            openFromOutsideGuide()
+            return
+        }
         queuedCapture = nil
         queuedDirectMode = mode
         if showSettings || showCaptureGuide || detailEntry != nil {
@@ -791,6 +809,12 @@ struct ContentView: View {
             return
         }
         startQueuedDirectCapture()
+    }
+
+    /// Explains the screenshot shortcut instead, unless something else already covers the screen.
+    private func openFromOutsideGuide() {
+        guard !(showSettings || detailEntry != nil) else { return }
+        showCaptureGuide = true
     }
 
     private func startQueuedDirectCapture() {

@@ -1,7 +1,7 @@
 import Foundation
 
 enum HistoryKind: String, Codable {
-    case text, url, image
+    case text, url, image, file
 
     static func classify(_ text: String) -> HistoryKind {
         guard !text.isEmpty,
@@ -42,9 +42,10 @@ struct HistoryEntry: Identifiable, Codable, Equatable {
     let isPinned: Bool
     let source: HistorySource
     let image: HistoryImage?
+    let file: HistoryFile?
 
     init(id: Int, kind: HistoryKind, text: String, savedAt: Date, lastCollectedAt: Date,
-         collectionCount: Int, isPinned: Bool, source: HistorySource, image: HistoryImage? = nil) {
+         collectionCount: Int, isPinned: Bool, source: HistorySource, image: HistoryImage? = nil, file: HistoryFile? = nil) {
         self.id = id
         self.kind = kind
         self.text = text
@@ -54,7 +55,11 @@ struct HistoryEntry: Identifiable, Codable, Equatable {
         self.isPinned = isPinned
         self.source = source
         self.image = image
+        self.file = file
     }
+
+    var attachmentFilenames: Set<String> { (image?.filenames ?? []).union(file?.filenames ?? []) }
+    var attachmentByteCount: Int { image?.byteCount ?? file?.byteCount ?? 0 }
 
     var characterCount: Int { text.count }
     var domain: String? { kind == .url ? URLComponents(string: text)?.host : nil }
@@ -74,7 +79,7 @@ struct HistoryExport: Codable {
             var container = encoder.singleValueContainer()
             try container.encode(formatter.string(from: date))
         }
-        return try encoder.encode(HistoryExport(formatVersion: 2, exportedAt: exportedAt, entries: entries))
+        return try encoder.encode(HistoryExport(formatVersion: entries.contains { $0.kind == .file } ? 3 : 2, exportedAt: exportedAt, entries: entries))
     }
 }
 

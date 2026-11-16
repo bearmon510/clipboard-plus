@@ -64,6 +64,8 @@ struct HistoryCard<Actions: View>: View {
         switch flavor {
         case .image:
             imageContent
+        case .file:
+            fileContent
         case .color(let red, let green, let blue):
             colorContent(Color(red: red, green: green, blue: blue))
         case .link:
@@ -107,7 +109,7 @@ struct HistoryCard<Actions: View>: View {
     /// Whether the text is likely cut off at four lines, so that an expand button is worth showing.
     private var isExpandable: Bool {
         switch flavor {
-        case .image, .color: return false
+        case .image, .color, .file: return false
         case .link: if query.isEmpty && EntryLinks.parts(entry.text) != nil { return false }
         case .text, .email, .phone: break
         }
@@ -194,11 +196,34 @@ struct HistoryCard<Actions: View>: View {
         }
     }
 
+    /// A document icon in its type's color beside the original name, like a file in the Files app.
+    @ViewBuilder private var fileContent: some View {
+        if let file = entry.file {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: file.symbolName)
+                    .font(.title2)
+                    .foregroundStyle(Color.teal)
+                    .frame(width: 46, height: 54)
+                    .background(Color.teal.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .accessibilityHidden(true)
+                Text(file.displayName)
+                    .font(.body.weight(.semibold))
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("ファイル \(file.displayName)")
+        }
+    }
+
     // MARK: Meta line
 
     private var meta: some View {
         HStack(spacing: 6) {
-            Image(systemName: flavor.symbolName)
+            Image(systemName: entry.file?.symbolName ?? flavor.symbolName)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(tint)
                 .accessibilityHidden(true)
@@ -230,6 +255,9 @@ struct HistoryCard<Actions: View>: View {
         if let image = entry.image {
             parts.append("\(image.pixelWidth)×\(image.pixelHeight)")
             parts.append(ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .decimal))
+        } else if let file = entry.file {
+            parts.append(file.typeDescription)
+            parts.append(file.sizeDescription)
         } else if entry.characterCount > EntryPreview.limit {
             parts.append("\(entry.characterCount.formatted())文字")
         }
@@ -244,6 +272,7 @@ struct HistoryCard<Actions: View>: View {
         case .email, .phone: return Color.green
         case .color: return Color.pink
         case .image: return Color.purple
+        case .file: return Color.teal
         }
     }
 

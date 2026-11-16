@@ -23,6 +23,7 @@ final class EntryPresentationTests: XCTestCase {
         let now = Date()
         XCTAssertEqual(EntryFlavor.detect(entry(1, "https://example.com/a", kind: .url, at: now)), .link)
         XCTAssertEqual(EntryFlavor.detect(entry(2, "", kind: .image, at: now)), .image)
+        XCTAssertEqual(EntryFlavor.detect(entry(3, "", kind: .file, at: now)), .file)
     }
 
     func testFlavorRecognizesColorsEmailAndPhone() {

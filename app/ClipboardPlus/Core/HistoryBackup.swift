@@ -8,7 +8,7 @@ extension UTType {
 }
 
 enum BackupError: Error, LocalizedError {
-    case cancelled, identifier, version, manifest, truncated, image, trailingData, unavailable
+    case cancelled, identifier, version, manifest, truncated, image, file, trailingData, unavailable
 
     var errorDescription: String? {
         switch self {
@@ -18,6 +18,7 @@ enum BackupError: Error, LocalizedError {
         case .manifest: return "履歴の情報が壊れているか、対応していない内容です。"
         case .truncated: return "ファイルが途中で切れているか、画像のバイト数が一致しません。"
         case .image: return "画像の形式・大きさ・寸法・ハッシュが正しくありません。"
+        case .file: return "ファイルの形式・大きさ・ハッシュが正しくありません。"
         case .trailingData: return "ファイルの末尾に予期しないデータがあります。"
         case .unavailable: return "バックアップの保存先または履歴を利用できません。"
         }
@@ -70,25 +71,34 @@ struct BackupManifest: Codable {
     let entries: [HistoryEntry]
 
     func validate() throws {
-        guard formatVersion == 1, createdAt.timeIntervalSince1970.isFinite,
+        guard (1...2).contains(formatVersion), createdAt.timeIntervalSince1970.isFinite,
               itemCount == entries.count else { throw BackupError.manifest }
         var texts = Set<Data>()
         var hashes = Set<String>()
+        var fileHashes = Set<String>()
         for entry in entries {
             guard entry.savedAt.timeIntervalSince1970.isFinite,
                   entry.lastCollectedAt.timeIntervalSince1970.isFinite,
                   entry.savedAt <= entry.lastCollectedAt, entry.collectionCount > 0,
                   entry.collectionCount <= HistoryCollectionCount.maximum else { throw BackupError.manifest }
             if entry.kind == .image {
-                guard let image = entry.image, entry.text.isEmpty,
+                guard let image = entry.image, entry.file == nil, entry.text.isEmpty,
                       image.byteCount > 0, image.byteCount <= HistoryImageFiles.maximumByteCount,
                       image.pixelWidth > 0, image.pixelHeight > 0,
                       UTType(image.typeIdentifier)?.conforms(to: .image) == true,
                       image.hash.utf8.count == 64,
                       image.hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
                       hashes.insert(image.hash).inserted else { throw BackupError.image }
+            } else if entry.kind == .file {
+                guard formatVersion >= 2, let file = entry.file, entry.image == nil, entry.text.isEmpty,
+                      file.byteCount >= 0, file.byteCount <= HistoryFileFiles.maximumByteCount,
+                      HistoryFileTypes.isFile(file.typeIdentifier),
+                      HistoryFileTypes.filename(file.originalFilename, typeIdentifier: file.typeIdentifier) == file.originalFilename,
+                      file.hash.utf8.count == 64,
+                      file.hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+                      fileHashes.insert(file.hash).inserted else { throw BackupError.file }
             } else {
-                guard entry.image == nil, HistoryKind.classify(entry.text) == entry.kind,
+                guard entry.image == nil, entry.file == nil, HistoryKind.classify(entry.text) == entry.kind,
                       texts.insert(Data(entry.text.utf8)).inserted else { throw BackupError.manifest }
             }
         }
@@ -128,7 +138,7 @@ final class ValidatedBackup {
 
 enum HistoryBackup {
     static let magic = Data("CLIPPLUS".utf8)
-    static let version: UInt64 = 1
+    static let version: UInt64 = 2
     static let chunkSize = 64 * 1024
     // Only JSON metadata is buffered. Bound untrusted length before allocating it.
     static let maximumManifestBytes = 64 * 1024 * 1024
@@ -144,7 +154,8 @@ enum HistoryBackup {
         var succeeded = false
         defer { if !succeeded { temporaryFiles.remove(url) } }
         try cancellation.check()
-        let manifest = BackupManifest(formatVersion: 1, createdAt: createdAt, itemCount: entries.count, entries: entries)
+        let outputVersion = entries.contains { $0.kind == .file } ? 2 : 1
+        let manifest = BackupManifest(formatVersion: outputVersion, createdAt: createdAt, itemCount: entries.count, entries: entries)
         try manifest.validate()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -154,7 +165,7 @@ enum HistoryBackup {
         let output = try FileHandle(forWritingTo: url)
         defer { try? output.close() }
         try output.write(contentsOf: magic)
-        try writeNumber(version, to: output)
+        try writeNumber(UInt64(outputVersion), to: output)
         try writeNumber(UInt64(json.count), to: output)
         try output.write(contentsOf: json)
         progress(BackupProgress(completed: 0, total: entries.count))
@@ -166,6 +177,13 @@ enum HistoryBackup {
                 try writeNumber(UInt64(image.byteCount), to: output)
                 let hash = try transfer(from: input, to: output, count: image.byteCount, cancellation: cancellation)
                 guard hash == image.hash, try input.read(upToCount: 1)?.isEmpty != false else { throw BackupError.image }
+            }
+            if let file = entry.file {
+                let input = try FileHandle(forReadingFrom: files.url(for: file.filename))
+                defer { try? input.close() }
+                try writeNumber(UInt64(file.byteCount), to: output)
+                let hash = try transfer(from: input, to: output, count: file.byteCount, cancellation: cancellation)
+                guard hash == file.hash, try input.read(upToCount: 1)?.isEmpty != false else { throw BackupError.file }
             }
             progress(BackupProgress(completed: index + 1, total: entries.count))
         }
@@ -188,11 +206,13 @@ enum HistoryBackup {
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
         guard try readExact(8, from: input) == magic else { throw BackupError.identifier }
-        guard try readNumber(from: input) == version else { throw BackupError.version }
+        let inputVersion = try readNumber(from: input)
+        guard (1...version).contains(inputVersion) else { throw BackupError.version }
         let length = try readNumber(from: input)
         guard length > 0, length <= UInt64(maximumManifestBytes) else { throw BackupError.manifest }
         let json = try readExact(Int(length), from: input, cancellation: cancellation)
         let manifest = try JSONDecoder().decode(BackupManifest.self, from: json)
+        guard manifest.formatVersion == Int(inputVersion) else { throw BackupError.manifest }
         try manifest.validate()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var entries: [HistoryEntry] = []
@@ -219,6 +239,22 @@ enum HistoryBackup {
                 } catch { try? output.close(); throw error }
                 try autoreleasepool { try prepareThumbnail(local, in: directory) }
                 restored = entry.with(image: local)
+            }
+            if let file = entry.file {
+                guard try readNumber(from: input) == UInt64(file.byteCount) else { throw BackupError.file }
+                let suffix = UTType(file.typeIdentifier)?.preferredFilenameExtension ?? "data"
+                let local = HistoryFile(hash: file.hash, filename: "\(file.hash)-\(UUID().uuidString).\(suffix)",
+                                        originalFilename: file.originalFilename, byteCount: file.byteCount,
+                                        typeIdentifier: file.typeIdentifier)
+                let original = directory.appendingPathComponent(local.filename)
+                guard FileManager.default.createFile(atPath: original.path, contents: nil) else { throw BackupError.unavailable }
+                let output = try FileHandle(forWritingTo: original)
+                do {
+                    let hash = try transfer(from: input, to: output, count: file.byteCount, cancellation: cancellation)
+                    try output.close()
+                    guard hash == file.hash else { throw BackupError.file }
+                } catch { try? output.close(); throw error }
+                restored = entry.with(file: local)
             }
             entries.append(restored)
             progress(BackupProgress(completed: index + 1, total: manifest.itemCount))
@@ -295,8 +331,13 @@ enum HistoryBackup {
 }
 
 extension HistoryEntry {
+    func with(file: HistoryFile) -> HistoryEntry {
+        HistoryEntry(id: id, kind: kind, text: text, savedAt: savedAt, lastCollectedAt: lastCollectedAt,
+                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image, file: file)
+    }
+
     func with(image: HistoryImage) -> HistoryEntry {
         HistoryEntry(id: id, kind: kind, text: text, savedAt: savedAt, lastCollectedAt: lastCollectedAt,
-                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image)
+                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image, file: file)
     }
 }

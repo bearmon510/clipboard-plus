@@ -18,7 +18,7 @@ enum HistoryImageInput {
 }
 
 enum HistoryImageLoader {
-    static let contentTypes: [UTType] = [.image] + DroppedTextLoader.contentTypes
+    static let contentTypes: [UTType] = [.image] + DroppedTextLoader.contentTypes + [.data, .content]
 
     static func hasImage(_ provider: NSItemProvider) -> Bool {
         provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) ||

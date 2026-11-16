@@ -10,11 +10,24 @@ protocol ClipboardPasteboard: AnyObject {
     var types: [String] { get }
     var string: String? { get set }
     var image: UIImage? { get }
+    var itemProviders: [NSItemProvider] { get }
+    func writeFileProviders(_ providers: [NSItemProvider]) -> Bool
     func data(forPasteboardType pasteboardType: String) -> Data?
     func setData(_ data: Data, forPasteboardType pasteboardType: String)
 }
 
-extension UIPasteboard: ClipboardPasteboard {}
+extension ClipboardPasteboard {
+    // Existing text/image-only test pasteboards remain valid; unsupported writes fail explicitly.
+    var itemProviders: [NSItemProvider] { [] }
+    func writeFileProviders(_ providers: [NSItemProvider]) -> Bool { false }
+}
+
+extension UIPasteboard: ClipboardPasteboard {
+    func writeFileProviders(_ providers: [NSItemProvider]) -> Bool {
+        setItemProviders(providers, localOnly: false, expirationDate: nil)
+        return true
+    }
+}
 
 @MainActor
 final class ClipboardMonitor: NSObject, ObservableObject {
@@ -36,6 +49,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var savedCount = 0
     @Published private(set) var imageUsage = HistoryImageUsage()
     @Published private(set) var imageNotice: String?
+    @Published private(set) var fileUsage = HistoryFileUsage()
+    @Published private(set) var fileNotice: String?
 
     let log: MeasurementLog
 
@@ -104,6 +119,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         // The baseline is not read, so it must not suppress the next external change.
         admission.discardPendingSelfCopy()
         store.resetImageAdmission()
+        store.resetFileAdmission()
         lastObservedChangeCount = pasteboard.changeCount
         isRecording = true
         defaults.set(true, forKey: "isRecording")
@@ -191,12 +207,17 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     func copy(_ entry: HistoryEntry, completion: ((Bool) -> Void)? = nil) {
         guard !isCopying && !isWriting && !isReading else { completion?(false); return }
         isCopying = true
+        if let file = entry.file {
+            copyFile(entry, file: file, completion: completion)
+            return
+        }
         if let image = entry.image {
             copyImage(entry, image: image, completion: completion)
             return
         }
         readBeforeCopy()
         store.resetImageAdmission()
+        store.resetFileAdmission()
         let before = pasteboard.changeCount
         isWriting = true
         admission.recordSelfCopy(entry.text)
@@ -332,6 +353,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         guard !isCopying && !isWriting && !isReading else { return }
         readBeforeCopy()
         store.resetImageAdmission()
+        store.resetFileAdmission()
         isWriting = true
         // The next read sees our own text and must not count it a second time.
         admission.recordSelfCopy(text)
@@ -376,9 +398,49 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         store.imageFiles.url(for: thumbnail ? image.thumbnailFilename : image.filename)
     }
 
+    func fileURL(_ file: HistoryFile) -> URL { store.fileFiles.url(for: file) }
+
     func rowProvider(_ entry: HistoryEntry) -> NSItemProvider {
+        if let file = entry.file { return HistoryFileLoader.rowProvider(file: file, store: store) }
         if let image = entry.image { return HistoryImageLoader.rowProvider(image: image, store: store) }
         return DroppedTextLoader.rowProvider(text: entry.text)
+    }
+
+    private func copyFile(_ entry: HistoryEntry, file: HistoryFile, completion: ((Bool) -> Void)?) {
+        store.snapshotFile(file) { result in
+            var succeeded = false
+            switch result {
+            case .success(let input):
+                self.readBeforeCopy()
+                let before = self.pasteboard.changeCount
+                self.isWriting = true
+                self.admission.discardPendingSelfCopy()
+                self.store.resetImageAdmission()
+                succeeded = self.pasteboard.writeFileProviders([HistoryFileLoader.copyProvider(input)])
+                let after = self.pasteboard.changeCount
+                if succeeded {
+                    self.store.recordFileCopy(hash: file.hash, changeCount: after)
+                    if self.shortcutOperationCount > 0 { self.lastObservedChangeCount = after }
+                    self.record("自己コピー", count: after, text: file.originalFilename, historyNumber: entry.id,
+                                details: "ファイル; 形式=\(file.typeIdentifier); バイト数=\(file.byteCount); hash=\(file.hash.prefix(8)); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
+                }
+                self.isWriting = false
+            case .failure: break
+            }
+            if !succeeded {
+                self.fileNotice = HistoryFileError.unavailable.message
+                self.record("ファイルコピーの失敗", historyNumber: entry.id)
+            }
+            let detections = self.deferredDetections
+            self.deferredDetections.removeAll()
+            if self.isRecording && self.shortcutOperationCount == 0 {
+                self.readIfChanged(count: self.pasteboard.changeCount, source: "自己コピー後の確認", detections: detections)
+            } else {
+                detections.forEach { self.log.append($0) }
+            }
+            self.isCopying = false
+            completion?(succeeded)
+        }
     }
 
     private func copyImage(_ entry: HistoryEntry, image: HistoryImage, completion: ((Bool) -> Void)?) {
@@ -389,6 +451,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 self.readBeforeCopy()
                 let before = self.pasteboard.changeCount
                 self.admission.discardPendingSelfCopy()
+                self.store.resetFileAdmission()
                 self.isWriting = true
                 self.pasteboard.setData(data, forPasteboardType: image.typeIdentifier)
                 let after = self.pasteboard.changeCount
@@ -423,6 +486,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func saveManually(_ providers: [NSItemProvider], receivedAt: Date) {
+        let types = providers.flatMap { $0.registeredTypeIdentifiers }
+        guard !ClipboardPrivacy.hasPrivateMarker(in: types) else {
+            record("秘密の印のため保存せず", details: "取得元=手動保存; provider.types=\(types)")
+            return
+        }
         for provider in providers {
             receiveProvider(provider, route: .manual, receivedAt: receivedAt,
                             details: "PasteButtonから受信; registeredTypeIdentifiers=\(provider.registeredTypeIdentifiers)")
@@ -430,6 +498,17 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     private func receiveProvider(_ provider: NSItemProvider, route: HistorySource, receivedAt: Date, details: String) {
+        let types = provider.registeredTypeIdentifiers
+        let measured = "\(details); registeredTypeIdentifiers=\(types)"
+        guard !ClipboardPrivacy.hasPrivateMarker(in: types), !types.contains("example.clipboardplus.backup") else {
+            record("ファイル保存の見送り", details: "\(measured); 理由=秘密の印またはバックアップ")
+            return
+        }
+        if let type = HistoryFileTypes.preferred(in: types), !HistoryImageLoader.hasImage(provider) {
+            receiveFile(provider, type: type, route: route, receivedAt: receivedAt, details: measured)
+            return
+        }
+        record("ファイル判定の見送り", details: "\(measured); 理由=\(HistoryFileTypes.rejectionReason(types))")
         if HistoryImageLoader.hasImage(provider) {
             let start = ProcessInfo.processInfo.systemUptime
             HistoryImageLoader.load(provider) { result in
@@ -457,6 +536,36 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
+    private func receiveFile(_ provider: NSItemProvider, type: String, route: HistorySource,
+                             receivedAt: Date, before: Int? = nil, details: String) {
+        pendingSaveCount += 1
+        fileNotice = nil
+        let start = ProcessInfo.processInfo.systemUptime
+        HistoryFileLoader.load(provider, typeIdentifier: type) { result in
+            let after = self.pasteboard.changeCount
+            let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+            let measured = "\(details); 選択型=\(type); 所要ms=\(String(format: "%.3f", elapsed))"
+            if let before, before != after {
+                // An async provider result cannot be attributed to a changed pasteboard.
+                // Discard even if the new content has no marker, and leave it eligible for polling.
+                self.pendingSaveCount -= 1
+                self.record("ファイル保存の見送り", count: after,
+                            details: "\(measured); 理由=非同期読み取り中の変更; 前=\(before); 後=\(after)")
+                return
+            }
+            switch result {
+            case .success(let input):
+                self.store.collectFile(input, source: route, at: receivedAt, before: before, after: after, details: measured)
+            case .failure(let error):
+                self.pendingSaveCount -= 1
+                self.store.resetFileAdmission()
+                let failure = error as? HistoryFileError ?? .unavailable
+                self.fileNotice = failure.message
+                self.record("ファイル保存の見送り", details: "\(measured); 理由=\(failure)")
+            }
+        }
+    }
+
     private func admitImage(_ input: HistoryImageInput, route: HistorySource, timestamp: Date,
                             before: Int? = nil, after: Int? = nil, details: String) {
         pendingSaveCount += 1
@@ -470,6 +579,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             "provider[\(index)].registeredTypeIdentifiers=\(provider.registeredTypeIdentifiers)"
         }.joined(separator: "; ")
         record("ドロップを受信", details: "providers=\(providers.count); \(providerDetails)", timestamp: receivedAt)
+        guard !ClipboardPrivacy.hasPrivateMarker(in: providers.flatMap { $0.registeredTypeIdentifiers }) else {
+            record("秘密の印のため保存せず", details: "取得元=ドラッグ; \(providerDetails)")
+            return false
+        }
         var accepted = false
         for (index, provider) in providers.enumerated() {
             guard !DroppedTextLoader.isLocalRow(provider) else {
@@ -611,7 +724,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             savedCount += 1
             HistoryList.upsert(entry, into: &entries)
             if pendingSaveCount == 0 { storageError = nil }
-            record(retried ? "履歴保存の再試行成功" : "履歴保存成功", text: entry.text,
+            record(retried ? "履歴保存の再試行成功" : "履歴保存成功", text: entry.file?.originalFilename ?? entry.text,
                    historyNumber: entry.id, details: "経路=\(entry.source.rawValue); 保存待ち=\(pendingSaveCount)件")
         case .saveFailed:
             reportStorageFailure()
@@ -626,11 +739,22 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             imageNotice = message
             record("画像保存の見送り", details: details)
         case .imageUsage(let usage): imageUsage = usage
+        case .fileProcessed(_, let details):
+            record("ファイルの読み取り成功", details: details)
+        case .fileSkipped(let details):
+            pendingSaveCount -= 1
+            record("ファイル保存の見送り", details: details)
+        case .fileRejected(let message, let details):
+            pendingSaveCount -= 1
+            fileNotice = message
+            record("ファイル保存の見送り", details: details)
+        case .fileUsage(let usage): fileUsage = usage
         case .automaticallyDeleted(let count, let retention):
             record("期限による自動削除", details: "件数=\(count); 日数=\(retention.rawValue)")
         case .cleanupFailed:
             imageNotice = "画像ファイルの後始末に失敗しました。自動で再試行します。"
-            record("画像ファイルの後始末失敗")
+            fileNotice = "ファイルの後始末に失敗しました。自動で再試行します。"
+            record("履歴ファイルの後始末失敗")
         }
     }
 
@@ -720,6 +844,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         if ClipboardPrivacy.hasPrivateMarker(in: types) {
             admission.discardPendingSelfCopy()
             store.resetImageAdmission()
+            store.resetFileAdmission()
             detections.forEach { log.append($0) }
             log.append(MeasurementEvent(
                 kind: "秘密の印のため保存せず", changeCount: before, scene: readScene,
@@ -730,13 +855,26 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         if types.contains("example.clipboardplus.backup") {
             admission.discardPendingSelfCopy()
             store.resetImageAdmission()
+            store.resetFileAdmission()
             detections.forEach { log.append($0) }
             record("バックアップファイルのため保存せず", count: before)
+            return
+        }
+        let providers = pasteboard.itemProviders
+        let offered = providers.flatMap { $0.registeredTypeIdentifiers } + types
+        if ClipboardPrivacy.hasPrivateMarker(in: offered) || offered.contains("example.clipboardplus.backup") {
+            admission.discardPendingSelfCopy()
+            store.resetImageAdmission()
+            store.resetFileAdmission()
+            detections.forEach { log.append($0) }
+            record("ファイル保存の見送り", details: "pasteboard.types=\(types); provider.types=\(offered); 理由=秘密の印またはバックアップ")
             return
         }
         // hasImages is false for some image types, such as the WebP that Safari copies on a long press.
         let imageTypes = HistoryImageFiles.imageTypes(in: types)
         if pasteboard.hasImages || !imageTypes.isEmpty {
+            record("ファイル判定の見送り", details: "pasteboard.types=\(types); provider.types=\(offered); 理由=画像を優先")
+            store.resetFileAdmission()
             admission.discardPendingSelfCopy()
             var input: HistoryImageInput?
             for type in imageTypes.isEmpty ? HistoryImageFiles.preferredTypes : imageTypes {
@@ -758,13 +896,30 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 admitImage(input, route: .automatic, timestamp: finished, before: before, after: after, details: details)
             } else {
                 store.resetImageAdmission()
+                store.resetFileAdmission()
                 imageNotice = HistoryImageError.invalidImage.message
                 record("画像の読み込み失敗", count: after, details: details, timestamp: finished)
             }
             if before != after { record("読み取り中の変更", count: after, details: details) }
             return
         }
+        let fileDetails = "取得元=\(source); pasteboard.types=\(types); provider.types=\(providers.map { $0.registeredTypeIdentifiers })"
+        if !pasteboard.hasStrings, let type = HistoryFileTypes.preferred(in: offered) {
+            admission.discardPendingSelfCopy()
+            store.resetImageAdmission()
+            detections.forEach { log.append($0) }
+            if let provider = providers.first(where: { $0.registeredTypeIdentifiers.contains(type) }) {
+                receiveFile(provider, type: type, route: .automatic, receivedAt: Date(), before: before, details: fileDetails)
+            } else {
+                store.resetFileAdmission()
+                fileNotice = HistoryFileError.unavailable.message
+                record("ファイル保存の見送り", details: "\(fileDetails); 理由=型に対応するitemProviderなし")
+            }
+            return
+        }
+        record("ファイル判定の見送り", details: "\(fileDetails); 理由=\(pasteboard.hasStrings ? "文章を優先" : HistoryFileTypes.rejectionReason(offered))")
         store.resetImageAdmission()
+        store.resetFileAdmission()
         let hasStrings = pasteboard.hasStrings
         let checkedAt = Date()
         let text = hasStrings ? pasteboard.string : nil
@@ -820,6 +975,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         guard ClipboardPrivacy.hasPrivateMarker(in: latest) else { return false }
         admission.discardPendingSelfCopy()
         store.resetImageAdmission()
+        store.resetFileAdmission()
         detections.forEach { log.append($0) }
         log.append(MeasurementEvent(
             kind: "秘密の印のため保存せず", changeCount: after, scene: scene,

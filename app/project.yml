@@ -9,11 +9,9 @@ settings:
     TARGETED_DEVICE_FAMILY: "2"
     SUPPORTS_MACCATALYST: NO
     SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-    # The real Bundle ID is passed from a GitHub secret at archive time. The Control Center
-    # extension derives its ID from this one, so both targets read the same setting.
+    # The real Bundle ID is passed from a GitHub secret at archive time.
     APP_BUNDLE_ID: example.clipboardplus
-    # The app and its extension must carry the same version.
-    MARKETING_VERSION: "0.10.0"
+    MARKETING_VERSION: "0.11.0"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   ClipboardPlus:
@@ -24,7 +22,6 @@ targets:
       - Shared
     dependencies:
       - sdk: libsqlite3.tbd
-      - target: ClipboardPlusControls
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID)
@@ -59,26 +56,6 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         ITSAppUsesNonExemptEncryption: false
-  ClipboardPlusControls:
-    type: app-extension
-    platform: iOS
-    # Controls in Control Center need iOS 18. The app itself still runs on iOS 17.
-    deploymentTarget: "18.0"
-    sources:
-      - ClipboardPlusControls
-      - Shared
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).controls
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) CLIPBOARD_PLUS_CONTROLS
-    info:
-      path: Generated/ClipboardPlusControls-Info.plist
-      properties:
-        CFBundleDisplayName: clipboard+
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.widgetkit-extension
   ClipboardPlusTests:
     type: bundle.unit-test
     platform: iOS

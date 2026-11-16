@@ -8,9 +8,11 @@ enum EntryFlavor: Equatable {
     case phone
     case color(red: Double, green: Double, blue: Double)
     case image
+    case file
 
     static func detect(_ entry: HistoryEntry) -> EntryFlavor {
         switch entry.kind {
+        case .file: return .file
         case .image: return .image
         case .url: return .link
         case .text: return detect(text: entry.text)
@@ -36,6 +38,7 @@ enum EntryFlavor: Equatable {
         case .phone: return "phone"
         case .color: return "paintpalette"
         case .image: return "photo"
+        case .file: return "doc"
         }
     }
 

@@ -332,9 +332,9 @@ final class HistoryDatabaseTests: XCTestCase {
     func testSchemaVersionIsStoredAndPreservedOnReopen() throws {
         let (database, url, clock) = try fixture()
         XCTAssertEqual(try database.readSchemaVersion(), HistoryDatabase.schemaVersion)
-        XCTAssertEqual(try scalar("PRAGMA user_version", url: url), 2)
+        XCTAssertEqual(try scalar("PRAGMA user_version", url: url), HistoryDatabase.schemaVersion)
         let reopened = try HistoryDatabase(url: url, now: { clock.date })
-        XCTAssertEqual(try reopened.readSchemaVersion(), 2)
+        XCTAssertEqual(try reopened.readSchemaVersion(), HistoryDatabase.schemaVersion)
     }
 
     func testFutureSchemaIsRejectedWithoutChangingDataOrVersion() throws {
