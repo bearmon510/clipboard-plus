@@ -79,7 +79,7 @@ final class ShortcutContentTests: XCTestCase {
         XCTAssertEqual(entity.text, item.text)
         XCTAssertEqual(entity.kind, "文章")
         XCTAssertEqual(entity.savedAt, item.savedAt)
-        XCTAssertTrue(entity.isTemplate)
+        XCTAssertTrue(entity.isPinned)
         XCTAssertNil(entity.picture)
         XCTAssertEqual(entity.displayTitle, "先頭の行")
         XCTAssertTrue(entity.displaySubtitle.contains("テンプレート"))
@@ -98,7 +98,7 @@ final class ShortcutContentTests: XCTestCase {
         XCTAssertEqual(entity.kind, "画像")
         XCTAssertEqual(entity.text, "")
         XCTAssertEqual(entity.picture?.data, file.data)
-        XCTAssertFalse(entity.isTemplate)
+        XCTAssertFalse(entity.isPinned)
         XCTAssertFalse(entity.displaySubtitle.contains("テンプレート"))
     }
 }
