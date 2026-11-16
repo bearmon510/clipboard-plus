@@ -311,7 +311,7 @@ final class HistoryDatabaseTests: XCTestCase {
         let entries = try database.fetchAll()
         let data = try HistoryExport.data(entries: entries, exportedAt: clock.date)
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(root["formatVersion"] as? Int, 2)
+        XCTAssertEqual(root["formatVersion"] as? Int, 4)
         XCTAssertEqual(root["exportedAt"] as? String, "1970-01-01T00:16:41.000Z")
         let rows = try XCTUnwrap(root["entries"] as? [[String: Any]])
         XCTAssertEqual(rows.count, 2)

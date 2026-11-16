@@ -79,7 +79,11 @@ struct HistoryEntryQuery: EntityStringQuery {
 
     @MainActor
     func entities(matching string: String) async throws -> [HistoryEntryEntity] {
-        let monitor = ClipboardMonitor.shared
+        try await entities(matching: string, monitor: .shared)
+    }
+
+    @MainActor
+    func entities(matching string: String, monitor: ClipboardMonitor) async throws -> [HistoryEntryEntity] {
         return try await monitor.performShortcut("HistoryEntryQuery.entities(matching:)") {
             HistoryEntryEntity.make(ShortcutContent.matchingEntries(monitor.entries, search: string), monitor: monitor)
         }

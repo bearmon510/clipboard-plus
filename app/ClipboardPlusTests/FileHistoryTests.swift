@@ -117,7 +117,7 @@ final class FileHistoryTests: XCTestCase {
             PRAGMA user_version = 2;
             """, at: url)
         let database = try HistoryDatabase(url: url, now: { Date(timeIntervalSince1970: 1000) })
-        XCTAssertEqual(try database.readSchemaVersion(), 3)
+        XCTAssertEqual(try database.readSchemaVersion(), 4)
         XCTAssertEqual(try database.fetchAll().first?.id, 7)
         XCTAssertNotNil(try database.latestDeletion())
         let file = try FileTestSupport.input(in: root).file
@@ -228,7 +228,7 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.fileFiles.url(for: expired).path))
     }
 
-    func testFileBackupRoundTripAndLegacyReaderRejectsVersionTwoBeforeJSON() throws {
+    func testPinnedFileBackupRoundTripAndLegacyReaderRejectsBeforeJSON() throws {
         let root = try ImageTestSupport.directory(self)
         let originals = HistoryImageFiles(directory: root.appendingPathComponent("originals"))
         let file = try HistoryFileFiles(directory: originals.directory).prepare(FileTestSupport.input(in: root))
@@ -244,9 +244,9 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertEqual(try header.read(upToCount: 8), HistoryBackup.magic)
         let version = try HistoryBackup.readNumber(from: header)
         try header.close()
-        XCTAssertEqual(version, 2)
-        // The previous app has `guard readNumber(...) == 1 else { throw BackupError.version }`.
-        XCTAssertNotEqual(version, 1)
+        XCTAssertEqual(version, 3)
+        // Version 0.11 accepts only formats 1...2, before attempting JSON decoding.
+        XCTAssertFalse((UInt64(1)...UInt64(2)).contains(version))
         let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
         let target = try HistoryDatabase(url: root.appendingPathComponent("target.sqlite"))
         let files = HistoryImageFiles(directory: root.appendingPathComponent("restored"))

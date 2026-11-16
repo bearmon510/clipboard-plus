@@ -30,6 +30,16 @@ struct HistoryRestorePlan {
         var byKey = Dictionary(uniqueKeysWithValues: existing.map { (Self.key($0), $0) })
         var writes: [HistoryEntry] = []
         var nextID = lastID
+        let existingPins = HistoryEntry.orderedPins(existing.filter { $0.isPinned })
+        let incomingPins = HistoryEntry.orderedPins(incoming.filter { $0.isPinned }.sorted {
+            $0.lastCollectedAt == $1.lastCollectedAt ? $0.id > $1.id : $0.lastCollectedAt > $1.lastCollectedAt
+        })
+        var pinOrders: [Data: Int] = [:]
+        // Existing pins lead; imported pins retain their relative order after them.
+        // Dense orders also make arbitrary Int.min/Int.max values in archives safe.
+        for entry in existingPins + incomingPins where pinOrders[Self.key(entry)] == nil {
+            pinOrders[Self.key(entry)] = pinOrders.count
+        }
         for entry in incoming {
             let key = Self.key(entry)
             if let old = byKey[key] {
@@ -39,7 +49,8 @@ struct HistoryRestorePlan {
                     lastCollectedAt: max(old.lastCollectedAt, entry.lastCollectedAt),
                     collectionCount: HistoryCollectionCount.clamped(max(old.collectionCount, entry.collectionCount)),
                     isPinned: old.isPinned || entry.isPinned,
-                    source: entry.lastCollectedAt > old.lastCollectedAt ? entry.source : old.source, image: old.image, file: old.file)
+                    source: entry.lastCollectedAt > old.lastCollectedAt ? entry.source : old.source, image: old.image, file: old.file,
+                    title: HistoryEntry.normalizedTitle(old.title) ?? HistoryEntry.normalizedTitle(entry.title), pinOrder: pinOrders[key])
                 if merged == old { counts.unchanged += 1 } else { counts.updated += 1; writes.append(merged) }
                 byKey[key] = merged
             } else {
@@ -48,11 +59,23 @@ struct HistoryRestorePlan {
                 let added = HistoryEntry(id: nextID, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
                                          lastCollectedAt: entry.lastCollectedAt,
                                          collectionCount: HistoryCollectionCount.clamped(entry.collectionCount),
-                                         isPinned: entry.isPinned, source: entry.source, image: entry.image, file: entry.file)
+                                         isPinned: entry.isPinned, source: entry.source, image: entry.image, file: entry.file,
+                                         title: HistoryEntry.normalizedTitle(entry.title), pinOrder: pinOrders[key])
                 byKey[key] = added
                 writes.append(added)
                 counts.added += 1
             }
+        }
+        let incomingKeys = Set(incoming.map { Self.key($0) })
+        for old in existingPins where !incomingKeys.contains(Self.key(old)) {
+            guard old.pinOrder != pinOrders[Self.key(old)] else { continue }
+            let reordered = HistoryEntry(id: old.id, kind: old.kind, text: old.text, savedAt: old.savedAt,
+                                         lastCollectedAt: old.lastCollectedAt, collectionCount: old.collectionCount,
+                                         isPinned: true, source: old.source, image: old.image, file: old.file,
+                                         title: old.displayTitle, pinOrder: pinOrders[Self.key(old)])
+            byKey[Self.key(old)] = reordered
+            writes.append(reordered)
+            counts.updated += 1
         }
         // Age is evaluated after merging (newer collection dates and pins win),
         // before either cap. Each removed row belongs to exactly one category.

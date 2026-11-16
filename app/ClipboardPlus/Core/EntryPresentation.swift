@@ -117,7 +117,7 @@ struct EntrySection: Identifiable, Equatable {
 }
 
 enum EntrySections {
-    /// Groups entries, which arrive newest first, by day. Order inside a section is kept.
+    /// Groups newest-first entries by day, preserving that order except for explicit pin order.
     static func make(_ entries: [HistoryEntry], separatesPinned: Bool, now: Date,
                      calendar: Calendar = .current) -> [EntrySection] {
         let startOfToday = calendar.startOfDay(for: now)
@@ -143,7 +143,7 @@ enum EntrySections {
         }
         let order: [EntrySectionKind] = [.pinned, .today, .yesterday, .thisWeek, .earlier]
         return order.compactMap { kind in
-            buckets[kind].map { EntrySection(kind: kind, entries: $0) }
+            buckets[kind].map { EntrySection(kind: kind, entries: kind == .pinned ? HistoryEntry.orderedPins($0) : $0) }
         }
     }
 }

@@ -1,6 +1,10 @@
 import Foundation
 
 protocol HistoryPersistence: AnyObject {
+    func createWritten(text: String, title: String?) throws -> HistoryEntry
+    func setTitle(_ title: String?, id: Int) throws
+    func editText(id: Int, text: String, title: String?) throws -> HistoryEntry
+    func reorderPins(_ orderedIDs: [Int]) throws
     func collect(_ text: String, source: HistorySource, at date: Date?) throws -> HistoryEntry
     func fetchAll() throws -> [HistoryEntry]
     func togglePin(id: Int) throws -> HistoryEntry?
@@ -21,6 +25,10 @@ protocol HistoryPersistence: AnyObject {
 }
 
 extension HistoryPersistence {
+    func createWritten(text: String, title: String?) throws -> HistoryEntry { throw HistoryEditError.failed }
+    func setTitle(_ title: String?, id: Int) throws { throw HistoryEditError.failed }
+    func editText(id: Int, text: String, title: String?) throws -> HistoryEntry { throw HistoryEditError.failed }
+    func reorderPins(_ orderedIDs: [Int]) throws { throw HistoryEditError.failed }
     func collectImage(_ image: HistoryImage, source: HistorySource, at date: Date?) throws -> HistoryEntry {
         throw HistoryImageError.unavailable
     }
@@ -313,13 +321,41 @@ final class HistoryStore {
         perform({ try $0.latestDeletion() }, completion: completion)
     }
 
+    func createWritten(text: String, title: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
+        perform({ database in
+            let entry = try database.createWritten(text: text, title: title)
+            self.emit(.replace(try database.fetchAll()))
+            return entry
+        }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
+    }
+
+    func setTitle(_ title: String?, id: Int, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        perform({ database in
+            try database.setTitle(title, id: id)
+            self.emit(.replace(try database.fetchAll()))
+        }, completion: completion)
+    }
+
+    func editText(id: Int, text: String, title: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
+        perform({ database in
+            let entry = try database.editText(id: id, text: text, title: title)
+            self.emit(.replace(try database.fetchAll()))
+            return entry
+        }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
+    }
+
+    func reorderPins(_ orderedIDs: [Int], completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        perform({ database in
+            try database.reorderPins(orderedIDs)
+            self.emit(.replace(try database.fetchAll()))
+        }, completion: completion)
+    }
+
     func togglePin(id: Int, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
-            if let entry = try database.togglePin(id: id) {
-                self.emit(.upsert(entry))
-            } else {
-                self.emit(.remove(id))
-            }
+            _ = try database.togglePin(id: id)
+            // A pin-order overflow can renumber other pins in the same transaction.
+            self.emit(.replace(try database.fetchAll()))
         }, completion: completion)
     }
 

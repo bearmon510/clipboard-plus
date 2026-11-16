@@ -43,9 +43,11 @@ enum HistoryFilter: Hashable, CaseIterable {
 
     static func entries(_ entries: [HistoryEntry], filter: HistoryFilter, search: String) -> [HistoryEntry] {
         let query = normalized(search)
-        return entries.filter {
+        let matches = entries.filter {
             filter.includes($0) &&
-            (query.isEmpty || ($0.kind != .image && ($0.file?.originalFilename ?? $0.text).range(of: query, options: .caseInsensitive) != nil))
+            (query.isEmpty || $0.displayTitle?.range(of: query, options: .caseInsensitive) != nil ||
+             ($0.kind != .image && ($0.file?.originalFilename ?? $0.text).range(of: query, options: .caseInsensitive) != nil))
         }
+        return filter == .pinned ? HistoryEntry.orderedPins(matches) : matches
     }
 }

@@ -71,7 +71,7 @@ struct BackupManifest: Codable {
     let entries: [HistoryEntry]
 
     func validate() throws {
-        guard (1...2).contains(formatVersion), createdAt.timeIntervalSince1970.isFinite,
+        guard (1...3).contains(formatVersion), createdAt.timeIntervalSince1970.isFinite,
               itemCount == entries.count else { throw BackupError.manifest }
         var texts = Set<Data>()
         var hashes = Set<String>()
@@ -138,7 +138,7 @@ final class ValidatedBackup {
 
 enum HistoryBackup {
     static let magic = Data("CLIPPLUS".utf8)
-    static let version: UInt64 = 2
+    static let version: UInt64 = 3
     static let chunkSize = 64 * 1024
     // Only JSON metadata is buffered. Bound untrusted length before allocating it.
     static let maximumManifestBytes = 64 * 1024 * 1024
@@ -154,7 +154,7 @@ enum HistoryBackup {
         var succeeded = false
         defer { if !succeeded { temporaryFiles.remove(url) } }
         try cancellation.check()
-        let outputVersion = entries.contains { $0.kind == .file } ? 2 : 1
+        let outputVersion = entries.contains { $0.needsTemplateBackupFormat } ? 3 : (entries.contains { $0.kind == .file } ? 2 : 1)
         let manifest = BackupManifest(formatVersion: outputVersion, createdAt: createdAt, itemCount: entries.count, entries: entries)
         try manifest.validate()
         let encoder = JSONEncoder()
@@ -333,11 +333,13 @@ enum HistoryBackup {
 extension HistoryEntry {
     func with(file: HistoryFile) -> HistoryEntry {
         HistoryEntry(id: id, kind: kind, text: text, savedAt: savedAt, lastCollectedAt: lastCollectedAt,
-                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image, file: file)
+                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image, file: file,
+                     title: title, pinOrder: pinOrder)
     }
 
     func with(image: HistoryImage) -> HistoryEntry {
         HistoryEntry(id: id, kind: kind, text: text, savedAt: savedAt, lastCollectedAt: lastCollectedAt,
-                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image, file: file)
+                     collectionCount: collectionCount, isPinned: isPinned, source: source, image: image, file: file,
+                     title: title, pinOrder: pinOrder)
     }
 }

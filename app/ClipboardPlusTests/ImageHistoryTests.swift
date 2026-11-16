@@ -220,7 +220,7 @@ final class ImageHistoryTests: XCTestCase {
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
-    func testVersionTwoExportContainsImageMetadataAndNoImagePayload() throws {
+    func testExportContainsImageMetadataPinOrderAndNoImagePayload() throws {
         let directory = try ImageTestSupport.directory(self)
         let files = HistoryImageFiles(directory: directory.appendingPathComponent("images"))
         let database = try HistoryDatabase(url: directory.appendingPathComponent("history.sqlite"))
@@ -229,7 +229,7 @@ final class ImageHistoryTests: XCTestCase {
         try database.togglePin(id: entry.id)
         let data = try HistoryExport.data(entries: database.fetchAll(), exportedAt: Date())
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(root["formatVersion"] as? Int, 2)
+        XCTAssertEqual(root["formatVersion"] as? Int, 4)
         let row = try XCTUnwrap((root["entries"] as? [[String: Any]])?.first)
         XCTAssertEqual(row["kind"] as? String, "image")
         XCTAssertEqual(row["collectionCount"] as? Int, 1)

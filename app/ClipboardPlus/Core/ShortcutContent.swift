@@ -50,13 +50,19 @@ enum ShortcutContent {
 
     static func matchingEntries(_ entries: [HistoryEntry], filter: HistoryFilter = .all,
                                 search: String) -> [HistoryEntry] {
-        HistoryFilter.entries(entries, filter: filter, search: search).sorted {
+        let query = HistoryFilter.normalized(search)
+        let ordered = entries.sorted {
             if $0.lastCollectedAt != $1.lastCollectedAt { return $0.lastCollectedAt > $1.lastCollectedAt }
             return $0.id > $1.id
         }
+        let matches = HistoryFilter.entries(ordered, filter: filter, search: search)
+        guard !query.isEmpty else { return matches }
+        let exact: (HistoryEntry) -> Bool = { $0.displayTitle?.compare(query, options: .caseInsensitive) == .orderedSame }
+        return matches.filter(exact) + matches.filter { !exact($0) }
     }
 
     static func title(_ entry: HistoryEntry) -> String {
+        if let title = entry.displayTitle { return title }
         if let file = entry.file { return file.displayName }
         if entry.kind == .image {
             if let image = entry.image { return "画像 \(image.pixelWidth)×\(image.pixelHeight)" }

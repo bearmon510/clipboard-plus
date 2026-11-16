@@ -118,6 +118,7 @@ struct EntryDetailView: View {
         case .manual: return "ペースト"
         case .drag: return "ドラッグ"
         case .capture: return "切り取り"
+        case .written: return "アプリで作成"
         }
     }
 }

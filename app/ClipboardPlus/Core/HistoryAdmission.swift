@@ -28,7 +28,8 @@ struct HistoryAdmission {
         if latestExport.map({ $0.utf8.elementsEqual(text.utf8) }) == true
             || (!backupExportDigests.isEmpty && backupExportDigests.contains(HistoryBackup.digest(Data(text.utf8))))
             || text.hasPrefix("CLIPPLUS\0\0\0\0\0\0\0\u{1}")
-            || text.hasPrefix("CLIPPLUS\0\0\0\0\0\0\0\u{2}") {
+            || text.hasPrefix("CLIPPLUS\0\0\0\0\0\0\0\u{2}")
+            || text.hasPrefix("CLIPPLUS\0\0\0\0\0\0\0\u{3}") {
             return .skip(reason: "このアプリが書き出した内容")
         }
         if isRepeated { return .skip(reason: "直前の内容と同じ") }
