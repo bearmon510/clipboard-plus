@@ -111,13 +111,13 @@ final class SyncDiskStore {
         if let old = state.partials.first(where: { $0.offer.id == offer.id }) {
             try SyncProtocol.require(old.offer == offer)
         } else {
+            let file = partial(offer.id)
+            try Data().write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             var evictedIDs: [UUID] = []
             while state.partials.count >= SyncProtocol.maxPending {
                 guard let oldestIndex = state.partials.indices.min(by: { state.partials[$0].created < state.partials[$1].created }) else { break }
                 evictedIDs.append(state.partials.remove(at: oldestIndex).offer.id)
             }
-            let file = partial(offer.id)
-            try Data().write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             state.partials.append(Partial(offer: offer, created: now))
             do { try save() }
             catch {

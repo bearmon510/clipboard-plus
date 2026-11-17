@@ -198,13 +198,14 @@ final class PCSyncControllerTests: XCTestCase {
         let storage: SyncStorageSwitch
         var creations: Int { link.starts }
         init(test: XCTestCase, prepaired: SyncPairing? = nil, storageFails: Bool = false,
-             readFails: Bool = false, beforeInit: ((URL, URL) throws -> Void)? = nil) throws {
+             readFails: Bool = false, retention: HistoryRetention = .never,
+             beforeInit: ((URL, URL) throws -> Void)? = nil) throws {
             root = try ImageTestSupport.directory(test)
             let suite = UUID().uuidString
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             let defaults = self.defaults
             test.addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
-            HistoryRetention.never.save(to: defaults)
+            retention.save(to: defaults)
             keys = SyncTestKeys(); keys.readFails = readFails
             link = SyncTestLink(); board = SyncTestPasteboard()
             storage = SyncStorageSwitch(storageFails)
@@ -243,11 +244,11 @@ final class PCSyncControllerTests: XCTestCase {
         }
     }
     @MainActor
-    private func awaitSave(_ fixture: Fixture, savedCount: Int) async {
+    private func awaitSave(_ fixture: Fixture, savedCount: Int, timeout: TimeInterval = 15) async {
         if fixture.monitor.savedCount < savedCount {
             let done = expectation(description: "saved \(savedCount)")
             let cancellable = fixture.monitor.$savedCount.first { $0 >= savedCount }.sink { _ in done.fulfill() }
-            await fulfillment(of: [done], timeout: 5)
+            await fulfillment(of: [done], timeout: timeout)
             cancellable.cancel()
         }
         await drain(fixture)
@@ -766,7 +767,11 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.pendingCount, 0)
     }
 
-    private func makeGrayImageData(width: Int, height: Int, type: UTType) throws -> Data {
+    private static let oversizedPng: Result<Data, Error> = Result {
+        try makeGrayImageData(width: 10_000, height: 4_001, type: .png)
+    }
+
+    private static func makeGrayImageData(width: Int, height: Int, type: UTType) throws -> Data {
         let bytes = Data(count: width * height)
         let provider = try XCTUnwrap(CGDataProvider(data: bytes as CFData))
         let cgImage = try XCTUnwrap(CGImage(
@@ -777,7 +782,7 @@ final class PCSyncControllerTests: XCTestCase {
         let output = NSMutableData()
         let destination = try XCTUnwrap(CGImageDestinationCreateWithData(output as CFMutableData, type.identifier as CFString, 1, nil))
         CGImageDestinationAddImage(destination, cgImage, nil)
-        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        try SyncProtocol.require(CGImageDestinationFinalize(destination), .format)
         return output as Data
     }
 
@@ -878,11 +883,11 @@ final class PCSyncControllerTests: XCTestCase {
     func testOversizedPngAndJpegAreNotQueuedOrSentToPC() async throws {
         let f = try Fixture(test: self), pairing = try pair(f)
         try f.link.connect(pairing, limit: 512)
-        let bigPng = try makeGrayImageData(width: 10_000, height: 4_001, type: .png)
-        let bigJpeg = try makeGrayImageData(width: 10_000, height: 4_001, type: .jpeg)
-        f.monitor.saveManually([makeImageProvider(data: bigPng, type: "public.png")], receivedAt: Date())
+        let bigPng = try Self.oversizedPng.get()
+        let bigJpeg = try Self.makeGrayImageData(width: 10_000, height: 4_001, type: .jpeg)
+        f.monitor.saveManually([makeImageProvider(data: bigPng, type: "public.png")], receivedAt: f.clock.date)
         await awaitSave(f, savedCount: 1)
-        f.monitor.saveManually([makeImageProvider(data: bigJpeg, type: "public.jpeg")], receivedAt: Date().addingTimeInterval(1))
+        f.monitor.saveManually([makeImageProvider(data: bigJpeg, type: "public.jpeg")], receivedAt: f.clock.date.addingTimeInterval(1))
         await awaitSave(f, savedCount: 2)
         XCTAssertEqual(f.monitor.entries.count, 2)
         XCTAssertEqual(f.controller.pendingCount, 0)
@@ -897,7 +902,7 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.connect(pairing, limit: 512)
         f.controller.copiesReceivedToPasteboard = false
 
-        let bigPng = try makeGrayImageData(width: 10_000, height: 4_001, type: .png)
+        let bigPng = try Self.oversizedPng.get()
         let smallJpeg = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image { context in
             UIColor.blue.setFill(); context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
         }.jpegData(compressionQuality: 0.8))
@@ -1043,23 +1048,36 @@ final class PCSyncControllerTests: XCTestCase {
     @MainActor
     func testResumeAtOrBeyondItemSizeIsRejectedImmediately() async throws {
         let f = try Fixture(test: self), pairing = try pair(f)
-        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(repeating: 1, count: 10), name: "ten.bin")], receivedAt: Date())
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(repeating: 1, count: 10), name: "ten.bin")], receivedAt: f.clock.date)
         await awaitSave(f, savedCount: 1)
         try f.link.connect(pairing, limit: 512)
         let tenOffer = try XCTUnwrap(f.link.offers.first)
+        f.link.canSend = false
         try f.link.send(.resume(id: tenOffer.id, offset: 10))
         XCTAssertEqual(f.link.rejected, [false])
+
+        try f.link.connect(pairing, limit: 512)
+        f.link.canSend = false
+        try f.link.send(.resume(id: tenOffer.id, offset: 11))
+        XCTAssertEqual(f.link.rejected, [false, false])
+
         try f.link.connect(pairing, limit: 512)
         try f.link.send(.ack(ids: [tenOffer.id]))
 
-        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(), name: "zero.bin")], receivedAt: Date().addingTimeInterval(1))
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(), name: "zero.bin")], receivedAt: f.clock.date.addingTimeInterval(1))
         await awaitSave(f, savedCount: 2)
-        // The reconnect offers ten.bin again, because it was not acknowledged before the drop.
-        XCTAssertEqual(f.link.offers.map(\.filename), ["ten.bin", "ten.bin", "zero.bin"])
+        // Reconnects re-offer ten.bin until acknowledged.
+        XCTAssertEqual(f.link.offers.map(\.filename), ["ten.bin", "ten.bin", "ten.bin", "zero.bin"])
         let zeroOffer = try XCTUnwrap(f.link.offers.last)
         XCTAssertEqual(zeroOffer.size, 0)
+        f.link.canSend = false
         try f.link.send(.resume(id: zeroOffer.id, offset: 0))
-        XCTAssertEqual(f.link.rejected, [false, false])
+        XCTAssertEqual(f.link.rejected, [false, false, false])
+
+        await drain(f)
+        let log = try String(contentsOf: f.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        XCTAssertTrue(log.contains("受信・接続確認失敗"))
+        XCTAssertFalse(log.contains("送信フレーム作成失敗"))
     }
 
     @MainActor
@@ -1173,5 +1191,135 @@ final class PCSyncControllerTests: XCTestCase {
             if case let .item(_, _, _, text) = $0 { return text == "未来の文章" }
             return false
         })
+    }
+
+    @MainActor
+    func testRemovalBeforeInitialHistoryLoadDoesNotPrunePendingItems() async throws {
+        let pairing = try SyncPairing.create(name: "PC")
+        let now = Date()
+        let f = try Fixture(test: self, prepaired: pairing, storageFails: true, readFails: false, retention: .oneDay) { dbURL, syncDir in
+            let db = try HistoryDatabase(url: dbURL)
+            let kept = try db.collect("残る項目", source: .manual, at: now)
+            _ = try db.collect("期限切れ項目", source: .manual, at: now.addingTimeInterval(-2 * 24 * 60 * 60))
+            let disk = SyncDiskStore(root: syncDir)
+            try disk.load(pairId: pairing.pcId, now: now)
+            let ms = Int64(now.timeIntervalSince1970 * 1000)
+            try disk.enqueue(SyncPending(id: UUID(), historyID: kept.id, at: ms, offer: nil), bytes: Data("残る項目".utf8), now: now)
+        }
+        await drain(f)
+        XCTAssertTrue(f.monitor.entries.isEmpty)
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        f.storage.fails = false
+        // Foreground transition triggers store.maintain(forceRetention: true), emitting .remove before .replace.
+        f.monitor.updateScene("active")
+        await drain(f)
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        try f.link.connect(pairing)
+        XCTAssertTrue(f.link.items.isEmpty)
+
+        let sent = expectation(description: "kept item sent after full history load")
+        let obs = f.controller.$lastSentAt.first { $0 != nil }.sink { _ in sent.fulfill() }
+        NotificationCenter.default.post(name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        await fulfillment(of: [sent], timeout: 5)
+        obs.cancel()
+        await drain(f)
+        XCTAssertEqual(f.link.items.count, 1)
+        if case let .item(_, _, _, text) = try XCTUnwrap(f.link.items.first) {
+            XCTAssertEqual(text, "残る項目")
+        }
+    }
+
+    @MainActor
+    func testPruneFailureAfterHistoryLoadRetriesInCheckTimeoutsAndStartsSending() async throws {
+        let pairing = try SyncPairing.create(name: "PC")
+        let now = Date()
+        var syncDirectory: URL?
+        let f = try Fixture(test: self, prepaired: pairing) { dbURL, syncDir in
+            syncDirectory = syncDir
+            let db = try HistoryDatabase(url: dbURL)
+            let kept = try db.collect("送る項目", source: .manual, at: now)
+            let deleted = try db.collect("消えた項目", source: .manual, at: now)
+            try db.delete(id: deleted.id)
+            let disk = SyncDiskStore(root: syncDir)
+            try disk.load(pairId: pairing.pcId, now: now)
+            let ms = Int64(now.timeIntervalSince1970 * 1000)
+            try disk.enqueue(SyncPending(id: UUID(), historyID: deleted.id, at: ms, offer: nil), bytes: Data("消えた項目".utf8), now: now)
+            try disk.enqueue(SyncPending(id: UUID(), historyID: kept.id, at: ms + 1, offer: nil), bytes: Data("送る項目".utf8), now: now)
+        }
+        let syncDir = try XCTUnwrap(syncDirectory)
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: syncDir.path) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: syncDir.path)
+        await drain(f)
+
+        try f.link.connect(pairing)
+        XCTAssertTrue(f.link.items.isEmpty)
+        XCTAssertEqual(f.controller.pendingCount, 2)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: syncDir.path)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.pendingCount, 1)
+        XCTAssertEqual(f.link.items.count, 1)
+        if case let .item(_, _, _, text) = try XCTUnwrap(f.link.items.first) {
+            XCTAssertEqual(text, "送る項目")
+        }
+    }
+
+    @MainActor
+    func testUnpairedStartupDoesNotLoadHistoryForSyncAndUnlockDoesNotDuplicateRetry() async throws {
+        let unpaired = try Fixture(test: self, storageFails: true)
+        await drain(unpaired)
+        let unpairedLog = try String(contentsOf: unpaired.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        XCTAssertFalse(unpairedLog.contains("送信待ち確認失敗; 理由=履歴読み込み"))
+
+        let pairing = try SyncPairing.create(name: "PC")
+        let locked = try Fixture(test: self, prepaired: pairing, storageFails: true, readFails: true)
+        await drain(locked)
+        let preUnlockLog = try String(contentsOf: locked.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        XCTAssertFalse(preUnlockLog.contains("送信待ち確認失敗; 理由=履歴読み込み"))
+
+        locked.keys.readFails = false
+        let failedOnce = expectation(description: "single post-unlock load failure logged")
+        let cancellable = locked.monitor.log.$lines.first { lines in
+            lines.contains { $0.fileLine.contains("送信待ち確認失敗; 理由=履歴読み込み") }
+        }.sink { _ in failedOnce.fulfill() }
+        NotificationCenter.default.post(name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        await fulfillment(of: [failedOnce], timeout: 5)
+        cancellable.cancel()
+        await drain(locked)
+        let postUnlockLog = try String(contentsOf: locked.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        let failures = postUnlockLog.components(separatedBy: "送信待ち確認失敗; 理由=履歴読み込み").count - 1
+        XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
+    func testFinishIncomingDoesNotClearOutgoingTransferProgress() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(repeating: 1, count: 10), name: "local.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+        try f.link.connect(pairing, limit: 512)
+        f.controller.copiesReceivedToPasteboard = false
+        let localOffer = try XCTUnwrap(f.link.offers.first)
+
+        let png = ImageTestSupport.png()
+        let remoteOffer = SyncOffer(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000), from: "pc", kind: "image",
+            size: png.count, sha256: SyncEchoGuard.hash(png), name64: "", type: "public.png")
+        try f.link.send(.offer(remoteOffer))
+        try f.link.send(.chunk(id: remoteOffer.id, offset: 0, data: png))
+        XCTAssertEqual(f.controller.transferProgress,
+            PCSyncController.TransferProgress(direction: "receive", itemID: remoteOffer.id, bytes: png.count, totalBytes: png.count))
+
+        // Outgoing send begins while incoming attachment save is still running on HistoryStore's queue.
+        try f.link.send(.resume(id: localOffer.id, offset: 0))
+        let expectedSend = PCSyncController.TransferProgress(direction: "send", itemID: localOffer.id, bytes: 10, totalBytes: 10)
+        XCTAssertEqual(f.controller.transferProgress, expectedSend)
+
+        await drain(f)
+        XCTAssertTrue(f.link.ackIDs.contains(remoteOffer.id))
+        XCTAssertEqual(f.controller.transferProgress, expectedSend)
+
+        try f.link.send(.ack(ids: [localOffer.id]))
+        XCTAssertNil(f.controller.transferProgress)
     }
 }

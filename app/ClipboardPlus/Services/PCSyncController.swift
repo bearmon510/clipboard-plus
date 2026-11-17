@@ -100,7 +100,6 @@ final class PCSyncController: ObservableObject {
             self.pruneWithHistoryIDs(ids)
         }
         restorePairing()
-        if !historyLoaded { loadHistoryForSync() }
         unlockObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -145,8 +144,14 @@ final class PCSyncController: ObservableObject {
         catch { record("鍵の削除待ち; ロック解除後に再試行") }
     }
     private func handleProtectedDataAvailable() {
+        let wasPaired = pairing != nil
         restorePairing()
-        if pairing != nil, !historyReady { loadHistoryForSync(retryOnUnlock: true) }
+        guard wasPaired, pairing != nil, !historyReady else { return }
+        if historyLoaded {
+            pruneWithHistoryIDs(Set(monitor.entries.map(\.id)))
+        } else {
+            loadHistoryForSync(retryOnUnlock: true)
+        }
     }
     private func loadHistoryForSync(retryOnUnlock: Bool = false) {
         if historyLoading {
@@ -158,11 +163,13 @@ final class PCSyncController: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let entries = try await self.monitor.historyForShortcuts()
+                _ = try await self.monitor.historyForShortcuts()
                 self.historyLoading = false
                 self.needsHistoryRetry = false
                 self.historyLoaded = true
-                if self.pairing != nil { self.pruneWithHistoryIDs(Set(entries.map(\.id))) }
+                if self.pairing != nil, !self.historyReady {
+                    self.pruneWithHistoryIDs(Set(self.monitor.entries.map(\.id)))
+                }
             } catch {
                 self.historyLoading = false
                 self.record("送信待ち確認失敗; 理由=履歴読み込み")
@@ -496,7 +503,7 @@ final class PCSyncController: ObservableObject {
         do { url = try disk.verified(offer) }
         catch {
             try? disk.discard(offer.id)
-            transferProgress = nil
+            clearReceiveProgress(for: offer.id)
             throw error
         }
         receiving.insert(offer.id)
@@ -510,11 +517,11 @@ final class PCSyncController: ObservableObject {
                 do { try self.disk.markSeen(offer.id); try self.disk.discard(offer.id) }
                 catch {
                     try? self.disk.discard(offer.id)
-                    self.transferProgress = nil
+                    self.clearReceiveProgress(for: offer.id)
                     self.fail(reject: false, reason: "受信確認保存失敗")
                     return
                 }
-                self.transferProgress = nil
+                self.clearReceiveProgress(for: offer.id)
                 if case .rejected(let reason) = outcome {
                     self.record("受信見送り; 理由=\(reason.rawValue); 件数=1")
                 } else {
@@ -523,9 +530,14 @@ final class PCSyncController: ObservableObject {
                 if self.status == .connected { self.queueAck(offer.id) }
             case .failed:
                 try? self.disk.discard(offer.id)
-                self.transferProgress = nil
+                self.clearReceiveProgress(for: offer.id)
                 self.fail(reject: false, reason: "受信履歴保存失敗")
             }
+        }
+    }
+    private func clearReceiveProgress(for id: UUID) {
+        if transferProgress?.direction == "receive", transferProgress?.itemID == id {
+            transferProgress = nil
         }
     }
     private func queueReply(_ message: SyncMessage) throws {
@@ -546,7 +558,13 @@ final class PCSyncController: ObservableObject {
     func checkTimeouts() {
         deleteKeyIfPending()
         let date = now()
-        if pairing != nil { do { try disk.prune(now: date); refreshPending() } catch { record("送信待ち保存失敗") } }
+        if pairing != nil {
+            if historyLoaded, !historyReady {
+                pruneWithHistoryIDs(Set(monitor.entries.map(\.id)))
+            } else {
+                do { try disk.prune(now: date); refreshPending() } catch { record("送信待ち保存失敗") }
+            }
+        }
         if let start = handshakeStart, date.timeIntervalSince(start) > 30 {
             fail(reject: true, countFailure: true, reason: "接続確認期限")
         } else if let start = partialStart, date.timeIntervalSince(start) > 60 {

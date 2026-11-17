@@ -874,9 +874,14 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     private func handleStorageEvent(_ event: HistoryStore.Event) {
         switch event {
-        case .replace(let values): entries = values; onHistoryIDsForPC?(Set(values.map(\.id)))
+        case .replace(let values):
+            entries = values
+            needsHistoryLoad = false
+            onHistoryIDsForPC?(Set(values.map(\.id)))
         case .upsert(let entry): HistoryList.upsert(entry, into: &entries)
-        case .remove(let id): entries.removeAll { $0.id == id }; onHistoryIDsForPC?(Set(entries.map(\.id)))
+        case .remove(let id):
+            entries.removeAll { $0.id == id }
+            if !needsHistoryLoad { onHistoryIDsForPC?(Set(entries.map(\.id))) }
         case .saved(let entry, let retried):
             pendingSaveCount -= 1
             savedCount += 1

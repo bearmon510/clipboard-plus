@@ -178,4 +178,32 @@ final class SyncStorageTests: XCTestCase {
         XCTAssertTrue(echo.observe(kind: "text", hash: hashes[500]))
         XCTAssertFalse(echo.observe(kind: "text", hash: hashes[1]))
     }
+
+    func testBeginFailureBeforeWritingPartPreservesExistingPartials() throws {
+        let root = try directory(), pair = UUID(), now = Date()
+        let disk = SyncDiskStore(root: root); try disk.load(pairId: pair, now: now)
+        let sha = SyncEchoGuard.hash(Data([1]))
+        var created: [SyncOffer] = []
+        for index in 0..<SyncProtocol.maxPending {
+            let offer = SyncOffer(id: UUID(), at: Int64(index), from: "pc", kind: "file", size: 1,
+                sha256: sha, name64: Data("f\(index).txt".utf8).base64EncodedString(), type: "public.data")
+            created.append(offer)
+            XCTAssertEqual(try disk.begin(offer, now: now.addingTimeInterval(Double(index))), 0)
+        }
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: root.path)
+
+        let extra = SyncOffer(id: UUID(), at: 999, from: "pc", kind: "file", size: 1,
+            sha256: sha, name64: Data("extra.txt".utf8).base64EncodedString(), type: "public.data")
+        XCTAssertThrowsError(try disk.begin(extra, now: now.addingTimeInterval(500)))
+        XCTAssertEqual(disk.state.partials.count, SyncProtocol.maxPending)
+        XCTAssertTrue(disk.state.partials.contains { $0.offer.id == created[0].id })
+        XCTAssertFalse(disk.state.partials.contains { $0.offer.id == extra.id })
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
+        XCTAssertEqual(try disk.begin(extra, now: now.addingTimeInterval(500)), 0)
+        XCTAssertEqual(disk.state.partials.count, SyncProtocol.maxPending)
+        XCTAssertFalse(disk.state.partials.contains { $0.offer.id == created[0].id })
+        XCTAssertTrue(disk.state.partials.contains { $0.offer.id == extra.id })
+    }
 }
