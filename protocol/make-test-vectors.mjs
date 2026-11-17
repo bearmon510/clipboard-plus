@@ -48,7 +48,8 @@ function plaintext(header, body = '') {
 const messages = {
   item: plaintext({ t:'item', id, kind:'text', at:1794873600123, from:'pad' }, 'こんにちは、Windows！\n2行目: 📋😊\n' + '同期の試験です。'.repeat(8)),
   ack: plaintext({ t:'ack', ids:[id,id2] }),
-  ping: plaintext({ t:'ping' })
+  ping: plaintext({ t:'ping' }),
+  pong: plaintext({ t:'pong' })
 };
 function frame(direction, sequence, message) {
   const seq = Buffer.alloc(8); seq.writeBigUInt64BE(BigInt(sequence));
@@ -63,7 +64,7 @@ function frame(direction, sequence, message) {
   return { direction, sequence:String(sequence), message, nonceHex:hex(nonce), aadHex:hex(aad), ciphertextHex:hex(encrypted), tagHex:hex(tag), frameHex:hex(result) };
 }
 // Each direction is one independent session; sequence 0 and 1 never reuse a nonce/key.
-const frames = [frame('pad->pc',0,'item'), frame('pad->pc',1,'ping'), frame('pc->pad',0,'ack'), frame('pc->pad',1,'ping')];
+const frames = [frame('pad->pc',0,'item'), frame('pad->pc',1,'ping'), frame('pc->pad',0,'ack'), frame('pc->pad',1,'pong')];
 function split(frame, limit) {
   const result = [];
   for (let i = 0; i < frame.length; i += limit - 1) {
@@ -87,7 +88,7 @@ const vectors = {
   pairing:{ qr, parsed:parsePair(qr) },
   handshake:{ keyHex:hex(key), padId, pcId, niHex:hex(ni), npHex:hex(np), helloHex:hex(hello), welcomeHex:hex(welcome), authHex:hex(auth), pcHmacHex:hex(pcHmac), padHmacHex:hex(padHmac), padToPcKeyHex:hex(keys['pad->pc']), pcToPadKeyHex:hex(keys['pc->pad']) },
   messages, frames,
-  fragmentation:[20,182].map(packetLimit => ({ frameIndex:0, packetLimit, packetsHex:split(bytes(frames[0].frameHex),packetLimit) })),
+  fragmentation:[20,182,512].map(packetLimit => ({ frameIndex:0, packetLimit, packetsHex:split(bytes(frames[0].frameHex),packetLimit) })),
   failures:{
     tamperedTag:{ direction:'pad->pc', frameHex:hex(badTag), error:'authentication' },
     rollback:{ direction:'pad->pc', framesHex:[frames[1].frameHex,frames[0].frameHex], error:'sequence' },
@@ -99,4 +100,4 @@ const vectors = {
   }
 };
 writeFileSync(new URL('./test-vectors.json',import.meta.url), JSON.stringify(vectors,null,2)+'\n');
-console.log(`Generated ${frames.length} frames, ${Object.keys(messages).length} messages, 2 packet limits; crypto self-checks passed.`);
+console.log(`Generated ${frames.length} frames, ${Object.keys(messages).length} messages, 3 packet limits; crypto self-checks passed.`);

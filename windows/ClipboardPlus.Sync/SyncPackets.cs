@@ -27,10 +27,13 @@ public sealed class SyncPacketAssembler
     private readonly MemoryStream buffer = new();
     private bool active, failed;
     public bool HasPartialFrame => active;
-    public SyncPacketAssembler(int packetLimit)
+    private readonly int frameLimit;
+    public SyncPacketAssembler(int packetLimit, int frameLimit = SyncProtocol.MaxFrameBytes)
     {
         SyncProtocol.Require(packetLimit >= 2, SyncError.Limit);
         this.packetLimit = packetLimit;
+        SyncProtocol.Require(frameLimit is > 0 and <= SyncProtocol.MaxFrameBytes, SyncError.Limit);
+        this.frameLimit = frameLimit;
     }
     public byte[]? Append(ReadOnlySpan<byte> packet)
     {
@@ -42,7 +45,7 @@ public sealed class SyncPacketAssembler
             SyncProtocol.Require((flags & ~3) == 0, SyncError.Packet);
             var start = (flags & 1) != 0;
             SyncProtocol.Require(start != active, SyncError.Packet);
-            SyncProtocol.Require(buffer.Length + packet.Length - 1 <= SyncProtocol.MaxFrameBytes, SyncError.Limit);
+            SyncProtocol.Require(buffer.Length + packet.Length - 1 <= frameLimit, SyncError.Limit);
             active = true;
             buffer.Write(packet[1..]);
             if ((flags & 2) == 0) return null;

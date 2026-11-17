@@ -36,6 +36,9 @@ final class PCSyncController: ObservableObject {
     private var receiveStart: Date?
     private var receiveBytes = 0
     private var writeBlockedSince: Date?
+    private var lastActivity: Date?
+    private var pingRequestedAt: Date?
+    private var pingQueued = false
     private var timer: Timer?
     private var unlockObserver: NSObjectProtocol?
     private var pumping = false
@@ -112,6 +115,9 @@ final class PCSyncController: ObservableObject {
         deleteKeyIfPending()
         guard pairing == nil, !settings.deletionPending else { return }
         pcName = settings.pcName
+        // A fresh install (including the snapshot test host) has no pairing to restore.
+        // Avoid synchronous Keychain IPC and Bluetooth initialization in that case.
+        guard pcName != nil else { status = .unpaired; return }
         if pcName != nil { status = .searching }
         do {
             guard let key = try keyStore.read(), let value = try settings.load(key: key) else {
@@ -146,6 +152,7 @@ final class PCSyncController: ObservableObject {
         sessionGeneration = UUID()
         handshakeStart = nil; partialStart = nil; receiveStart = nil; receiveBytes = 0
         writeBlockedSince = nil
+        lastActivity = nil; pingRequestedAt = nil; pingQueued = false
         output = nil; controlFrames.removeAll(); ackQueue.removeAll()
         sentThisConnection.removeAll(); sentAt.removeAll()
     }
@@ -159,7 +166,7 @@ final class PCSyncController: ObservableObject {
             resetSession()
             do {
                 guard let pairing else { return }
-                writeLimit = limit; peerId = id
+                writeLimit = min(512, limit); peerId = id
                 assembler = try SyncPacketAssembler(packetLimit: receiveLimit)
                 handshake = try SyncPadHandshake(pairing: pairing, padId: settings.padId)
                 handshakeStart = now(); status = .connecting
@@ -210,6 +217,9 @@ final class PCSyncController: ObservableObject {
                             let ids = Array(ackQueue.prefix(SyncProtocol.maxAckIds))
                             ackQueue.removeFirst(ids.count)
                             frame = try sender.seal(SyncMessageCodec.encode(.ack(ids: ids)))
+                        } else if pingQueued {
+                            pingQueued = false
+                            frame = try sender.seal(SyncMessageCodec.encode(.ping))
                         } else if let index = pending.firstIndex(where: { !sentThisConnection.contains($0.id) }) {
                             id = pending[index].id
                             let retry = pending[index].attempts > 0
@@ -234,6 +244,7 @@ final class PCSyncController: ObservableObject {
                     if pending.contains(where: { $0.id == id }) { sentAt[id] = now() }
                     lastSentAt = now()
                 }
+                lastActivity = now()
                 transport.write(packet)
                 guard sessionGeneration == session else { return }
                 if finished {
@@ -248,7 +259,7 @@ final class PCSyncController: ObservableObject {
                 }
             }
             if writeBlockedSince == nil,
-               output != nil || !controlFrames.isEmpty || !ackQueue.isEmpty ||
+               output != nil || !controlFrames.isEmpty || !ackQueue.isEmpty || pingQueued ||
                 (status == .connected && pending.contains(where: { !sentThisConnection.contains($0.id) })) {
                 writeBlockedSince = now()
             }
@@ -261,6 +272,7 @@ final class PCSyncController: ObservableObject {
             if receiveStart == nil { receiveStart = now(); receiveBytes = 0 }
             receiveBytes += packet.count
             let frame = try assembler.append(packet)
+            lastActivity = now()
             partialStart = assembler.hasPartialFrame ? now() : nil
             guard let frame else { return }
             let start = receiveStart ?? now(), bytes = receiveBytes
@@ -304,6 +316,8 @@ final class PCSyncController: ObservableObject {
                     pending.remove(at: index); sentThisConnection.remove(id)
                 }
             case .ping: break
+            case .pong:
+                if !pingQueued { pingRequestedAt = nil }
             }
         } catch { fail(reject: status != .connected, reason: "受信・接続確認失敗") }
     }
@@ -330,6 +344,14 @@ final class PCSyncController: ObservableObject {
             fail(reject: false, reason: "送信準備待ち期限")
         } else if sentAt.values.contains(where: { date.timeIntervalSince($0) > 60 }) {
             fail(reject: false, reason: "ack期限")
+        } else if let start = pingRequestedAt, date.timeIntervalSince(start) >= 10 {
+            fail(reject: false, reason: "pong期限")
+        } else if status == .connected, pingRequestedAt == nil,
+                  let lastActivity, date.timeIntervalSince(lastActivity) >= 30 {
+            // Start the deadline before pump: even a synchronous test reply can clear it.
+            // A stalled write queue must not leave a liveness probe pending indefinitely.
+            pingRequestedAt = date; pingQueued = true
+            pump()
         }
     }
     private func milliseconds(since date: Date) -> Int { Int(max(0, now().timeIntervalSince(date)) * 1000) }

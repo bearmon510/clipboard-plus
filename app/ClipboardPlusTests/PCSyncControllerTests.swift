@@ -6,7 +6,8 @@ import XCTest
 private final class SyncTestKeys: PCSyncKeyStore {
     var key: Data?
     var fails = false
-    func read() throws -> Data? { key }
+    var reads = 0
+    func read() throws -> Data? { reads += 1; return key }
     func write(_ key: Data) throws {
         if fails { throw SyncProtocolError.state }
         self.key = key
@@ -53,6 +54,7 @@ private final class SyncTestLink: PCSyncTransport {
     var authenticatedId: UUID?
     var acceptedPadIds: [UUID] = []
     var corruptWelcome = false
+    var dropsNotifications = false
     var stopAfterPackets: Int?
     private var pc: SyncPcHandshake?
     private var assembler: SyncPacketAssembler?
@@ -102,7 +104,8 @@ private final class SyncTestLink: PCSyncTransport {
     }
     func send(_ message: SyncMessage) throws {
         let sender = try XCTUnwrap(sender)
-        try deliver(sender.seal(SyncMessageCodec.encode(message)))
+        let frame = try sender.seal(SyncMessageCodec.encode(message))
+        if !dropsNotifications { try deliver(frame) }
     }
     func sendInvalidPlaintext() throws {
         let sender = try XCTUnwrap(sender)
@@ -168,12 +171,12 @@ final class PCSyncControllerTests: XCTestCase {
         }
     }
     @MainActor
-    private func drain(_ fixture: Fixture) {
+    private func drain(_ fixture: Fixture) async {
         let done = expectation(description: "history and log committed")
         fixture.monitor.pendingDeletion { _ in
             fixture.monitor.log.flush(context: fixture.monitor.logContext()) { done.fulfill() }
         }
-        wait(for: [done], timeout: 5)
+        await fulfillment(of: [done], timeout: 5)
     }
     @MainActor
     private func pair(_ fixture: Fixture) throws -> SyncPairing {
@@ -187,10 +190,11 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testPairingValidationLazyBluetoothStorageAndUnpair() throws {
+    func testPairingValidationLazyBluetoothStorageAndUnpair() async throws {
         let f = try Fixture(test: self)
         XCTAssertEqual(f.controller.status, .unpaired)
         XCTAssertEqual(f.creations, 0)
+        XCTAssertEqual(f.keys.reads, 0, "Unpaired initialization must not call Keychain")
         XCTAssertTrue(f.controller.copiesReceivedToPasteboard)
         f.controller.copiesReceivedToPasteboard = false
         XCTAssertFalse(PCSyncSettings(defaults: f.defaults).copiesReceivedToPasteboard)
@@ -217,7 +221,7 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testStoredPairingStartsAutomaticallyAndAuthenticatesFreshSessions() throws {
+    func testStoredPairingStartsAutomaticallyAndAuthenticatesFreshSessions() async throws {
         let pairing = try SyncPairing.create(name: "PC")
         let f = try Fixture(test: self, prepaired: pairing)
         XCTAssertEqual(f.creations, 1)
@@ -233,7 +237,7 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testHandshakeFailureRejectsPeerAndNeverSendsPendingText() throws {
+    func testHandshakeFailureRejectsPeerAndNeverSendsPendingText() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         f.monitor.saveManually(["pending"], receivedAt: Date())
@@ -242,11 +246,11 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.link.rejected, [true])
         XCTAssertNil(PCSyncSettings(defaults: f.defaults).peripheralId)
         XCTAssertTrue(f.link.items.isEmpty)
-        drain(f)
+        await drain(f)
     }
 
     @MainActor
-    func testSendAckFlowControlReconnectAndRepeatedCollection() throws {
+    func testSendAckFlowControlReconnectAndRepeatedCollection() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing, limit: 20)
@@ -268,12 +272,12 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.link.items.count, 3)
         XCTAssertNotEqual(try itemID(f.link.items[2]), id)
         XCTAssertNotNil(f.controller.lastSentAt)
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 2)
     }
 
     @MainActor
-    func testReceivedTextIsPCSourceDeduplicatedNotEchoedOrCollectedTwice() throws {
+    func testReceivedTextIsPCSourceDeduplicatedNotEchoedOrCollectedTwice() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
@@ -285,7 +289,7 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.send(message)
         try f.link.send(message) // Duplicate while the original write is in flight.
         XCTAssertFalse(f.link.ackIDs.contains(id), "ACK must follow storage commit")
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.monitor.entries.count, 1)
         XCTAssertEqual(f.monitor.entries.first?.source, .pc)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 1)
@@ -293,7 +297,7 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertTrue(f.link.ackIDs.contains(id))
         f.monitor.pollPasteboard()
         try f.link.send(message)
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 1)
         XCTAssertTrue(f.link.items.isEmpty)
         XCTAssertNotNil(f.controller.lastReceivedAt)
@@ -304,25 +308,25 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertFalse(log.contains(id.uuidString))
         // A NEW item with identical text is a real collection, not an ID replay.
         try f.link.send(.item(id: UUID(), at: 1, from: "pc", text: secret))
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 2)
         // A later local copy of identical text still gets sent.
-        f.board.string = secret; f.monitor.pollPasteboard(); drain(f)
+        f.board.string = secret; f.monitor.pollPasteboard(); await drain(f)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 3)
         XCTAssertEqual(f.link.items.count, 1)
     }
 
     @MainActor
-    func testRemoteHistoryAndTemplateCardsDoNotEchoLocalCardsDo() throws {
+    func testRemoteHistoryAndTemplateCardsDoNotEchoLocalCardsDo() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
         try f.link.send(.item(id: UUID(), at: 0, from: "pc", text: "PCのカード"))
-        drain(f)
+        await drain(f)
         f.monitor.copy(try XCTUnwrap(f.monitor.entries.first))
         XCTAssertTrue(f.link.items.isEmpty)
         f.monitor.saveManually(["ローカルカード"], receivedAt: Date())
-        drain(f)
+        await drain(f)
         let local = try XCTUnwrap(f.monitor.entries.first { $0.text == "ローカルカード" })
         f.monitor.copy(local)
         let done = expectation(description: "template")
@@ -330,12 +334,12 @@ final class PCSyncControllerTests: XCTestCase {
             if case .success(let entry) = result { f.monitor.copy(entry) } else { XCTFail("Template failed") }
             done.fulfill()
         }
-        wait(for: [done], timeout: 5)
+        await fulfillment(of: [done], timeout: 5)
         XCTAssertEqual(f.link.items.count, 3)
     }
 
     @MainActor
-    func testQueueKeepsNewestFiftyAndClearsOnUnpair() throws {
+    func testQueueKeepsNewestFiftyAndClearsOnUnpair() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         for index in 0..<52 { f.monitor.saveManually(["item \(index)"], receivedAt: Date()) }
@@ -346,24 +350,24 @@ final class PCSyncControllerTests: XCTestCase {
         try f.controller.pair(code: pairing.qrString())
         try f.link.connect(pairing)
         XCTAssertEqual(f.link.items.count, 50)
-        drain(f)
+        await drain(f)
     }
 
     @MainActor
-    func testReceiveSettingAndRefusedBackgroundWriteStillSaveAndAck() throws {
+    func testReceiveSettingAndRefusedBackgroundWriteStillSaveAndAck() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
         f.controller.copiesReceivedToPasteboard = false
         f.monitor.updateScene("active")
         try f.link.send(.item(id: UUID(), at: 0, from: "pc", text: "設定OFF"))
-        drain(f)
+        await drain(f)
         XCTAssertNil(f.board.string)
         f.controller.copiesReceivedToPasteboard = true
         f.monitor.updateScene("background")
         f.board.acceptsWrites = false
         try f.link.send(.item(id: UUID(), at: 0, from: "pc", text: "背景受信"))
-        drain(f)
+        await drain(f)
         XCTAssertNil(f.board.string)
         XCTAssertEqual(f.monitor.entries.count, 2)
         XCTAssertEqual(f.link.ackIDs.count, 2)
@@ -371,17 +375,17 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertTrue(log.contains("書き込みを確認できず"))
         f.board.acceptsWrites = true
         try f.link.send(.item(id: UUID(), at: 0, from: "pc", text: "背景で書ける場合"))
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.board.string, "背景で書ける場合")
         f.monitor.updateScene("active"); f.monitor.start()
         defer { f.monitor.stop() }
-        f.monitor.pollPasteboard(); drain(f)
+        f.monitor.pollPasteboard(); await drain(f)
         XCTAssertEqual(f.monitor.entries.count, 3)
         XCTAssertTrue(f.link.items.isEmpty)
     }
 
     @MainActor
-    func testMalformedPacketDisconnectsAndFailedKeyDeletionRetries() throws {
+    func testMalformedPacketDisconnectsAndFailedKeyDeletionRetries() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
@@ -398,7 +402,7 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testTimeoutsDiscardIncompleteFramesAndRetryUnackedItems() throws {
+    func testTimeoutsDiscardIncompleteFramesAndRetryUnackedItems() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
@@ -420,11 +424,11 @@ final class PCSyncControllerTests: XCTestCase {
         f.clock.date.addTimeInterval(61)
         f.controller.checkTimeouts()
         XCTAssertEqual(f.link.rejected, [false, false, false])
-        drain(f)
+        await drain(f)
     }
 
     @MainActor
-    func testUnpairedEventsAndFailedKeyWriteNeverStartBluetooth() throws {
+    func testUnpairedEventsAndFailedKeyWriteNeverStartBluetooth() async throws {
         let f = try Fixture(test: self)
         f.monitor.saveManually(["組にする前"], receivedAt: Date())
         let pairing = try SyncPairing.create(name: "PC")
@@ -438,16 +442,16 @@ final class PCSyncControllerTests: XCTestCase {
         try f.controller.pair(code: pairing.qrString())
         try f.link.connect(pairing)
         XCTAssertTrue(f.link.items.isEmpty)
-        drain(f)
+        await drain(f)
     }
 
     @MainActor
-    func testLinksAppearInShortcutsAndExportsContainOnlyHistory() throws {
+    func testLinksAppearInShortcutsAndExportsContainOnlyHistory() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
         try f.link.send(.item(id: UUID(), at: 0, from: "pc", text: "https://example.com/path"))
-        drain(f)
+        await drain(f)
         let entry = try XCTUnwrap(f.monitor.entries.first)
         XCTAssertEqual(entry.kind, .url)
         XCTAssertEqual(entry.source, .pc)
@@ -463,7 +467,7 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testReceiveDeduplicationKeepsTheLatestFiveHundredIDs() throws {
+    func testReceiveDeduplicationKeepsTheLatestFiveHundredIDs() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
@@ -473,19 +477,19 @@ final class PCSyncControllerTests: XCTestCase {
             for id in ids[start..<min(start + 25, ids.count)] {
                 try f.link.send(.item(id: id, at: 0, from: "pc", text: "同じ本文"))
             }
-            drain(f)
+            await drain(f)
         }
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 501)
         try f.link.send(.item(id: ids[500], at: 0, from: "pc", text: "同じ本文"))
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 501)
         try f.link.send(.item(id: ids[0], at: 0, from: "pc", text: "同じ本文"))
-        drain(f)
+        await drain(f)
         XCTAssertEqual(f.monitor.entries.first?.collectionCount, 502)
     }
 
     @MainActor
-    func testUnpairDuringSaveDoesNotWritePasteboardOrSendAckToNewPairing() throws {
+    func testUnpairDuringSaveDoesNotWritePasteboardOrSendAckToNewPairing() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
@@ -495,20 +499,20 @@ final class PCSyncControllerTests: XCTestCase {
         f.controller.unpair()
         try f.controller.pair(code: pairing.qrString())
         try f.link.connect(pairing)
-        drain(f)
+        await drain(f)
         XCTAssertNil(f.board.string)
         XCTAssertFalse(f.link.ackIDs.contains(id))
     }
 
     @MainActor
-    func testFailedHistoryCommitDoesNotAckOrWritePasteboard() throws {
+    func testFailedHistoryCommitDoesNotAckOrWritePasteboard() async throws {
         let f = try Fixture(test: self, storageFails: true)
         let pairing = try pair(f)
         try f.link.connect(pairing)
         f.monitor.updateScene("active")
         let id = UUID()
         try f.link.send(.item(id: id, at: 0, from: "pc", text: "保存に失敗する文章"))
-        drain(f)
+        await drain(f)
         XCTAssertFalse(f.link.ackIDs.contains(id))
         XCTAssertEqual(f.link.rejected, [false])
         XCTAssertNil(f.board.string)
@@ -517,7 +521,7 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testDecryptionMessageAndIdentityFailuresDisconnect() throws {
+    func testDecryptionMessageAndIdentityFailuresDisconnect() async throws {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         try f.link.connect(pairing)
@@ -530,5 +534,82 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.connect(differentPC)
         XCTAssertEqual(f.link.rejected, [false, false, true])
         XCTAssertTrue(f.link.items.isEmpty)
+    }
+
+    @MainActor
+    func testIdleProbeDetectsLostFirstNotificationAndReconnects() async throws {
+        let f = try Fixture(test: self)
+        let pairing = try pair(f)
+        try f.link.connect(pairing)
+        // AUTH is sent, but Windows' first encrypted notification never reaches iPad.
+        f.link.dropsNotifications = true
+        try f.link.send(.pong)
+        f.clock.date.addTimeInterval(29); f.controller.checkTimeouts()
+        XCTAssertTrue(f.link.messages.isEmpty)
+        f.clock.date.addTimeInterval(1); f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.messages, [.ping])
+        f.clock.date.addTimeInterval(9); f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        f.clock.date.addTimeInterval(1); f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
+        XCTAssertEqual(f.controller.status, .searching)
+        f.link.dropsNotifications = false
+        try f.link.connect(pairing)
+        f.clock.date.addTimeInterval(30); f.controller.checkTimeouts()
+        try f.link.send(.pong)
+        f.clock.date.addTimeInterval(10); f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertEqual(f.link.rejected, [false])
+    }
+
+    @MainActor
+    func testTrafficDefersPingButOnlyPongSatisfiesProbeAndPingDoesNotEcho() async throws {
+        let f = try Fixture(test: self)
+        let pairing = try pair(f)
+        try f.link.connect(pairing)
+        f.clock.date.addTimeInterval(20)
+        try f.link.send(.ping)
+        XCTAssertTrue(f.link.messages.isEmpty, "iPad must not answer ping")
+        f.clock.date.addTimeInterval(29); f.controller.checkTimeouts()
+        XCTAssertTrue(f.link.messages.isEmpty)
+        f.clock.date.addTimeInterval(1); f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.messages, [.ping])
+        f.clock.date.addTimeInterval(9)
+        try f.link.send(.ping)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.messages, [.ping])
+        f.clock.date.addTimeInterval(1); f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
+    }
+
+    @MainActor
+    func testPongResetsProbeAndDisconnectedSessionDiscardsItsDeadline() async throws {
+        let f = try Fixture(test: self)
+        let pairing = try pair(f)
+        try f.link.connect(pairing)
+        f.clock.date.addTimeInterval(30); f.controller.checkTimeouts()
+        f.clock.date.addTimeInterval(9); try f.link.send(.pong)
+        f.clock.date.addTimeInterval(29); f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.messages, [.ping])
+        f.clock.date.addTimeInterval(1); f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.messages, [.ping, .ping])
+        f.link.disconnect(); try f.link.connect(pairing)
+        f.clock.date.addTimeInterval(10); f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+    }
+
+    @MainActor
+    func testWritesNeverExceed512EvenWhenTransportReportsLargerLimit() async throws {
+        for limit in [511, 512, 514] {
+            let f = try Fixture(test: self)
+            let pairing = try pair(f)
+            try f.link.connect(pairing, limit: limit)
+            f.link.packets.removeAll()
+            f.monitor.saveManually([String(repeating: "x", count: 2000)], receivedAt: Date())
+            XCTAssertEqual(f.link.packets.map(\.count).max(), min(limit, 512))
+            XCTAssertEqual(f.link.items.count, 1)
+            await drain(f)
+        }
     }
 }

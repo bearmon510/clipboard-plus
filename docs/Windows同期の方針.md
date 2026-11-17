@@ -56,7 +56,7 @@ iPadとPCの両方で同じ決まりを実装する。食い違いを防ぐた�
 - 平文：見出しの長さ2バイト（ビッグエンディアン）、見出し（UTF-8のJSON）、本体のバイト列。
   - 項目：`{"t":"item","id":"<UUID>","kind":"text","at":<ミリ秒>,"from":"pad"|"pc"}`、本体は文章のUTF-8。画像は後の版で `kind:"image"` と型を足す。
   - 確認：`{"t":"ack","ids":["<UUID>", ...]}`、本体なし。
-  - 生存確認：`{"t":"ping"}`。
+  - 生存確認：`{"t":"ping"}`、その返答：`{"t":"pong"}`。どちらも本文なし。接続済みのiPadは最後のパケット送受信から30秒でpingを送り、10秒以内にpongを受け取れなければ切断して再接続する。Windowsはpingにpongで答える。iPadはpingに答えず、両側ともpongには答えない。その他の通信はpongの代わりにならない。
 - 送った項目は、確認が来るまで手元に残し、つなぎ直したら送り直す。受け取った側は、見たことのある `id` を無視する。
 
 ### 自分の書き込みを拾わない
@@ -108,26 +108,28 @@ iPadとPCの両方で同じ決まりを実装する。食い違いを防ぐた�
 - **保存。** 鍵は `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` の非同期化Keychain項目。PCの識別子・名前、iPadのUUID、確認済みperipheralのUUID、設定は `pcSync.v1.*` のUserDefaultsに置く。iPadのUUIDは組の解除でも維持する。解除時に鍵を消せない場合は解除済みの印を残して再利用を禁止し、タイマー・ロック解除・次回起動で削除を再試行する。OS再起動後の最初のロック解除前には鍵が読めないため、解除後に再開する。
 - **接続。** `PCSyncTransport` が差し替え可能な薄い境界、`PCSyncBluetooth` が実機のcentral。CoreBluetoothのdelegateと通信処理をmain queue/MainActorに直列化する。確認済みの識別子には `retrievePeripherals` と期限なしの `connect` を出す。未接続の前面ではサービスUUID指定のscanも継続し、広告の重複通知を許可して失敗後・10分の除外期間後にも再発見する。既知の接続待ちと新しい候補は最大2台。新しい未確認の候補への接続待ちは20秒で次に進む（確認済み相手の待ちは切らない）。確認失敗は10分除外、通常の再試行は3秒間隔。初回発見とアドレス変更後の再発見はアプリを前面に置く。
 - **状態復元。** `clipboardplus.pc-sync.central.v1` を復元識別子とし `willRestoreState` でperipheralを保持する。既に接続済みの復元リンクは一度切断し、PC側にも古い暗号セッションを捨てさせてから新しいHELLOを送る。暗号鍵・送信番号を復元せず、新しい乱数で接続し直す。
-- **送受信。** 通知の有効化後にHELLOを送り、WELCOMEを検証し、AUTHの全パケットをwrite without responseへ渡してから項目を送る。送信の値上限には `maximumWriteValueLength(for: .withoutResponse)` を使い、`canSendWriteWithoutResponse` とready callbackで停止・再開する。通知側の交渉済み上限はiOS APIから得られないため、受信組み立て器にはGATT属性値の最大512バイトを渡す（送信上限とは分ける）。一度に展開する送信フレームは1個、ackを次の項目より先に送る。
+- **送受信。** 通知の有効化後にHELLOを送り、WELCOMEを検証し、AUTHの全パケットをwrite without responseへ渡してから項目を送る。送信の値上限には `min(512, maximumWriteValueLength(for: .withoutResponse))` を使い、`canSendWriteWithoutResponse` とready callbackで停止・再開する。通知側の交渉済み上限はiOS APIから得られないため、受信組み立て器にはGATT属性値の最大512バイトを渡す（送信上限とは分ける）。一度に展開する送信フレームは1個、ackを次の項目より先に送る。
 - **期限。** サービス・通知準備と接続確認はそれぞれ30秒。組み立ての無進行、送信の無進行、項目全体を書き込んでからのack待ちは60秒。期限切れは接続を切り、未ackの項目を同じIDで再送する。背景でOSに停止されている間の実時間どおりのタイマー実行は保証されない。
+- **死活確認。** 接続済みで30秒パケットの送受信がなければpingを送信待ちに入れる。送信準備の停止も検出するため、その時点から10秒以内にpongが来なければ切断・再接続する。pong待ちはほかの受信や送信では延長せず、切断・組み直しで捨てる。ack、ping、次の項目の順に優先し、送信中のフレームには割り込ませない。PCからの最初の通知が失敗して部分フレームやack待ちがない場合も、この期限で復帰できる。
 - **履歴との受け渡し。** `ClipboardMonitor.admit` が取り込みイベントごと（同一本文の再取り込みを含む）に送信通知し、文章・リンクのカードコピーも通知する。履歴とテンプレートの両方に適用する。`source == .pc` のカードコピーとPC受信専用経路では送信しない。未ackは最大50件をメモリに保持し、古い順に破棄する。組の解除・変更とプロセス終了では消える。画像・ファイルは対象外。
 - **受信とack。** `HistoryStore.collectFromPC` は通常と同じ本文の重複統合を `source: .pc` で行い、SQLiteへの保存成功後だけackする。PCの時計ずれで履歴の順番や自動削除が乱れないよう、履歴の時刻はiPadで受け取った時刻にする。保存失敗はackせず、履歴層には別の再試行を残さずPCからの再送に任せる。保存中のIDも二重に保存しない。保存済みIDは直近500件をメモリに保持し、再受信はackのみ返す。プロセス終了をまたぐ重複排除は次段階。
 - **iPadのクリップボード。** 設定は初期値true。保存済みの本文を書き込み、既存の自己コピー印と書き込み後のchangeCountで二重取り込みを抑える。書いた本文を再読しないので、同期ログへ本文を出さない。後から外部アプリが同じ本文をコピーした場合は通常どおり取り込む。背景でも書き込みを試すが、UIKitは失敗をthrowしないためchangeCountの増加で判定する。変化しなければ書けなかったことを固定文でログに残し、履歴保存とackは続ける。他のコピー・読み取り操作中は書き込みを見送る。組の解除中に終わった古い受信の保存は、新しい組へのackやクリップボード書き込みを行わない。
 - **ログ。** 既存の計測ログに `PC同期` として状態、scan、接続、確認、失敗理由、GATT値上限、件数、GATTパケットのバイト数、所要時間、再送とack待ち時間を出す。OSエラーは数値コードだけにし、本文・QR・鍵・機器名・UUID・NSErrorの説明を渡さない。本文プレビュー設定が有効でもPC受信経路の本文は出ない。
 - **バックアップ・JSON・ショートカット。** 履歴のCodable/SQLite/バックアップは `pc` を保持し、リンクは既存のURL判定とショートカット表示を使う。鍵・接続先UUID・送受信ID・送信待ち・設定は履歴モデルに持たせず、アプリのバックアップとJSON書き出しには入れない。`pc` を知らない旧版では新しい履歴・バックアップを読めないため、ダウングレードは対象外。iOS自体の端末バックアップとは別の話で、UserDefaultsは通常のOS保存に従う。
 - **画面担当との結合。** `HistorySource.pc` の追加に伴い、`Views/EntryDetailView.swift` の `sourceLabel` のswitchに `case .pc: return "PC"` が必要。Viewsを編集しないという担当境界のため、画面側でこの分岐を追加する（未追加のままでは網羅性エラーになる）。
-- **検証。** `PCSyncControllerTests` は偽のGATT接続・Keychain・pasteboardと実際の `SyncPcHandshake`/暗号部品を使用する。QR、遅延Bluetooth生成、認証、flow control、ack、再送、待ち件数、受信の重複500件、source pc、リンク、自己コピー、送り返しの防止、解除、期限、ログの秘匿を確認する。`ShortcutCompatibilityTests` にpcのSQLite・JSON・バックアップ復元の往復を追加。MainActorのテストは同期メソッドでexpectationを待つ。WindowsではSwift/XCTestを実行できないため、Xcode 27.1の既存CIと実機BLEでの確認が必要。
+- **検証。** `PCSyncControllerTests` は偽のGATT接続・Keychain・pasteboardと実際の `SyncPcHandshake`/暗号部品を使用する。QR、遅延Bluetooth生成、認証、flow control、ack、再送、待ち件数、受信の重複500件、source pc、リンク、自己コピー、送り返しの防止、解除、期限、ログの秘匿に加え、30秒／10秒の死活確認、pong後の再確認、pingを返答しないこと、書き込みの512バイト上限を検証する。`PCSyncControllerTests` と `ScreenSnapshotTests` のMainActor上のexpectation待ちは `await fulfillment` とし、メインキューへ戻る履歴・ログ完了を阻害しない。WindowsではSwift/XCTestを実行できないため、Xcode 27.1の既存CIと実機BLEでの確認が必要。
 - **実機で試す際の注意。** 最初の接続とアドレス変更後の再発見はアプリを前面に置く。背景の再接続では、切断コールバックの中で既知の相手への接続要求を出し直し、アプリのタイマーの再実行を待たない。アプリを利用者が強制終了した場合は通常の状態復元で再起動されないので、一度手動で開く。端末再起動後も最初にロック解除する。未ackの送信待ちと受信ID一覧は試作のためアプリ終了で失われる。
 - **APIの根拠。** 接続要求と状態復元は[Appleの背景処理の説明](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/CoreBluetoothBackgroundProcessingForIOSApps/PerformingTasksWhileYourAppIsInTheBackground.html)、強制終了時の制約は[Apple TN3115](https://developer.apple.com/documentation/technotes/tn3115-bluetooth-state-restoration-app-relaunch-rules)、受信属性値512バイトの上限は[Bluetooth ATT仕様](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-62/out/en/host/attribute-protocol--att-.html)を参照。
 
 ## PC側の実装メモ
 
-2026年11月17日。`windows/ClipboardPlus.Windows/` にWPFの常駐アプリを実装。出力名は `ClipboardPlusForWindows`。既存の通信ライブラリ・仕様・試験データは変更していない。追加のNuGetパッケージはない。
+2026年11月17日。`windows/ClipboardPlus.Windows/` にWPFの常駐アプリを実装。出力名は `ClipboardPlusForWindows`。レビュー対応で共通プロトコルにpongを追加し、Nodeの試験データと両言語のテストを更新した。追加のNuGetパッケージはない。
 
 - **構成。** `Core/SyncCoordinator.cs` はWindows APIに依存しない接続・確認・送受信の窓口。`ISyncPeer` と `IClipboardAccess` が差し替え可能な境界。既存の組み立て型の名前は `SyncPacketAssembler`。同じソースを既存の `ClipboardPlus.Sync.Tests` にリンクし、WPFや実機に依存せずテストする。
-- **Bluetooth。** `Infrastructure/BleServer.cs` がGATTサーバー。指定のUUID、write / write without response / notify、Plain、discoverable / connectableを使用。WinRTイベントはFIFOのキューに入れ、writeのdeferralを取得してから直列に処理する。通知は購読クライアントを指定し、各通知の完了を待つ。値上限は `max(20, MaxPduSize - 3)`。購読後のMTU増加にも対応する。
+- **Bluetooth。** `Infrastructure/BleServer.cs` がGATTサーバー。指定のUUID、write / write without response / notify、Plain、discoverable / connectableを使用。イベントキューは128件。writeは入口で処理中を含め全体64件、相手ごと16件まで受け付け、上限超過・キュー満杯・停止中は受け付けない。取得済みのwrite with responseにはATT Insufficient Resourcesを返す。要求取得自体が未完ならキャンセルしてGATTスタックへ返し、拒否用の非同期待ち行列は作らない。受理・拒否・例外・キュー終了の各経路でdeferralを解放する。要求取得の待ちは最大10秒。通知値上限は `max(20, min(512, MaxPduSize - 3))`。購読後のMTU増加にも対応する。
+- **送信待ち。** 接続ごとに1個の送信処理を持ち、共通gateの中では次のフレームの選択・暗号化と状態更新だけを行う。通知完了を待つ間はgateとBLEイベントworkerを占有しない。フレームは順序どおり送り、ack/pongの返信（最大64件）を次の項目より優先する。項目は共有の未ack一覧から1件ずつ選び、全項目を暗号フレームとして複製しない。通知完了直前のackを受けても未確認扱いへ戻さない。切断時は送信の待機をキャンセルし、再接続には新しい暗号状態を使う。
 - **再開と破棄。** アダプター・radio・広告状態を3秒間隔で確認し、オフ・無効・非対応・アクセス不可・開始失敗を区別して表示する。オンに戻ればサービスと広告を作り直す。購読解除・sessionのClosedで接続状態を破棄する。受信不正、認証失敗、復号失敗、通知失敗、クリップボード書き込み失敗でもその相手の状態を破棄する。認証前は接続開始から20秒、組み立て途中は最後のパケットから20秒で期限切れ。通知1回の待ちは最大10秒。
-- **GATT APIの制約。** ローカルGATTサーバーの公開APIには相手を強制切断する操作がないため、失敗した購読は失効させ、以後のwriteを拒否する。write with responseにはATTエラーを返し、write without responseは処理しない。iPadは期限切れ等で切断し、購読し直してから新しいHELLOを送る必要がある。失敗した購読のままHELLOを送り直しても復帰させない。接続は最大8件まで保持する。
+- **GATT APIの制約。** ローカルGATTサーバーの公開APIには相手を強制切断する操作がないため、失敗した購読は失効させ、以後のwriteを拒否する。write with responseにはATTエラーを返し、write without responseは処理しない。通知失敗時は接続の暗号・組み立て・送信待ち状態を破棄し、購読側には拒否の印だけを残す。iPadはpong待ちなどの期限で切断し、購読し直してから新しいHELLOを送る。失敗した購読のままHELLOを送り直しても復帰させない。購読・接続は最大8件まで保持する。認証前の組み立て上限はHELLO 50バイト、AUTH 33バイトで、認証後だけ4MiBを認める。
 - **組にする情報。** 初回に `SyncPairing.Create(Environment.MachineName)` を呼ぶ。`%LOCALAPPDATA%\clipboardplus\pairing.dat` はQR文字列全体をDPAPI CurrentUserで暗号化し、一時ファイルから置き換える。平文のQRや鍵をファイル・ログに出さない。読み込み・復号に失敗したら黙って新しい鍵に置き換えず、起動エラーを表示する。「組み直す」は確認後に新しいPC識別子と鍵を保存し、古い接続・未確認項目を捨てて再開する。
 - **クリップボード。** メッセージ専用の見えないHwndSourceと `AddClipboardFormatListener` を使う。1回のOpenClipboard中に文章と3種類の除外形式を読み、開けない場合は40/80/120/160/200ms待ちながら最大5回試す。除外形式が存在して読めない場合も送信を見送る。iPadからの書き込みはDispatcherで行い、その直後の通し番号の変化だけを除外する。同じ本文を利用者が新たにコピーした場合は送る。本文・除外理由の元データはログに出さない。
 - **待ち項目と重複。** 未ackは最大50件をメモリに保持し、超過時は最古を捨てて件数だけ記録する。新しい認証接続に同じ項目IDで再送し、同じ接続でも60秒ackがなければ番号を進めた新しい暗号フレームで再送する。受信はクリップボード書き込みの成功後にackし、成功済みの直近500個のIDは本文を書かずackだけ返す。未ackと重複IDはプロセス終了・組み直しで消える。ディスクへの履歴保存は次段階。
@@ -145,7 +147,9 @@ $packageCache = Join-Path $env:USERPROFILE '.nuget/packages'
 & 'C:/Program Files/dotnet/dotnet.exe' test windows/ClipboardPlus.slnx --no-build --no-restore
 ```
 
-確認結果：buildは警告0・エラー0。既存の通信試験を含め24件成功、失敗0。偽の接続と `SyncPadHandshake` で両方向のitem/ack、20/182バイト分割、再接続再送、同じ接続でのack待ち再送、重複500件、未確認50件、自己コピー・除外・非文章、認証前データ・不正AUTH・改ざん・不正JSON・番号の再利用・逆方向項目、相手ごとの破棄、書き込み失敗、MTU増加、期限切れを確認した。テストランナーは `VSTEST_ARTIFACTS_DIRECTORY` 未設定時に一時フォルダへ出力する案内を表示するが、全テストは成功している。
+レビュー修正後の確認結果：buildは警告0・エラー0。既存の通信試験を含め41件成功、失敗0。新しいNode生成例のpong、20/182/512バイト分割に加え、全体／相手別の入口制限、並行した受付、拒否・例外・キュー終了時の解放、認証前50/33バイトの上限、遅延通知中の受信・ack・タイマー・切断、ack/pong優先、通知失敗後の状態破棄、MTU 517→512と513バイト拒否を確認した。テストランナーは `VSTEST_ARTIFACTS_DIRECTORY` 未設定時に一時フォルダへ出力する案内を表示するが、全テストは成功している。
+
+CI停止の点検：前回の「テスト出力0件」の原因は未確定。`PCSyncControllerTests` の履歴・ログ・テンプレート完了待ちと `ScreenSnapshotTests.makeMonitor` はMainActor上で `wait(for:)` を使っていたため、`await fulfillment` に変更した。`PCSyncController` は未ペアリング時にも初期化中に同期Keychain読み取りを行っていたため、保存済みPC情報がない場合は読み取りを省略する。`SettingsView` 経由で `PCSyncController.shared` を作るスナップショットにも適用される。初期化経路に循環したsingleton参照、セマフォ待ち、メインキューへの同期dispatchは見つからず、復元とタイマーにも完了を同期的に待つ箇所はない。`SyncProtocolTests` は非同期処理やexpectationを持たず、分割ループは各回でoffsetを進める。変更したSwiftのenum分岐とasync化したヘルパーの全呼び出しを点検したが、このPCではSwiftのbuild・テストは未実行。新しい例でのSwiftテスト成功とCI停止の解消はMacのCIで確認が必要。
 
 画面だけのプレビューはプロセス起動まで確認したが、画面操作ツールからウインドウを取得できなかったため、見た目の確認は未完了。通常起動はBLEとクリップボードへの影響について自動承認レビューで停止されたため、実機の広告開始・接続・常駐・レジストリ変更は未確認。
 

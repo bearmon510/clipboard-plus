@@ -9,6 +9,7 @@ public abstract record SyncMessage;
 public sealed record SyncItem(Guid Id, long At, string From, string Text) : SyncMessage;
 public sealed record SyncAck(IReadOnlyList<Guid> Ids) : SyncMessage;
 public sealed record SyncPing : SyncMessage;
+public sealed record SyncPong : SyncMessage;
 
 public static class SyncMessageCodec
 {
@@ -40,6 +41,8 @@ public static class SyncMessageCodec
                     break;
                 case SyncPing:
                     json.WriteString("t", "ping"); break;
+                case SyncPong:
+                    json.WriteString("t", "pong"); break;
                 default: throw new SyncProtocolException(SyncError.Format);
             }
             json.WriteEndObject(); json.Flush();
@@ -100,6 +103,8 @@ public static class SyncMessageCodec
                     return new SyncAck(ids.EnumerateArray().Select(v => SyncProtocol.ParseId(v.GetString())).ToArray());
                 case "ping":
                     Keys("t"); SyncProtocol.Require(body.IsEmpty); return new SyncPing();
+                case "pong":
+                    Keys("t"); SyncProtocol.Require(body.IsEmpty); return new SyncPong();
                 default: throw new SyncProtocolException(SyncError.Format);
             }
         }

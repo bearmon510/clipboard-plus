@@ -200,6 +200,9 @@ final class SyncProtocolTests: XCTestCase {
             XCTAssertEqual(try SyncMessageCodec.decode(SyncMessageCodec.encode(m)), m)
         }
         error(.format) { _ = try SyncMessageCodec.decode(plain("{\"t\":\"ping\"}", body: Data([0]))) }
+        error(.format) { _ = try SyncMessageCodec.decode(plain("{\"t\":\"pong\"}", body: Data([0]))) }
+        error(.format) { _ = try SyncMessageCodec.decode(plain("{\"t\":\"pong\",\"extra\":0}")) }
+        XCTAssertEqual(try SyncMessageCodec.decode(plain("{\"t\":\"pong\"}")), .pong)
         error(.format) { _ = try SyncMessageCodec.decode(plain("{\"t\":\"ack\",\"ids\":[\"\(id)\"]}", body: Data([0]))) }
         error(.format) { _ = try SyncMessageCodec.decode(plain("{\"t\":\"item\",\"kind\":\"text\",\"id\":\"\(id)\",\"from\":\"pad\",\"at\":0}", body: Data([0xC0, 0xAF]))) }
         error(.format) { _ = try SyncMessageCodec.decode(Data([0, 30, 123])) }
@@ -213,6 +216,14 @@ final class SyncProtocolTests: XCTestCase {
     }
 
     func testPacketBoundariesAndCipherFailures() throws {
+        let attributeFrame = Data(repeating: 7, count: 1023)
+        let attributePackets = try SyncPacketizer.split(attributeFrame, packetLimit: 512)
+        XCTAssertEqual(attributePackets.map(\.count), [512, 512, 2])
+        let attributeAssembler = try SyncPacketAssembler(packetLimit: 512)
+        var assembledAttribute: Data?
+        for packet in attributePackets { assembledAttribute = try attributeAssembler.append(packet) }
+        XCTAssertEqual(assembledAttribute, attributeFrame)
+        error(.packet) { _ = try SyncPacketAssembler(packetLimit: 512).append(Data([3]) + Data(repeating: 7, count: 512)) }
         let invalidPackets: [[UInt8]] = [[], [1], [4, 0], [0, 1], [2, 1], Array(repeating: 0, count: 21)]
         for packet in invalidPackets {
             error(.packet) { _ = try SyncPacketAssembler(packetLimit: 20).append(Data(packet)) }

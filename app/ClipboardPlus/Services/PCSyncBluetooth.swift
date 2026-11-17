@@ -241,7 +241,7 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
         }
         guard !ready else { return }
         ready = true; discoveryStarted = nil
-        let limit = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        let limit = min(512, peripheral.maximumWriteValueLength(for: .withoutResponse))
         log("MTU; writeWithoutResponse値上限=\(limit); 受信GATT値上限=512")
         // iOS exposes no negotiated notification limit. ATT attribute values are at most
         // 512 bytes; do not incorrectly use the independently reported write limit here.

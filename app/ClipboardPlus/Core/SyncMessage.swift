@@ -4,6 +4,7 @@ public enum SyncMessage: Equatable {
     case item(id: UUID, at: Int64, from: String, text: String)
     case ack(ids: [UUID])
     case ping
+    case pong
 }
 
 public enum SyncMessageCodec {
@@ -23,6 +24,9 @@ public enum SyncMessageCodec {
             body = Data()
         case .ping:
             header = "{\"t\":\"ping\"}"
+            body = Data()
+        case .pong:
+            header = "{\"t\":\"pong\"}"
             body = Data()
         }
         let bytes = Data(header.utf8)
@@ -67,6 +71,10 @@ public enum SyncMessageCodec {
                 try keys(["t"])
                 try SyncProtocol.require(body.isEmpty)
                 return .ping
+            case "pong":
+                try keys(["t"])
+                try SyncProtocol.require(body.isEmpty)
+                return .pong
             default: throw SyncProtocolError.format
             }
         } catch let error as SyncProtocolError { throw error }

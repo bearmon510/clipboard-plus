@@ -186,6 +186,9 @@ public sealed class SyncProtocolTests : IDisposable
         foreach (var at in new[] { -SyncProtocol.MaxTimestamp, 0, SyncProtocol.MaxTimestamp })
             Assert.Equal(at, ((SyncItem)SyncMessageCodec.Decode(SyncMessageCodec.Encode(new SyncItem(Guid.Parse(id), at, "pc", "")))).At);
         Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain("{\"t\":\"ping\"}", [0])));
+        Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain("{\"t\":\"pong\"}", [0])));
+        Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain("{\"t\":\"pong\",\"extra\":0}")));
+        Assert.IsType<SyncPong>(SyncMessageCodec.Decode(Plain("{\"t\":\"pong\"}")));
         Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain("{\"t\":\"ack\",\"ids\":[\"" + id + "\"]}", [0])));
         Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain($$"""{"t":"item","kind":"text","id":"{{id}}","from":"pad","at":0}""", [0xC0, 0xAF])));
         Error(SyncError.Format, () => SyncMessageCodec.Decode([0, 30, 123]));

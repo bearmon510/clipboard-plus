@@ -29,22 +29,22 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
-    func testRenderWelcome() throws {
+    func testRenderWelcome() async throws {
         try save(render(WelcomeView(), size: Self.narrow, style: .light), "welcome-narrow-light")
         try save(render(WelcomeView(), size: Self.wide, style: .dark), "welcome-wide-dark")
     }
 
     /// The settings, with the Windows sync section unpaired as on a fresh install.
     @MainActor
-    func testRenderSettings() throws {
-        let monitor = try makeMonitor(populated: false)
+    func testRenderSettings() async throws {
+        let monitor = try await makeMonitor(populated: false)
         let settings = SettingsView(monitor: monitor, log: monitor.log, screenshots: ScreenshotWatcher(log: monitor.log))
         try save(render(settings, size: Self.narrow, style: .light), "settings-narrow-light")
     }
 
     @MainActor
-    func testRenderMainScreens() throws {
-        let monitor = try makeMonitor(populated: true)
+    func testRenderMainScreens() async throws {
+        let monitor = try await makeMonitor(populated: true)
         monitor.start()
         defer { monitor.stop() }
         try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.narrow, style: .light), "main-narrow-light")
@@ -64,10 +64,10 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
-    func testRenderPausedAndEmptyScreens() throws {
-        let paused = try makeMonitor(populated: true)
+    func testRenderPausedAndEmptyScreens() async throws {
+        let paused = try await makeMonitor(populated: true)
         try save(render(ContentView(monitor: paused, log: paused.log), size: Self.narrow, style: .light), "paused-narrow-light")
-        let empty = try makeMonitor(populated: false)
+        let empty = try await makeMonitor(populated: false)
         empty.start()
         defer { empty.stop() }
         try save(render(ContentView(monitor: empty, log: empty.log), size: Self.narrow, style: .light), "empty-narrow-light")
@@ -76,8 +76,8 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
-    func testRenderTemplateEditorAndOrder() throws {
-        let monitor = try makeMonitor(populated: true)
+    func testRenderTemplateEditorAndOrder() async throws {
+        let monitor = try await makeMonitor(populated: true)
         monitor.start()
         defer { monitor.stop() }
         let groups = TemplateGroups.make(monitor.entries, search: "")
@@ -96,7 +96,7 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
-    func testRenderDetailScreen() throws {
+    func testRenderDetailScreen() async throws {
         let now = Date()
         let entry = HistoryEntry(
             id: 1, kind: .url, text: "https://developer.apple.com/documentation/swiftui/lazyvgrid",
@@ -107,7 +107,7 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
-    func testRenderCaptureScreens() throws {
+    func testRenderCaptureScreens() async throws {
         let source = CaptureSource(image: Self.sampleScreenshot())
         // Mid-drag in a wide window: the selection and the magnifier at the finger.
         let dragging = CaptureView(source: source, mode: .text,
@@ -165,7 +165,7 @@ final class ScreenSnapshotTests: XCTestCase {
     // MARK: Sample data
 
     @MainActor
-    private func makeMonitor(populated: Bool) throws -> ClipboardMonitor {
+    private func makeMonitor(populated: Bool) async throws -> ClipboardMonitor {
         let root = try ImageTestSupport.directory(self)
         let url = root.appendingPathComponent("history.sqlite")
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
@@ -183,7 +183,7 @@ final class ScreenSnapshotTests: XCTestCase {
                                        pasteboard: IdlePasteboard())
         let loaded = expectation(description: "history loaded")
         monitor.pendingDeletion { _ in loaded.fulfill() }
-        wait(for: [loaded], timeout: 10)
+        await fulfillment(of: [loaded], timeout: 10)
         return monitor
     }
 

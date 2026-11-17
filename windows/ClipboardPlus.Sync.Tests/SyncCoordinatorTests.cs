@@ -11,6 +11,7 @@ public sealed class SyncCoordinatorTests
         public int PacketLimit { get; set; } = 20;
         public bool Rejected { get; private set; }
         public bool FailSend { get; set; }
+        public Func<byte[], Task>? OnSend;
         public readonly List<byte[]> Packets = [];
         public Task SendPacketAsync(byte[] packet)
         {
@@ -18,7 +19,7 @@ public sealed class SyncCoordinatorTests
             Assert.InRange(packet.Length, 2, PacketLimit);
             if (FailSend) throw new IOException("fake transport error");
             Packets.Add(packet.ToArray());
-            return Task.CompletedTask;
+            return OnSend?.Invoke(packet) ?? Task.CompletedTask;
         }
         public void Reject() => Rejected = true;
         public byte[][] DrainFrames()
@@ -51,12 +52,12 @@ public sealed class SyncCoordinatorTests
     {
         public readonly SyncPairing Pairing = SyncPairing.Create("test-pc");
         public readonly FakeClipboard Clipboard = new();
-        public readonly List<string> Logs = [];
+        public readonly System.Collections.Concurrent.ConcurrentQueue<string> Logs = new();
         public readonly SyncCoordinator Pc;
         public SyncStatus State = new(0, 0, null, null);
         public Rig()
         {
-            Pc = new(Pairing, Clipboard, Logs.Add);
+            Pc = new(Pairing, Clipboard, Logs.Enqueue);
             Pc.Changed += s => State = s;
         }
 
@@ -77,6 +78,7 @@ public sealed class SyncCoordinatorTests
         {
             foreach (var packet in SyncPacketizer.Split(frame, peer.PacketLimit))
                 Assert.True(await Pc.ReceiveAsync(peer, packet));
+            await Pc.WaitForOutgoingAsync(peer);
         }
     }
 
@@ -90,15 +92,121 @@ public sealed class SyncCoordinatorTests
         public SyncMessage[] Drain() => Peer.DrainFrames().Select(f => SyncMessageCodec.Decode(receiver.Open(f))).ToArray();
     }
 
+    [Fact]
+    public async Task SlowReconnectSenderDoesNotBlockReceiveAckTimersOrDisconnectAndPrioritizesReplies()
+    {
+        var r = new Rig();
+        await r.Pc.ClipboardChangedAsync(new(1, new string('a', 100_000), false));
+        await r.Pc.ClipboardChangedAsync(new(2, new string('b', 100_000), false));
+        var peer = new FakePeer { PacketLimit = 512 };
+        await r.Pc.ConnectAsync(peer);
+        var handshake = new SyncPadHandshake(r.Pairing, Guid.NewGuid());
+        await r.SendFrameAsync(peer, handshake.CreateHello());
+        var auth = handshake.AcceptWelcome(Assert.Single(peer.DrainFrames()));
+        var pad = new Pad(r, peer, auth.Keys);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        peer.OnSend = packet =>
+        {
+            // Hold completion of the first whole item, as if NotifyValueAsync were slow.
+            if ((packet[0] & 2) != 0 && !entered.Task.IsCompleted)
+            { entered.SetResult(); return release.Task; }
+            return Task.CompletedTask;
+        };
+        foreach (var packet in SyncPacketizer.Split(auth.Auth, 512))
+            Assert.True(await r.Pc.ReceiveAsync(peer, packet).WaitAsync(TimeSpan.FromSeconds(2)));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var first = Assert.IsType<SyncItem>(Assert.Single(pad.Drain()));
+        var received = new SyncItem(Guid.NewGuid(), 0, "pad", "while PC is sending");
+        async Task Receive(SyncMessage message)
+        {
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(message), 512))
+                Assert.True(await r.Pc.ReceiveAsync(peer, packet).WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+        try
+        {
+            await Receive(received);
+            await Receive(new SyncAck([first.Id]));
+            await Receive(new SyncPing());
+            Assert.Single(r.Clipboard.Writes); Assert.Equal(1, r.State.Pending);
+            // Simulate more than the iPad's 60-second ACK deadline without sleeping.
+            await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61)).WaitAsync(TimeSpan.FromSeconds(2));
+            var other = new FakePeer(); await r.Pc.ConnectAsync(other);
+            await r.Pc.DisconnectAsync(other).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(other.Rejected);
+        }
+        finally { release.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(peer);
+        var messages = pad.Drain();
+        Assert.Equal(received.Id, Assert.Single(Assert.IsType<SyncAck>(messages[0]).Ids));
+        Assert.IsType<SyncPong>(messages[1]);
+        Assert.Equal(new string('b', 100_000), Assert.IsType<SyncItem>(messages[2]).Text);
+        Assert.Equal(3, messages.Length); // First ACK was not resurrected after send completion.
+        await r.Pc.DisconnectAsync(peer);
+    }
+
+    [Fact]
+    public async Task DisconnectCancelsBlockedSenderAndFreshConnectionCanResend()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { entered.TrySetResult(); return release.Task; };
+        await r.Pc.ClipboardChangedAsync(new(1, new string('x', 1000), false));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var idle = r.Pc.WaitForOutgoingAsync(pad.Peer);
+        await r.Pc.DisconnectAsync(pad.Peer).WaitAsync(TimeSpan.FromSeconds(2));
+        await idle.WaitAsync(TimeSpan.FromSeconds(2));
+        release.SetResult();
+        Assert.True(pad.Peer.Rejected); Assert.Equal(0, r.State.Connected);
+        Assert.Equal(1, r.State.Pending);
+        var fresh = await r.ConnectAsync(); Assert.Single(fresh.Drain());
+    }
+
+    [Fact]
+    public async Task FailedFirstNotificationRetiresProtocolStateAndPongDoesNotLoop()
+    {
+        var r = new Rig(); var peer = new FakePeer { FailSend = true };
+        await r.Pc.ConnectAsync(peer);
+        await r.SendFrameAsync(peer, new SyncPadHandshake(r.Pairing, Guid.NewGuid()).CreateHello());
+        Assert.True(peer.Rejected); Assert.Equal(0, r.State.Connected);
+        Assert.False(await r.Pc.ReceiveAsync(peer, [3, 1]));
+        // Retired peers do not consume the eight protocol connection slots.
+        for (var i = 0; i < 9; i++)
+        {
+            var fresh = await r.ConnectAsync();
+            await fresh.SendAsync(new SyncPing());
+            Assert.IsType<SyncPong>(Assert.Single(fresh.Drain()));
+            await fresh.SendAsync(new SyncPong()); Assert.Empty(fresh.Drain());
+            await r.Pc.DisconnectAsync(fresh.Peer);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, 50)]
+    [InlineData(true, 33)]
+    public async Task PreAuthenticationAssemblyRejectsOneByteBeyondHandshake(bool afterHello, int limit)
+    {
+        var r = new Rig(); var peer = new FakePeer { PacketLimit = 512 };
+        await r.Pc.ConnectAsync(peer);
+        if (afterHello)
+            await r.SendFrameAsync(peer, new SyncPadHandshake(r.Pairing, Guid.NewGuid()).CreateHello());
+        var packet = new byte[limit + 1]; packet[0] = 1;
+        Assert.True(await r.Pc.ReceiveAsync(peer, packet));
+        Assert.False(await r.Pc.ReceiveAsync(peer, [0, 0]));
+        Assert.True(peer.Rejected); Assert.Empty(r.Clipboard.Writes);
+    }
+
     [Theory]
     [InlineData(20)]
     [InlineData(182)]
+    [InlineData(512)]
     public async Task HandshakeAndBidirectionalItemsAndAcknowledgements(int limit)
     {
         var r = new Rig(); var pad = await r.ConnectAsync(limit);
         Assert.Equal(1, r.State.Connected);
         var text = "日本語・改行\n📋" + new string('x', 1000);
-        await r.Pc.ClipboardChangedAsync(new(1, text, false));
+        await r.Pc.ClipboardChangedAsync(new(1, text, false)); await r.Pc.WaitForOutgoingAsync();
         var sent = Assert.IsType<SyncItem>(Assert.Single(pad.Drain()));
         Assert.Equal(text, sent.Text); Assert.Equal("pc", sent.From);
         Assert.Equal(1, r.State.Pending); Assert.NotNull(r.State.LastSent);
@@ -116,12 +224,12 @@ public sealed class SyncCoordinatorTests
     public async Task UnacknowledgedItemsAreResentWithStableIdsAndFreshSessionKeys()
     {
         var r = new Rig();
-        await r.Pc.ClipboardChangedAsync(new(1, "offline", false));
+        await r.Pc.ClipboardChangedAsync(new(1, "offline", false)); await r.Pc.WaitForOutgoingAsync();
         var first = await r.ConnectAsync();
         var original = Assert.IsType<SyncItem>(Assert.Single(first.Drain()));
         await r.Pc.DisconnectAsync(first.Peer);
         Assert.True(first.Peer.Rejected); Assert.Equal(1, r.State.Pending);
-        await r.Pc.ClipboardChangedAsync(new(2, "offline two", false));
+        await r.Pc.ClipboardChangedAsync(new(2, "offline two", false)); await r.Pc.WaitForOutgoingAsync();
         var second = await r.ConnectAsync(182);
         var retry = second.Drain().Cast<SyncItem>().ToArray();
         Assert.Equal(2, retry.Length); Assert.Equal(original, retry[0]);
@@ -152,13 +260,13 @@ public sealed class SyncCoordinatorTests
         var r = new Rig(); var pad = await r.ConnectAsync();
         await pad.SendAsync(new SyncItem(Guid.NewGuid(), 0, "pad", "remote"));
         pad.Drain();
-        await r.Pc.ClipboardChangedAsync(new(r.Clipboard.Sequence, "remote", false));
-        await r.Pc.ClipboardChangedAsync(new(102, "password", true));
-        await r.Pc.ClipboardChangedAsync(new(103, null, false));
+        await r.Pc.ClipboardChangedAsync(new(r.Clipboard.Sequence, "remote", false)); await r.Pc.WaitForOutgoingAsync();
+        await r.Pc.ClipboardChangedAsync(new(102, "password", true)); await r.Pc.WaitForOutgoingAsync();
+        await r.Pc.ClipboardChangedAsync(new(103, null, false)); await r.Pc.WaitForOutgoingAsync();
         Assert.Empty(pad.Drain()); Assert.Equal(0, r.State.Pending);
         // The same text copied by the user at a new sequence must still be sent.
-        await r.Pc.ClipboardChangedAsync(new(104, "remote", false));
-        await r.Pc.ClipboardChangedAsync(new(104, "remote", false));
+        await r.Pc.ClipboardChangedAsync(new(104, "remote", false)); await r.Pc.WaitForOutgoingAsync();
+        await r.Pc.ClipboardChangedAsync(new(104, "remote", false)); await r.Pc.WaitForOutgoingAsync();
         Assert.Single(pad.Drain()); Assert.Equal(1, r.State.Pending);
     }
 
@@ -171,7 +279,7 @@ public sealed class SyncCoordinatorTests
     public async Task BadDataRetiresOnlyItsConnectionAndLeavesPendingForReconnect(string fault)
     {
         var r = new Rig(); var pad = await r.ConnectAsync(); var healthy = await r.ConnectAsync();
-        await r.Pc.ClipboardChangedAsync(new(1, "pending", false));
+        await r.Pc.ClipboardChangedAsync(new(1, "pending", false)); await r.Pc.WaitForOutgoingAsync();
         pad.Drain(); healthy.Drain();
         var frame = pad.Seal(new SyncPing());
         if (fault == "cipher") frame[^1] ^= 1;
@@ -222,7 +330,7 @@ public sealed class SyncCoordinatorTests
     public async Task PendingAndDuplicateCachesHaveTheirSpecifiedBounds()
     {
         var r = new Rig();
-        for (uint i = 1; i <= 51; i++) await r.Pc.ClipboardChangedAsync(new(i, $"item {i}", false));
+        for (uint i = 1; i <= 51; i++) await r.Pc.ClipboardChangedAsync(new(i, $"item {i}", false)); await r.Pc.WaitForOutgoingAsync();
         Assert.Equal(50, r.State.Pending);
         var pad = await r.ConnectAsync(182);
         var sent = pad.Drain().Cast<SyncItem>().ToArray();
@@ -242,7 +350,7 @@ public sealed class SyncCoordinatorTests
     {
         var r = new Rig(); var pad = await r.ConnectAsync();
         pad.Peer.FailSend = true;
-        await r.Pc.ClipboardChangedAsync(new(1, "retry", false));
+        await r.Pc.ClipboardChangedAsync(new(1, "retry", false)); await r.Pc.WaitForOutgoingAsync();
         Assert.True(pad.Peer.Rejected); Assert.Equal(1, r.State.Pending);
         pad = await r.ConnectAsync(); Assert.Single(pad.Drain());
         var item = new SyncItem(Guid.NewGuid(), 0, "pad", "retry receive");
@@ -259,10 +367,10 @@ public sealed class SyncCoordinatorTests
     public async Task HandshakeAndPartialFrameTimeoutRetireState()
     {
         var r = new Rig(); var peer = new FakePeer(); await r.Pc.ConnectAsync(peer);
-        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(21)); Assert.True(peer.Rejected);
+        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(21)); await r.Pc.WaitForOutgoingAsync(); Assert.True(peer.Rejected);
         var pad = await r.ConnectAsync();
         Assert.True(await r.Pc.ReceiveAsync(pad.Peer, [1, 0x10]));
-        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(21));
+        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(21)); await r.Pc.WaitForOutgoingAsync();
         Assert.True(pad.Peer.Rejected); Assert.Contains(r.Logs, l => l.Contains("assembly ended"));
     }
 
@@ -273,7 +381,7 @@ public sealed class SyncCoordinatorTests
         pad.Peer.PacketLimit = 182;
         await pad.SendAsync(new SyncItem(Guid.NewGuid(), 0, "pad", new string('x', 1000)));
         Assert.Single(r.Clipboard.Writes); Assert.Single(pad.Drain());
-        await r.Pc.ClipboardChangedAsync(new(1, new string('y', 1000), false));
+        await r.Pc.ClipboardChangedAsync(new(1, new string('y', 1000), false)); await r.Pc.WaitForOutgoingAsync();
         Assert.Single(pad.Drain());
     }
 
@@ -281,15 +389,15 @@ public sealed class SyncCoordinatorTests
     public async Task MissingAckRetriesOnTheSameLinkWithoutReusingFrameSequence()
     {
         var r = new Rig(); var pad = await r.ConnectAsync();
-        await r.Pc.ClipboardChangedAsync(new(1, "retry on a live link", false));
+        await r.Pc.ClipboardChangedAsync(new(1, "retry on a live link", false)); await r.Pc.WaitForOutgoingAsync();
         var original = Assert.IsType<SyncItem>(Assert.Single(pad.Drain()));
-        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(59));
+        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(59)); await r.Pc.WaitForOutgoingAsync();
         Assert.Empty(pad.Drain());
-        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61));
+        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61)); await r.Pc.WaitForOutgoingAsync();
         // The same receiver accepts this, proving its sequence was advanced.
         Assert.Equal(original, Assert.Single(pad.Drain()));
         await pad.SendAsync(new SyncAck([original.Id]));
-        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddMinutes(2));
+        await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddMinutes(2)); await r.Pc.WaitForOutgoingAsync();
         Assert.Empty(pad.Drain()); Assert.Equal(0, r.State.Pending);
     }
 }

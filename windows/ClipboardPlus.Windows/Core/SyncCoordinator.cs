@@ -28,7 +28,14 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly ISyncPeer Peer = peer;
         // MTU can increase after subscribing. Validate the current limit at each write
         // without replacing an assembler which may already hold a partial frame.
-        public readonly SyncPacketAssembler Assembler = new(ushort.MaxValue);
+        public SyncPacketAssembler Assembler = new(512, 50);
+        public readonly Queue<byte[]> ControlFrames = new();
+        public readonly Queue<SyncMessage> Replies = new();
+        public readonly CancellationTokenSource Stop = new();
+        public Task Outgoing = Task.CompletedTask;
+        public bool Sending;
+        public bool Retired;
+        public Guid? InFlight;
         public readonly SyncPcHandshake Handshake = new(pair);
         public readonly Dictionary<Guid, DateTimeOffset> Sent = [];
         public readonly DateTimeOffset Started = now;
@@ -41,6 +48,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly Dictionary<ISyncPeer, Connection> connections = new(ReferenceEqualityComparer.Instance);
     private readonly List<SyncItem> pending = [];
+    private readonly HashSet<Guid> attempted = [];
     private readonly HashSet<Guid> seen = [];
     private readonly Queue<Guid> seenOrder = [];
     private uint? ownSequence;
@@ -73,14 +81,16 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             try
             {
                 c.LastPacket = DateTimeOffset.UtcNow;
-                if (packet.Length > peer.PacketLimit) throw new SyncProtocolException(SyncError.Packet);
+                if (packet.Length > Math.Min(512, peer.PacketLimit)) throw new SyncProtocolException(SyncError.Packet);
                 var frame = c.Assembler.Append(packet);
                 if (frame is null) return true;
                 if (c.Stage == 0)
                 {
-                    await SendFrameAsync(c, c.Handshake.AcceptHello(frame));
+                    c.ControlFrames.Enqueue(c.Handshake.AcceptHello(frame));
+                    c.Assembler = new(512, 33);
                     c.Stage = 1;
                     log("handshake welcome");
+                    StartSending(c);
                 }
                 else if (c.Stage == 1)
                 {
@@ -88,8 +98,9 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     c.Sender = new(keys.PcToPad);
                     c.Receiver = new(keys.PadToPc);
                     c.Stage = 2;
+                    c.Assembler = new(512);
                     log($"handshake authenticated elapsedMs={(DateTimeOffset.UtcNow - c.Started).TotalMilliseconds:F0}");
-                    await FlushAsync(c, retransmission: true);
+                    StartSending(c);
                 }
                 else
                 {
@@ -107,16 +118,18 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                                 log($"received items=1 bytes={frame.Length}");
                             }
                             else log("duplicate items=1");
-                            await SendMessageAsync(c, new SyncAck([item.Id]));
+                            QueueReply(c, new SyncAck([item.Id]));
                             break;
                         case SyncAck ack:
-                            var removed = pending.RemoveAll(i => ack.Ids.Contains(i.Id) && c.Sent.ContainsKey(i.Id));
+                            var removed = pending.RemoveAll(i => ack.Ids.Contains(i.Id) && (c.Sent.ContainsKey(i.Id) || c.InFlight == i.Id));
+                            attempted.RemoveWhere(id => !pending.Any(i => i.Id == id));
                             foreach (var connection in connections.Values)
                                 foreach (var id in connection.Sent.Keys.Where(id => !pending.Any(i => i.Id == id)).ToArray())
                                     connection.Sent.Remove(id);
                             log($"ack removed={removed} pending={pending.Count}");
                             break;
-                        case SyncPing: log("ping received"); break;
+                        case SyncPing: QueueReply(c, new SyncPong()); break;
+                        case SyncPong: break;
                     }
                 }
                 Publish();
@@ -147,6 +160,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             {
                 var oldest = pending[0].Id;
                 pending.RemoveAt(0);
+                attempted.Remove(oldest);
                 foreach (var c in connections.Values) c.Sent.Remove(oldest);
                 log("pending overflow discarded=1");
             }
@@ -155,7 +169,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             foreach (var c in connections.Values.ToArray())
             {
                 if (c.Stage != 2) continue;
-                try { await FlushAsync(c, retransmission: false); }
+                try { StartSending(c); }
                 catch (Exception e) { Drop(c, Failure(e)); }
             }
             Publish();
@@ -186,7 +200,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     // link (for example, a temporary history-save failure on iPad).
                     foreach (var id in c.Sent.Where(p => now - p.Value > TimeSpan.FromSeconds(60)).Select(p => p.Key).ToArray())
                         c.Sent.Remove(id);
-                    try { await FlushAsync(c, retransmission: true); }
+                    try { StartSending(c); }
                     catch (Exception e) { Drop(c, Failure(e)); }
                 }
             }
@@ -202,31 +216,95 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         finally { gate.Release(); }
     }
 
-    private async Task FlushAsync(Connection c, bool retransmission)
+    // Only selection/sealing uses gate; notification I/O never holds it.
+    private void StartSending(Connection c)
     {
-        foreach (var item in pending.Where(i => !c.Sent.ContainsKey(i.Id)))
-        {
-            await SendMessageAsync(c, item);
-            c.Sent.Add(item.Id, DateTimeOffset.UtcNow);
-            lastSent = DateTimeOffset.Now;
-            log($"sent items=1 resend={retransmission} pending={pending.Count}");
-        }
+        if (c.Sending || c.Retired) return;
+        c.Sending = true;
+        c.Outgoing = Task.Run(() => SendLoopAsync(c));
     }
 
-    private Task SendMessageAsync(Connection c, SyncMessage message) =>
-        SendFrameAsync(c, c.Sender!.Seal(SyncMessageCodec.Encode(message)));
-
-    private async Task SendFrameAsync(Connection c, byte[] frame)
+    private void QueueReply(Connection c, SyncMessage message)
     {
-        var watch = Stopwatch.StartNew();
-        var packets = SyncPacketizer.Split(frame, c.Peer.PacketLimit);
-        foreach (var packet in packets)
-            await c.Peer.SendPacketAsync(packet).WaitAsync(TimeSpan.FromSeconds(10));
-        log($"notify packets={packets.Count} bytes={frame.Length} elapsedMs={watch.ElapsedMilliseconds} packetLimit={c.Peer.PacketLimit}");
+        if (c.Replies.Count >= 64) throw new SyncProtocolException(SyncError.Limit);
+        c.Replies.Enqueue(message);
+        StartSending(c);
+    }
+
+    // Test synchronization only. Production must not wait for the sender to become idle.
+    internal async Task WaitForOutgoingAsync(ISyncPeer? peer = null)
+    {
+        Task[] tasks;
+        await gate.WaitAsync();
+        try { tasks = connections.Values.Where(c => peer is null || c.Peer == peer).Select(c => c.Outgoing).ToArray(); }
+        finally { gate.Release(); }
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    private async Task SendLoopAsync(Connection c)
+    {
+        try
+        {
+            while (true)
+            {
+                byte[] frame;
+                SyncItem? item = null;
+                var retransmission = false;
+                await gate.WaitAsync();
+                try
+                {
+                    if (c.Retired) return;
+                    if (c.ControlFrames.TryDequeue(out var control)) frame = control;
+                    else if (c.Stage == 2 && c.Replies.TryDequeue(out var reply))
+                        frame = c.Sender!.Seal(SyncMessageCodec.Encode(reply));
+                    else if (c.Stage == 2 && (item = pending.FirstOrDefault(i => !c.Sent.ContainsKey(i.Id))) is not null)
+                    {
+                        frame = c.Sender!.Seal(SyncMessageCodec.Encode(item));
+                        retransmission = !attempted.Add(item.Id);
+                        c.InFlight = item.Id;
+                    }
+                    else { c.Sending = false; return; }
+                }
+                finally { gate.Release(); }
+
+                var watch = Stopwatch.StartNew();
+                var packets = SyncPacketizer.Split(frame, Math.Min(512, c.Peer.PacketLimit));
+                foreach (var packet in packets)
+                {
+                    c.Stop.Token.ThrowIfCancellationRequested();
+                    await c.Peer.SendPacketAsync(packet).WaitAsync(TimeSpan.FromSeconds(10), c.Stop.Token);
+                }
+                await gate.WaitAsync();
+                try
+                {
+                    if (c.Retired) return;
+                    // An ACK may arrive before NotifyValueAsync completes.
+                    if (item is not null)
+                    {
+                        if (pending.Any(i => i.Id == item.Id)) c.Sent[item.Id] = DateTimeOffset.UtcNow;
+                        c.InFlight = null;
+                        lastSent = DateTimeOffset.Now;
+                        log($"sent items=1 resend={retransmission} pending={pending.Count}");
+                    }
+                    log($"notify packets={packets.Count} bytes={frame.Length} elapsedMs={watch.ElapsedMilliseconds}");
+                    Publish();
+                }
+                finally { gate.Release(); }
+            }
+        }
+        catch (Exception e)
+        {
+            await gate.WaitAsync();
+            try { if (!c.Retired) Drop(c, Failure(e)); }
+            finally { gate.Release(); }
+        }
     }
 
     private void Drop(Connection c, string reason)
     {
+        c.Retired = true;
+        c.Stop.Cancel();
+        c.ControlFrames.Clear(); c.Replies.Clear(); c.Sent.Clear();
         connections.Remove(c.Peer);
         try { c.Assembler.Finish(); }
         catch (SyncProtocolException e) { log($"assembly ended error={e.Code}"); }

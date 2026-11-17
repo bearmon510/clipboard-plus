@@ -16,7 +16,9 @@ internal sealed class BleServer : IAsyncDisposable
     private static readonly Guid ToPadId = new("3A7ADCFC-CD62-4AF8-BF09-2C73023C5B83");
     private readonly SyncCoordinator coordinator;
     private readonly Action<string> log;
-    private readonly Channel<Func<Task>> work = Channel.CreateUnbounded<Func<Task>>(new() { SingleReader = true });
+    private readonly Channel<Func<Task>> work = Channel.CreateBounded<Func<Task>>(new BoundedChannelOptions(128)
+        { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
+    private readonly WriteAdmission writes = new();
     private readonly CancellationTokenSource stop = new();
     private readonly Task worker;
     private readonly Dictionary<string, Peer> peers = [];
@@ -57,6 +59,7 @@ internal sealed class BleServer : IAsyncDisposable
                     Status("Bluetoothを開始できません。再試行しています");
                 }
                 await coordinator.TickAsync(DateTimeOffset.UtcNow);
+                await UpdateSubscriptionsAsync();
             });
             try { await Task.Delay(3000, stop.Token); }
             catch (OperationCanceledException) { break; }
@@ -150,11 +153,13 @@ internal sealed class BleServer : IAsyncDisposable
         if (outbound is null) return;
         var clients = outbound.SubscribedClients.ToArray();
         foreach (var old in peers.Values.ToArray())
-            if (!clients.Any(c => c.Session.DeviceId.Id == old.Id)) await RemovePeerAsync(old);
+            if (old.Session.SessionStatus == GattSessionStatus.Closed ||
+                !clients.Any(c => c.Session.DeviceId.Id == old.Id)) await RemovePeerAsync(old);
         foreach (var client in clients)
         {
             var id = client.Session.DeviceId.Id;
             if (peers.TryGetValue(id, out var existing)) { existing.Client = client; continue; }
+            if (peers.Count >= 8) continue;
             var peer = new Peer(client, outbound, log, () => stopping);
             peer.StatusHandler = (session, args) => _ = Queue(async () =>
             {
@@ -172,23 +177,26 @@ internal sealed class BleServer : IAsyncDisposable
 
     private void WriteRequested(GattLocalCharacteristic sender, GattWriteRequestedEventArgs args)
     {
+        var id = args.Session.DeviceId.Id;
         var deferral = args.GetDeferral();
         // Acquire the deferral synchronously, and enqueue before awaiting GetRequestAsync,
         // so write-without-response packets cannot overtake each other.
-        _ = Queue(async () =>
+        writes.Dispatch(work.Writer, id, async () =>
         {
             GattWriteRequest? request = null;
             try
             {
-                request = await args.GetRequestAsync();
+                using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
+                requestTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+                request = await args.GetRequestAsync().AsTask(requestTimeout.Token);
                 if (request is null) return;
                 var ok = false;
                 if (sender == inbound && !stopping)
                 {
                     await UpdateSubscriptionsAsync();
-                    if (peers.TryGetValue(args.Session.DeviceId.Id, out var peer) && !peer.Rejected)
+                    if (peers.TryGetValue(id, out var peer) && !peer.Rejected)
                     {
-                        if (request.Offset == 0)
+                        if (request.Offset == 0 && request.Value.Length <= 512)
                             ok = await coordinator.ReceiveAsync(peer, request.Value.ToArray());
                         else await coordinator.DisconnectAsync(peer);
                     }
@@ -202,12 +210,30 @@ internal sealed class BleServer : IAsyncDisposable
             catch (Exception e)
             {
                 log($"write request error={e.GetType().Name}");
-                if (peers.TryGetValue(args.Session.DeviceId.Id, out var peer)) await coordinator.DisconnectAsync(peer);
+                if (peers.TryGetValue(id, out var peer)) await coordinator.DisconnectAsync(peer);
                 try { if (request?.Option == GattWriteOption.WriteWithResponse) request.RespondWithProtocolError(0x0E); }
                 catch (Exception) { /* Request may already have expired. */ }
             }
-            finally { deferral.Complete(); }
-        });
+        }, () => RejectWrite(args), deferral.Complete, accepting: !stopping);
+    }
+
+    private void RejectWrite(GattWriteRequestedEventArgs args)
+    {
+        // Never enqueue or create an async rejection backlog. If device access has not
+        // completed, abandon it and return the unhandled request to the GATT stack.
+        // A materialized write-with-response gets an explicit ATT resource error.
+        try
+        {
+            var operation = args.GetRequestAsync();
+            if (operation.Status == AsyncStatus.Completed)
+            {
+                var request = operation.GetResults();
+                if (request?.Option == GattWriteOption.WriteWithResponse)
+                    request.RespondWithProtocolError(0x11); // ATT Insufficient Resources
+            }
+            else operation.Cancel();
+        }
+        catch (Exception) { /* Expired / inaccessible request; never report success. */ }
     }
 
     private async Task RemovePeerAsync(Peer peer)
@@ -236,7 +262,13 @@ internal sealed class BleServer : IAsyncDisposable
     {
         stopping = true; stop.Cancel();
         if (polling is not null) await polling;
-        await Queue(StopProviderAsync);
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await work.Writer.WriteAsync(async () =>
+        {
+            try { await StopProviderAsync(); }
+            finally { stopped.SetResult(); }
+        });
+        await stopped.Task;
         work.Writer.TryComplete(); await worker;
         stop.Dispose();
     }
@@ -246,10 +278,11 @@ internal sealed class BleServer : IAsyncDisposable
         public GattSubscribedClient Client = client;
         public readonly GattSession Session = client.Session;
         public string Id => Session.DeviceId.Id;
-        public bool Rejected { get; private set; }
+        private volatile bool rejected;
+        public bool Rejected => rejected;
         public TypedEventHandler<GattSession, GattSessionStatusChangedEventArgs>? StatusHandler;
         public TypedEventHandler<GattSession, object>? MtuHandler;
-        public int PacketLimit => Math.Max(20, Client.Session.MaxPduSize - 3);
+        public int PacketLimit => BleLimits.NotificationBytes(Client.Session.MaxPduSize);
         public async Task SendPacketAsync(byte[] packet)
         {
             if (Rejected || isStopping()) throw new InvalidOperationException("Retired connection");
@@ -260,7 +293,7 @@ internal sealed class BleServer : IAsyncDisposable
         {
             // Windows' local GATT API does not expose a force-disconnect operation.
             // Reject all subsequent writes on this subscription until it disappears.
-            Rejected = true;
+            rejected = true;
             log("subscription retired; waiting for reconnect");
         }
     }
