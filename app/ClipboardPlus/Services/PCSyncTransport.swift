@@ -1,11 +1,17 @@
 import Foundation
 
+enum PCSyncDisconnectReason: Equatable {
+    case immediate
+    case preAuthFailure
+    case rejectTenMinutes
+}
+
 enum PCSyncTransportEvent {
     case status(PCSyncController.Status)
     case ready(id: UUID, writeLimit: Int, receiveLimit: Int)
     case packet(Data)
     case writable
-    case disconnected
+    case disconnected(nextReconnectAt: Date?)
 }
 
 /// All callbacks and calls run on MainActor. write hands off exactly one GATT value.
@@ -18,5 +24,6 @@ protocol PCSyncTransport: AnyObject {
     func stop()
     func write(_ packet: Data)
     func authenticated(_ id: UUID)
-    func reconnect(rejectForTenMinutes: Bool, retryDelay: TimeInterval)
+    @discardableResult
+    func reconnect(reason: PCSyncDisconnectReason) -> TimeInterval
 }

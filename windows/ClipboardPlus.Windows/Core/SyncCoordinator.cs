@@ -55,13 +55,22 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public TransferProgress? Progress;
         public bool VersionRejected;
         public readonly SyncPcHandshake Handshake = new(pair);
-        public readonly Dictionary<Guid, DateTimeOffset> Sent = [];
+        public readonly Dictionary<Guid, PendingReply> Sent = [];
+        public ulong NextIncomingFrameToken;
+        public ulong? CurrentIncomingFrameToken;
+        public int IncomingFrameBytes;
         public readonly DateTimeOffset Started = now;
         public DateTimeOffset LastPacket = now;
         public int Stage;
         public SyncFrameSender? Sender;
         public SyncFrameReceiver? Receiver;
     }
+
+    private sealed record PendingReply(DateTimeOffset InitialSentAt, DateTimeOffset Deadline, ulong? AllowedFrameToken);
+
+    private static readonly TimeSpan ReplyTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan MaxReplyExtension = TimeSpan.FromMinutes(3);
+    private const int MinExtendableFrameBytes = 64;
 
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly Dictionary<ISyncPeer, Connection> connections = new(ReferenceEqualityComparer.Instance);
@@ -199,11 +208,36 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 c.LastPacket = Now();
                 if (packet.Length > Math.Min(512, peer.PacketLimit)) throw new SyncProtocolException(SyncError.Packet);
                 var frame = c.Assembler.Append(packet);
-                if (c.Stage == 2 && (wasPartial || c.Assembler.HasPartialFrame))
+                ulong? frameToken = null;
+                var payloadCount = Math.Max(0, packet.Length - 1);
+                var frameBytes = payloadCount;
+                if (!wasPartial)
                 {
-                    foreach (var id in c.Sent.Keys.ToArray())
-                        if (c.Sent[id] < c.LastPacket) c.Sent[id] = c.LastPacket;
+                    if (c.Assembler.HasPartialFrame)
+                    {
+                        c.NextIncomingFrameToken++;
+                        c.CurrentIncomingFrameToken = c.NextIncomingFrameToken;
+                        c.IncomingFrameBytes = payloadCount;
+                        frameToken = c.CurrentIncomingFrameToken;
+                        frameBytes = c.IncomingFrameBytes;
+                    }
                 }
+                else if (c.Assembler.HasPartialFrame)
+                {
+                    c.IncomingFrameBytes += payloadCount;
+                    frameToken = c.CurrentIncomingFrameToken;
+                    frameBytes = c.IncomingFrameBytes;
+                }
+                else
+                {
+                    c.IncomingFrameBytes += payloadCount;
+                    frameToken = c.CurrentIncomingFrameToken;
+                    frameBytes = c.IncomingFrameBytes;
+                    c.CurrentIncomingFrameToken = null;
+                    c.IncomingFrameBytes = 0;
+                }
+                if (c.Stage == 2 && frame is null && frameToken is not null && frameBytes > MinExtendableFrameBytes)
+                    ExtendReplyDeadlines(c, frameToken.Value, c.LastPacket);
                 if (frame is null) return true;
                 if (c.Stage == 0)
                 {
@@ -246,6 +280,17 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 else
                 {
                     var message = SyncMessageCodec.Decode(c.Receiver!.Open(frame));
+                    if (frameToken is not null)
+                    {
+                        if (message is SyncPing or SyncPong)
+                            RevertReplyExtension(c, frameToken.Value);
+                        else
+                        {
+                            if (frameBytes > MinExtendableFrameBytes)
+                                ExtendReplyDeadlines(c, frameToken.Value, c.LastPacket);
+                            ClearAllowedFrameToken(c, frameToken.Value);
+                        }
+                    }
                     switch (message)
                     {
                         case SyncDevice device:
@@ -369,7 +414,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 {
                     // An attachment whose 60-second reply deadline expires drops the connection so the
                     // next session restarts cleanly from offer; text items may resend on the same link.
-                    var expired = c.Sent.Where(p => p.Key != c.InFlight && now - p.Value > TimeSpan.FromSeconds(60)).Select(p => p.Key).ToArray();
+                    var expired = c.Sent.Where(p => p.Key != c.InFlight && now > p.Value.Deadline).Select(p => p.Key).ToArray();
                     if (expired.Any(id => c.AwaitingOffsets.ContainsKey(id) || c.Offsets.ContainsKey(id) ||
                         store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == id)?.Kind is "image" or "file"))
                     {
@@ -501,7 +546,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         } else { message = item.Offer; c.AwaitingOffsets[item.Id] = -1; finishesItem = item.Size == 0; }
                         // Mark before I/O: resume/ack may arrive before notification completion.
                         var sentNow = Now();
-                        c.Sent[item.Id] = sentNow;
+                        c.Sent[item.Id] = new(sentNow, sentNow + ReplyTimeout, c.CurrentIncomingFrameToken);
                         c.Attempted.Add(item.Id);
                         store.MarkSent(item, sentNow);
                         frame = c.Sender!.Seal(SyncMessageCodec.Encode(message));
@@ -537,7 +582,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     if (item is not null)
                     {
                         if ((item.Kind == "text" || c.AwaitingOffsets.ContainsKey(item.Id)) && store.Pending(c.DeviceId).Any(i => i.Id == item.Id))
-                            c.Sent[item.Id] = Now();
+                        {
+                            var completedNow = Now();
+                            c.Sent[item.Id] = new(completedNow, completedNow + ReplyTimeout, c.CurrentIncomingFrameToken);
+                        }
                         c.InFlight = null;
                         if (finishesItem) lastSent = Now();
                         log($"sent items=1 resend={retransmission} pending={store.PendingCount}");
@@ -571,6 +619,40 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         c.Peer.Reject();
         log($"connection retired reason={reason}");
         Publish();
+    }
+
+    private static void ExtendReplyDeadlines(Connection c, ulong frameToken, DateTimeOffset now)
+    {
+        var candidate = now + ReplyTimeout;
+        foreach (var id in c.Sent.Keys.ToArray())
+        {
+            var entry = c.Sent[id];
+            if (entry.AllowedFrameToken != frameToken) continue;
+            var maxDeadline = entry.InitialSentAt + ReplyTimeout + MaxReplyExtension;
+            var updated = candidate > maxDeadline ? maxDeadline : candidate;
+            if (updated > entry.Deadline)
+                c.Sent[id] = entry with { Deadline = updated };
+        }
+    }
+
+    private static void RevertReplyExtension(Connection c, ulong frameToken)
+    {
+        foreach (var id in c.Sent.Keys.ToArray())
+        {
+            var entry = c.Sent[id];
+            if (entry.AllowedFrameToken == frameToken)
+                c.Sent[id] = entry with { Deadline = entry.InitialSentAt + ReplyTimeout, AllowedFrameToken = null };
+        }
+    }
+
+    private static void ClearAllowedFrameToken(Connection c, ulong frameToken)
+    {
+        foreach (var id in c.Sent.Keys.ToArray())
+        {
+            var entry = c.Sent[id];
+            if (entry.AllowedFrameToken == frameToken)
+                c.Sent[id] = entry with { AllowedFrameToken = null };
+        }
     }
 
     // Exception messages can contain paths or external input. Log only a fixed code/type.
