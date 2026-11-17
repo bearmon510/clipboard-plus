@@ -1125,6 +1125,8 @@ final class PCSyncControllerTests: XCTestCase {
         await awaitSave(f, savedCount: 4)
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data([9]), name: "after.bin")], receivedAt: baseDate.addingTimeInterval(4))
         await awaitSave(f, savedCount: 5)
+        // awaitSave covers the history write only; after.bin joins the send queue asynchronously.
+        await drain(f)
         XCTAssertEqual(f.link.offers.count, 3)
         let emptyOffer = f.link.offers[2]
         XCTAssertEqual(emptyOffer.filename, "empty.bin")
