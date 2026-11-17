@@ -980,7 +980,8 @@ final class PCSyncControllerTests: XCTestCase {
         let f = try Fixture(test: self), pairing = try pair(f)
         let data1 = Data(repeating: 11, count: SyncProtocol.chunkBytes + 5)
         let data2 = Data([22, 23, 24])
-        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        // Items older than 24 hours on the fixture clock (which starts now) are pruned from the queue.
+        let baseDate = f.clock.date
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data1, name: "one.bin")], receivedAt: baseDate)
         await awaitSave(f, savedCount: 1)
         f.monitor.saveManually(["途中の文章"], receivedAt: baseDate.addingTimeInterval(1))
@@ -1053,7 +1054,8 @@ final class PCSyncControllerTests: XCTestCase {
 
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(), name: "zero.bin")], receivedAt: Date().addingTimeInterval(1))
         await awaitSave(f, savedCount: 2)
-        XCTAssertEqual(f.link.offers.count, 2)
+        // The reconnect offers ten.bin again, because it was not acknowledged before the drop.
+        XCTAssertEqual(f.link.offers.map(\.filename), ["ten.bin", "ten.bin", "zero.bin"])
         let zeroOffer = try XCTUnwrap(f.link.offers.last)
         XCTAssertEqual(zeroOffer.size, 0)
         try f.link.send(.resume(id: zeroOffer.id, offset: 0))

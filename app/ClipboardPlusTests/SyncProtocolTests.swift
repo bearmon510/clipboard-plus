@@ -272,7 +272,8 @@ final class SyncProtocolTests: XCTestCase {
             return XCTFail("Expected offer")
         }
         XCTAssertEqual(zwjOffer.filename, "家族👨‍👩‍👧‍👦.txt")
-        XCTAssertTrue(zwjOffer.filename.contains("\u{200D}"))
+        // String.contains compares grapheme clusters, and U+200D is inside the emoji's cluster.
+        XCTAssertTrue(zwjOffer.filename.unicodeScalars.contains("\u{200D}"))
 
         let bad = try object(failures, "controlNameOffer")
         XCTAssertEqual(try string(bad, "error"), "format")
