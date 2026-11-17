@@ -1,0 +1,41 @@
+<Window x:Class="ClipboardPlus.Windows.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="clipboard+ for Windows" Width="570" Height="690" MinWidth="500" MinHeight="460"
+        Background="#F3F5F8" Foreground="#1F2937" FontFamily="Yu Gothic UI, Segoe UI" FontSize="14"
+        WindowStartupLocation="CenterScreen" Closing="OnClosing">
+  <ScrollViewer VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="30,26">
+      <TextBlock Text="clipboard+" FontSize="30" FontWeight="SemiBold"/>
+      <TextBlock Text="iPad と Windows を、近くで同期" Foreground="#64748B" Margin="0,2,0,22"/>
+      <Border Background="White" CornerRadius="12" Padding="20" BorderBrush="#E2E8F0" BorderThickness="1">
+        <StackPanel>
+          <TextBlock x:Name="StatusText" Text="Bluetoothを確認しています" FontSize="19" FontWeight="SemiBold"/>
+          <TextBlock Text="文章をBluetooth LEで両方向に送ります。" Foreground="#64748B" Margin="0,6,0,14"/>
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+            <StackPanel><TextBlock Text="最後に送った時刻" Foreground="#64748B" FontSize="12"/><TextBlock x:Name="SentText" Text="まだありません" Margin="0,4,0,0"/></StackPanel>
+            <StackPanel Grid.Column="1"><TextBlock Text="最後に受け取った時刻" Foreground="#64748B" FontSize="12"/><TextBlock x:Name="ReceivedText" Text="まだありません" Margin="0,4,0,0"/></StackPanel>
+          </Grid>
+          <TextBlock x:Name="PendingText" Foreground="#64748B" Margin="0,12,0,0" FontSize="12" Text="確認待ち 0 件"/>
+        </StackPanel>
+      </Border>
+      <Border Background="White" CornerRadius="12" Padding="20" Margin="0,16,0,18" BorderBrush="#E2E8F0" BorderThickness="1">
+        <StackPanel>
+          <TextBlock x:Name="PairingTitle" Text="iPadと組にする" FontSize="18" FontWeight="SemiBold"/>
+          <TextBlock Text="iPadのclipboard+で、メニューの「設定」→「Windowsと同期」→「QRコードを読む」を選び、このコードを読んでください。" Margin="0,8,0,12"/>
+          <Border Background="White" Padding="8" HorizontalAlignment="Center">
+            <Image x:Name="QrImage" Width="240" Height="240" RenderOptions.BitmapScalingMode="NearestNeighbor"/>
+          </Border>
+          <TextBlock Text="このコードには組にするための鍵が含まれます。他の人に見せないでください。" FontSize="12" Foreground="#64748B" Margin="0,10,0,0"/>
+        </StackPanel>
+      </Border>
+      <WrapPanel Margin="0,0,0,16">
+        <Button x:Name="RepairButton" Content="組み直す" Click="OnRepair"/>
+        <Button x:Name="LogsButton" Content="ログのフォルダを開く" Click="OnOpenLogs"/>
+      </WrapPanel>
+      <CheckBox x:Name="StartupCheck" Content="Windowsの起動時に開く" Click="OnStartupChanged"/>
+      <TextBlock Text="ウインドウを閉じても同期を続けます。終了するには、タスクトレイのアイコンから「終了」を選んでください。" FontSize="12" Foreground="#64748B" Margin="0,14,0,0"/>
+    </StackPanel>
+  </ScrollViewer>
+</Window>

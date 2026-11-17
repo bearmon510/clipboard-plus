@@ -1,0 +1,163 @@
+using System.Diagnostics;
+using System.Threading;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Interop;
+using ClipboardPlus.Sync;
+using ClipboardPlus.Windows.Core;
+using ClipboardPlus.Windows.Infrastructure;
+using Forms = System.Windows.Forms;
+
+namespace ClipboardPlus.Windows;
+
+public partial class App : System.Windows.Application
+{
+    private Mutex? mutex;
+    private EventWaitHandle? activation;
+    private RegisteredWaitHandle? activationWait;
+    private Forms.NotifyIcon? tray;
+    private ClipboardMonitor? clipboard;
+    private BleServer? server;
+    private SyncCoordinator? coordinator;
+    private AppLog? log;
+    private MainWindow? window;
+    private bool exiting;
+    private const string InstanceName = @"Local\clipboardplus.windows.instance.v1";
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+        if (e.Args.Contains("--preview"))
+        {
+            // A UI-only mode: no store, registry access, IPC, clipboard listener,
+            // tray icon or Bluetooth. Pairing lives only in this process's memory.
+            ShutdownMode = ShutdownMode.OnMainWindowClose;
+            MainWindow = new MainWindow(SyncPairing.Create("プレビュー"), _ => { }, preview: true);
+            MainWindow.Show();
+            return;
+        }
+        mutex = new Mutex(true, InstanceName, out var first);
+        if (!first)
+        {
+            // The first process may still be constructing its event.
+            for (var i = 0; i < 20; i++)
+            {
+                if (EventWaitHandle.TryOpenExisting(InstanceName + ".open", out var existing))
+                {
+                    var hwnd = FindWindow(null, "clipboard+ for Windows");
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        GetWindowThreadProcessId(hwnd, out var processId);
+                        AllowSetForegroundWindow(processId);
+                    }
+                    using (existing) existing.Set(); break;
+                }
+                Thread.Sleep(50);
+            }
+            Shutdown(); return;
+        }
+        try
+        {
+            log = new AppLog(); log.Write("application starting");
+            var pairing = LocalStore.LoadOrCreate();
+            window = new MainWindow(pairing, log.Write);
+            MainWindow = window;
+            _ = new WindowInteropHelper(window).EnsureHandle();
+            window.RepairRequested += RepairAsync;
+            activation = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + ".open");
+            activationWait = ThreadPool.RegisterWaitForSingleObject(activation, (_, _) => Dispatcher.BeginInvoke(OpenWindow), null, Timeout.Infinite, false);
+            clipboard = new ClipboardMonitor(Dispatcher, log.Write);
+            clipboard.Changed += ClipboardChanged;
+            StartSync(pairing);
+            tray = new Forms.NotifyIcon
+            {
+                Text = "clipboard+ for Windows",
+                Icon = System.Drawing.SystemIcons.Application,
+                Visible = true,
+                ContextMenuStrip = new Forms.ContextMenuStrip()
+            };
+            tray.ContextMenuStrip.Items.Add("開く", null, (_, _) => OpenWindow());
+            tray.ContextMenuStrip.Items.Add("終了", null, async (_, _) => await ExitAsync());
+            tray.DoubleClick += (_, _) => OpenWindow();
+            if (!e.Args.Contains("--background")) OpenWindow();
+        }
+        catch (Exception ex)
+        {
+            log?.Write($"startup failed error={ex.GetType().Name}");
+            System.Windows.MessageBox.Show("起動できませんでした。保存先へのアクセスとBluetoothの設定を確認してください。\n組にする情報の読み込みに失敗した場合は、ログとpairing.datを退避してから起動し直してください。", "clipboard+", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown(1);
+        }
+    }
+
+    private void StartSync(SyncPairing pairing)
+    {
+        coordinator = new(pairing, clipboard!, log!.Write);
+        var current = coordinator;
+        coordinator.Changed += state => Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(state); });
+        server = new(coordinator, log.Write);
+        var currentServer = server;
+        server.StatusChanged += state => Dispatcher.BeginInvoke(() => { if (server == currentServer) window!.UpdateBluetooth(state); });
+        server.Start();
+    }
+
+    private async void ClipboardChanged(ClipboardSnapshot snapshot)
+    {
+        if (coordinator is not null && !exiting)
+            try { await coordinator.ClipboardChangedAsync(snapshot); }
+            catch (Exception e) { log!.Write($"clipboard event error={e.GetType().Name}"); }
+    }
+
+    private async void RepairAsync()
+    {
+        if (window is null || exiting) return;
+        if (System.Windows.MessageBox.Show(window, "組にする鍵を作り直します。前のiPadはつながらなくなります。\n新しいQRコードをiPadで読み直してください。", "組み直す", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        window.SetBusy(true);
+        try
+        {
+            // Persist successfully before retiring the old pairing.
+            var pairing = LocalStore.CreatePairing();
+            coordinator = null;
+            if (server is not null) await server.DisposeAsync();
+            window.UpdatePairing(pairing);
+            StartSync(pairing);
+            log!.Write("pairing replaced");
+        }
+        catch (Exception e)
+        {
+            log!.Write($"repair failed error={e.GetType().Name}");
+            System.Windows.MessageBox.Show(window, "組み直せませんでした。ログを確認して、アプリを起動し直してください。", "clipboard+");
+        }
+        finally { window.SetBusy(false); }
+    }
+
+    private void OpenWindow()
+    {
+        if (window is null || exiting) return;
+        window.Show(); window.WindowState = WindowState.Normal;
+        window.Activate();
+        window.Topmost = true; window.Topmost = false;
+    }
+
+    private async Task ExitAsync()
+    {
+        if (exiting) return;
+        exiting = true;
+        tray!.Visible = false;
+        clipboard?.Dispose();
+        if (server is not null) await server.DisposeAsync();
+        log?.Write("application stopped");
+        Shutdown();
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        tray?.Dispose();
+        activationWait?.Unregister(null); activation?.Dispose();
+        mutex?.Dispose();
+        base.OnExit(e);
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindow(string? className, string title);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+    [DllImport("user32.dll")] private static extern bool AllowSetForegroundWindow(uint processId);
+}

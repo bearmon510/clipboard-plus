@@ -99,3 +99,62 @@ iPadとPCの両方で同じ決まりを実装する。食い違いを防ぐた�
 - iPad側：`app/ClipboardPlus/Core/Sync*.swift`（通信の決まり・暗号。テストしやすいように分ける）、`app/ClipboardPlus/Services/`（Bluetoothの接続と履歴への受け渡し）。
 - PC側：`windows/`。.NET 10、`net10.0-windows10.0.19041.0`。通信の決まりと暗号のライブラリ、テスト、常駐アプリに分ける。このPCでビルドして試せる。
 - 共通：`protocol/test-vectors.json`。
+
+## iPad側の実装メモ
+
+2026年11月17日。画面用の窓口は `Services/PCSyncController.swift` の `@MainActor PCSyncController.shared`。依頼どおりの `Status`、`pcName`、`lastSentAt`、`lastReceivedAt`、`copiesReceivedToPasteboard`、`pair(code:)`、`unpair()` を持つ。`pair` の失敗は `PCSyncPairError.message`（日本語）。画面向けAPIの変更はない。内部のテスト用初期化では履歴、Keychain、Bluetooth、時計を差し替えられる。
+
+- **起動と許可。** アプリの初期化で窓口を起動する。未登録では `CBCentralManager` を作らず、有効なQRの検証とKeychain保存に成功した後に初めて作る。登録済みなら起動時に作る。カメラの許可要求は別担当のQR画面に任せる。テストホストのアプリ初期化では自動接続を起動しない。
+- **保存。** 鍵は `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` の非同期化Keychain項目。PCの識別子・名前、iPadのUUID、確認済みperipheralのUUID、設定は `pcSync.v1.*` のUserDefaultsに置く。iPadのUUIDは組の解除でも維持する。解除時に鍵を消せない場合は解除済みの印を残して再利用を禁止し、タイマー・ロック解除・次回起動で削除を再試行する。OS再起動後の最初のロック解除前には鍵が読めないため、解除後に再開する。
+- **接続。** `PCSyncTransport` が差し替え可能な薄い境界、`PCSyncBluetooth` が実機のcentral。CoreBluetoothのdelegateと通信処理をmain queue/MainActorに直列化する。確認済みの識別子には `retrievePeripherals` と期限なしの `connect` を出す。未接続の前面ではサービスUUID指定のscanも継続し、広告の重複通知を許可して失敗後・10分の除外期間後にも再発見する。既知の接続待ちと新しい候補は最大2台。新しい未確認の候補への接続待ちは20秒で次に進む（確認済み相手の待ちは切らない）。確認失敗は10分除外、通常の再試行は3秒間隔。初回発見とアドレス変更後の再発見はアプリを前面に置く。
+- **状態復元。** `clipboardplus.pc-sync.central.v1` を復元識別子とし `willRestoreState` でperipheralを保持する。既に接続済みの復元リンクは一度切断し、PC側にも古い暗号セッションを捨てさせてから新しいHELLOを送る。暗号鍵・送信番号を復元せず、新しい乱数で接続し直す。
+- **送受信。** 通知の有効化後にHELLOを送り、WELCOMEを検証し、AUTHの全パケットをwrite without responseへ渡してから項目を送る。送信の値上限には `maximumWriteValueLength(for: .withoutResponse)` を使い、`canSendWriteWithoutResponse` とready callbackで停止・再開する。通知側の交渉済み上限はiOS APIから得られないため、受信組み立て器にはGATT属性値の最大512バイトを渡す（送信上限とは分ける）。一度に展開する送信フレームは1個、ackを次の項目より先に送る。
+- **期限。** サービス・通知準備と接続確認はそれぞれ30秒。組み立ての無進行、送信の無進行、項目全体を書き込んでからのack待ちは60秒。期限切れは接続を切り、未ackの項目を同じIDで再送する。背景でOSに停止されている間の実時間どおりのタイマー実行は保証されない。
+- **履歴との受け渡し。** `ClipboardMonitor.admit` が取り込みイベントごと（同一本文の再取り込みを含む）に送信通知し、文章・リンクのカードコピーも通知する。履歴とテンプレートの両方に適用する。`source == .pc` のカードコピーとPC受信専用経路では送信しない。未ackは最大50件をメモリに保持し、古い順に破棄する。組の解除・変更とプロセス終了では消える。画像・ファイルは対象外。
+- **受信とack。** `HistoryStore.collectFromPC` は通常と同じ本文の重複統合を `source: .pc` で行い、SQLiteへの保存成功後だけackする。PCの時計ずれで履歴の順番や自動削除が乱れないよう、履歴の時刻はiPadで受け取った時刻にする。保存失敗はackせず、履歴層には別の再試行を残さずPCからの再送に任せる。保存中のIDも二重に保存しない。保存済みIDは直近500件をメモリに保持し、再受信はackのみ返す。プロセス終了をまたぐ重複排除は次段階。
+- **iPadのクリップボード。** 設定は初期値true。保存済みの本文を書き込み、既存の自己コピー印と書き込み後のchangeCountで二重取り込みを抑える。書いた本文を再読しないので、同期ログへ本文を出さない。後から外部アプリが同じ本文をコピーした場合は通常どおり取り込む。背景でも書き込みを試すが、UIKitは失敗をthrowしないためchangeCountの増加で判定する。変化しなければ書けなかったことを固定文でログに残し、履歴保存とackは続ける。他のコピー・読み取り操作中は書き込みを見送る。組の解除中に終わった古い受信の保存は、新しい組へのackやクリップボード書き込みを行わない。
+- **ログ。** 既存の計測ログに `PC同期` として状態、scan、接続、確認、失敗理由、GATT値上限、件数、GATTパケットのバイト数、所要時間、再送とack待ち時間を出す。OSエラーは数値コードだけにし、本文・QR・鍵・機器名・UUID・NSErrorの説明を渡さない。本文プレビュー設定が有効でもPC受信経路の本文は出ない。
+- **バックアップ・JSON・ショートカット。** 履歴のCodable/SQLite/バックアップは `pc` を保持し、リンクは既存のURL判定とショートカット表示を使う。鍵・接続先UUID・送受信ID・送信待ち・設定は履歴モデルに持たせず、アプリのバックアップとJSON書き出しには入れない。`pc` を知らない旧版では新しい履歴・バックアップを読めないため、ダウングレードは対象外。iOS自体の端末バックアップとは別の話で、UserDefaultsは通常のOS保存に従う。
+- **画面担当との結合。** `HistorySource.pc` の追加に伴い、`Views/EntryDetailView.swift` の `sourceLabel` のswitchに `case .pc: return "PC"` が必要。Viewsを編集しないという担当境界のため、画面側でこの分岐を追加する（未追加のままでは網羅性エラーになる）。
+- **検証。** `PCSyncControllerTests` は偽のGATT接続・Keychain・pasteboardと実際の `SyncPcHandshake`/暗号部品を使用する。QR、遅延Bluetooth生成、認証、flow control、ack、再送、待ち件数、受信の重複500件、source pc、リンク、自己コピー、送り返しの防止、解除、期限、ログの秘匿を確認する。`ShortcutCompatibilityTests` にpcのSQLite・JSON・バックアップ復元の往復を追加。MainActorのテストは同期メソッドでexpectationを待つ。WindowsではSwift/XCTestを実行できないため、Xcode 27.1の既存CIと実機BLEでの確認が必要。
+- **実機で試す際の注意。** 最初の接続とアドレス変更後の再発見はアプリを前面に置く。背景の再接続では、切断コールバックの中で既知の相手への接続要求を出し直し、アプリのタイマーの再実行を待たない。アプリを利用者が強制終了した場合は通常の状態復元で再起動されないので、一度手動で開く。端末再起動後も最初にロック解除する。未ackの送信待ちと受信ID一覧は試作のためアプリ終了で失われる。
+- **APIの根拠。** 接続要求と状態復元は[Appleの背景処理の説明](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/CoreBluetoothBackgroundProcessingForIOSApps/PerformingTasksWhileYourAppIsInTheBackground.html)、強制終了時の制約は[Apple TN3115](https://developer.apple.com/documentation/technotes/tn3115-bluetooth-state-restoration-app-relaunch-rules)、受信属性値512バイトの上限は[Bluetooth ATT仕様](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-62/out/en/host/attribute-protocol--att-.html)を参照。
+
+## PC側の実装メモ
+
+2026年11月17日。`windows/ClipboardPlus.Windows/` にWPFの常駐アプリを実装。出力名は `ClipboardPlusForWindows`。既存の通信ライブラリ・仕様・試験データは変更していない。追加のNuGetパッケージはない。
+
+- **構成。** `Core/SyncCoordinator.cs` はWindows APIに依存しない接続・確認・送受信の窓口。`ISyncPeer` と `IClipboardAccess` が差し替え可能な境界。既存の組み立て型の名前は `SyncPacketAssembler`。同じソースを既存の `ClipboardPlus.Sync.Tests` にリンクし、WPFや実機に依存せずテストする。
+- **Bluetooth。** `Infrastructure/BleServer.cs` がGATTサーバー。指定のUUID、write / write without response / notify、Plain、discoverable / connectableを使用。WinRTイベントはFIFOのキューに入れ、writeのdeferralを取得してから直列に処理する。通知は購読クライアントを指定し、各通知の完了を待つ。値上限は `max(20, MaxPduSize - 3)`。購読後のMTU増加にも対応する。
+- **再開と破棄。** アダプター・radio・広告状態を3秒間隔で確認し、オフ・無効・非対応・アクセス不可・開始失敗を区別して表示する。オンに戻ればサービスと広告を作り直す。購読解除・sessionのClosedで接続状態を破棄する。受信不正、認証失敗、復号失敗、通知失敗、クリップボード書き込み失敗でもその相手の状態を破棄する。認証前は接続開始から20秒、組み立て途中は最後のパケットから20秒で期限切れ。通知1回の待ちは最大10秒。
+- **GATT APIの制約。** ローカルGATTサーバーの公開APIには相手を強制切断する操作がないため、失敗した購読は失効させ、以後のwriteを拒否する。write with responseにはATTエラーを返し、write without responseは処理しない。iPadは期限切れ等で切断し、購読し直してから新しいHELLOを送る必要がある。失敗した購読のままHELLOを送り直しても復帰させない。接続は最大8件まで保持する。
+- **組にする情報。** 初回に `SyncPairing.Create(Environment.MachineName)` を呼ぶ。`%LOCALAPPDATA%\clipboardplus\pairing.dat` はQR文字列全体をDPAPI CurrentUserで暗号化し、一時ファイルから置き換える。平文のQRや鍵をファイル・ログに出さない。読み込み・復号に失敗したら黙って新しい鍵に置き換えず、起動エラーを表示する。「組み直す」は確認後に新しいPC識別子と鍵を保存し、古い接続・未確認項目を捨てて再開する。
+- **クリップボード。** メッセージ専用の見えないHwndSourceと `AddClipboardFormatListener` を使う。1回のOpenClipboard中に文章と3種類の除外形式を読み、開けない場合は40/80/120/160/200ms待ちながら最大5回試す。除外形式が存在して読めない場合も送信を見送る。iPadからの書き込みはDispatcherで行い、その直後の通し番号の変化だけを除外する。同じ本文を利用者が新たにコピーした場合は送る。本文・除外理由の元データはログに出さない。
+- **待ち項目と重複。** 未ackは最大50件をメモリに保持し、超過時は最古を捨てて件数だけ記録する。新しい認証接続に同じ項目IDで再送し、同じ接続でも60秒ackがなければ番号を進めた新しい暗号フレームで再送する。受信はクリップボード書き込みの成功後にackし、成功済みの直近500個のIDは本文を書かずackだけ返す。未ackと重複IDはプロセス終了・組み直しで消える。ディスクへの履歴保存は次段階。
+- **画面・常駐。** 名前付きMutexとイベントで二重起動を防ぎ、2回目は元の画面を開く。閉じる操作は非表示にし、トレイの「終了」で広告と監視を停止する。起動時のチェックはHKCUのRunに実行ファイルと `--background` を登録する。QR・送受信時刻・確認待ち件数を表示する。`--preview` は画面確認専用で、Bluetooth、クリップボード、レジストリ、ペア情報ファイル、ログ、トレイ、単一起動IPCを使用しない。QRもプレビュー用にメモリで生成する。
+- **ログ。** `%LOCALAPPDATA%\clipboardplus\logs\sync.log` と `.1`〜`.4`。約1MiBごとに回し、最大5ファイルを保持する。接続・広告・認証・MTU・件数・バイト数・所要時間・再送を残す。例外は型名または固定コードのみを記録し、例外メッセージ、本文、鍵、QR、機器名、相手のIDやアドレスを記録しない。
+
+### PC側のビルドとテスト
+
+リポジトリ直下のPowerShellで実行する。通常は既定のNuGetキャッシュで復元できる。実行環境の既定キャッシュが異なる場合は、取得済みのパッケージフォルダを明示してオフライン復元する（新しいパッケージを取得する操作ではない）。
+
+```powershell
+$packageCache = Join-Path $env:USERPROFILE '.nuget/packages'
+& 'C:/Program Files/dotnet/dotnet.exe' restore windows/ClipboardPlus.slnx --source $packageCache -p:NuGetAudit=false
+& 'C:/Program Files/dotnet/dotnet.exe' build windows/ClipboardPlus.slnx --no-restore
+& 'C:/Program Files/dotnet/dotnet.exe' test windows/ClipboardPlus.slnx --no-build --no-restore
+```
+
+確認結果：buildは警告0・エラー0。既存の通信試験を含め24件成功、失敗0。偽の接続と `SyncPadHandshake` で両方向のitem/ack、20/182バイト分割、再接続再送、同じ接続でのack待ち再送、重複500件、未確認50件、自己コピー・除外・非文章、認証前データ・不正AUTH・改ざん・不正JSON・番号の再利用・逆方向項目、相手ごとの破棄、書き込み失敗、MTU増加、期限切れを確認した。テストランナーは `VSTEST_ARTIFACTS_DIRECTORY` 未設定時に一時フォルダへ出力する案内を表示するが、全テストは成功している。
+
+画面だけのプレビューはプロセス起動まで確認したが、画面操作ツールからウインドウを取得できなかったため、見た目の確認は未完了。通常起動はBLEとクリップボードへの影響について自動承認レビューで停止されたため、実機の広告開始・接続・常駐・レジストリ変更は未確認。
+
+### PCとiPadで試す手順
+
+1. ビルド後、`windows/ClipboardPlus.Windows/bin/Debug/net10.0-windows10.0.19041.0/ClipboardPlusForWindows.exe` を起動する。WindowsのBluetoothをオンにし、状態が「iPadを待っています」になることと、ログに広告のStartedが出ることを確認する。画面だけなら実行ファイルに `--preview` を付ける。
+2. iPadのclipboard+で「設定」→「Windowsと同期」→「QRコードを読む」。必要なBluetooth・カメラの許可を利用者が行う。PCが「iPadとつながっています」になること、ログの認証とMTUを確認する。
+3. 検証用の文章（日本語、絵文字、改行、長い文章）をPCでコピーし、iPadの履歴・PCの確認待ち件数の解消を確認する。逆方向はiPadのclipboard+に取り込んだ文章を使い、PCのメモ帳などへ貼り付ける。Windowsの履歴が有効ならWin+Vにも入ることを確認する。受信した文章が往復して件数を増やさないことも見る。
+4. iPadを背景にしてPCでコピーし、iPadの履歴への到着を確認する。次にiPadのBluetoothを切り、PCで数件コピーしてから戻し、同じIDの再送で履歴が二重にならないことを確認する。PC側のBluetoothも切って戻し、3秒程度で待ち受けを再開することを確認する。
+5. パスワード管理アプリ等の監視除外付きコピーと画像のみのコピーが送られないことを、内容をログに出さず件数で確認する。クリップボードが一時的に使用中でも、リトライ後に文章が届くことを確認する。
+6. ウインドウを閉じても同期が続くこと、もう一度exeを起動すると元の画面が開くこと、トレイの「開く」「終了」を確認する。「Windowsの起動時に開く」は利用者がチェックし、次のWindowsサインインで画面を出さず常駐することを確認する。
+7. 「組み直す」のキャンセルでは既存接続が続くこと、確定後は古いiPadの鍵では認証できず、新しいQRで組み直せることを確認する。PC再起動後もQRのPC識別子と鍵が維持されることを確認する（未ack項目のプロセス終了をまたぐ保持は対象外）。
