@@ -224,6 +224,16 @@ final class HistoryStore {
         }
     }
 
+    /// A remote sender owns retries until ACK. Do not also retain a failed write in pending.
+    func collectFromPC(_ text: String, at date: Date,
+                       completion: @escaping @MainActor (Result<HistoryEntry, Error>) -> Void) {
+        perform({ database in
+            let entry = try database.collect(text, source: .pc, at: date)
+            self.emit(.upsert(entry))
+            return entry
+        }, completion: completion)
+    }
+
     func load(completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
             try self.applyRetention(database, force: true)

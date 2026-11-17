@@ -54,6 +54,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     let log: MeasurementLog
 
+    /// Installed by PCSyncController. An admission event also fires for repeated text.
+    var onLocalTextForPC: ((String) -> Void)?
+
     private let pasteboard: ClipboardPasteboard
     private let defaults: UserDefaults
     private let makeDatabase: (() throws -> HistoryPersistence)?
@@ -221,7 +224,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         admission.recordSelfCopy(entry.text)
         pasteboard.string = entry.text
         let after = pasteboard.changeCount
-        if shortcutOperationCount > 0 {
+        if shortcutOperationCount > 0 || entry.source == .pc {
             lastObservedChangeCount = after
             // No readback is needed. A later external copy of the same text must count.
             admission.discardPendingSelfCopy()
@@ -236,7 +239,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             characterCount: entry.text.count,
             historyNumber: entry.id,
             details: "読み書き前changeCount=\(before); 書き込み後changeCount=\(after)",
-            text: entry.text
+            text: entry.source == .pc ? nil : entry.text
         )
         if isRecording && shortcutOperationCount == 0 {
             let detections = deferredDetections
@@ -251,7 +254,50 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             log.append(copyEvent)
         }
         isCopying = false
+        if entry.source != .pc { onLocalTextForPC?(entry.text) }
         completion?(true)
+    }
+
+    /// Remote items bypass local admission and outgoing events. ACK follows durable storage.
+    func receiveFromPC(_ text: String, copyToPasteboard: Bool,
+                       isCurrentPairing: @escaping () -> Bool = { true }, completion: @escaping (Bool) -> Void) {
+        pendingSaveCount += 1
+        store.collectFromPC(text, at: Date()) { [weak self] result in
+            guard let self else { completion(false); return }
+            self.pendingSaveCount -= 1
+            switch result {
+            case .failure:
+                self.reportStorageFailure()
+                completion(false)
+            case .success:
+                self.savedCount += 1
+                if self.pendingSaveCount == 0 { self.storageError = nil }
+                if copyToPasteboard && isCurrentPairing() { self.copyReceivedText(text) }
+                completion(true)
+            }
+        }
+    }
+
+    private func copyReceivedText(_ text: String) {
+        guard !isCopying, !isWriting, !isReading else {
+            record("PC同期", details: "クリップボードへの書き込み見送り; 理由=操作中")
+            return
+        }
+        readBeforeCopy()
+        store.resetImageAdmission(); store.resetFileAdmission()
+        let before = pasteboard.changeCount
+        isWriting = true
+        admission.recordSelfCopy(text)
+        pasteboard.string = text
+        let after = pasteboard.changeCount
+        // Consume this known self-copy without reading its contents (or logging a preview).
+        // A subsequent external copy of the SAME text must still be admitted and sent.
+        if after != before { lastObservedChangeCount = after }
+        admission.discardPendingSelfCopy()
+        isWriting = false
+        // UIPasteboard has no throwing write API. In the background the OS can refuse
+        // the write; a non-advancing changeCount is logged without reading the contents.
+        record("PC同期", details: after != before ? "クリップボードへの書き込み成功" : "クリップボードへの書き込みを確認できず; 背景制約などの可能性")
     }
 
     // MARK: Content made inside the app
@@ -1052,6 +1098,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         case .add:
             pendingSaveCount += 1
             store.collect(text, source: route, at: timestamp)
+            if route != .pc { onLocalTextForPC?(text) }
             return true
         case .skip(let reason):
             record(

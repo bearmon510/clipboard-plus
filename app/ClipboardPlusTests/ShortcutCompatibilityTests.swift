@@ -11,7 +11,7 @@ final class ShortcutCompatibilityTests: XCTestCase {
         let sourceURL = root.appendingPathComponent("source.sqlite")
         let source = try HistoryDatabase(url: sourceURL)
         let files = HistoryImageFiles(directory: root.appendingPathComponent("originals"))
-        for (index, route) in [HistorySource.automatic, .manual, .drag, .capture].enumerated() {
+        for (index, route) in [HistorySource.automatic, .manual, .drag, .capture, .pc].enumerated() {
             try source.collect("出どころ\(index)", source: route, at: Date(timeIntervalSince1970: Double(index + 1)))
         }
         let picture = try ImageTestSupport.prepare(files)
@@ -24,7 +24,7 @@ final class ShortcutCompatibilityTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: export) as? [String: Any])
         XCTAssertEqual(json["formatVersion"] as? Int, 5)
         let records = try XCTUnwrap(json["entries"] as? [[String: Any]])
-        XCTAssertTrue(records.allSatisfy { ["automatic", "manual", "drag", "capture"].contains($0["source"] as? String ?? "") })
+        XCTAssertTrue(records.allSatisfy { ["automatic", "manual", "drag", "capture", "pc"].contains($0["source"] as? String ?? "") })
 
         let url = root.appendingPathComponent("shortcut.clipboardplus")
         _ = try HistoryBackup.write(entries: expected, files: files, to: url, cancellation: BackupCancellation())

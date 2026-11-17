@@ -119,6 +119,7 @@ struct EntryDetailView: View {
         case .drag: return "ドラッグ"
         case .capture: return "切り取り"
         case .written: return "アプリで作成"
+        case .pc: return "PCから受け取り"
         }
     }
 }

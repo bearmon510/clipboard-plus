@@ -34,6 +34,14 @@ final class ScreenSnapshotTests: XCTestCase {
         try save(render(WelcomeView(), size: Self.wide, style: .dark), "welcome-wide-dark")
     }
 
+    /// The settings, with the Windows sync section unpaired as on a fresh install.
+    @MainActor
+    func testRenderSettings() throws {
+        let monitor = try makeMonitor(populated: false)
+        let settings = SettingsView(monitor: monitor, log: monitor.log, screenshots: ScreenshotWatcher(log: monitor.log))
+        try save(render(settings, size: Self.narrow, style: .light), "settings-narrow-light")
+    }
+
     @MainActor
     func testRenderMainScreens() throws {
         let monitor = try makeMonitor(populated: true)

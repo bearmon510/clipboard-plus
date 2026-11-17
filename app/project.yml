@@ -34,6 +34,9 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
+        UIBackgroundModes: [bluetooth-central]
+        NSBluetoothAlwaysUsageDescription: 近くのWindowsのPCと、コピーした文章を受け渡すために使います。
+        NSCameraUsageDescription: PCに表示されたQRコードを読んで、PCと組にするために使います。
         NSPhotoLibraryUsageDescription: 撮ったスクリーンショットを見つけて、範囲を選んで切り取るために使います。写真を外へ送ることはありません。
         # Shows the Documents folder (measurement log only) in the Files app.
         # History, images and backups stay outside it.

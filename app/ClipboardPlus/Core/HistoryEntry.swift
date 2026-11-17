@@ -19,6 +19,8 @@ enum HistorySource: String, Codable {
     case automatic, manual, drag, written
     /// Made inside the app from a picture: a cut-out part, or text read from it.
     case capture
+    /// Text received from the paired Windows PC.
+    case pc = "pc"
 }
 
 enum HistoryCollectionCount {
