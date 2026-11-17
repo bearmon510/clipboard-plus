@@ -79,7 +79,8 @@ final class PCSyncController: ObservableObject {
     private struct PendingReply {
         let initialSentAt: Date
         var deadline: Date
-        var allowedFrameToken: UInt64?
+        var baselineDeadline: Date
+        var activeFrameToken: UInt64?
     }
     private var sentAt: [UUID: PendingReply] = [:]
     private var nextIncomingFrameToken: UInt64 = 0
@@ -451,10 +452,12 @@ final class PCSyncController: ObservableObject {
                 if finished, let id = current.id {
                     let completedNow = now()
                     if pending.contains(where: { $0.id == id }) {
+                        let initialDeadline = completedNow.addingTimeInterval(Self.replyTimeout)
                         sentAt[id] = PendingReply(
                             initialSentAt: completedNow,
-                            deadline: completedNow.addingTimeInterval(Self.replyTimeout),
-                            allowedFrameToken: currentIncomingFrameToken
+                            deadline: initialDeadline,
+                            baselineDeadline: initialDeadline,
+                            activeFrameToken: nil
                         )
                     }
                     if current.finishesAttachment { finalChunkSentAttachments.insert(id) }
@@ -494,32 +497,29 @@ final class PCSyncController: ObservableObject {
             let current = now()
             lastActivity = current
             partialStart = assembler.hasPartialFrame ? current : nil
-            let frameToken: UInt64?
+            let frameToken: UInt64
             let frameBytes: Int
             let payloadCount = max(0, packet.count - 1)
             if !wasPartial {
+                nextIncomingFrameToken &+= 1
+                frameToken = nextIncomingFrameToken
+                frameBytes = payloadCount
                 if assembler.hasPartialFrame {
-                    nextIncomingFrameToken &+= 1
-                    currentIncomingFrameToken = nextIncomingFrameToken
+                    currentIncomingFrameToken = frameToken
                     incomingFrameBytes = payloadCount
-                    frameToken = currentIncomingFrameToken
-                    frameBytes = incomingFrameBytes
-                } else {
-                    frameToken = nil
-                    frameBytes = payloadCount
                 }
             } else if assembler.hasPartialFrame {
                 incomingFrameBytes += payloadCount
-                frameToken = currentIncomingFrameToken
+                frameToken = currentIncomingFrameToken ?? nextIncomingFrameToken
                 frameBytes = incomingFrameBytes
             } else {
                 incomingFrameBytes += payloadCount
-                frameToken = currentIncomingFrameToken
+                frameToken = currentIncomingFrameToken ?? nextIncomingFrameToken
                 frameBytes = incomingFrameBytes
                 currentIncomingFrameToken = nil
                 incomingFrameBytes = 0
             }
-            if status == .connected, frame == nil, let frameToken, frameBytes > Self.minExtendableFrameBytes {
+            if status == .connected, frame == nil, frameBytes > Self.minExtendableFrameBytes {
                 extendReplyDeadlines(for: frameToken, at: current)
             }
             guard let frame else { return }
@@ -539,16 +539,14 @@ final class PCSyncController: ObservableObject {
             // AUTH must already have been handed to Bluetooth before application data arrives.
             guard status == .connected, let receiver else { throw SyncProtocolError.state }
             let message = try SyncMessageCodec.decode(receiver.open(frame))
-            if let frameToken {
-                switch message {
-                case .ping, .pong:
-                    revertReplyExtension(for: frameToken)
-                default:
-                    if frameBytes > Self.minExtendableFrameBytes {
-                        extendReplyDeadlines(for: frameToken, at: current)
-                    }
-                    clearAllowedFrameToken(frameToken)
+            switch message {
+            case .ping, .pong:
+                revertReplyExtension(for: frameToken)
+            default:
+                if frameBytes > Self.minExtendableFrameBytes {
+                    extendReplyDeadlines(for: frameToken, at: current)
                 }
+                confirmReplyExtension(for: frameToken)
             }
             switch message {
             case let .item(id, at, from, text):
@@ -681,27 +679,32 @@ final class PCSyncController: ObservableObject {
     private func extendReplyDeadlines(for frameToken: UInt64, at now: Date) {
         let candidate = now.addingTimeInterval(Self.replyTimeout)
         for id in Array(sentAt.keys) {
-            guard var entry = sentAt[id], entry.allowedFrameToken == frameToken else { continue }
+            guard var entry = sentAt[id] else { continue }
+            if entry.activeFrameToken != frameToken {
+                entry.baselineDeadline = entry.deadline
+                entry.activeFrameToken = frameToken
+            }
             let maxDeadline = entry.initialSentAt.addingTimeInterval(Self.replyTimeout + Self.maxReplyExtension)
             let updated = min(candidate, maxDeadline)
             if updated > entry.deadline {
                 entry.deadline = updated
-                sentAt[id] = entry
             }
+            sentAt[id] = entry
         }
     }
     private func revertReplyExtension(for frameToken: UInt64) {
         for id in Array(sentAt.keys) {
-            guard var entry = sentAt[id], entry.allowedFrameToken == frameToken else { continue }
-            entry.deadline = entry.initialSentAt.addingTimeInterval(Self.replyTimeout)
-            entry.allowedFrameToken = nil
+            guard var entry = sentAt[id], entry.activeFrameToken == frameToken else { continue }
+            entry.deadline = entry.baselineDeadline
+            entry.activeFrameToken = nil
             sentAt[id] = entry
         }
     }
-    private func clearAllowedFrameToken(_ frameToken: UInt64) {
+    private func confirmReplyExtension(for frameToken: UInt64) {
         for id in Array(sentAt.keys) {
-            guard var entry = sentAt[id], entry.allowedFrameToken == frameToken else { continue }
-            entry.allowedFrameToken = nil
+            guard var entry = sentAt[id], entry.activeFrameToken == frameToken else { continue }
+            entry.baselineDeadline = entry.deadline
+            entry.activeFrameToken = nil
             sentAt[id] = entry
         }
     }

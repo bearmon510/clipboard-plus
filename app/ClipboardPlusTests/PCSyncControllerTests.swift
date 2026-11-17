@@ -202,6 +202,10 @@ private final class SyncTestLink: PCSyncTransport {
         let sender = try XCTUnwrap(sender)
         return try sender.seal(SyncMessageCodec.encode(message))
     }
+    func sealRawPlaintext(_ plaintext: Data) throws -> Data {
+        let sender = try XCTUnwrap(sender)
+        return try sender.seal(plaintext)
+    }
     func send(_ message: SyncMessage) throws {
         let frame = try seal(message)
         if !dropsNotifications { try deliver(frame) }
@@ -1453,8 +1457,8 @@ final class PCSyncControllerTests: XCTestCase {
         f.controller.copiesReceivedToPasteboard = false
         try f.link.connect(pairing, limit: 512)
 
-        // 1. An already-in-progress multi-packet frame (>64B) extends until that frame finishes,
-        //    and a SECOND frame started later does NOT extend past the 60s window after completion.
+        // 1. An in-progress large frame (>64B) extends until that frame completes,
+        //    and a SECOND large frame started later ALSO extends until it completes.
         let frame = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
                                           from: "pc", text: String(repeating: "長", count: 500)))
         let packets = try SyncPacketizer.split(frame, packetLimit: 182)
@@ -1466,19 +1470,20 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.link.items.count, 1)
 
         for packet in packets.dropFirst().dropLast() {
-            f.clock.date.addTimeInterval(20)
+            f.clock.date.addTimeInterval(8)
             f.controller.checkTimeouts()
             XCTAssertEqual(f.controller.status, .connected)
             f.link.onEvent?(.packet(packet))
         }
-        f.clock.date.addTimeInterval(20)
+        f.clock.date.addTimeInterval(8)
         f.controller.checkTimeouts()
         XCTAssertEqual(f.controller.status, .connected)
         f.link.onEvent?(.packet(try XCTUnwrap(packets.last)))
         await drain(f)
         XCTAssertEqual(f.controller.status, .connected)
 
-        // Second multi-packet frame started after the first finished does NOT extend past 60s.
+        // Second large frame started after the first finished ALSO extends past 60s,
+        // and drops 60s after the last large frame completes if still unacked.
         let frame2 = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
                                            from: "pc", text: String(repeating: "次", count: 500)))
         let packets2 = try SyncPacketizer.split(frame2, packetLimit: 182)
@@ -1487,12 +1492,17 @@ final class PCSyncControllerTests: XCTestCase {
         f.link.onEvent?(.packet(packets2[0]))
         f.controller.checkTimeouts()
         XCTAssertEqual(f.controller.status, .connected)
-        f.clock.date.addTimeInterval(20)
-        f.link.onEvent?(.packet(packets2[1]))
+        for packet in packets2.dropFirst() {
+            f.clock.date.addTimeInterval(8)
+            f.link.onEvent?(.packet(packet))
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        await drain(f)
+        f.clock.date.addTimeInterval(59)
         f.controller.checkTimeouts()
         XCTAssertEqual(f.controller.status, .connected)
-        f.clock.date.addTimeInterval(21) // +61s since first frame finished.
-        f.link.onEvent?(.packet(packets2[2]))
+        f.clock.date.addTimeInterval(2)
         f.controller.checkTimeouts()
         XCTAssertEqual(f.link.rejected, [false])
 
@@ -1535,19 +1545,30 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.pendingCount, 0)
         f.link.disconnect()
 
-        // 3. A multi-packet frame started AFTER sending an item does NOT extend the 60s reply deadline.
+        // 3. A large frame started AFTER sending an item ALSO extends the 60s reply deadline.
         try f.link.connect(pairing, limit: 512)
         f.monitor.saveManually(["送信後開始"], receivedAt: f.clock.date)
         await drain(f)
+        let afterItemId = try itemID(try XCTUnwrap(f.link.items.last))
+        let lateFrame = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                              from: "pc", text: String(repeating: "後", count: 500)))
+        let latePackets = try SyncPacketizer.split(lateFrame, packetLimit: 182)
+        XCTAssertGreaterThanOrEqual(latePackets.count, 5)
         f.clock.date.addTimeInterval(50)
-        f.link.onEvent?(.packet(packets[0]))
-        f.clock.date.addTimeInterval(11)
+        f.link.onEvent?(.packet(latePackets[0]))
+        f.clock.date.addTimeInterval(15) // +65s since send.
         f.controller.checkTimeouts()
-        XCTAssertEqual(f.link.rejected, [false, false, false])
-
-        try f.link.connect(pairing, limit: 512)
-        try f.link.send(.ack(ids: [try itemID(try XCTUnwrap(f.link.items.last))]))
+        XCTAssertEqual(f.controller.status, .connected)
+        for packet in latePackets.dropFirst() {
+            f.clock.date.addTimeInterval(15)
+            f.link.onEvent?(.packet(packet))
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        await drain(f)
+        try f.link.send(.ack(ids: [afterItemId]))
         XCTAssertEqual(f.controller.pendingCount, 0)
+        XCTAssertEqual(f.link.rejected, [false, false])
         f.link.disconnect()
 
         // 4. Multi-packet ping at 20-byte packet limit (39 bytes = 3 packets) already in progress does NOT extend.
@@ -1562,14 +1583,17 @@ final class PCSyncControllerTests: XCTestCase {
         f.link.onEvent?(.packet(pingPackets[2]))
         f.clock.date.addTimeInterval(11)
         f.controller.checkTimeouts()
-        XCTAssertEqual(f.link.rejected, [false, false, false, false])
+        XCTAssertEqual(f.link.rejected, [false, false, false])
 
         // 5. Stalled partial assembly still drops at 60s.
         try f.link.connect(pairing, limit: 512)
-        f.link.onEvent?(.packet(packets[0]))
+        let stallFrame = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                               from: "pc", text: String(repeating: "止", count: 500)))
+        let stallPackets = try SyncPacketizer.split(stallFrame, packetLimit: 182)
+        f.link.onEvent?(.packet(stallPackets[0]))
         f.clock.date.addTimeInterval(61)
         f.controller.checkTimeouts()
-        XCTAssertEqual(f.link.rejected, [false, false, false, false, false])
+        XCTAssertEqual(f.link.rejected, [false, false, false, false])
     }
 
     @MainActor
@@ -1797,5 +1821,180 @@ final class PCSyncControllerTests: XCTestCase {
         f.controller.checkTimeouts()
         XCTAssertEqual(f.link.retryDelays.last, 30)
         XCTAssertEqual(f.controller.nextReconnectAt, f.clock.date.addingTimeInterval(30))
+    }
+
+    @MainActor
+    func testSimultaneousSendAfterReconnectExtendsDeadlineUntilLargeIncomingFrameCompletes() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        f.monitor.saveManually(["再接続直後の送信"], receivedAt: f.clock.date)
+        await drain(f)
+
+        // On reconnect, iOS sends .device + queued item immediately before PC sends any packet.
+        try f.link.connect(pairing, limit: 512)
+        let sentId = try itemID(try XCTUnwrap(f.link.items.last))
+
+        let largeIncoming = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                                  from: "pc", text: String(repeating: "同", count: 600)))
+        let packets = try SyncPacketizer.split(largeIncoming, packetLimit: 182)
+        XCTAssertGreaterThanOrEqual(packets.count, 6)
+
+        for packet in packets {
+            f.clock.date.addTimeInterval(15)
+            f.link.onEvent?(.packet(packet))
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        await drain(f)
+        try f.link.send(.ack(ids: [sentId]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+    }
+
+    @MainActor
+    func testLargeIncomingFrameStartedAfterSendExtendsAndSupportsConsecutiveLargeFrames() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        try f.link.connect(pairing, limit: 512)
+
+        f.monitor.saveManually(["連続受信待ち"], receivedAt: f.clock.date)
+        await drain(f)
+        let sentId = try itemID(try XCTUnwrap(f.link.items.last))
+
+        f.clock.date.addTimeInterval(40)
+        try f.link.send(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                              from: "pc", text: String(repeating: "単", count: 10)))
+        await drain(f)
+        f.clock.date.addTimeInterval(25) // +65s since send.
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+
+        for ch in ["一", "二"] {
+            let incoming = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                                 from: "pc", text: String(repeating: ch, count: 400)))
+            let packets = try SyncPacketizer.split(incoming, packetLimit: 182)
+            for packet in packets {
+                f.clock.date.addTimeInterval(10)
+                f.link.onEvent?(.packet(packet))
+                f.controller.checkTimeouts()
+                XCTAssertEqual(f.controller.status, .connected)
+            }
+            await drain(f)
+        }
+        try f.link.send(.ack(ids: [sentId]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+    }
+
+    @MainActor
+    func testPingPongOnlyDoesNotExtendAndPaddedPingRevertsOnlyOwnExtension() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+
+        // 1. ping / pong only never extends past 60s.
+        try f.link.connect(pairing, limit: 512)
+        f.monitor.saveManually(["pingだけ"], receivedAt: f.clock.date)
+        await drain(f)
+        let firstId = try itemID(try XCTUnwrap(f.link.items.last))
+
+        f.clock.date.addTimeInterval(20)
+        try f.link.send(.ping)
+        f.clock.date.addTimeInterval(20)
+        try f.link.send(.pong)
+        f.clock.date.addTimeInterval(15)
+        try f.link.send(.ping)
+        f.clock.date.addTimeInterval(6) // +61s since send.
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
+
+        // 2. Padded >64B multi-packet ping reverts only its own provisional extension and keeps earlier real extension.
+        try f.link.connect(pairing, limit: 512)
+        let realFrame = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                              from: "pc", text: String(repeating: "前", count: 400)))
+        let realPackets = try SyncPacketizer.split(realFrame, packetLimit: 182)
+        f.clock.date.addTimeInterval(20)
+        for packet in realPackets {
+            f.clock.date.addTimeInterval(5)
+            f.link.onEvent?(.packet(packet))
+        }
+        await drain(f)
+        let realCompletedAt = f.clock.date
+
+        let paddedHeader = Data(("{\"t\":\"ping\"" + String(repeating: " ", count: 150) + "}").utf8)
+        let paddedPlaintext = Data([UInt8(paddedHeader.count >> 8), UInt8(truncatingIfNeeded: paddedHeader.count)]) + paddedHeader
+        let paddedPingPackets = try SyncPacketizer.split(f.link.sealRawPlaintext(paddedPlaintext), packetLimit: 100)
+        XCTAssertGreaterThanOrEqual(paddedPingPackets.count, 2)
+
+        f.clock.date = realCompletedAt.addingTimeInterval(20)
+        f.link.onEvent?(.packet(paddedPingPackets[0]))
+        f.clock.date = realCompletedAt.addingTimeInterval(35)
+        for packet in paddedPingPackets.dropFirst() {
+            f.link.onEvent?(.packet(packet))
+        }
+        f.clock.date = realCompletedAt.addingTimeInterval(59)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        f.clock.date = realCompletedAt.addingTimeInterval(61)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false, false])
+
+        // 3. Padded >64B multi-packet ping with no prior extension reverts back to initial 60s.
+        try f.link.connect(pairing, limit: 512)
+        let paddedPlaintext3 = Data([UInt8(paddedHeader.count >> 8), UInt8(truncatingIfNeeded: paddedHeader.count)]) + paddedHeader
+        let paddedPingPackets3 = try SyncPacketizer.split(f.link.sealRawPlaintext(paddedPlaintext3), packetLimit: 100)
+        f.clock.date.addTimeInterval(20)
+        f.link.onEvent?(.packet(paddedPingPackets3[0]))
+        f.clock.date.addTimeInterval(20)
+        for packet in paddedPingPackets3.dropFirst() {
+            f.link.onEvent?(.packet(packet))
+        }
+        f.clock.date.addTimeInterval(21) // +61s since send.
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false, false, false])
+
+        try f.link.connect(pairing, limit: 512)
+        try f.link.send(.ack(ids: [firstId]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+    }
+
+    @MainActor
+    func testExtensionCapStopsAtThreeMinutesAcrossPostSendLargeFrames() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        try f.link.connect(pairing, limit: 512)
+
+        f.monitor.saveManually(["3分上限"], receivedAt: f.clock.date)
+        await drain(f)
+        let sentAt = f.clock.date
+        f.clock.date = sentAt.addingTimeInterval(10)
+
+        let frames = try ["a", "b", "c", "d"].enumerated().map { index, ch in
+            let frame = try f.link.seal(.item(id: UUID(), at: Int64(sentAt.timeIntervalSince1970 * 1000) + Int64(index),
+                                              from: "pc", text: String(repeating: ch, count: 1500)))
+            return try SyncPacketizer.split(frame, packetLimit: 182)
+        }
+
+        var frameIndex = 0
+        var packetIndex = 0
+        while f.clock.date.timeIntervalSince(sentAt) < 225 {
+            f.link.onEvent?(.packet(frames[frameIndex][packetIndex]))
+            packetIndex += 1
+            if packetIndex == frames[frameIndex].count {
+                await drain(f)
+                frameIndex += 1
+                packetIndex = 0
+            }
+            f.clock.date.addTimeInterval(12)
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+
+        f.clock.date = sentAt.addingTimeInterval(239)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        f.link.onEvent?(.packet(frames[frameIndex][packetIndex]))
+        f.clock.date = sentAt.addingTimeInterval(241)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
     }
 }

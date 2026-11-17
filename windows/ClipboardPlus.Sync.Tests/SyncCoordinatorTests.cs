@@ -105,6 +105,7 @@ public sealed class SyncCoordinatorTests
         private readonly SyncFrameReceiver receiver = new(keys.PcToPad);
         public Task SendAsync(SyncMessage message) => rig.SendFrameAsync(Peer, Seal(message));
         public byte[] Seal(SyncMessage message) => sender.Seal(SyncMessageCodec.Encode(message));
+        public byte[] SealRawPlaintext(byte[] plaintext) => sender.Seal(plaintext);
         public SyncMessage[] Drain() => Peer.DrainFrames().Select(f => SyncMessageCodec.Decode(receiver.Open(f))).ToArray();
     }
 
@@ -1101,34 +1102,40 @@ public sealed class SyncCoordinatorTests
 
         for (var i = 1; i < packets.Count - 1; i++)
         {
-            r.Now = r.Now.AddSeconds(15);
+            r.Now = r.Now.AddSeconds(8);
             await r.Pc.TickAsync(r.Now);
             Assert.False(pad.Peer.Rejected);
             Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packets[i]));
         }
-        r.Now = r.Now.AddSeconds(15);
+        r.Now = r.Now.AddSeconds(8);
         await r.Pc.TickAsync(r.Now);
         Assert.False(pad.Peer.Rejected);
         Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packets[^1]));
         await r.Pc.WaitForOutgoingAsync(pad.Peer);
         Assert.Equal(largeText.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
 
-        // After the in-progress frame finishes, the peer still has 60s, but a SECOND frame started later does NOT extend.
+        // A SECOND large frame started later while still awaiting reply ALSO extends until it completes,
+        // and drops 60s after the last large frame completes if still unacked.
         var secondFramePackets = SyncPacketizer.Split(pad.Seal(new SyncItem(Guid.NewGuid(), 101, "pad", new string('q', 1000))), 200);
         Assert.True(secondFramePackets.Count >= 5);
         r.Now = r.Now.AddSeconds(20);
         Assert.True(await r.Pc.ReceiveAsync(pad.Peer, secondFramePackets[0]));
         await r.Pc.TickAsync(r.Now);
         Assert.False(pad.Peer.Rejected);
-        for (var i = 1; i <= 2; i++)
+        for (var i = 1; i < secondFramePackets.Count; i++)
         {
-            r.Now = r.Now.AddSeconds(15);
+            r.Now = r.Now.AddSeconds(8);
             Assert.True(await r.Pc.ReceiveAsync(pad.Peer, secondFramePackets[i]));
             await r.Pc.TickAsync(r.Now);
             Assert.False(pad.Peer.Rejected);
         }
-        r.Now = r.Now.AddSeconds(15); // +65s since largeText completed, with packet progress 0s ago.
-        Assert.True(await r.Pc.ReceiveAsync(pad.Peer, secondFramePackets[3]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        pad.Drain();
+        // 59s after the second frame completes: still alive; 61s after completion: drops.
+        r.Now = r.Now.AddSeconds(59);
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad.Peer.Rejected);
+        r.Now = r.Now.AddSeconds(2);
         await r.Pc.TickAsync(r.Now);
         Assert.True(pad.Peer.Rejected);
         Assert.Equal(1, r.State.Pending);
@@ -1167,22 +1174,29 @@ public sealed class SyncCoordinatorTests
         await r.Pc.TickAsync(r.Now);
         Assert.True(capped.Peer.Rejected);
 
-        // 3. A multi-packet frame started AFTER the offer was sent does NOT extend the 60s reply deadline.
+        // 3. A large frame started AFTER the offer was sent ALSO extends the 60s reply deadline.
         var afterSend = await r.ConnectAsync(512);
         var afterOffer = Assert.IsType<SyncOffer>(Assert.Single(afterSend.Drain()));
-        var latePackets = SyncPacketizer.Split(afterSend.Seal(new SyncItem(Guid.NewGuid(), 103, "pad", new string('r', 1200))), 200);
+        var lateItem = new SyncItem(Guid.NewGuid(), 103, "pad", new string('r', 1200));
+        var latePackets = SyncPacketizer.Split(afterSend.Seal(lateItem), 200);
+        Assert.True(latePackets.Count >= 5);
         r.Now = r.Now.AddSeconds(50);
         Assert.True(await r.Pc.ReceiveAsync(afterSend.Peer, latePackets[0]));
-        r.Now = r.Now.AddSeconds(11);
+        r.Now = r.Now.AddSeconds(11); // +61s since offer was sent, while latePackets is still arriving.
         await r.Pc.TickAsync(r.Now);
-        Assert.True(afterSend.Peer.Rejected);
-
-        // Finish cap.bin/afterOffer on a clean link.
-        var cleanup = await r.ConnectAsync(512);
-        var cleanOffer = Assert.IsType<SyncOffer>(Assert.Single(cleanup.Drain()));
-        await cleanup.SendAsync(new SyncAck([cleanOffer.Id]));
+        Assert.False(afterSend.Peer.Rejected);
+        for (var i = 1; i < latePackets.Count; i++)
+        {
+            r.Now = r.Now.AddSeconds(15);
+            Assert.True(await r.Pc.ReceiveAsync(afterSend.Peer, latePackets[i]));
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(afterSend.Peer.Rejected);
+        }
+        await r.Pc.WaitForOutgoingAsync(afterSend.Peer);
+        Assert.Equal(lateItem.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(afterSend.Drain())).Ids));
+        await afterSend.SendAsync(new SyncAck([afterOffer.Id]));
         Assert.Equal(0, r.State.Pending);
-        await r.Pc.DisconnectAsync(cleanup.Peer);
+        await r.Pc.DisconnectAsync(afterSend.Peer);
 
         // 4. Multi-packet SyncPing at 20-byte packet limit (39-byte frame = 3 packets) already in progress does NOT extend.
         var pingPad = await r.ConnectAsync(20);
@@ -1417,5 +1431,208 @@ public sealed class SyncCoordinatorTests
         await r.Pc.TickAsync(r.Now);
         status = await r.Pc.GetStatusAsync();
         Assert.Empty(status.Transfers!);
+    }
+
+    [Fact]
+    public async Task SimultaneousSendAfterReconnectExtendsDeadlineUntilLargeIncomingFrameCompletes()
+    {
+        var r = new Rig();
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "queued.bin", Data: [1, 2, 3, 4])]));
+
+        // Reconnect: PC sends queued offer immediately after AUTH before receiving any packets from pad.
+        var pad = await r.ConnectAsync(512);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        // Pad sends small SyncDevice (<=64B) followed by a large incoming item taking >60s.
+        await pad.SendAsync(new SyncDevice("pad"));
+        var incoming = new SyncItem(Guid.NewGuid(), 200, "pad", new string('s', 2000));
+        var packets = SyncPacketizer.Split(pad.Seal(incoming), 200);
+        Assert.True(packets.Count >= 6);
+
+        for (var i = 0; i < packets.Count; i++)
+        {
+            r.Now = r.Now.AddSeconds(15);
+            Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packets[i]));
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad.Peer.Rejected);
+        }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        Assert.Equal(incoming.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+
+        await pad.SendAsync(new SyncAck([offer.Id]));
+        Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task LargeIncomingFrameStartedAfterSendExtendsAndSupportsConsecutiveLargeFrames()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "after.bin", Data: [9, 8])]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        // Wait 40s, receive a single-packet large frame (>64B), verify survival past 60s,
+        // then start two consecutive multi-packet large frames before ACKing.
+        r.Now = r.Now.AddSeconds(40);
+        await pad.SendAsync(new SyncItem(Guid.NewGuid(), 200, "pad", new string('s', 100)));
+        r.Now = r.Now.AddSeconds(25); // +65s since offer sent.
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad.Peer.Rejected);
+
+        var item1 = new SyncItem(Guid.NewGuid(), 201, "pad", new string('a', 1200));
+        var packets1 = SyncPacketizer.Split(pad.Seal(item1), 200);
+        foreach (var packet in packets1)
+        {
+            r.Now = r.Now.AddSeconds(10);
+            Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad.Peer.Rejected);
+        }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        pad.Drain();
+
+        var item2 = new SyncItem(Guid.NewGuid(), 202, "pad", new string('b', 1200));
+        var packets2 = SyncPacketizer.Split(pad.Seal(item2), 200);
+        foreach (var packet in packets2)
+        {
+            r.Now = r.Now.AddSeconds(10);
+            Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad.Peer.Rejected);
+        }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        pad.Drain();
+
+        await pad.SendAsync(new SyncAck([offer.Id]));
+        Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task SmallFramesAndPingPongDoNotExtendAndPaddedPingRevertsOnlyOwnExtension()
+    {
+        var r = new Rig();
+
+        // 1. Small frames (device, ping, pong <=64B) never extend past 60s.
+        var pad1 = await r.ConnectAsync(512);
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "ping-only.bin", Data: [1])]));
+        await r.Pc.WaitForOutgoingAsync(pad1.Peer);
+        pad1.Drain();
+
+        r.Now = r.Now.AddSeconds(20);
+        await pad1.SendAsync(new SyncDevice("pad"));
+        r.Now = r.Now.AddSeconds(20);
+        await pad1.SendAsync(new SyncPing());
+        pad1.Drain();
+        r.Now = r.Now.AddSeconds(15);
+        await pad1.SendAsync(new SyncPong());
+        r.Now = r.Now.AddSeconds(6); // +61s since offer sent.
+        await r.Pc.TickAsync(r.Now);
+        Assert.True(pad1.Peer.Rejected);
+
+        // 2. Padded >64B multi-packet ping reverts ONLY its own provisional extension and preserves an earlier real extension.
+        var pad2 = await r.ConnectAsync(512);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad2.Drain()));
+        var realItem = new SyncItem(Guid.NewGuid(), 203, "pad", new string('x', 1200));
+        var realPackets = SyncPacketizer.Split(pad2.Seal(realItem), 200);
+        r.Now = r.Now.AddSeconds(20);
+        foreach (var packet in realPackets)
+        {
+            r.Now = r.Now.AddSeconds(5);
+            Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, packet));
+        }
+        await r.Pc.WaitForOutgoingAsync(pad2.Peer);
+        pad2.Drain();
+        var realCompletedAt = r.Now; // Deadline should now be realCompletedAt + 60s.
+
+        var paddedPingHeader = System.Text.Encoding.ASCII.GetBytes("{\"t\":\"ping\"" + new string(' ', 150) + "}");
+        var paddedPingPlaintext = new byte[2 + paddedPingHeader.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(paddedPingPlaintext, (ushort)paddedPingHeader.Length);
+        paddedPingHeader.CopyTo(paddedPingPlaintext, 2);
+        var pingPackets = SyncPacketizer.Split(pad2.SealRawPlaintext(paddedPingPlaintext), 100);
+        Assert.True(pingPackets.Count >= 2);
+
+        r.Now = realCompletedAt.AddSeconds(20);
+        Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, pingPackets[0]));
+        r.Now = realCompletedAt.AddSeconds(35);
+        foreach (var packet in pingPackets.Skip(1))
+            Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, packet));
+        await r.Pc.WaitForOutgoingAsync(pad2.Peer);
+        Assert.IsType<SyncPong>(Assert.Single(pad2.Drain()));
+
+        // Earlier extension up to realCompletedAt + 60s must remain intact, while padded ping's +35s extension is reverted.
+        r.Now = realCompletedAt.AddSeconds(59);
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad2.Peer.Rejected);
+        r.Now = realCompletedAt.AddSeconds(61);
+        await r.Pc.TickAsync(r.Now);
+        Assert.True(pad2.Peer.Rejected);
+
+        // 3. Padded >64B multi-packet ping with no prior extension reverts to initial 60s deadline.
+        var pad3 = await r.ConnectAsync(512);
+        var offer3 = Assert.IsType<SyncOffer>(Assert.Single(pad3.Drain()));
+        var paddedPingHeader3 = System.Text.Encoding.ASCII.GetBytes("{\"t\":\"ping\"" + new string(' ', 150) + "}");
+        var paddedPingPlaintext3 = new byte[2 + paddedPingHeader3.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(paddedPingPlaintext3, (ushort)paddedPingHeader3.Length);
+        paddedPingHeader3.CopyTo(paddedPingPlaintext3, 2);
+        var pingPackets3 = SyncPacketizer.Split(pad3.SealRawPlaintext(paddedPingPlaintext3), 100);
+        r.Now = r.Now.AddSeconds(20);
+        Assert.True(await r.Pc.ReceiveAsync(pad3.Peer, pingPackets3[0]));
+        r.Now = r.Now.AddSeconds(20);
+        foreach (var packet in pingPackets3.Skip(1))
+            Assert.True(await r.Pc.ReceiveAsync(pad3.Peer, packet));
+        await r.Pc.WaitForOutgoingAsync(pad3.Peer);
+        Assert.IsType<SyncPong>(Assert.Single(pad3.Drain()));
+        r.Now = r.Now.AddSeconds(21); // +61s since offer3 sent.
+        await r.Pc.TickAsync(r.Now);
+        Assert.True(pad3.Peer.Rejected);
+
+        var ackPad = await r.ConnectAsync(512);
+        var reoffered = Assert.IsType<SyncOffer>(Assert.Single(ackPad.Drain()));
+        Assert.Equal(offer3.Id, reoffered.Id);
+        await ackPad.SendAsync(new SyncAck([offer3.Id]));
+        Assert.Equal(0, r.State.Pending);
+        await r.Pc.DisconnectAsync(ackPad.Peer);
+    }
+
+    [Fact]
+    public async Task ExtensionCapStopsAtThreeMinutesAcrossMultiplePostSendLargeFrames()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "cap-multi.bin", Data: [7])]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        pad.Drain();
+        var sentAt = r.Now;
+
+        r.Now = sentAt.AddSeconds(10);
+        var frames = Enumerable.Range(0, 4).Select(i =>
+            SyncPacketizer.Split(pad.Seal(new SyncItem(Guid.NewGuid(), 300 + i, "pad", new string((char)('a' + i), 1500))), 200)).ToArray();
+
+        var frameIndex = 0;
+        var packetIndex = 0;
+        while ((r.Now - sentAt).TotalSeconds < 225)
+        {
+            Assert.True(await r.Pc.ReceiveAsync(pad.Peer, frames[frameIndex][packetIndex]));
+            packetIndex++;
+            if (packetIndex == frames[frameIndex].Count)
+            {
+                await r.Pc.WaitForOutgoingAsync(pad.Peer);
+                pad.Drain();
+                frameIndex++;
+                packetIndex = 0;
+            }
+            r.Now = r.Now.AddSeconds(12);
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad.Peer.Rejected);
+        }
+
+        r.Now = sentAt.AddSeconds(239);
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad.Peer.Rejected);
+        Assert.True(await r.Pc.ReceiveAsync(pad.Peer, frames[frameIndex][packetIndex]));
+        r.Now = sentAt.AddSeconds(241);
+        await r.Pc.TickAsync(r.Now);
+        Assert.True(pad.Peer.Rejected);
     }
 }
