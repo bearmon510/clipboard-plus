@@ -46,6 +46,35 @@ final class ScreenSnapshotTests: XCTestCase {
         try save(render(settings, size: Self.narrow, style: .light), "settings-narrow-light")
     }
 
+    /// The Windows sync section in the states that matter: a transfer in progress, and the two
+    /// stops that need the user, which used to read "cannot be used on this iPad".
+    @MainActor
+    func testRenderSyncSettingsStates() async throws {
+        let now = Date()
+        let transferring = SyncDisplay(
+            pcName: "DESK-PC", status: .connected, lastSentAt: now, lastReceivedAt: now.addingTimeInterval(-90),
+            pendingCount: 3,
+            transfer: PCSyncController.TransferProgress(direction: "send", itemID: UUID(), bytes: 1_400_000, totalBytes: 3_600_000))
+        let repair = SyncDisplay(pcName: "DESK-PC", status: .unsupported, requiresRepair: true, lastSentAt: now.addingTimeInterval(-86_400))
+        let update = SyncDisplay(pcName: "DESK-PC", status: .unsupported, requiresPeerUpdate: true, pendingCount: 12)
+        try save(render(syncForm(transferring), size: Self.narrow, style: .light), "sync-transferring-narrow-light")
+        try save(render(syncForm(repair), size: Self.narrow, style: .dark), "sync-repair-narrow-dark")
+        try save(render(syncForm(update, device: .phone), size: Self.phone, style: .light), "sync-update-phone-light")
+        try save(render(syncForm(SyncDisplay(), device: .phone), size: Self.phone, style: .dark), "sync-unpaired-phone-dark")
+
+        XCTAssertEqual(repair.statusLabel(device: .pad).text, "組み直しが必要です")
+        XCTAssertEqual(update.statusLabel(device: .pad).text, "アプリの更新が必要です")
+        XCTAssertEqual(SyncDisplay(pcName: "PC", status: .unsupported).statusLabel(device: .phone).text, "このiPhoneでは使えません")
+    }
+
+    @MainActor
+    private func syncForm(_ display: SyncDisplay, device: DeviceKind? = nil) -> some View {
+        let actions = SyncSettingsActions(pair: { _ in }, unpair: {}, retryAfterPeerUpdate: {}, retryAfterRepair: {})
+        return Form {
+            SyncSettingsContent(display: display, copiesReceivedToPasteboard: .constant(true), actions: actions, deviceOverride: device)
+        }
+    }
+
     @MainActor
     func testRenderMainScreens() async throws {
         let monitor = try await makeMonitor(populated: true)

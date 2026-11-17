@@ -96,6 +96,12 @@ public partial class App : System.Windows.Application
         coordinator = new(pairing, clipboard!, log!.Write, new SyncRepository(LocalStore.Root, pairing.PcId));
         var current = coordinator;
         coordinator.Changed += state => Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(state); });
+        // Devices paired in an earlier run show before anything changes.
+        _ = current.GetStatusAsync().ContinueWith(task =>
+        {
+            if (task.IsCompletedSuccessfully)
+                Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(task.Result); });
+        }, TaskScheduler.Default);
         server = new(coordinator, log.Write);
         var currentServer = server;
         server.StatusChanged += state => Dispatcher.BeginInvoke(() => { if (server == currentServer) window!.UpdateBluetooth(state); });
