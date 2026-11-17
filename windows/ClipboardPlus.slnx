@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ClipboardPlus.Sync/ClipboardPlus.Sync.csproj" />
+  <Project Path="ClipboardPlus.Sync.Tests/ClipboardPlus.Sync.Tests.csproj" />
+</Solution>
