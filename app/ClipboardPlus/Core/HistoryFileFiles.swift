@@ -115,11 +115,21 @@ enum HistoryFileTypes {
         return "対象の型なし（動的型・内部型・未登録型・ディレクトリを除外）"
     }
 
+    private static func isUnsafeFilenameScalar(_ scalar: Unicode.Scalar) -> Bool {
+        SyncProtocol.isControlCharacter(scalar)
+            || scalar.value == 0x061C
+            || scalar.value == 0x200E
+            || scalar.value == 0x200F
+            || (0x2028...0x202E).contains(scalar.value)
+            || (0x2066...0x2069).contains(scalar.value)
+    }
+
     static func filename(_ suggested: String?, typeIdentifier: String) -> String {
-        // A provider name is a label, never a path. Strip control characters too.
+        // A provider name is a label, never a path. Strip Cc/bidi control characters while keeping ZWJ.
         let name = (suggested ?? "").replacingOccurrences(of: "\\", with: "/")
-            .components(separatedBy: "/").last ?? ""
-        let clean = String(String.UnicodeScalarView(name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
+            .components(separatedBy: "/").last?
+            .replacingOccurrences(of: ":", with: "_") ?? ""
+        let clean = String(String.UnicodeScalarView(name.unicodeScalars.filter { !isUnsafeFilenameScalar($0) }))
         if !clean.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, clean != ".", clean != ".." {
             // Shorten the stem, not the extension: a text file is recognised by its extension.
             let ext = (clean as NSString).pathExtension

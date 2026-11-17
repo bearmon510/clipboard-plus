@@ -265,4 +265,31 @@ final class SyncProtocolTests: XCTestCase {
         let fresh = try SyncFrameSender(key: keys.padToPc).seal(SyncMessageCodec.encode(.ping))
         XCTAssertEqual(try SyncMessageCodec.decode(SyncFrameReceiver(key: auth.keys.padToPc).open(fresh)), .ping)
     }
+
+    func testOfferFilenameAllowsFormatControlsAndRejectsControlCharacters() throws {
+        let v = try vectors(), messages = try object(v, "messages"), failures = try object(v, "failures")
+        guard case .offer(let zwjOffer) = try SyncMessageCodec.decode(try bytes(try object(messages, "zwjOffer"), "plaintextHex")) else {
+            return XCTFail("Expected offer")
+        }
+        XCTAssertEqual(zwjOffer.filename, "家族👨‍👩‍👧‍👦.txt")
+        XCTAssertTrue(zwjOffer.filename.contains("\u{200D}"))
+
+        let bad = try object(failures, "controlNameOffer")
+        XCTAssertEqual(try string(bad, "error"), "format")
+        error(.format) { _ = try SyncMessageCodec.decode(try bytes(bad, "plaintextHex")) }
+
+        let sha = String(repeating: "a", count: 64)
+        for allowed in ["a\u{200D}b.txt", "a\u{200E}b.txt", "a\u{202E}b.txt", "a\u{FEFF}b.txt"] {
+            let offer = SyncOffer(id: UUID(), at: 0, from: "pc", kind: "file", size: 1, sha256: sha,
+                name64: Data(allowed.utf8).base64EncodedString(), type: "public.data")
+            let decoded = try SyncMessageCodec.decode(SyncMessageCodec.encode(.offer(offer)))
+            XCTAssertEqual(decoded, .offer(offer))
+            if case .offer(let roundtrip) = decoded { XCTAssertEqual(roundtrip.filename, allowed) }
+        }
+        for forbidden in ["\u{0000}", "\u{0007}", "\u{001F}", "\u{007F}", "\u{0080}", "\u{0085}", "\u{009F}"] {
+            let offer = SyncOffer(id: UUID(), at: 0, from: "pc", kind: "file", size: 1, sha256: sha,
+                name64: Data(("a" + forbidden + "b").utf8).base64EncodedString(), type: "public.data")
+            error(.format) { try offer.validate() }
+        }
+    }
 }

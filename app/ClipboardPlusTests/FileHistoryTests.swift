@@ -82,6 +82,23 @@ final class FileHistoryTests: XCTestCase {
         XCTAssertEqual(empty.file.hash, HistoryBackup.digest(Data()))
     }
 
+    func testFilenameSanitizesBidiControlsAndSeparatorsWhileKeepingZwj() throws {
+        XCTAssertEqual(HistoryFileTypes.filename("家族👨‍👩‍👧‍👦.txt", typeIdentifier: "public.plain-text"), "家族👨‍👩‍👧‍👦.txt")
+        XCTAssertEqual(HistoryFileTypes.filename("a/b\\c:d.txt", typeIdentifier: "public.plain-text"), "c_d.txt")
+        for bidi in ["\u{061C}", "\u{200E}", "\u{200F}", "\u{202A}", "\u{202B}", "\u{202C}", "\u{202D}", "\u{202E}", "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}"] {
+            XCTAssertEqual(HistoryFileTypes.filename("a\(bidi)b.txt", typeIdentifier: "public.plain-text"), "ab.txt")
+            XCTAssertEqual(HistoryFileTypes.filename(bidi, typeIdentifier: "public.plain-text"), "ファイル.txt")
+        }
+        for control in ["\u{0000}", "\u{0007}", "\u{001F}", "\u{007F}", "\u{0085}", "\u{009F}"] {
+            XCTAssertEqual(HistoryFileTypes.filename("bad\(control)name.txt", typeIdentifier: "public.plain-text"), "badname.txt")
+        }
+        let root = try ImageTestSupport.directory(self)
+        let zwj = try FileTestSupport.input(in: root, name: "家族👨‍👩‍👧‍👦.txt", type: "public.plain-text")
+        XCTAssertEqual(zwj.file.originalFilename, "家族👨‍👩‍👧‍👦.txt")
+        let spoofed = try FileTestSupport.input(in: root, name: "dir/\u{202E}gpj.txt", type: "public.plain-text")
+        XCTAssertEqual(spoofed.file.originalFilename, "gpj.txt")
+    }
+
     func testFiftyMillionByteBoundaryUsesFileInsteadOfLargeData() throws {
         let root = try ImageTestSupport.directory(self)
         let url = root.appendingPathComponent("large.pdf")

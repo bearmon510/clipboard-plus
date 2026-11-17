@@ -148,7 +148,8 @@ final class FileMonitorTests: XCTestCase {
         monitor.pollPasteboard()
         drain(monitor)
         let previewLogs = monitor.log.lines.map(\.fileLine).joined()
-        XCTAssertTrue(previewLogs.contains("冒頭20文字=秘密の名前.pdf"))
+        XCTAssertFalse(previewLogs.contains("秘密の名前"))
+        XCTAssertFalse(previewLogs.contains("冒頭20文字="))
         XCTAssertFalse(previewLogs.contains("preview-enabled-body"))
     }
 

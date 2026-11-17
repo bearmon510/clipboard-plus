@@ -60,6 +60,7 @@ final class ImageProviderTests: XCTestCase {
             XCTAssertTrue(lines.contains(expected), expected)
         }
         XCTAssertFalse(lines.contains(privateText))
+        XCTAssertFalse(lines.contains("冒頭20文字="))
         XCTAssertFalse(lines.contains(data.base64EncodedString()))
         XCTAssertFalse(lines.contains(hash))
     }

@@ -91,7 +91,7 @@ public partial class App : System.Windows.Application
 
     private void StartSync(SyncPairing pairing)
     {
-        coordinator = new(pairing, clipboard!, log!.Write);
+        coordinator = new(pairing, clipboard!, log!.Write, new SyncRepository(LocalStore.Root, pairing.PcId));
         var current = coordinator;
         coordinator.Changed += state => Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(state); });
         server = new(coordinator, log.Write);
@@ -116,8 +116,12 @@ public partial class App : System.Windows.Application
         {
             // Persist successfully before retiring the old pairing.
             var pairing = LocalStore.CreatePairing();
+            var oldCoordinator = coordinator;
+            var oldServer = server;
             coordinator = null;
-            if (server is not null) await server.DisposeAsync();
+            server = null;
+            if (oldServer is not null) await oldServer.DisposeAsync();
+            if (oldCoordinator is not null) await oldCoordinator.DisposeAsync();
             window.UpdatePairing(pairing);
             StartSync(pairing);
             log!.Write("pairing replaced");
@@ -145,6 +149,7 @@ public partial class App : System.Windows.Application
         tray!.Visible = false;
         clipboard?.Dispose();
         if (server is not null) await server.DisposeAsync();
+        if (coordinator is not null) await coordinator.DisposeAsync();
         log?.Write("application stopped");
         Shutdown();
     }

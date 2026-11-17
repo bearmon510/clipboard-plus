@@ -1,5 +1,5 @@
 // Independent reference implementation. All secrets here are PUBLIC TEST VALUES.
-import { createHmac, hkdfSync, createCipheriv, createDecipheriv, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, hkdfSync, createCipheriv, createDecipheriv, timingSafeEqual } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 
 const hex = b => Buffer.from(b).toString('hex');
@@ -33,23 +33,35 @@ function parsePair(s) {
   if (Buffer.byteLength(name) > 255 || /[\u0000-\u001f\u007f]/.test(name)) throw Error('pairing');
   return { pcId: uuid(decode(p[2], 16)), keyHex: hex(decode(p[3], 32)), name };
 }
-const mac = label => createHmac('sha256', key).update(cat(Buffer.from(label), ni, np)).digest();
+const mac = label => createHmac('sha256', key).update(cat(bytes("02"), Buffer.from(label), uuidBytes(pcId), uuidBytes(padId), ni, np)).digest();
 const pcHmac = mac('pc'), padHmac = mac('pad');
-const hello = cat(bytes('0101'), uuidBytes(padId), ni);
-const welcome = cat(bytes('0201'), uuidBytes(pcId), np, pcHmac);
+const hello = cat(bytes('0102'), uuidBytes(padId), ni);
+const welcome = cat(bytes('0202'), uuidBytes(pcId), np, pcHmac);
 const auth = cat(bytes('03'), padHmac);
-const keys = Object.fromEntries(['pad->pc','pc->pad'].map(d => [d, Buffer.from(hkdfSync('sha256', key, cat(ni,np), `clipboardplus v1 ${d}`, 32))]));
+const keys = Object.fromEntries(['pad->pc','pc->pad'].map(d => [d, Buffer.from(hkdfSync('sha256', key, cat(ni,np), `clipboardplus v2 ${d}`, 32))]));
 function plaintext(header, body = '') {
   const json = JSON.stringify(Object.fromEntries(Object.entries(header).sort(([a],[b]) => a < b ? -1 : a > b ? 1 : 0)));
   const h = Buffer.from(json), length = Buffer.alloc(2);
   length.writeUInt16BE(h.length);
   return { headerJson: json, bodyUtf8: body, plaintextHex: hex(cat(length, h, Buffer.from(body))) };
 }
+const tinyPNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP+8AAAAASUVORK5CYII=', 'base64');
 const messages = {
   item: plaintext({ t:'item', id, kind:'text', at:1794873600123, from:'pad' }, 'こんにちは、Windows！\n2行目: 📋😊\n' + '同期の試験です。'.repeat(8)),
   ack: plaintext({ t:'ack', ids:[id,id2] }),
   ping: plaintext({ t:'ping' }),
-  pong: plaintext({ t:'pong' })
+  pong: plaintext({ t:'pong' }),
+  device: plaintext({ t:'device', kind:'phone' }),
+  offer: plaintext({ t:'offer', id:id2, at:1794873600123, from:'pc', kind:'file', size:4,
+    sha256:createHash('sha256').update(bytes('0001feff')).digest('hex'), name64:Buffer.from('試験.txt').toString('base64'), type:'public.data' }),
+  chunk: plaintext({ t:'chunk', id:id2, offset:0 }, bytes('0001feff')),
+  resume: plaintext({ t:'resume', id:id2, offset:2 }),
+  continuedChunk: plaintext({ t:'chunk', id:id2, offset:2 }, bytes('feff')),
+  imageOffer: plaintext({ t:'offer', id, at:1794873600123, from:'pad', kind:'image', size:tinyPNG.length,
+    sha256:createHash('sha256').update(tinyPNG).digest('hex'), name64:'', type:'public.png' }),
+  imageChunk: plaintext({ t:'chunk', id, offset:0 }, tinyPNG),
+  zwjOffer: plaintext({ t:'offer', id:id2, at:1794873600123, from:'pc', kind:'file', size:4,
+    sha256:createHash('sha256').update(bytes('0001feff')).digest('hex'), name64:Buffer.from('家族👨‍👩‍👧‍👦.txt').toString('base64'), type:'public.data' })
 };
 function frame(direction, sequence, message) {
   const seq = Buffer.alloc(8); seq.writeBigUInt64BE(BigInt(sequence));
@@ -64,7 +76,8 @@ function frame(direction, sequence, message) {
   return { direction, sequence:String(sequence), message, nonceHex:hex(nonce), aadHex:hex(aad), ciphertextHex:hex(encrypted), tagHex:hex(tag), frameHex:hex(result) };
 }
 // Each direction is one independent session; sequence 0 and 1 never reuse a nonce/key.
-const frames = [frame('pad->pc',0,'item'), frame('pad->pc',1,'ping'), frame('pc->pad',0,'ack'), frame('pc->pad',1,'pong')];
+const frames = [frame('pad->pc',0,'item'), frame('pad->pc',1,'ping'), frame('pc->pad',0,'ack'), frame('pc->pad',1,'pong'),
+  frame('pc->pad',2,'offer'), frame('pc->pad',3,'chunk'), frame('pad->pc',2,'resume')];
 function split(frame, limit) {
   const result = [];
   for (let i = 0; i < frame.length; i += limit - 1) {
@@ -83,8 +96,8 @@ try {
 } catch { rejected = true; }
 if (!rejected || timingSafeEqual(pcHmac, flipLast(pcHmac))) throw Error('negative crypto check');
 const vectors = {
-  version:1, warning:'PUBLIC deterministic test secrets. Never use for real pairing or connections.',
-  limits:{ maxFrameBytes, maxHeaderBytes:65535, maxNameUtf8Bytes:255, maxAckIds:1024 },
+  version:2, warning:'PUBLIC deterministic test secrets. Never use for real pairing or connections.',
+  limits:{ maxFrameBytes, maxHeaderBytes:65535, maxNameUtf8Bytes:255, maxAckIds:1024, maxItemBytes:10*1024*1024, chunkBytes:32768, maxPending:100, pendingHours:24, duplicateMinutes:10, maxHistory:300 },
   pairing:{ qr, parsed:parsePair(qr) },
   handshake:{ keyHex:hex(key), padId, pcId, niHex:hex(ni), npHex:hex(np), helloHex:hex(hello), welcomeHex:hex(welcome), authHex:hex(auth), pcHmacHex:hex(pcHmac), padHmacHex:hex(padHmac), padToPcKeyHex:hex(keys['pad->pc']), pcToPadKeyHex:hex(keys['pc->pad']) },
   messages, frames,
@@ -96,7 +109,9 @@ const vectors = {
     authHmac:{ frameHex:hex(flipLast(auth)), error:'authentication' },
     oversizedFrame:{ byteLength:maxFrameBytes+1, fillByte:0, packetLimit:182, error:'limit', note:'Materialize repeated fillByte locally; no multi-megabyte hex fixture.' },
     unfinishedStart:{ packetsHex:['010102'], finish:true, error:'packet' },
-    continuationWithoutStart:{ packetsHex:['000102'], finish:false, error:'packet' }
+    continuationWithoutStart:{ packetsHex:['000102'], finish:false, error:'packet' },
+    controlNameOffer:{ ...plaintext({ t:'offer', id:id2, at:1794873600123, from:'pc', kind:'file', size:4,
+      sha256:createHash('sha256').update(bytes('0001feff')).digest('hex'), name64:Buffer.from('bad\u0007.txt').toString('base64'), type:'public.data' }), error:'format' }
   }
 };
 writeFileSync(new URL('./test-vectors.json',import.meta.url), JSON.stringify(vectors,null,2)+'\n');

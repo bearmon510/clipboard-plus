@@ -11,22 +11,22 @@ public sealed class SyncSessionKeys
     internal SyncSessionKeys(byte[] key, byte[] ni, byte[] np)
     {
         byte[] salt = [.. ni, .. np];
-        padToPc = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes("clipboardplus v1 pad->pc"));
-        pcToPad = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes("clipboardplus v1 pc->pad"));
+        padToPc = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes("clipboardplus v2 pad->pc"));
+        pcToPad = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes("clipboardplus v2 pc->pad"));
     }
 }
 
 internal static class SyncHandshakeWire
 {
-    internal static byte[] Mac(byte[] key, string label, byte[] ni, byte[] np)
+    internal static byte[] Mac(byte[] key, string label, byte[] ni, byte[] np, Guid pcId, Guid padId)
     {
-        byte[] data = [.. Encoding.ASCII.GetBytes(label), .. ni, .. np];
+        byte[] data = [2, .. Encoding.ASCII.GetBytes(label), .. SyncProtocol.IdBytes(pcId), .. SyncProtocol.IdBytes(padId), .. ni, .. np];
         return HMACSHA256.HashData(key, data);
     }
     internal static void Check(ReadOnlySpan<byte> frame, int count, byte type)
     {
         SyncProtocol.Require(frame.Length == count && frame[0] == type);
-        if (type != 3) SyncProtocol.Require(frame[1] == 1);
+        if (type != 3) SyncProtocol.Require(frame[1] == SyncProtocol.Version, SyncError.Version);
     }
 }
 
@@ -49,7 +49,7 @@ public sealed class SyncPadHandshake
         var previous = state; state = -1;
         SyncProtocol.Require(previous == 0, SyncError.State);
         state = 1;
-        return [1, 1, .. SyncProtocol.IdBytes(padId), .. ni];
+        return [1, SyncProtocol.Version, .. SyncProtocol.IdBytes(padId), .. ni];
     }
     public SyncPadAuthentication AcceptWelcome(ReadOnlySpan<byte> frame)
     {
@@ -58,8 +58,8 @@ public sealed class SyncPadHandshake
         SyncHandshakeWire.Check(frame, 82, 2);
         SyncProtocol.Require(new Guid(frame.Slice(2, 16), bigEndian: true) == expectedPcId, SyncError.Identity);
         var np = frame.Slice(18, 32).ToArray();
-        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[50..], SyncHandshakeWire.Mac(key, "pc", ni, np)), SyncError.Authentication);
-        var result = new SyncPadAuthentication([3, .. SyncHandshakeWire.Mac(key, "pad", ni, np)], new SyncSessionKeys(key, ni, np));
+        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[50..], SyncHandshakeWire.Mac(key, "pc", ni, np, expectedPcId, padId)), SyncError.Authentication);
+        var result = new SyncPadAuthentication([3, .. SyncHandshakeWire.Mac(key, "pad", ni, np, expectedPcId, padId)], new SyncSessionKeys(key, ni, np));
         state = 2;
         return result;
     }
@@ -88,7 +88,7 @@ public sealed class SyncPcHandshake
         candidatePadId = new Guid(frame.Slice(2, 16), bigEndian: true);
         SyncProtocol.Require(expectedPadId is null || candidatePadId == expectedPadId, SyncError.Identity);
         ni = frame.Slice(18, 32).ToArray();
-        var result = new byte[] { 2, 1 }.Concat(SyncProtocol.IdBytes(pcId)).Concat(np).Concat(SyncHandshakeWire.Mac(key, "pc", ni, np)).ToArray();
+        var result = new byte[] { 2, SyncProtocol.Version }.Concat(SyncProtocol.IdBytes(pcId)).Concat(np).Concat(SyncHandshakeWire.Mac(key, "pc", ni, np, pcId, candidatePadId!.Value)).ToArray();
         state = 1; return result;
     }
     public SyncSessionKeys AcceptAuth(ReadOnlySpan<byte> frame)
@@ -96,7 +96,7 @@ public sealed class SyncPcHandshake
         var previous = state; state = -1; AuthenticatedPadId = null;
         SyncProtocol.Require(previous == 1, SyncError.State);
         SyncHandshakeWire.Check(frame, 33, 3);
-        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[1..], SyncHandshakeWire.Mac(key, "pad", ni!, np)), SyncError.Authentication);
+        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[1..], SyncHandshakeWire.Mac(key, "pad", ni!, np, pcId, candidatePadId!.Value)), SyncError.Authentication);
         var result = new SyncSessionKeys(key, ni!, np!);
         state = 2; AuthenticatedPadId = candidatePadId;
         return result;

@@ -44,6 +44,19 @@ enum HistoryFileLoader {
             }
             return nil
         }
+        provider.registerDataRepresentation(forTypeIdentifier: file.typeIdentifier, visibility: .all) { completion in
+            snapshot.read { result in
+                switch result {
+                case .success(let input):
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do { completion(try Data(contentsOf: input.url, options: .mappedIfSafe), nil) }
+                        catch { completion(nil, HistoryFileError.unavailable) }
+                    }
+                case .failure: completion(nil, HistoryFileError.unavailable)
+                }
+            }
+            return nil
+        }
         return provider
     }
 }

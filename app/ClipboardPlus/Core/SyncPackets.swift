@@ -24,9 +24,11 @@ public final class SyncPacketAssembler {
     private var active = false
     private var failed = false
     public var hasPartialFrame: Bool { active }
-    public init(packetLimit: Int) throws {
-        try SyncProtocol.require(packetLimit >= 2, .limit)
+    private let frameLimit: Int
+    public init(packetLimit: Int, frameLimit: Int = SyncProtocol.maxFrameBytes) throws {
+        try SyncProtocol.require(packetLimit >= 2 && frameLimit > 0 && frameLimit <= SyncProtocol.maxFrameBytes, .limit)
         self.packetLimit = packetLimit
+        self.frameLimit = frameLimit
     }
     public func append(_ packet: Data) throws -> Data? {
         try SyncProtocol.require(!failed, .state)
@@ -36,7 +38,7 @@ public final class SyncPacketAssembler {
             try SyncProtocol.require(flags & 0xFC == 0, .packet)
             let start = flags & 1 != 0
             try SyncProtocol.require(start != active, .packet)
-            try SyncProtocol.require(packet.count - 1 <= SyncProtocol.maxFrameBytes - buffer.count, .limit)
+            try SyncProtocol.require(packet.count - 1 <= frameLimit - buffer.count, .limit)
             active = true
             buffer.append(contentsOf: packet.dropFirst())
             if flags & 2 == 0 { return nil }

@@ -29,6 +29,12 @@ extension UIPasteboard: ClipboardPasteboard {
     }
 }
 
+enum PCSyncReceiveResult: Equatable {
+    case saved
+    case rejected(SyncContentRejectReason)
+    case failed
+}
+
 @MainActor
 final class ClipboardMonitor: NSObject, ObservableObject {
     /// Also available when App Intents launches the process without a window.
@@ -54,16 +60,28 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     let log: MeasurementLog
 
-    /// Installed by PCSyncController. An admission event also fires for repeated text.
-    var onLocalTextForPC: ((String) -> Void)?
+    /// Installed by PCSyncController. Only committed history entries are sent.
+    var onLocalEntryForPC: ((HistoryEntry, Date) -> Void)?
+    var onHistoryIDsForPC: ((Set<Int>) -> Void)?
+    var syncDirectory: URL { imageDirectory.appendingPathComponent("PCSync-v2", isDirectory: true) }
+    private let syncEcho: SyncEchoGuard
+    func prepareForPC(_ entry: HistoryEntry, completion: @escaping (Result<HistoryStore.SyncBody, Error>) -> Void) {
+        store.prepareForPC(entry, completion: completion)
+    }
+    func clearPCFingerprints() { syncEcho.clear() }
+    func rememberIncomingPC(kind: String, hash: String) { syncEcho.remember(kind: kind, hash: hash) }
 
     private let pasteboard: ClipboardPasteboard
     private let defaults: UserDefaults
     private let makeDatabase: (() throws -> HistoryPersistence)?
     private let imageDirectory: URL
-    private lazy var store = HistoryStore(retention: historyRetention, makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
+    private lazy var store: HistoryStore = {
+        let value = HistoryStore(retention: historyRetention, makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
         self?.handleStorageEvent(event)
-    }
+        }
+        value.syncEchoGuard = syncEcho
+        return value
+    }()
     lazy var backup = BackupController(store: store, record: { [weak self] kind, details in
         self?.record(kind, details: details)
     }, remember: { [weak self] snapshot in
@@ -89,6 +107,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
          pasteboard: ClipboardPasteboard? = nil, resumesRecordingOnInit: Bool = true) {
         self.defaults = defaults
+        self.syncEcho = SyncEchoGuard(defaults: defaults)
         self.log = log ?? MeasurementLog()
         self.makeDatabase = makeDatabase
         self.imageDirectory = imageDirectory
@@ -196,7 +215,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let count = pasteboard.changeCount
         let details = "PasteButtonから受信; changeCountは処理時点の観測値で、本文との対応は未確定"
         for text in strings {
-            admit(text, source: "手動保存", route: .manual, timestamp: receivedAt, count: count, additionalDetails: details)
+            guard admit(text, source: "手動保存", route: .manual, timestamp: receivedAt, count: count, additionalDetails: details) else { continue }
             record(
                 "手動保存", count: count, text: text,
                 details: details,
@@ -224,7 +243,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         admission.recordSelfCopy(entry.text)
         pasteboard.string = entry.text
         let after = pasteboard.changeCount
-        if shortcutOperationCount > 0 || entry.source == .pc {
+        if after == before {
+            admission.discardPendingSelfCopy()
+        } else if shortcutOperationCount > 0 || entry.source == .pc {
             lastObservedChangeCount = after
             // No readback is needed. A later external copy of the same text must count.
             admission.discardPendingSelfCopy()
@@ -254,15 +275,16 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             log.append(copyEvent)
         }
         isCopying = false
-        if entry.source != .pc { onLocalTextForPC?(entry.text) }
+        if entry.source != .pc { onLocalEntryForPC?(entry, Date()) }
         completion?(true)
     }
 
     /// Remote items bypass local admission and outgoing events. ACK follows durable storage.
-    func receiveFromPC(_ text: String, copyToPasteboard: Bool,
+    func receiveFromPC(_ text: String, copyToPasteboard: Bool, at date: Date = Date(),
                        isCurrentPairing: @escaping () -> Bool = { true }, completion: @escaping (Bool) -> Void) {
+        syncEcho.remember(kind: "text", hash: SyncEchoGuard.hash(Data(text.utf8)))
         pendingSaveCount += 1
-        store.collectFromPC(text, at: Date()) { [weak self] result in
+        store.collectFromPC(text, at: date) { [weak self] result in
             guard let self else { completion(false); return }
             self.pendingSaveCount -= 1
             switch result {
@@ -287,17 +309,50 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         store.resetImageAdmission(); store.resetFileAdmission()
         let before = pasteboard.changeCount
         isWriting = true
+        syncEcho.remember(kind: "text", hash: SyncEchoGuard.hash(Data(text.utf8)))
         admission.recordSelfCopy(text)
         pasteboard.string = text
         let after = pasteboard.changeCount
         // Consume this known self-copy without reading its contents (or logging a preview).
-        // A subsequent external copy of the SAME text must still be admitted and sent.
+        // Matching Universal Clipboard readbacks stay suppressed until different content is observed.
         if after != before { lastObservedChangeCount = after }
         admission.discardPendingSelfCopy()
         isWriting = false
         // UIPasteboard has no throwing write API. In the background the OS can refuse
         // the write; a non-advancing changeCount is logged without reading the contents.
         record("PC同期", details: after != before ? "クリップボードへの書き込み成功" : "クリップボードへの書き込みを確認できず; 背景制約などの可能性")
+    }
+
+    func receiveFromPC(_ offer: SyncOffer, url: URL, copyToPasteboard: Bool,
+                       isCurrentPairing: @escaping () -> Bool = { true }, completion: @escaping (PCSyncReceiveResult) -> Void) {
+        syncEcho.remember(kind: offer.kind, hash: offer.sha256)
+        pendingSaveCount += 1
+        store.collectFromPC(offer, url: url) { [weak self] result in
+            guard let self else { completion(.failed); return }
+            self.pendingSaveCount -= 1
+            switch result {
+            case .failure(let error):
+                if let rejected = error as? SyncContentRejectedError {
+                    completion(.rejected(rejected.reason))
+                } else {
+                    self.reportStorageFailure()
+                    completion(.failed)
+                }
+            case .success(let entry):
+                self.savedCount += 1
+                if self.pendingSaveCount == 0 { self.storageError = nil }
+                if copyToPasteboard && isCurrentPairing() {
+                    self.syncEcho.remember(kind: offer.kind, hash: offer.sha256)
+                    // These paths use the image representation or a provider of the file's real type.
+                    // An older remote copy may merge into newer local history; it is still a remote write.
+                    let remote = HistoryEntry(id: entry.id, kind: entry.kind, text: entry.text,
+                        savedAt: entry.savedAt, lastCollectedAt: entry.lastCollectedAt, collectionCount: entry.collectionCount,
+                        isTemplate: entry.isTemplate, source: .pc, image: entry.image, file: entry.file,
+                        title: entry.title, templateOrder: entry.templateOrder, tag: entry.tag)
+                    self.copy(remote) { _ in completion(.saved) }
+                } else { completion(.saved) }
+            }
+        }
     }
 
     // MARK: Content made inside the app
@@ -423,8 +478,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         readBeforeCopy()
         admission.discardPendingSelfCopy()
         isWriting = true
+        let before = pasteboard.changeCount
         pasteboard.setData(data, forPasteboardType: "public.png")
-        store.recordImageCopy(hash: hash, changeCount: pasteboard.changeCount)
+        let after = pasteboard.changeCount
+        if after != before { store.recordImageCopy(hash: hash, changeCount: after) }
         isWriting = false
         if isRecording {
             readIfChanged(count: pasteboard.changeCount, source: "自己コピー後の確認", detections: [])
@@ -463,10 +520,17 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 succeeded = self.pasteboard.writeFileProviders([HistoryFileLoader.copyProvider(input)])
                 let after = self.pasteboard.changeCount
                 if succeeded {
-                    self.store.recordFileCopy(hash: file.hash, changeCount: after)
-                    if self.shortcutOperationCount > 0 { self.lastObservedChangeCount = after }
-                    self.record("自己コピー", count: after, text: file.originalFilename, historyNumber: entry.id,
-                                details: "ファイル; 形式=\(file.typeIdentifier); バイト数=\(file.byteCount); hash=\(file.hash.prefix(8)); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
+                    if after != before {
+                        if entry.source == .pc { self.syncEcho.remember(kind: "file", hash: file.hash) }
+                        if self.shortcutOperationCount > 0 || entry.source == .pc {
+                            self.lastObservedChangeCount = after
+                            self.store.resetFileAdmission()
+                        } else {
+                            self.store.recordFileCopy(hash: file.hash, changeCount: after)
+                        }
+                    }
+                    self.record("自己コピー", count: after, historyNumber: entry.id,
+                                details: "ファイル; バイト数=\(file.byteCount); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
                 }
                 self.isWriting = false
             case .failure: break
@@ -483,6 +547,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 detections.forEach { self.log.append($0) }
             }
             self.isCopying = false
+            if succeeded && entry.source != .pc { self.onLocalEntryForPC?(entry, Date()) }
             completion?(succeeded)
         }
     }
@@ -499,11 +564,18 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 self.isWriting = true
                 self.pasteboard.setData(data, forPasteboardType: image.typeIdentifier)
                 let after = self.pasteboard.changeCount
-                if self.shortcutOperationCount > 0 { self.lastObservedChangeCount = after }
-                self.store.recordImageCopy(hash: image.hash, changeCount: after)
+                if after != before {
+                    if entry.source == .pc { self.syncEcho.remember(kind: "image", hash: image.hash) }
+                    if self.shortcutOperationCount > 0 || entry.source == .pc {
+                        self.lastObservedChangeCount = after
+                        self.store.resetImageAdmission()
+                    } else {
+                        self.store.recordImageCopy(hash: image.hash, changeCount: after)
+                    }
+                }
                 self.isWriting = false
                 self.record("自己コピー", count: after, historyNumber: entry.id,
-                            details: "画像; 形式=\(image.typeIdentifier); バイト数=\(data.count); ピクセル=\(image.pixelWidth)x\(image.pixelHeight); hash=\(image.hash.prefix(8)); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
+                            details: "画像; バイト数=\(data.count); 読み書き前changeCount=\(before); 書き込み後changeCount=\(after)")
                 succeeded = true
             case .failure:
                 self.imageNotice = HistoryImageError.unavailable.message
@@ -518,6 +590,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
                 detections.forEach { self.log.append($0) }
             }
             self.isCopying = false
+            if succeeded && entry.source != .pc { self.onLocalEntryForPC?(entry, Date()) }
             completion?(succeeded)
         }
     }
@@ -801,16 +874,19 @@ final class ClipboardMonitor: NSObject, ObservableObject {
 
     private func handleStorageEvent(_ event: HistoryStore.Event) {
         switch event {
-        case .replace(let values): entries = values
+        case .replace(let values): entries = values; onHistoryIDsForPC?(Set(values.map(\.id)))
         case .upsert(let entry): HistoryList.upsert(entry, into: &entries)
-        case .remove(let id): entries.removeAll { $0.id == id }
+        case .remove(let id): entries.removeAll { $0.id == id }; onHistoryIDsForPC?(Set(entries.map(\.id)))
         case .saved(let entry, let retried):
             pendingSaveCount -= 1
             savedCount += 1
             HistoryList.upsert(entry, into: &entries)
             if pendingSaveCount == 0 { storageError = nil }
-            record(retried ? "履歴保存の再試行成功" : "履歴保存成功", text: entry.file?.originalFilename ?? entry.text,
+            record(retried ? "履歴保存の再試行成功" : "履歴保存成功",
+                   text: (entry.kind == .text || entry.kind == .url) ? entry.text : nil,
                    historyNumber: entry.id, details: "経路=\(entry.source.rawValue); 保存待ち=\(pendingSaveCount)件")
+        case .localEntry(let entry, let source, let date):
+            if source != .pc { onLocalEntryForPC?(entry, date) }
         case .saveFailed:
             reportStorageFailure()
             record("履歴保存の失敗", details: "未保存キューを保持して再試行; 保存待ち=\(pendingSaveCount)件")
@@ -920,6 +996,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         lastObservedChangeCount = before
         let types = pasteboard.types
         if ClipboardPrivacy.hasPrivateMarker(in: types) {
+            syncEcho.clear()
             admission.discardPendingSelfCopy()
             store.resetImageAdmission()
             store.resetFileAdmission()
@@ -1025,6 +1102,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             details: "hasStrings=\(hasStrings); \(details)"
         ))
         if let text {
+            if syncEcho.observe(kind: "text", hash: SyncEchoGuard.hash(Data(text.utf8))) {
+                record("PC同期", count: after, details: "取り込み見送り; 理由=PC受信内容の共有; 件数=1")
+                admission.discardPendingSelfCopy(); return
+            }
             admit(text, source: source, timestamp: finishedAt, count: after, before: before, after: after)
             log.append(MeasurementEvent(
                 timestamp: finishedAt,
@@ -1037,6 +1118,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             ))
         } else {
             admission.discardPendingSelfCopy()
+            syncEcho.clear()
             log.append(MeasurementEvent(
                 timestamp: finishedAt,
                 kind: hasStrings ? "取得できず・原因未確定" : "文章以外のため読み取らず",
@@ -1093,12 +1175,14 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         timestamp: Date = Date(), count: Int? = nil, additionalDetails: String = "",
         before: Int? = nil, after: Int? = nil
     ) -> Bool {
+        if route == .manual && syncEcho.observe(kind: "text", hash: SyncEchoGuard.hash(Data(text.utf8))) {
+            record("PC同期", details: "取り込み見送り; 理由=PC受信内容の共有; 件数=1"); return false
+        }
         let decision = route == .automatic ? admission.receive(text, before: before, after: after) : .add
         switch decision {
         case .add:
             pendingSaveCount += 1
             store.collect(text, source: route, at: timestamp)
-            if route != .pc { onLocalTextForPC?(text) }
             return true
         case .skip(let reason):
             record(

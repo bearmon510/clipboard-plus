@@ -7,7 +7,7 @@ public struct SyncSessionKeys {
     init(key: Data, ni: Data, np: Data) {
         func derive(_ direction: String) -> Data {
             let derived = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: key), salt: ni + np,
-                info: Data("clipboardplus v1 \(direction)".utf8), outputByteCount: 32)
+                info: Data("clipboardplus v2 \(direction)".utf8), outputByteCount: 32)
             return derived.withUnsafeBytes { Data($0) }
         }
         padToPc = derive("pad->pc"); pcToPad = derive("pc->pad")
@@ -16,16 +16,16 @@ public struct SyncSessionKeys {
 
 enum SyncHandshakeWire {
     static func randomNonce() -> Data { SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) } }
-    static func mac(key: Data, label: String, ni: Data, np: Data) -> Data {
-        Data(HMAC<SHA256>.authenticationCode(for: Data(label.utf8) + ni + np, using: SymmetricKey(data: key)))
+    static func mac(key: Data, label: String, ni: Data, np: Data, pcId: UUID, padId: UUID) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: Data([2]) + Data(label.utf8) + SyncProtocol.idBytes(pcId) + SyncProtocol.idBytes(padId) + ni + np, using: SymmetricKey(data: key)))
     }
-    static func verify(_ code: Data, key: Data, label: String, ni: Data, np: Data) throws {
+    static func verify(_ code: Data, key: Data, label: String, ni: Data, np: Data, pcId: UUID, padId: UUID) throws {
         try SyncProtocol.require(HMAC<SHA256>.isValidAuthenticationCode(code,
-            authenticating: Data(label.utf8) + ni + np, using: SymmetricKey(data: key)), .authentication)
+            authenticating: Data([2]) + Data(label.utf8) + SyncProtocol.idBytes(pcId) + SyncProtocol.idBytes(padId) + ni + np, using: SymmetricKey(data: key)), .authentication)
     }
     static func check(_ frame: Data, count: Int, type: UInt8) throws {
         try SyncProtocol.require(frame.count == count && frame.first == type)
-        if type != 3 { try SyncProtocol.require(frame[1] == 1) }
+        if type != 3 { try SyncProtocol.require(frame[1] == SyncProtocol.version, .version) }
     }
 }
 
@@ -49,7 +49,7 @@ public final class SyncPadHandshake {
         let previous = state; state = -1
         try SyncProtocol.require(previous == 0, .state)
         state = 1
-        return Data([1, 1]) + SyncProtocol.idBytes(padId) + ni
+        return Data([1, SyncProtocol.version]) + SyncProtocol.idBytes(padId) + ni
     }
     /// Send auth before any data frame. Keys are available only after WELCOME authentication.
     public func acceptWelcome(_ input: Data) throws -> SyncPadAuthentication {
@@ -59,8 +59,8 @@ public final class SyncPadHandshake {
         try SyncHandshakeWire.check(frame, count: 82, type: 2)
         try SyncProtocol.require(try SyncProtocol.id(frame.subdata(in: 2..<18)) == expectedPcId, .identity)
         let np = frame.subdata(in: 18..<50)
-        try SyncHandshakeWire.verify(frame.subdata(in: 50..<82), key: key, label: "pc", ni: ni, np: np)
-        let result = SyncPadAuthentication(auth: Data([3]) + SyncHandshakeWire.mac(key: key, label: "pad", ni: ni, np: np),
+        try SyncHandshakeWire.verify(frame.subdata(in: 50..<82), key: key, label: "pc", ni: ni, np: np, pcId: expectedPcId, padId: padId)
+        let result = SyncPadAuthentication(auth: Data([3]) + SyncHandshakeWire.mac(key: key, label: "pad", ni: ni, np: np, pcId: expectedPcId, padId: padId),
             keys: SyncSessionKeys(key: key, ni: ni, np: np))
         state = 2
         return result
@@ -89,8 +89,8 @@ public final class SyncPcHandshake {
         try SyncProtocol.require(expectedPadId == nil || expectedPadId == peer, .identity)
         candidatePadId = peer
         let nonce = frame.subdata(in: 18..<50); ni = nonce
-        let result = Data([2, 1]) + SyncProtocol.idBytes(pcId) + np
-            + SyncHandshakeWire.mac(key: key, label: "pc", ni: nonce, np: np)
+        let result = Data([2, SyncProtocol.version]) + SyncProtocol.idBytes(pcId) + np
+            + SyncHandshakeWire.mac(key: key, label: "pc", ni: nonce, np: np, pcId: pcId, padId: peer)
         state = 1
         return result
     }
@@ -99,7 +99,7 @@ public final class SyncPcHandshake {
         try SyncProtocol.require(previous == 1, .state)
         let frame = Data(input)
         try SyncHandshakeWire.check(frame, count: 33, type: 3)
-        try SyncHandshakeWire.verify(Data(frame.dropFirst()), key: key, label: "pad", ni: ni!, np: np)
+        try SyncHandshakeWire.verify(Data(frame.dropFirst()), key: key, label: "pad", ni: ni!, np: np, pcId: pcId, padId: candidatePadId!)
         let result = SyncSessionKeys(key: key, ni: ni!, np: np)
         state = 2; authenticatedPadId = candidatePadId
         return result

@@ -237,4 +237,59 @@ public sealed class SyncProtocolTests : IDisposable
         var fresh = new SyncFrameSender(keys.PadToPc).Seal(SyncMessageCodec.Encode(new SyncPing()));
         Assert.Equal(new SyncPing(), SyncMessageCodec.Decode(new SyncFrameReceiver(auth.Keys.PadToPc).Open(fresh)));
     }
+
+    [Fact]
+    public void NullAndNonStringHeaderFieldsThrowFormatError()
+    {
+        const string id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        var sha = new string('a', 64);
+        foreach (var json in new[]
+        {
+            $$"""{"t":null}""",
+            $$"""{"t":1}""",
+            $$"""{"t":"device","kind":null}""",
+            $$"""{"t":"ack","ids":[null]}""",
+            $$"""{"t":"resume","id":null,"offset":0}""",
+            $$"""{"t":"item","kind":"text","id":null,"from":"pad","at":0}""",
+            $$"""{"t":"item","kind":"text","id":"{{id}}","from":null,"at":0}""",
+            $$"""{"t":"item","kind":null,"id":"{{id}}","from":"pad","at":0}""",
+            $$"""{"t":"offer","id":"{{id}}","at":0,"from":"pad","kind":"file","size":4,"sha256":"{{sha}}","name64":null,"type":"public.data"}""",
+            $$"""{"t":"offer","id":"{{id}}","at":0,"from":"pad","kind":"file","size":4,"sha256":"{{sha}}","name64":123,"type":"public.data"}""",
+            $$"""{"t":"offer","id":null,"at":0,"from":"pad","kind":"file","size":4,"sha256":"{{sha}}","name64":"YS50eHQ=","type":"public.data"}""",
+            $$"""{"t":"offer","id":"{{id}}","at":0,"from":null,"kind":"file","size":4,"sha256":"{{sha}}","name64":"YS50eHQ=","type":"public.data"}""",
+            $$"""{"t":"offer","id":"{{id}}","at":0,"from":"pad","kind":null,"size":4,"sha256":"{{sha}}","name64":"YS50eHQ=","type":"public.data"}""",
+            $$"""{"t":"offer","id":"{{id}}","at":0,"from":"pad","kind":"file","size":4,"sha256":null,"name64":"YS50eHQ=","type":"public.data"}""",
+            $$"""{"t":"offer","id":"{{id}}","at":0,"from":"pad","kind":"file","size":4,"sha256":"{{sha}}","name64":"YS50eHQ=","type":null}"""
+        })
+            Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain(json)));
+
+        Error(SyncError.Format, () => SyncMessageCodec.ValidateOffer(new(Guid.Parse(id), 0, "pc", "file", 4, sha, null!, "public.data")));
+        Error(SyncError.Format, () => SyncMessageCodec.Encode(new SyncItem(Guid.Parse(id), 0, "pc", null!)));
+        Error(SyncError.Format, () => SyncMessageCodec.Encode(new SyncAck(null!)));
+    }
+
+    [Fact]
+    public void OfferFilenameAllowsFormatControlsAndRejectsControlCharacters()
+    {
+        var zwj = (SyncOffer)SyncMessageCodec.Decode(Hex(V.GetProperty("messages").GetProperty("zwjOffer"), "plaintextHex"));
+        Assert.Equal("家族👨‍👩‍👧‍👦.txt", zwj.Filename);
+        Assert.Contains("\u200D", zwj.Filename);
+
+        var bad = V.GetProperty("failures").GetProperty("controlNameOffer");
+        Assert.Equal("format", bad.GetProperty("error").GetString());
+        Error(SyncError.Format, () => SyncMessageCodec.Decode(Hex(bad, "plaintextHex")));
+
+        var sha = new string('a', 64);
+        foreach (var allowed in new[] { "a\u200Db.txt", "a\u200Eb.txt", "a\u202Eb.txt", "a\uFEFFb.txt" })
+        {
+            var offer = new SyncOffer(Guid.NewGuid(), 0, "pc", "file", 1, sha, Convert.ToBase64String(Encoding.UTF8.GetBytes(allowed)), "public.data");
+            var roundtrip = Assert.IsType<SyncOffer>(SyncMessageCodec.Decode(SyncMessageCodec.Encode(offer)));
+            Assert.Equal(allowed, roundtrip.Filename);
+        }
+        foreach (var forbidden in new[] { "\u0000", "\u0007", "\u001F", "\u007F", "\u0080", "\u0085", "\u009F" })
+        {
+            var offer = new SyncOffer(Guid.NewGuid(), 0, "pc", "file", 1, sha, Convert.ToBase64String(Encoding.UTF8.GetBytes("a" + forbidden + "b")), "public.data");
+            Error(SyncError.Format, () => SyncMessageCodec.ValidateOffer(offer));
+        }
+    }
 }

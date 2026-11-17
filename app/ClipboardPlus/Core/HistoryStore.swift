@@ -1,4 +1,6 @@
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 protocol HistoryPersistence: AnyObject {
     func createTemplate(text: String, title: String?, tag: String?) throws -> HistoryEntry
@@ -55,6 +57,7 @@ final class HistoryStore {
         case upsert(HistoryEntry)
         case remove(Int)
         case saved(HistoryEntry, retried: Bool)
+        case localEntry(HistoryEntry, source: HistorySource, at: Date)
         case saveFailed
         case imageProcessed(HistoryImage, details: String)
         case imageSkipped(String)
@@ -89,6 +92,7 @@ final class HistoryStore {
     let fileFiles: HistoryFileFiles
     private var fileAdmission = ImageAdmission()
     private var imageAdmission = ImageAdmission()
+    var syncEchoGuard: SyncEchoGuard?
     private var didCleanFiles = false
     private var didScheduleBackupCleanup = false
     private var unusedFiles: Set<String> = []
@@ -135,6 +139,9 @@ final class HistoryStore {
                      before: Int? = nil, after: Int? = nil, details: String = "") {
         queue.async {
             let file = input.file
+            if source == .automatic || source == .manual, self.syncEchoGuard?.observe(kind: "file", hash: file.hash) == true {
+                self.emit(.fileSkipped("理由=PC受信内容の共有; 件数=1")); return
+            }
             let measured = "\(details); 形式=\(file.typeIdentifier); バイト数=\(file.byteCount); hash=\(file.hash.prefix(8))"
             if source == .automatic, let before, let after,
                case .skip(let reason) = self.fileAdmission.receive(hash: file.hash, before: before, after: after) {
@@ -181,6 +188,9 @@ final class HistoryStore {
                     let (data, type) = try input.encoded()
                     diagnostics += "; 形式=\(type); バイト数=\(data.count)"
                     let hash = try HistoryImageFiles.hash(data)
+                    if source == .automatic || source == .manual, self.syncEchoGuard?.observe(kind: "image", hash: hash) == true {
+                        self.emit(.imageSkipped("理由=PC受信内容の共有; 件数=1")); return
+                    }
                     let measured = "\(diagnostics); hash=\(hash.prefix(8))"
                     if source == .automatic, let before, let after,
                        case .skip(let reason) = self.imageAdmission.receive(hash: hash, before: before, after: after) {
@@ -234,6 +244,94 @@ final class HistoryStore {
         }, completion: completion)
     }
 
+    struct SyncBody { let data: Data; let kind: String; let name: String; let type: String; let hash: String }
+    func prepareForPC(_ entry: HistoryEntry, completion: @escaping @MainActor (Result<SyncBody, Error>) -> Void) {
+        queue.async {
+            let result = Result { () throws -> SyncBody in
+                let data: Data, kind: String, name: String, type: String
+                if let image = entry.image {
+                    guard image.byteCount <= SyncProtocol.maxItemBytes,
+                          image.pixelWidth > 0, image.pixelHeight > 0,
+                          Int64(image.pixelWidth) <= SyncProtocol.maxImagePixels / Int64(image.pixelHeight) else {
+                        throw SyncProtocolError.limit
+                    }
+                    let original = try self.imageFiles.read(image)
+                    kind = "image"; name = ""
+                    if ["public.png", "public.jpeg"].contains(image.typeIdentifier) { data = original; type = image.typeIdentifier }
+                    else {
+                        guard let source = CGImageSourceCreateWithData(original as CFData, nil),
+                              let bitmap = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw SyncProtocolError.limit }
+                        let png = NSMutableData()
+                        guard let destination = CGImageDestinationCreateWithData(png as CFMutableData, UTType.png.identifier as CFString, 1, nil) else { throw SyncProtocolError.format }
+                        CGImageDestinationAddImage(destination, bitmap, nil)
+                        guard CGImageDestinationFinalize(destination) else { throw SyncProtocolError.format }
+                        data = png as Data; type = "public.png"
+                    }
+                } else if let file = entry.file {
+                    guard file.byteCount <= SyncProtocol.maxItemBytes else { throw SyncProtocolError.limit }
+                    data = try Data(contentsOf: self.fileFiles.url(for: file), options: .mappedIfSafe)
+                    kind = "file"; name = file.originalFilename; type = file.typeIdentifier
+                } else { data = Data(entry.text.utf8); kind = "text"; name = ""; type = "public.utf8-plain-text" }
+                try SyncProtocol.require(data.count <= SyncProtocol.maxItemBytes, .limit)
+                return SyncBody(data: data, kind: kind, name: name, type: type, hash: SyncEchoGuard.hash(data))
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func collectFromPC(_ offer: SyncOffer, url: URL, completion: @escaping @MainActor (Result<HistoryEntry, Error>) -> Void) {
+        perform({ database in
+            let date = Date(timeIntervalSince1970: Double(offer.at) / 1000)
+            let entry: HistoryEntry
+            if offer.kind == "image" {
+                let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                guard ["public.png", "public.jpeg"].contains(offer.type) else {
+                    throw SyncContentRejectedError(reason: .imageFormat)
+                }
+                guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+                      let actualType = CGImageSourceGetType(source) else {
+                    throw SyncContentRejectedError(reason: .imageCorrupt)
+                }
+                guard actualType as String == offer.type else {
+                    throw SyncContentRejectedError(reason: .imageFormat)
+                }
+                guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                      let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+                      let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+                      width.intValue > 0, height.intValue > 0 else {
+                    throw SyncContentRejectedError(reason: .imageCorrupt)
+                }
+                guard Int64(width.intValue) <= SyncProtocol.maxImagePixels / Int64(height.intValue) else {
+                    throw SyncContentRejectedError(reason: .imageDimensions)
+                }
+                let image: HistoryImage
+                do {
+                    image = try self.imageFiles.prepare(data, typeIdentifier: offer.type, hash: offer.sha256)
+                } catch HistoryImageError.invalidImage {
+                    throw SyncContentRejectedError(reason: .imageCorrupt)
+                } catch HistoryImageError.tooLarge {
+                    throw SyncContentRejectedError(reason: .imageDimensions)
+                }
+                do {
+                    entry = try database.collectImage(image, source: .pc, at: date)
+                    if entry.image?.filename != image.filename { self.unusedFiles.formUnion(image.filenames) }
+                }
+                catch { try? self.imageFiles.remove(image.filenames); throw error }
+            } else {
+                let inferred = UTType(filenameExtension: (offer.filename as NSString).pathExtension)?.identifier ?? "public.data"
+                let type = HistoryFileTypes.isStorable(offer.type) && offer.type != "public.data" ? offer.type : (HistoryFileTypes.isStorable(inferred) ? inferred : "public.data")
+                let staged = try HistoryFileFiles.stage(url, typeIdentifier: type, suggestedName: offer.filename)
+                let file = try self.fileFiles.prepare(staged)
+                do {
+                    entry = try database.collectFile(file, source: .pc, at: date)
+                    if entry.file?.filename != file.filename { self.unusedFiles.formUnion(file.filenames) }
+                }
+                catch { try? self.imageFiles.remove(file.filenames); throw error }
+            }
+            self.emit(.upsert(entry)); return entry
+        }, completion: completion)
+    }
+
     func load(completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
             try self.applyRetention(database, force: true)
@@ -248,11 +346,12 @@ final class HistoryStore {
                           completion: @escaping @MainActor (Result<HistoryEntry, Error>) -> Void) {
         perform({ database in
             let entry: HistoryEntry
+            let date = self.now()
             if let data = pngData {
                 let image = try self.imageFiles.prepare(data, typeIdentifier: "public.png",
                                                        hash: HistoryImageFiles.hash(data))
                 do {
-                    entry = try database.collectImage(image, source: .manual, at: self.now())
+                    entry = try database.collectImage(image, source: .manual, at: date)
                 } catch {
                     try? self.imageFiles.remove(image.filenames)
                     throw error
@@ -261,9 +360,10 @@ final class HistoryStore {
                     self.unusedFiles.formUnion(image.filenames)
                 }
             } else {
-                entry = try database.collect(text, source: .manual, at: self.now())
+                entry = try database.collect(text, source: .manual, at: date)
             }
             self.emit(.saved(entry, retried: false))
+            self.emit(.localEntry(entry, source: .manual, at: date))
             return entry
         }, completion: completion)
     }
@@ -535,6 +635,7 @@ final class HistoryStore {
                 unusedFiles.formUnion(file.filenames)
             }
             emit(.saved(entry, retried: item.failed))
+            if item.source != .pc { emit(.localEntry(entry, source: item.source, at: item.date)) }
             finishChanges(database)
         }
     }

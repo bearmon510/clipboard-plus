@@ -40,7 +40,18 @@ public sealed class SyncCoordinatorTests
     {
         public uint Sequence = 100;
         public bool Fail;
+        public ClipboardRejectReason? RejectReason;
+        public Func<Task>? BeforeWrite;
         public readonly List<string> Writes = [];
+        public readonly List<HistoryItem> MediaWrites = [];
+        public async Task<uint> WriteItemAsync(HistoryItem item)
+        {
+            if (BeforeWrite is not null) await BeforeWrite();
+            if (item.Kind == "text") return await WriteTextAsync(item.Text!);
+            if (RejectReason is { } reason) throw new ClipboardContentRejectedException(reason);
+            if (Fail) throw new IOException("busy clipboard");
+            MediaWrites.Add(item); return ++Sequence;
+        }
         public Task<uint> WriteTextAsync(string text)
         {
             if (Fail) throw new IOException("busy clipboard");
@@ -52,20 +63,24 @@ public sealed class SyncCoordinatorTests
     {
         public readonly SyncPairing Pairing = SyncPairing.Create("test-pc");
         public readonly FakeClipboard Clipboard = new();
+        public readonly Guid DeviceId = Guid.NewGuid();
+        public readonly string Root = Path.Combine(Path.GetTempPath(), "clipboardplus-tests", Guid.NewGuid().ToString("N"));
+        public readonly SyncRepository Store;
         public readonly System.Collections.Concurrent.ConcurrentQueue<string> Logs = new();
         public readonly SyncCoordinator Pc;
         public SyncStatus State = new(0, 0, null, null);
         public Rig()
         {
-            Pc = new(Pairing, Clipboard, Logs.Enqueue);
+            Store = new(Root, Pairing.PcId); Store.Register(DeviceId, "pad", DateTimeOffset.UtcNow);
+            Pc = new(Pairing, Clipboard, Logs.Enqueue, Store);
             Pc.Changed += s => State = s;
         }
 
-        public async Task<Pad> ConnectAsync(int limit = 20)
+        public async Task<Pad> ConnectAsync(int limit = 20, Guid? deviceId = null)
         {
             var alreadyConnected = State.Connected;
             var peer = new FakePeer { PacketLimit = limit };
-            var handshake = new SyncPadHandshake(Pairing, Guid.NewGuid());
+            var handshake = new SyncPadHandshake(Pairing, deviceId ?? DeviceId);
             await Pc.ConnectAsync(peer);
             await SendFrameAsync(peer, handshake.CreateHello());
             Assert.Equal(alreadyConnected, State.Connected);
@@ -100,7 +115,7 @@ public sealed class SyncCoordinatorTests
         await r.Pc.ClipboardChangedAsync(new(2, new string('b', 100_000), false));
         var peer = new FakePeer { PacketLimit = 512 };
         await r.Pc.ConnectAsync(peer);
-        var handshake = new SyncPadHandshake(r.Pairing, Guid.NewGuid());
+        var handshake = new SyncPadHandshake(r.Pairing, r.DeviceId);
         await r.SendFrameAsync(peer, handshake.CreateHello());
         var auth = handshake.AcceptWelcome(Assert.Single(peer.DrainFrames()));
         var pad = new Pad(r, peer, auth.Keys);
@@ -168,7 +183,7 @@ public sealed class SyncCoordinatorTests
     {
         var r = new Rig(); var peer = new FakePeer { FailSend = true };
         await r.Pc.ConnectAsync(peer);
-        await r.SendFrameAsync(peer, new SyncPadHandshake(r.Pairing, Guid.NewGuid()).CreateHello());
+        await r.SendFrameAsync(peer, new SyncPadHandshake(r.Pairing, r.DeviceId).CreateHello());
         Assert.True(peer.Rejected); Assert.Equal(0, r.State.Connected);
         Assert.False(await r.Pc.ReceiveAsync(peer, [3, 1]));
         // Retired peers do not consume the eight protocol connection slots.
@@ -190,7 +205,7 @@ public sealed class SyncCoordinatorTests
         var r = new Rig(); var peer = new FakePeer { PacketLimit = 512 };
         await r.Pc.ConnectAsync(peer);
         if (afterHello)
-            await r.SendFrameAsync(peer, new SyncPadHandshake(r.Pairing, Guid.NewGuid()).CreateHello());
+            await r.SendFrameAsync(peer, new SyncPadHandshake(r.Pairing, r.DeviceId).CreateHello());
         var packet = new byte[limit + 1]; packet[0] = 1;
         Assert.True(await r.Pc.ReceiveAsync(peer, packet));
         Assert.False(await r.Pc.ReceiveAsync(peer, [0, 0]));
@@ -278,7 +293,7 @@ public sealed class SyncCoordinatorTests
     [InlineData("direction")]
     public async Task BadDataRetiresOnlyItsConnectionAndLeavesPendingForReconnect(string fault)
     {
-        var r = new Rig(); var pad = await r.ConnectAsync(); var healthy = await r.ConnectAsync();
+        var r = new Rig(); var pad = await r.ConnectAsync(); var healthy = await r.ConnectAsync(deviceId: Guid.NewGuid());
         await r.Pc.ClipboardChangedAsync(new(1, "pending", false)); await r.Pc.WaitForOutgoingAsync();
         pad.Drain(); healthy.Drain();
         var frame = pad.Seal(new SyncPing());
@@ -288,7 +303,7 @@ public sealed class SyncCoordinatorTests
             // Authenticated but invalid plaintext: obtain a separate connection's keys.
             await r.Pc.DisconnectAsync(pad.Peer);
             var peer = new FakePeer(); await r.Pc.ConnectAsync(peer);
-            var h = new SyncPadHandshake(r.Pairing, Guid.NewGuid());
+            var h = new SyncPadHandshake(r.Pairing, r.DeviceId);
             await r.SendFrameAsync(peer, h.CreateHello());
             var auth = h.AcceptWelcome(Assert.Single(peer.DrainFrames()));
             await r.SendFrameAsync(peer, auth.Auth); peer.DrainFrames();
@@ -301,7 +316,7 @@ public sealed class SyncCoordinatorTests
         foreach (var packet in fault == "packet" ? new byte[][] { [4, 0] } : SyncPacketizer.Split(frame, pad.Peer.PacketLimit))
             accepted = await r.Pc.ReceiveAsync(pad.Peer, packet);
         Assert.False(accepted); Assert.True(pad.Peer.Rejected);
-        Assert.Equal(1, r.State.Connected); Assert.Equal(1, r.State.Pending);
+        Assert.Equal(1, r.State.Connected); Assert.Equal(2, r.State.Pending);
         Assert.False(await r.Pc.ReceiveAsync(pad.Peer, [3, 1]));
         await healthy.SendAsync(new SyncPing()); Assert.False(healthy.Peer.Rejected);
         var replacement = await r.ConnectAsync();
@@ -316,7 +331,7 @@ public sealed class SyncCoordinatorTests
         Assert.False(await r.Pc.ReceiveAsync(peer, [3, 0x10, 0]));
         Assert.True(peer.Rejected); Assert.Empty(r.Clipboard.Writes);
         peer = new FakePeer(); await r.Pc.ConnectAsync(peer);
-        var pad = new SyncPadHandshake(r.Pairing, Guid.NewGuid());
+        var pad = new SyncPadHandshake(r.Pairing, r.DeviceId);
         await r.SendFrameAsync(peer, pad.CreateHello());
         var auth = pad.AcceptWelcome(Assert.Single(peer.DrainFrames())).Auth;
         auth[^1] ^= 1;
@@ -330,11 +345,11 @@ public sealed class SyncCoordinatorTests
     public async Task PendingAndDuplicateCachesHaveTheirSpecifiedBounds()
     {
         var r = new Rig();
-        for (uint i = 1; i <= 51; i++) await r.Pc.ClipboardChangedAsync(new(i, $"item {i}", false)); await r.Pc.WaitForOutgoingAsync();
-        Assert.Equal(50, r.State.Pending);
+        for (uint i = 1; i <= 101; i++) await r.Pc.ClipboardChangedAsync(new(i, $"item {i}", false)); await r.Pc.WaitForOutgoingAsync();
+        Assert.Equal(100, r.State.Pending);
         var pad = await r.ConnectAsync(182);
         var sent = pad.Drain().Cast<SyncItem>().ToArray();
-        Assert.Equal(50, sent.Length); Assert.Equal("item 2", sent[0].Text);
+        Assert.Equal(100, sent.Length); Assert.Equal("item 2", sent[0].Text);
         await pad.SendAsync(new SyncAck(sent.Select(i => i.Id).ToArray()));
         var oldest = new SyncItem(Guid.NewGuid(), 0, "pad", "oldest");
         await pad.SendAsync(oldest);
@@ -399,5 +414,412 @@ public sealed class SyncCoordinatorTests
         await pad.SendAsync(new SyncAck([original.Id]));
         await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddMinutes(2)); await r.Pc.WaitForOutgoingAsync();
         Assert.Empty(pad.Drain()); Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task EachDeviceOwnsItsAckAndOfflineQueueAndDeviceKind()
+    {
+        var r = new Rig(); var phoneId = Guid.NewGuid();
+        var pad = await r.ConnectAsync(); var phone = await r.ConnectAsync(deviceId: phoneId);
+        await phone.SendAsync(new SyncDevice("phone"));
+        await r.Pc.ClipboardChangedAsync(new(1, "both", false)); await r.Pc.WaitForOutgoingAsync();
+        var item = Assert.IsType<SyncItem>(Assert.Single(pad.Drain()));
+        Assert.Equal(item, Assert.Single(phone.Drain()));
+        await pad.SendAsync(new SyncAck([item.Id]));
+        Assert.Empty(r.Store.Pending(r.DeviceId)); Assert.Single(r.Store.Pending(phoneId));
+        await r.Pc.DisconnectAsync(phone.Peer);
+        await r.Pc.ClipboardChangedAsync(new(2, "offline", false)); await r.Pc.WaitForOutgoingAsync();
+        Assert.Equal(2, r.Store.Pending(phoneId).Count);
+        phone = await r.ConnectAsync(deviceId: phoneId);
+        Assert.Equal(2, phone.Drain().Length);
+        var state = await r.Pc.GetStatusAsync();
+        Assert.Contains(state.Devices!, d => d.Id == phoneId && d.Kind == "phone" && d.Pending == 2 && d.Connected);
+    }
+
+    [Fact]
+    public async Task SharedClipboardDeduplicatesAcrossDevicesAndNeverRelays()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(); var phone = await r.ConnectAsync(deviceId: Guid.NewGuid());
+        await phone.SendAsync(new SyncDevice("phone"));
+        await phone.SendAsync(new SyncItem(Guid.NewGuid(), 10, "pad", "shared"));
+        phone.Drain(); Assert.Empty(pad.Drain());
+        await pad.SendAsync(new SyncItem(Guid.NewGuid(), 11, "pad", "shared"));
+        Assert.Single(r.Clipboard.Writes); Assert.IsType<SyncAck>(Assert.Single(pad.Drain()));
+        var history = await r.Pc.GetHistoryAsync();
+        Assert.Equal("iPhone", Assert.Single(history).Source); Assert.Equal(10, history[0].At);
+        await r.Pc.ClipboardChangedAsync(new(1, "PC echo", false)); await r.Pc.WaitForOutgoingAsync();
+        phone.Drain(); pad.Drain();
+        await pad.SendAsync(new SyncItem(Guid.NewGuid(), 12, "pad", "PC echo"));
+        Assert.Single(r.Clipboard.Writes); Assert.IsType<SyncAck>(Assert.Single(pad.Drain()));
+    }
+
+    [Fact]
+    public async Task FileReceiveResumesAfterReconnectAndOnlyAcksVerifiedCommittedContent()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(512);
+        var data = Enumerable.Range(0, SyncProtocol.ChunkBytes + 7).Select(i => (byte)i).ToArray();
+        var offer = new SyncOffer(Guid.NewGuid(), 1234567, "pad", "file", data.Length,
+            Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(data)), Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("secret.txt")), "public.data");
+        await pad.SendAsync(offer);
+        Assert.Equal(new SyncResume(offer.Id, 0), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(offer.Id, 0, data[..SyncProtocol.ChunkBytes]));
+        Assert.Equal(new SyncResume(offer.Id, SyncProtocol.ChunkBytes), Assert.Single(pad.Drain()));
+        Assert.Empty(r.Clipboard.MediaWrites); Assert.Empty(await r.Pc.GetHistoryAsync());
+        await r.Pc.DisconnectAsync(pad.Peer); pad = await r.ConnectAsync(512);
+        await pad.SendAsync(offer); Assert.Equal(new SyncResume(offer.Id, SyncProtocol.ChunkBytes), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(offer.Id, SyncProtocol.ChunkBytes, data[SyncProtocol.ChunkBytes..]));
+        Assert.Equal(offer.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+        var saved = Assert.Single(await r.Pc.GetHistoryAsync());
+        Assert.Equal(data, File.ReadAllBytes(saved.Path!)); Assert.Equal(offer.At, saved.At);
+        await pad.SendAsync(offer); Assert.IsType<SyncAck>(Assert.Single(pad.Drain())); Assert.Single(r.Clipboard.MediaWrites);
+        Assert.DoesNotContain(r.Logs, l => l.Contains("secret.txt") || l.Contains(offer.Sha256));
+    }
+
+    [Fact]
+    public async Task BinarySendWaitsForDurableOffsetsAndPrioritizesPong()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(512);
+        var data = new byte[SyncProtocol.ChunkBytes + 1]; data[^1] = 42;
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "a.txt", Data: data)]));
+        await r.Pc.WaitForOutgoingAsync(); var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncPing()); Assert.IsType<SyncPong>(Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncResume(offer.Id, 0));
+        var first = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain())); Assert.Equal(SyncProtocol.ChunkBytes, first.Data.Length);
+        await pad.SendAsync(new SyncResume(offer.Id, first.Data.Length));
+        var last = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain())); Assert.Equal(new byte[] { 42 }, last.Data);
+        await pad.SendAsync(new SyncAck([offer.Id])); Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task HistoryApiSearchDeleteClearAndCopyDoNotResend()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(); var notifications = 0;
+        r.Pc.HistoryChanged += () => notifications++;
+        await r.Pc.ClipboardChangedAsync(new(1, "Find Me", false)); await r.Pc.WaitForOutgoingAsync();
+        var sent = Assert.IsType<SyncItem>(Assert.Single(pad.Drain())); await pad.SendAsync(new SyncAck([sent.Id]));
+        var item = Assert.Single(await r.Pc.GetHistoryAsync("find"));
+        await r.Pc.CopyHistoryAsync(item.Id);
+        await r.Pc.ClipboardChangedAsync(new(r.Clipboard.Sequence, item.Text, false)); await r.Pc.WaitForOutgoingAsync();
+        Assert.Empty(pad.Drain());
+        await r.Pc.DeleteHistoryAsync(item.Id); Assert.Empty(await r.Pc.GetHistoryAsync());
+        await r.Pc.ClearHistoryAsync(); Assert.Equal(3, notifications);
+    }
+
+    [Fact]
+    public async Task DeleteHistoryAfterAckKeepsConnectionWhileUnackedInFlightDeletionDrops()
+    {
+        var r = new Rig();
+        await r.Pc.ClipboardChangedAsync(new(1, "first", false));
+        await r.Pc.ClipboardChangedAsync(new(2, "second", false));
+        var pad = await r.ConnectAsync(512);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = packet =>
+        {
+            if ((packet[0] & 2) != 0 && !entered.Task.IsCompleted)
+            { entered.SetResult(); return release.Task; }
+            return Task.CompletedTask;
+        };
+        // Reconnect triggers sending while holding the first item in flight.
+        await r.Pc.DisconnectAsync(pad.Peer);
+        var peer = new FakePeer { PacketLimit = 512 };
+        await r.Pc.ConnectAsync(peer);
+        var handshake = new SyncPadHandshake(r.Pairing, r.DeviceId);
+        await r.SendFrameAsync(peer, handshake.CreateHello());
+        var auth = handshake.AcceptWelcome(Assert.Single(peer.DrainFrames()));
+        var pad2 = new Pad(r, peer, auth.Keys);
+        peer.OnSend = packet =>
+        {
+            if ((packet[0] & 2) != 0 && !entered.Task.IsCompleted)
+            { entered.SetResult(); return release.Task; }
+            return Task.CompletedTask;
+        };
+        entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        foreach (var packet in SyncPacketizer.Split(auth.Auth, 512))
+            Assert.True(await r.Pc.ReceiveAsync(peer, packet));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var first = Assert.IsType<SyncItem>(Assert.Single(pad2.Drain()));
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad2.Seal(new SyncAck([first.Id])), 512))
+                Assert.True(await r.Pc.ReceiveAsync(peer, packet));
+            await r.Pc.DeleteHistoryAsync(first.Id);
+            Assert.False(peer.Rejected);
+        }
+        finally { release.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(peer);
+        Assert.Equal("second", Assert.IsType<SyncItem>(Assert.Single(pad2.Drain())).Text);
+
+        // Now verify unacked in-flight deletion still drops the connection.
+        var thirdEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thirdRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        peer.OnSend = packet =>
+        {
+            if ((packet[0] & 2) != 0 && !thirdEntered.Task.IsCompleted)
+            { thirdEntered.SetResult(); return thirdRelease.Task; }
+            return Task.CompletedTask;
+        };
+        await r.Pc.ClipboardChangedAsync(new(3, "third", false));
+        await thirdEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var third = Assert.Single(await r.Pc.GetHistoryAsync("third"));
+        try { await r.Pc.DeleteHistoryAsync(third.Id); }
+        finally { thirdRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(peer);
+        Assert.True(peer.Rejected);
+    }
+
+    [Fact]
+    public async Task RejectedContentDiscardsPartialLogsFixedReasonAcksAndDoesNotCommit()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(512);
+        var data = new byte[] { 1, 2, 3, 4 };
+        var sha = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(data));
+        var offer = new SyncOffer(Guid.NewGuid(), 100, "pad", "image", data.Length, sha, Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("secret-huge.png")), "public.png");
+        r.Clipboard.RejectReason = ClipboardRejectReason.ImageDimensions;
+
+        await pad.SendAsync(offer);
+        Assert.Equal(new SyncResume(offer.Id, 0), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(offer.Id, 0, data));
+
+        Assert.False(pad.Peer.Rejected);
+        Assert.Equal(offer.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+        Assert.Empty(await r.Pc.GetHistoryAsync());
+        Assert.Empty(r.Clipboard.MediaWrites);
+        Assert.Null(r.Store.Incoming(r.DeviceId, offer.Id));
+        Assert.False(File.Exists(r.Store.PartialPath(r.DeviceId, offer.Id)));
+        Assert.False(File.Exists(Path.Combine(r.Root, "bodies", sha)));
+        Assert.Contains(r.Logs, l => l.Contains("reason=image-dimensions"));
+        Assert.DoesNotContain(r.Logs, l => l.Contains("secret-huge.png") || l.Contains(sha));
+
+        // If sender re-offers the same rejected ID (e.g., missed ACK), PC immediately ACKs without writing.
+        await pad.SendAsync(offer);
+        Assert.Equal(offer.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+        Assert.Empty(await r.Pc.GetHistoryAsync());
+    }
+
+    [Fact]
+    public async Task TransientFailureDuringFinishDiscardsPartialAndDisconnects()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(512);
+        var data = new byte[] { 9, 8, 7, 6 };
+        var sha = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(data));
+        var offer = new SyncOffer(Guid.NewGuid(), 100, "pad", "image", data.Length, sha, "", "public.png");
+        r.Clipboard.Fail = true;
+
+        await pad.SendAsync(offer);
+        Assert.Equal(new SyncResume(offer.Id, 0), Assert.Single(pad.Drain()));
+        var frame = pad.Seal(new SyncChunk(offer.Id, 0, data));
+        bool ok = true;
+        foreach (var packet in SyncPacketizer.Split(frame, pad.Peer.PacketLimit))
+            ok = await r.Pc.ReceiveAsync(pad.Peer, packet);
+        Assert.False(ok);
+        Assert.True(pad.Peer.Rejected);
+        Assert.Empty(pad.Peer.Packets);
+        Assert.Null(r.Store.Incoming(r.DeviceId, offer.Id));
+        Assert.False(File.Exists(r.Store.PartialPath(r.DeviceId, offer.Id)));
+        Assert.False(File.Exists(Path.Combine(r.Root, "bodies", sha)));
+
+        r.Clipboard.Fail = false;
+        pad = await r.ConnectAsync(512);
+        await pad.SendAsync(offer);
+        Assert.Equal(new SyncResume(offer.Id, 0), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(offer.Id, 0, data));
+        Assert.Equal(offer.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+        Assert.Single(r.Clipboard.MediaWrites);
+    }
+
+    [Fact]
+    public async Task OnlyOneAttachmentTransfersAtATimePerConnectionWhileAllowingTextAndControl()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(512);
+        var data1 = new byte[SyncProtocol.ChunkBytes + 5]; data1[^1] = 1;
+        var data2 = new byte[] { 2, 3, 4 };
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [
+            new("file", Filename: "one.bin", Data: data1),
+            new("text", Text: "interleaved text"),
+            new("file", Filename: "two.bin", Data: data2)
+        ]));
+        await r.Pc.WaitForOutgoingAsync();
+
+        var batch1 = pad.Drain();
+        Assert.Equal(2, batch1.Length);
+        var offer1 = Assert.IsType<SyncOffer>(batch1[0]);
+        Assert.Equal("one.bin", offer1.Filename);
+        var textItem = Assert.IsType<SyncItem>(batch1[1]);
+        Assert.Equal("interleaved text", textItem.Text);
+
+        await pad.SendAsync(new SyncPing());
+        Assert.IsType<SyncPong>(Assert.Single(pad.Drain()));
+
+        await pad.SendAsync(new SyncResume(offer1.Id, 0));
+        var chunk1 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(offer1.Id, chunk1.Id);
+        await pad.SendAsync(new SyncResume(offer1.Id, chunk1.Data.Length));
+        var chunk2 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(offer1.Id, chunk2.Id);
+
+        // Wait for final ACK of file 1 before offering file 2.
+        await pad.SendAsync(new SyncAck([textItem.Id]));
+        Assert.Empty(pad.Drain());
+
+        await pad.SendAsync(new SyncAck([offer1.Id]));
+        var offer2 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("two.bin", offer2.Filename);
+        await pad.SendAsync(new SyncResume(offer2.Id, 0));
+        Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncAck([offer2.Id]));
+        Assert.Equal(0, r.State.Pending);
+
+        // Zero-byte attachment also blocks next offer until ACKed.
+        await r.Pc.ClipboardChangedAsync(new(2, null, false, [
+            new("file", Filename: "empty.bin", Data: []),
+            new("file", Filename: "after-empty.bin", Data: [9])
+        ]));
+        await r.Pc.WaitForOutgoingAsync();
+        var emptyOffer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("empty.bin", emptyOffer.Filename);
+        await pad.SendAsync(new SyncAck([emptyOffer.Id]));
+        var afterEmpty = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("after-empty.bin", afterEmpty.Filename);
+    }
+
+    [Theory]
+    [InlineData(10)]
+    [InlineData(0)]
+    public async Task ResumeAtOrBeyondItemSizeIsRejectedImmediately(int size)
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync(512);
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "f.bin", Data: new byte[size])]));
+        await r.Pc.WaitForOutgoingAsync();
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        var frame = pad.Seal(new SyncResume(offer.Id, size));
+        bool ok = true;
+        foreach (var packet in SyncPacketizer.Split(frame, pad.Peer.PacketLimit))
+            ok = await r.Pc.ReceiveAsync(pad.Peer, packet);
+        Assert.False(ok);
+        Assert.True(pad.Peer.Rejected);
+    }
+
+    [Fact]
+    public async Task FutureHistoryItemsDoNotEvictPendingAttachmentBodyBeforeSend()
+    {
+        var r = new Rig();
+        var future = DateTimeOffset.UtcNow.AddDays(1);
+        for (var i = 0; i < SyncProtocol.MaxHistory; i++)
+            r.Store.AddHistory(r.Store.Create(new("text", Text: $"future {i}"), future.AddSeconds(i).ToUnixTimeMilliseconds(), "iPad"));
+
+        var pad = await r.ConnectAsync(512);
+        var data = new byte[] { 11, 22, 33, 44 };
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "local.bin", Data: data)]));
+        await r.Pc.WaitForOutgoingAsync();
+
+        Assert.Equal(1, r.State.Pending);
+        var pendingItem = Assert.Single(r.Store.Pending(r.DeviceId));
+        Assert.True(File.Exists(pendingItem.Path));
+
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncResume(offer.Id, 0));
+        var chunk = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(data, chunk.Data);
+    }
+
+    [Fact]
+    public async Task DuplicateFromOtherDeviceDoesNotBlockOriginalDeviceCopy()
+    {
+        var r = new Rig();
+        var phoneId = Guid.NewGuid();
+        var pad = await r.ConnectAsync();
+        var phone = await r.ConnectAsync(deviceId: phoneId);
+        await phone.SendAsync(new SyncDevice("phone"));
+
+        await phone.SendAsync(new SyncItem(Guid.NewGuid(), 10, "pad", "A"));
+        phone.Drain();
+        await pad.SendAsync(new SyncItem(Guid.NewGuid(), 11, "pad", "A"));
+        pad.Drain();
+        Assert.Single(r.Clipboard.Writes);
+
+        await phone.SendAsync(new SyncItem(Guid.NewGuid(), 12, "pad", "A"));
+        Assert.Equal(2, r.Clipboard.Writes.Count);
+        Assert.IsType<SyncAck>(Assert.Single(phone.Drain()));
+    }
+
+    [Fact]
+    public async Task LastSentAndLastReceivedUseUtcBasis()
+    {
+        var r = new Rig(); var pad = await r.ConnectAsync();
+        await r.Pc.ClipboardChangedAsync(new(1, "utc out", false));
+        await r.Pc.WaitForOutgoingAsync();
+        pad.Drain();
+        await pad.SendAsync(new SyncItem(Guid.NewGuid(), 100, "pad", "utc in"));
+        Assert.NotNull(r.State.LastSent);
+        Assert.NotNull(r.State.LastReceived);
+        Assert.Equal(TimeSpan.Zero, r.State.LastSent!.Value.Offset);
+        Assert.Equal(TimeSpan.Zero, r.State.LastReceived!.Value.Offset);
+    }
+
+    [Fact]
+    public async Task VersionMismatchTracksOnlyRegisteredDevicesAndClearsAfterV2Auth()
+    {
+        var r = new Rig();
+        byte[] V1Hello(Guid id) => [1, 1, .. id.ToByteArray(bigEndian: true), .. new byte[32]];
+
+        // Unregistered device sending v1 HELLO does not set RequiresPeerUpdate.
+        var unknownPeer = new FakePeer { PacketLimit = 512 };
+        await r.Pc.ConnectAsync(unknownPeer);
+        await r.SendFrameAsync(unknownPeer, V1Hello(Guid.NewGuid()));
+        Assert.True(unknownPeer.Rejected);
+        Assert.Single(unknownPeer.DrainFrames());
+        Assert.False(r.State.RequiresPeerUpdate);
+
+        // Registered device sending v1 HELLO sets RequiresPeerUpdate and clears on v2 auth.
+        var registeredPeer = new FakePeer { PacketLimit = 512 };
+        await r.Pc.ConnectAsync(registeredPeer);
+        await r.SendFrameAsync(registeredPeer, V1Hello(r.DeviceId));
+        Assert.True(registeredPeer.Rejected);
+        Assert.Single(registeredPeer.DrainFrames());
+        Assert.True(r.State.RequiresPeerUpdate);
+
+        var updated = await r.ConnectAsync();
+        Assert.False(r.State.RequiresPeerUpdate);
+        await r.Pc.DisconnectAsync(updated.Peer);
+    }
+
+    [Fact]
+    public async Task DisposeAsyncWaitsForInFlightSenderAndReceiveAndPreventsStateOverwrite()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var writeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        r.Clipboard.BeforeWrite = () =>
+        {
+            writeEntered.TrySetResult();
+            return allowWrite.Task;
+        };
+
+        var receiveTask = pad.SendAsync(new SyncItem(Guid.NewGuid(), 100, "pad", "in-flight receive"));
+        await writeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // Enqueue a clipboard change behind the gate, then dispose the coordinator.
+        var queuedClipboard = r.Pc.ClipboardChangedAsync(new(1, "queued before dispose", false));
+        var disposing = r.Pc.DisposeAsync().AsTask();
+        Assert.False(disposing.IsCompleted);
+
+        allowWrite.SetResult();
+        await receiveTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await queuedClipboard.WaitAsync(TimeSpan.FromSeconds(2));
+        await disposing.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // Replace with a new pairing/repository in the same root directory and verify old coordinator cannot overwrite it.
+        var newPairing = SyncPairing.Create("repaired");
+        var freshStore = new SyncRepository(r.Root, newPairing.PcId);
+        await r.Pc.ClipboardChangedAsync(new(2, "stale after dispose", false));
+
+        var reloaded = new SyncRepository(r.Root, newPairing.PcId);
+        Assert.Empty(reloaded.Pending(r.DeviceId));
+        Assert.Empty(reloaded.Devices);
+        Assert.Empty(freshStore.Pending(r.DeviceId));
     }
 }

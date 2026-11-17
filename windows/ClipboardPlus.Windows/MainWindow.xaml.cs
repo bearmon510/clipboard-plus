@@ -14,6 +14,7 @@ public partial class MainWindow : Window
     private readonly Action<string> log;
     private string bluetoothState = "Bluetoothを確認しています";
     private int connected;
+    private bool requiresPeerUpdate;
     private readonly bool preview;
     public event Action? RepairRequested;
 
@@ -39,7 +40,7 @@ public partial class MainWindow : Window
         var bitmap = new BitmapImage();
         bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.StreamSource = stream; bitmap.EndInit(); bitmap.Freeze();
         QrImage.Source = bitmap;
-        connected = 0; StatusText.Text = "Bluetoothを確認しています";
+        connected = 0; requiresPeerUpdate = false; UpdateStatus();
         PairingTitle.Text = "iPhone・iPadと組にする";
         SentText.Text = ReceivedText.Text = "まだありません";
         PendingText.Text = "確認待ち 0 件";
@@ -49,13 +50,18 @@ public partial class MainWindow : Window
     public void UpdateSync(SyncStatus state)
     {
         connected = state.Connected;
-        SentText.Text = state.LastSent?.ToString("MM/dd HH:mm:ss") ?? "まだありません";
-        ReceivedText.Text = state.LastReceived?.ToString("MM/dd HH:mm:ss") ?? "まだありません";
+        SentText.Text = state.LastSent?.ToLocalTime().ToString("MM/dd HH:mm:ss") ?? "まだありません";
+        ReceivedText.Text = state.LastReceived?.ToLocalTime().ToString("MM/dd HH:mm:ss") ?? "まだありません";
         PendingText.Text = $"確認待ち {state.Pending} 件";
+        requiresPeerUpdate = state.RequiresPeerUpdate;
         if (connected > 0) PairingTitle.Text = "組にするコード";
         UpdateStatus();
     }
-    private void UpdateStatus() => StatusText.Text = connected > 0 ? "iPhone・iPadとつながっています" : bluetoothState;
+    private void UpdateStatus()
+    {
+        var baseStatus = connected > 0 ? "iPhone・iPadとつながっています" : bluetoothState;
+        StatusText.Text = requiresPeerUpdate ? $"{baseStatus}\n相手のアプリを更新してください" : baseStatus;
+    }
     public void SetBusy(bool busy) => RepairButton.IsEnabled = !busy;
     private void OnClosing(object? sender, CancelEventArgs e) { if (!preview) { e.Cancel = true; Hide(); } }
     private void OnRepair(object sender, RoutedEventArgs e) => RepairRequested?.Invoke();

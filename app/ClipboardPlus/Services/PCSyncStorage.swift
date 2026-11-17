@@ -67,6 +67,10 @@ final class PCSyncSettings {
         get { defaults.object(forKey: prefix + "copiesReceivedToPasteboard") as? Bool ?? true }
         set { defaults.set(newValue, forKey: prefix + "copiesReceivedToPasteboard") }
     }
+    var requiresPeerUpdate: Bool {
+        get { defaults.bool(forKey: prefix + "requiresPeerUpdate") }
+        set { defaults.set(newValue, forKey: prefix + "requiresPeerUpdate") }
+    }
     // A deletion tombstone prevents loading a stale secret if Keychain is temporarily locked.
     var deletionPending: Bool {
         get { defaults.bool(forKey: prefix + "deletionPending") }

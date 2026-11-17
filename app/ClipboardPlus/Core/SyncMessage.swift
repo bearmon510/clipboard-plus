@@ -5,6 +5,34 @@ public enum SyncMessage: Equatable {
     case ack(ids: [UUID])
     case ping
     case pong
+    case device(kind: String)
+    case offer(SyncOffer)
+    case chunk(id: UUID, offset: Int, data: Data)
+    case resume(id: UUID, offset: Int)
+}
+
+public struct SyncOffer: Codable, Equatable {
+    public let id: UUID
+    public let at: Int64
+    public let from: String
+    public let kind: String
+    public let size: Int
+    public let sha256: String
+    public let name64: String
+    public let type: String
+    public var filename: String { String(data: Data(base64Encoded: name64) ?? Data(), encoding: .utf8) ?? "" }
+    func validate() throws {
+        try SyncProtocol.require(at >= -SyncProtocol.maxTimestamp && at <= SyncProtocol.maxTimestamp && ["pc", "pad"].contains(from))
+        try SyncProtocol.require(["image", "file"].contains(kind) && (0...SyncProtocol.maxItemBytes).contains(size))
+        try SyncProtocol.require(sha256.utf8.count == 64 && sha256.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) })
+        try SyncProtocol.require((1...255).contains(type.utf8.count) && type.utf8.allSatisfy { (32..<127).contains($0) })
+        try SyncProtocol.require(kind != "image" || ["public.png", "public.jpeg"].contains(type))
+        guard let name = Data(base64Encoded: name64), name.count <= 1024, name.base64EncodedString() == name64,
+              let decoded = String(data: name, encoding: .utf8),
+              // Reject Unicode Cc (U+0000..U+001F, U+007F..U+009F) while permitting Cf (e.g. U+200D ZWJ).
+              !decoded.unicodeScalars.contains(where: SyncProtocol.isControlCharacter),
+              kind != "file" || !decoded.isEmpty else { throw SyncProtocolError.format }
+    }
 }
 
 public enum SyncMessageCodec {
@@ -13,6 +41,21 @@ public enum SyncMessageCodec {
         let body: Data
         // Only fixed ASCII vocabulary, UUIDs and integers enter the header.
         switch message {
+        case .device(let kind):
+            try SyncProtocol.require(["phone", "pad"].contains(kind))
+            header = "{\"kind\":\"\(kind)\",\"t\":\"device\"}"; body = Data()
+        case .offer(let offer):
+            try offer.validate()
+            let object: [String: Any] = ["at": offer.at, "from": offer.from, "id": offer.id.uuidString,
+                "kind": offer.kind, "name64": offer.name64, "sha256": offer.sha256, "size": offer.size, "t": "offer", "type": offer.type]
+            header = String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
+            body = Data()
+        case let .resume(id, offset):
+            try SyncProtocol.require((0...SyncProtocol.maxItemBytes).contains(offset))
+            header = "{\"id\":\"\(id.uuidString)\",\"offset\":\(offset),\"t\":\"resume\"}"; body = Data()
+        case let .chunk(id, offset, data):
+            try SyncProtocol.require(offset >= 0 && (1...SyncProtocol.chunkBytes).contains(data.count) && offset <= SyncProtocol.maxItemBytes - data.count)
+            header = "{\"id\":\"\(id.uuidString)\",\"offset\":\(offset),\"t\":\"chunk\"}"; body = data
         case let .item(id, at, from, text):
             try SyncProtocol.require(at >= -SyncProtocol.maxTimestamp && at <= SyncProtocol.maxTimestamp && (from == "pad" || from == "pc"))
             try SyncProtocol.require(text.utf8.count <= SyncProtocol.maxPlaintextBytes, .limit)
@@ -52,7 +95,38 @@ public enum SyncMessageCodec {
             func keys(_ expected: [String]) throws {
                 try SyncProtocol.require(Set(object.keys) == Set(expected))
             }
+            func integer(_ key: String) throws -> Int64 {
+                guard let bytes = raw[key], let text = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      text.range(of: "^-?(0|[1-9][0-9]*)$", options: .regularExpression) != nil,
+                      let value = Int64(text) else { throw SyncProtocolError.format }
+                return value
+            }
+            func string(_ key: String) throws -> String {
+                guard let value = object[key] as? String else { throw SyncProtocolError.format }; return value
+            }
             switch object["t"] as? String {
+            case "device":
+                try keys(["kind", "t"])
+                let kind = try string("kind")
+                try SyncProtocol.require(body.isEmpty && ["phone", "pad"].contains(kind))
+                return .device(kind: kind)
+            case "offer":
+                try keys(["at", "from", "id", "kind", "name64", "sha256", "size", "t", "type"])
+                try SyncProtocol.require(body.isEmpty)
+                let size = try integer("size")
+                try SyncProtocol.require(size >= 0 && size <= Int64(SyncProtocol.maxItemBytes))
+                let offer = try SyncOffer(id: SyncProtocol.parseId(string("id")), at: integer("at"), from: string("from"),
+                    kind: string("kind"), size: Int(size), sha256: string("sha256"), name64: string("name64"), type: string("type"))
+                try offer.validate(); return .offer(offer)
+            case "chunk", "resume":
+                try keys(["id", "offset", "t"])
+                let offset = try integer("offset"), id = try SyncProtocol.parseId(string("id"))
+                try SyncProtocol.require(offset >= 0 && offset <= Int64(SyncProtocol.maxItemBytes))
+                if object["t"] as? String == "resume" {
+                    try SyncProtocol.require(body.isEmpty); return .resume(id: id, offset: Int(offset))
+                }
+                try SyncProtocol.require((1...SyncProtocol.chunkBytes).contains(body.count) && offset + Int64(body.count) <= Int64(SyncProtocol.maxItemBytes))
+                return .chunk(id: id, offset: Int(offset), data: body)
             case "item":
                 try keys(["at", "from", "id", "kind", "t"])
                 guard object["kind"] as? String == "text", let from = object["from"] as? String,
