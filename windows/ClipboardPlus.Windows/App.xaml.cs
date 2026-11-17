@@ -22,6 +22,8 @@ public partial class App : System.Windows.Application
     private AppLog? log;
     private MainWindow? window;
     private bool exiting;
+    private bool repairing;
+    private Task? repairTask;
     private const string InstanceName = @"Local\clipboardplus.windows.instance.v1";
 
     protected override void OnStartup(StartupEventArgs e)
@@ -109,9 +111,26 @@ public partial class App : System.Windows.Application
 
     private async void RepairAsync()
     {
-        if (window is null || exiting) return;
-        if (System.Windows.MessageBox.Show(window, "組にする鍵を作り直します。いま組んでいるiPhone・iPadはつながらなくなります。\n新しいQRコードを読み直してください。", "組み直す", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
-        window.SetBusy(true);
+        if (window is null || exiting || repairing || repairTask is not null) return;
+        repairing = true;
+        try
+        {
+            if (System.Windows.MessageBox.Show(window, "組にする鍵を作り直します。いま組んでいるiPhone・iPadはつながらなくなります。\n新しいQRコードを読み直してください。", "組み直す", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK)
+                return;
+            if (exiting) return;
+            repairTask = ExecuteRepairAsync();
+            await repairTask;
+        }
+        finally
+        {
+            repairing = false;
+            repairTask = null;
+        }
+    }
+
+    private async Task ExecuteRepairAsync()
+    {
+        window!.SetBusy(true);
         try
         {
             // Persist successfully before retiring the old pairing.
@@ -120,8 +139,15 @@ public partial class App : System.Windows.Application
             var oldServer = server;
             coordinator = null;
             server = null;
-            if (oldServer is not null) await oldServer.DisposeAsync();
-            if (oldCoordinator is not null) await oldCoordinator.DisposeAsync();
+            try
+            {
+                if (oldServer is not null) await oldServer.DisposeAsync();
+            }
+            finally
+            {
+                if (oldCoordinator is not null) await oldCoordinator.DisposeAsync();
+            }
+            if (exiting) return;
             window.UpdatePairing(pairing);
             StartSync(pairing);
             log!.Write("pairing replaced");
@@ -129,7 +155,8 @@ public partial class App : System.Windows.Application
         catch (Exception e)
         {
             log!.Write($"repair failed error={e.GetType().Name}");
-            System.Windows.MessageBox.Show(window, "組み直せませんでした。ログを確認して、アプリを起動し直してください。", "clipboard+");
+            if (!exiting)
+                System.Windows.MessageBox.Show(window!, "組み直せませんでした。ログを確認して、アプリを起動し直してください。", "clipboard+");
         }
         finally { window.SetBusy(false); }
     }
@@ -148,8 +175,19 @@ public partial class App : System.Windows.Application
         exiting = true;
         tray!.Visible = false;
         clipboard?.Dispose();
-        if (server is not null) await server.DisposeAsync();
-        if (coordinator is not null) await coordinator.DisposeAsync();
+        if (repairTask is { } running) await running;
+        var currentServer = server;
+        var currentCoordinator = coordinator;
+        server = null;
+        coordinator = null;
+        try
+        {
+            if (currentServer is not null) await currentServer.DisposeAsync();
+        }
+        finally
+        {
+            if (currentCoordinator is not null) await currentCoordinator.DisposeAsync();
+        }
         log?.Write("application stopped");
         Shutdown();
     }

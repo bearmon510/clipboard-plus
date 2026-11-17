@@ -47,6 +47,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public Guid DeviceId;
         public readonly Dictionary<Guid, int> Offsets = [];
         public readonly Dictionary<Guid, int> AwaitingOffsets = [];
+        public readonly HashSet<Guid> Attempted = [];
         public TransferProgress? Progress;
         public bool VersionRejected;
         public readonly SyncPcHandshake Handshake = new(pair);
@@ -105,6 +106,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             foreach (var id in c.Sent.Keys.Where(id => !ids.Contains(id)).ToArray()) c.Sent.Remove(id);
             foreach (var id in c.Offsets.Keys.Where(id => !ids.Contains(id)).ToArray()) c.Offsets.Remove(id);
             foreach (var id in c.AwaitingOffsets.Keys.Where(id => !ids.Contains(id)).ToArray()) c.AwaitingOffsets.Remove(id);
+            c.Attempted.RemoveWhere(id => !ids.Contains(id));
             if (c.Progress is { Direction: "send" } p && !ids.Contains(p.ItemId)) c.Progress = null;
         }
     }
@@ -221,9 +223,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     foreach (var old in connections.Values.Where(x => x != c && x.Stage == 2 && x.DeviceId == c.DeviceId).ToArray()) Drop(old, "replaced session");
                     store.Register(c.DeviceId, null, DateTimeOffset.UtcNow);
                     store.Prune(DateTimeOffset.UtcNow);
+                    TrimConnectionQueues();
                     c.Assembler = new(512);
                     log($"handshake authenticated elapsedMs={(DateTimeOffset.UtcNow - c.Started).TotalMilliseconds:F0}");
-                    StartSending(c);
+                    foreach (var active in connections.Values.Where(x => x.Stage == 2).ToArray()) StartSending(active);
                 }
                 else
                 {
@@ -262,9 +265,9 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             c.AwaitingOffsets.Remove(resume.Id); c.Offsets[resume.Id] = resume.Offset;
                             c.Sent.Remove(resume.Id); StartSending(c); break;
                         case SyncAck ack:
-                            var ids = ack.Ids.Where(id => c.Sent.ContainsKey(id) || c.InFlight == id).ToHashSet();
+                            var ids = ack.Ids.Where(id => c.Sent.ContainsKey(id) || c.InFlight == id || c.Offsets.ContainsKey(id) || c.AwaitingOffsets.ContainsKey(id) || c.Attempted.Contains(id)).ToHashSet();
                             store.Ack(c.DeviceId, ids);
-                            foreach (var id in ids) { c.Sent.Remove(id); c.Offsets.Remove(id); c.AwaitingOffsets.Remove(id); }
+                            foreach (var id in ids) { c.Sent.Remove(id); c.Offsets.Remove(id); c.AwaitingOffsets.Remove(id); c.Attempted.Remove(id); }
                             if (c.InFlight is Guid current && ids.Contains(current)) c.InFlight = null;
                             if (c.Progress is { Direction: "send" } p && ids.Contains(p.ItemId)) c.Progress = null;
                             log($"ack removed={ids.Count} pending={store.PendingCount}"); StartSending(c); break;
@@ -341,7 +344,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 {
                     // A missing ACK must not strand an item on an otherwise healthy
                     // link (for example, a temporary history-save failure on iPad).
-                    foreach (var id in c.Sent.Where(p => now - p.Value > TimeSpan.FromSeconds(60)).Select(p => p.Key).ToArray())
+                    foreach (var id in c.Sent.Where(p => p.Key != c.InFlight && now - p.Value > TimeSpan.FromSeconds(60)).Select(p => p.Key).ToArray())
                     { c.Sent.Remove(id); c.Offsets.Remove(id); c.AwaitingOffsets.Remove(id); }
                     try { StartSending(c); }
                     catch (Exception e) { Drop(c, Failure(e)); }
@@ -364,9 +367,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         await gate.WaitAsync();
         try
         {
-            if (stopped) return;
-            stopped = true;
-            foreach (var c in connections.Values.ToArray()) Drop(c, "stopped");
+            if (!stopped)
+            {
+                stopped = true;
+                foreach (var c in connections.Values.ToArray()) Drop(c, "stopped");
+            }
         }
         finally { gate.Release(); }
         while (true)
@@ -450,6 +455,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         } else { message = item.Offer; c.AwaitingOffsets[item.Id] = -1; finishesItem = item.Size == 0; }
                         // Mark before I/O: resume/ack may arrive before notification completion.
                         c.Sent[item.Id] = DateTimeOffset.UtcNow;
+                        c.Attempted.Add(item.Id);
                         store.MarkSent(item, DateTimeOffset.UtcNow);
                         frame = c.Sender!.Seal(SyncMessageCodec.Encode(message));
                         retransmission = !attempted.Add(item.Id);
@@ -473,7 +479,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     // An ACK may arrive before NotifyValueAsync completes.
                     if (item is not null)
                     {
-                        if (item.Kind == "text" && store.Pending(c.DeviceId).Any(i => i.Id == item.Id)) c.Sent[item.Id] = DateTimeOffset.UtcNow;
+                        if ((item.Kind == "text" || c.AwaitingOffsets.ContainsKey(item.Id)) && store.Pending(c.DeviceId).Any(i => i.Id == item.Id))
+                            c.Sent[item.Id] = DateTimeOffset.UtcNow;
                         c.InFlight = null;
                         if (finishesItem) lastSent = DateTimeOffset.UtcNow;
                         log($"sent items=1 resend={retransmission} pending={store.PendingCount}");

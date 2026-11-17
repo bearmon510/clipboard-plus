@@ -791,35 +791,293 @@ public sealed class SyncCoordinatorTests
     {
         var r = new Rig();
         var pad = await r.ConnectAsync(512);
-        var writeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var allowWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        r.Clipboard.BeforeWrite = () =>
+        var sendEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseSend = new ManualResetEventSlim(false);
+        pad.Peer.OnSend = _ =>
         {
-            writeEntered.TrySetResult();
-            return allowWrite.Task;
+            sendEntered.TrySetResult();
+            releaseSend.Wait(TimeSpan.FromSeconds(5));
+            return Task.CompletedTask;
         };
 
-        var receiveTask = pad.SendAsync(new SyncItem(Guid.NewGuid(), 100, "pad", "in-flight receive"));
-        await writeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            await r.Pc.ClipboardChangedAsync(new(1, "in-flight send", false));
+            await sendEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-        // Enqueue a clipboard change behind the gate, then dispose the coordinator.
-        var queuedClipboard = r.Pc.ClipboardChangedAsync(new(1, "queued before dispose", false));
-        var disposing = r.Pc.DisposeAsync().AsTask();
-        Assert.False(disposing.IsCompleted);
+            var writeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var allowWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            r.Clipboard.BeforeWrite = () =>
+            {
+                writeEntered.TrySetResult();
+                return allowWrite.Task;
+            };
 
-        allowWrite.SetResult();
-        await receiveTask.WaitAsync(TimeSpan.FromSeconds(2));
-        await queuedClipboard.WaitAsync(TimeSpan.FromSeconds(2));
-        await disposing.WaitAsync(TimeSpan.FromSeconds(2));
+            var receivePacket = Assert.Single(SyncPacketizer.Split(pad.Seal(new SyncItem(Guid.NewGuid(), 100, "pad", "in-flight receive")), pad.Peer.PacketLimit));
+            var receiveTask = r.Pc.ReceiveAsync(pad.Peer, receivePacket);
+            await writeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-        // Replace with a new pairing/repository in the same root directory and verify old coordinator cannot overwrite it.
-        var newPairing = SyncPairing.Create("repaired");
-        var freshStore = new SyncRepository(r.Root, newPairing.PcId);
-        await r.Pc.ClipboardChangedAsync(new(2, "stale after dispose", false));
+            // Enqueue a clipboard change behind the gate, then dispose the coordinator.
+            var queuedClipboard = r.Pc.ClipboardChangedAsync(new(2, "queued before dispose", false));
+            var disposing = r.Pc.DisposeAsync().AsTask();
+            await Task.Delay(50);
+            Assert.False(disposing.IsCompleted);
 
-        var reloaded = new SyncRepository(r.Root, newPairing.PcId);
-        Assert.Empty(reloaded.Pending(r.DeviceId));
-        Assert.Empty(reloaded.Devices);
-        Assert.Empty(freshStore.Pending(r.DeviceId));
+            // Release the receive holding the gate; DisposeAsync must still wait for activeOutgoing.
+            allowWrite.SetResult();
+            Assert.True(await receiveTask.WaitAsync(TimeSpan.FromSeconds(2)));
+            await queuedClipboard.WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.Delay(50);
+            Assert.False(disposing.IsCompleted);
+
+            releaseSend.Set();
+            await disposing.WaitAsync(TimeSpan.FromSeconds(2));
+
+            // Replace with a new pairing/repository in the same root directory and verify old coordinator cannot overwrite it.
+            var newPairing = SyncPairing.Create("repaired");
+            var freshStore = new SyncRepository(r.Root, newPairing.PcId);
+            await r.Pc.ClipboardChangedAsync(new(3, "stale after dispose", false));
+
+            var reloaded = new SyncRepository(r.Root, newPairing.PcId);
+            Assert.Empty(reloaded.Pending(r.DeviceId));
+            Assert.Empty(reloaded.Devices);
+            Assert.Empty(freshStore.Pending(r.DeviceId));
+        }
+        finally { releaseSend.Set(); }
+    }
+
+    [Fact]
+    public async Task DisposeAsyncSecondCallerAlsoWaitsForInFlightSender()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var sendEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseSend = new ManualResetEventSlim(false);
+        pad.Peer.OnSend = _ =>
+        {
+            sendEntered.TrySetResult();
+            releaseSend.Wait(TimeSpan.FromSeconds(5));
+            return Task.CompletedTask;
+        };
+
+        try
+        {
+            await r.Pc.ClipboardChangedAsync(new(1, "in-flight", false));
+            await sendEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var firstDispose = r.Pc.DisposeAsync().AsTask();
+            var secondDispose = r.Pc.DisposeAsync().AsTask();
+            await Task.Delay(50);
+            Assert.False(firstDispose.IsCompleted);
+            Assert.False(secondDispose.IsCompleted);
+
+            releaseSend.Set();
+            await Task.WhenAll(firstDispose, secondDispose).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally { releaseSend.Set(); }
+    }
+
+    [Fact]
+    public async Task InFlightAttachmentSurvivesSixtySecondTickForOfferAndFinalChunk()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var data1 = new byte[SyncProtocol.ChunkBytes + 5];
+        data1[0] = 11;
+        data1[^1] = 22;
+        var data2 = new byte[] { 33, 44 };
+
+        var offerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var offerRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { offerEntered.TrySetResult(); return offerRelease.Task; };
+
+        try
+        {
+            await r.Pc.ClipboardChangedAsync(new(1, null, false, [
+                new("file", Filename: "one.bin", Data: data1),
+                new("file", Filename: "two.bin", Data: data2)
+            ]));
+            await offerEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            // 60-second tick while offer 1 is InFlight must not clear AwaitingOffsets or start offer 2.
+            await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61)).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally { offerRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var offer1 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("one.bin", offer1.Filename);
+
+        await pad.SendAsync(new SyncResume(offer1.Id, 0));
+        var chunk1 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(SyncProtocol.ChunkBytes, chunk1.Data.Length);
+
+        var chunkEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var chunkRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { chunkEntered.TrySetResult(); return chunkRelease.Task; };
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer1.Id, chunk1.Data.Length)), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+            await chunkEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61)).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally { chunkRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var chunk2 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(data1[SyncProtocol.ChunkBytes..], chunk2.Data);
+        Assert.False(pad.Peer.Rejected);
+
+        await pad.SendAsync(new SyncAck([offer1.Id]));
+        var offer2 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("two.bin", offer2.Filename);
+        Assert.Equal(1, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task AttachmentSendCompletionUpdatesSentDeadlineAndAcceptsAckAcrossSixtySecondBoundary()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var data = new byte[SyncProtocol.ChunkBytes + 3];
+        data[^1] = 77;
+
+        var offerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var offerRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { offerEntered.TrySetResult(); return offerRelease.Task; };
+
+        DateTimeOffset mid;
+        try
+        {
+            await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "timed.bin", Data: data)]));
+            await offerEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.Delay(250);
+            mid = DateTimeOffset.UtcNow;
+        }
+        finally { offerRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        // >60s after send start, <60s after send completion: Sent timestamp was refreshed on completion.
+        await r.Pc.TickAsync(mid.AddSeconds(59.9));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        Assert.Empty(pad.Drain());
+
+        // Trigger resend after 60s, and deliver a resume before OnSend completes: completion must not re-arm Sent.
+        var resendEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resendRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { resendEntered.TrySetResult(); return resendRelease.Task; };
+        try
+        {
+            await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61));
+            await resendEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer.Id, 0)), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+        }
+        finally { resendRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var messages = pad.Drain();
+        Assert.Equal(2, messages.Length);
+        Assert.IsType<SyncOffer>(messages[0]);
+        var chunk1 = Assert.IsType<SyncChunk>(messages[1]);
+        Assert.Equal(SyncProtocol.ChunkBytes, chunk1.Data.Length);
+
+        await pad.SendAsync(new SyncResume(offer.Id, chunk1.Data.Length));
+        var chunk2 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(data[SyncProtocol.ChunkBytes..], chunk2.Data);
+
+        // Hold SendLoopAsync in SyncPong so TickAsync expires Sent/AwaitingOffsets before resend starts,
+        // then deliver SyncAck in that window and verify it is still accepted.
+        var pongEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pongRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { pongEntered.TrySetResult(); return pongRelease.Task; };
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncPing()), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+            await pongEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61)).WaitAsync(TimeSpan.FromSeconds(2));
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncAck([offer.Id])), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+        }
+        finally { pongRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        Assert.IsType<SyncPong>(Assert.Single(pad.Drain()));
+        Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task AttachmentDeletionAndExpiryStartNextAttachmentImmediately()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [
+            new("file", Filename: "one.bin", Data: [1, 2]),
+            new("file", Filename: "two.bin", Data: [3, 4])
+        ]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var offer1 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("one.bin", offer1.Filename);
+
+        // Deleting item 1 while awaiting resume keeps the connection and immediately offers item 2.
+        await r.Pc.DeleteHistoryAsync(offer1.Id);
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        Assert.False(pad.Peer.Rejected);
+        var offer2 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("two.bin", offer2.Filename);
+        await pad.SendAsync(new SyncAck([offer2.Id]));
+
+        // Expiring an awaiting attachment via 24h TickAsync also advances immediately to the next attachment.
+        await r.Pc.DisconnectAsync(pad.Peer);
+        var now = DateTimeOffset.UtcNow;
+        var expiring = r.Store.Create(new("file", Filename: "expiring.bin", Data: [5]), now.AddHours(-23).AddMinutes(-59).ToUnixTimeMilliseconds(), "PC");
+        r.Store.AddAndEnqueue(expiring, now);
+        var fresh = r.Store.Create(new("file", Filename: "fresh.bin", Data: [6]), now.ToUnixTimeMilliseconds(), "PC");
+        r.Store.AddAndEnqueue(fresh, now);
+
+        pad = await r.ConnectAsync(512);
+        var first = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("expiring.bin", first.Filename);
+
+        await r.Pc.TickAsync(now.AddMinutes(2));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        Assert.False(pad.Peer.Rejected);
+        var next = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("fresh.bin", next.Filename);
+    }
+
+    [Fact]
+    public async Task PeerAuthenticationPruneTrimsOtherConnectionsAndStartsNextAttachment()
+    {
+        var r = new Rig();
+        var phoneId = Guid.NewGuid();
+        r.Store.Register(phoneId, "phone", DateTimeOffset.UtcNow);
+        var pad = await r.ConnectAsync(512);
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [
+            new("file", Filename: "missing.bin", Data: [10, 20]),
+            new("file", Filename: "next.bin", Data: [30, 40])
+        ]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var offer1 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("missing.bin", offer1.Filename);
+
+        var missingItem = r.Store.Pending(r.DeviceId).First(i => i.Id == offer1.Id);
+        File.Delete(missingItem.Path!);
+
+        // Without calling TickAsync, authenticating another device prunes the missing body and trims pad's queue.
+        var phone = await r.ConnectAsync(512, deviceId: phoneId);
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        Assert.False(pad.Peer.Rejected);
+        var offer2 = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("next.bin", offer2.Filename);
+        Assert.Equal("next.bin", Assert.IsType<SyncOffer>(Assert.Single(phone.Drain())).Filename);
     }
 }

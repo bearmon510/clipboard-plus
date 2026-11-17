@@ -2,4 +2,5 @@
   <Project Path="ClipboardPlus.Sync/ClipboardPlus.Sync.csproj" />
   <Project Path="ClipboardPlus.Sync.Tests/ClipboardPlus.Sync.Tests.csproj" />
   <Project Path="ClipboardPlus.Windows/ClipboardPlus.Windows.csproj" />
+  <Project Path="ClipboardPlus.Windows.Tests/ClipboardPlus.Windows.Tests.csproj" />
 </Solution>

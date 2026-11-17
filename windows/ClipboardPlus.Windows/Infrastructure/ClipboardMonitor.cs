@@ -150,37 +150,11 @@ internal sealed class ClipboardMonitor : IClipboardAccess, IDisposable
             var data = new System.Windows.DataObject();
             if (item.Kind == "image")
             {
-                using var stream = File.OpenRead(item.Path!);
-                try
-                {
-                    // Probe dimensions before OnLoad so oversized images fail without allocating pixel buffers.
-                    var probe = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnDemand);
-                    if ((item.Type == "public.png" && probe is not PngBitmapDecoder) ||
-                        (item.Type == "public.jpeg" && probe is not JpegBitmapDecoder) ||
-                        item.Type is not ("public.png" or "public.jpeg"))
-                        throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageFormat);
-                    if (probe.Frames.Count == 0)
-                        throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageCorrupt);
-                    var probeFrame = probe.Frames[0];
-                    if ((long)probeFrame.PixelWidth * probeFrame.PixelHeight > SyncProtocol.MaxImagePixels)
-                        throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageDimensions);
-
-                    stream.Position = 0;
-                    var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-                    if (decoder.Frames.Count == 0)
-                        throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageCorrupt);
-                    var bitmap = decoder.Frames[0];
-                    if ((long)bitmap.PixelWidth * bitmap.PixelHeight > SyncProtocol.MaxImagePixels)
-                        throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageDimensions);
-                    bitmap.Freeze(); data.SetData(System.Windows.DataFormats.Bitmap, bitmap);
-                    var encoder = new PngBitmapEncoder(); encoder.Frames.Add(bitmap);
-                    var encoded = new MemoryStream(); encoder.Save(encoded); encoded.Position = 0;
-                    data.SetData("PNG", encoded);
-                }
-                catch (Exception ex) when (ex is FileFormatException or NotSupportedException or InvalidDataException or OverflowException or ArgumentException or COMException)
-                {
-                    throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageCorrupt);
-                }
+                BitmapFrame bitmap;
+                using (var stream = File.OpenRead(item.Path!))
+                    bitmap = LoadClipboardImage(stream, item.Type);
+                data.SetData(System.Windows.DataFormats.Bitmap, bitmap);
+                data.SetData("PNG", EncodeClipboardPng(bitmap));
             }
             else
             {
@@ -197,6 +171,48 @@ internal sealed class ClipboardMonitor : IClipboardAccess, IDisposable
             }
         }).Task.Unwrap();
     }
+    internal static BitmapFrame LoadClipboardImage(Stream stream, string type)
+    {
+        try
+        {
+            // Probe dimensions before OnLoad so oversized images fail without allocating pixel buffers.
+            var probe = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnDemand);
+            if ((type == "public.png" && probe is not PngBitmapDecoder) ||
+                (type == "public.jpeg" && probe is not JpegBitmapDecoder) ||
+                type is not ("public.png" or "public.jpeg"))
+                throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageFormat);
+            if (probe.Frames.Count == 0)
+                throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageCorrupt);
+            var probeFrame = probe.Frames[0];
+            if ((long)probeFrame.PixelWidth * probeFrame.PixelHeight > SyncProtocol.MaxImagePixels)
+                throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageDimensions);
+
+            stream.Position = 0;
+            var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+            if (decoder.Frames.Count == 0)
+                throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageCorrupt);
+            var bitmap = decoder.Frames[0];
+            if ((long)bitmap.PixelWidth * bitmap.PixelHeight > SyncProtocol.MaxImagePixels)
+                throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageDimensions);
+            bitmap.Freeze();
+            return bitmap;
+        }
+        catch (Exception ex) when (ex is FileFormatException or NotSupportedException or InvalidDataException or OverflowException or ArgumentException or COMException)
+        {
+            throw new ClipboardContentRejectedException(ClipboardRejectReason.ImageCorrupt);
+        }
+    }
+
+    internal static MemoryStream EncodeClipboardPng(BitmapFrame bitmap)
+    {
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(bitmap);
+        var encoded = new MemoryStream();
+        encoder.Save(encoded);
+        encoded.Position = 0;
+        return encoded;
+    }
+
     internal static string SafeFilename(string name) => SyncRepository.SafeFilename(name);
 
     private static bool IsZero(uint format)

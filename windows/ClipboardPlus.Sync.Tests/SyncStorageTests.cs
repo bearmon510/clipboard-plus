@@ -270,4 +270,35 @@ public sealed class SyncStorageTests : IDisposable
         foreach (var bidi in new[] { '\u061C', '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069' })
             Assert.Equal("a_b.txt", SyncRepository.SafeFilename($"a{bidi}b.txt"));
     }
+
+    [Fact]
+    public void BeginEvictionAtomicWriteFailureDoesNotLoseExistingPartial()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var store = new SyncRepository(root, pair);
+        var sha = Convert.ToHexStringLower(SHA256.HashData([1]));
+        var created = new List<SyncOffer>();
+        for (var i = 0; i < SyncProtocol.MaxPending; i++)
+        {
+            var offer = new SyncOffer(Guid.NewGuid(), i, "pad", "file", 1, sha, Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes($"p{i}.txt")), "public.data");
+            created.Add(offer);
+            store.Begin(device, offer, now.AddSeconds(i));
+        }
+
+        var extra = new SyncOffer(Guid.NewGuid(), 999, "pad", "file", 1, sha, "ZXh0cmEudHh0", "public.data");
+        Directory.CreateDirectory(store.PartialPath(device, extra.Id) + ".tmp");
+
+        var failure = Assert.ThrowsAny<Exception>(() => store.Begin(device, extra, now.AddSeconds(500)));
+        Assert.True(failure is IOException or UnauthorizedAccessException);
+
+        Assert.NotNull(store.Incoming(device, created[0].Id));
+        Assert.True(File.Exists(store.PartialPath(device, created[0].Id)));
+        Assert.Null(store.Incoming(device, extra.Id));
+
+        // A later successful Save() must preserve the un-evicted oldest partial on disk as well.
+        store.Register(Guid.NewGuid(), "phone", now);
+        var reloaded = new SyncRepository(root, pair);
+        Assert.NotNull(reloaded.Incoming(device, created[0].Id));
+        Assert.True(File.Exists(reloaded.PartialPath(device, created[0].Id)));
+    }
 }

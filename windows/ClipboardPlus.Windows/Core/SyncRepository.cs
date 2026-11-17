@@ -158,6 +158,9 @@ public sealed class SyncRepository
         if (previous is not null && previous.Offer != offer) throw new SyncProtocolException(SyncError.Format);
         if (previous is null)
         {
+            var path = PartialPath(device, offer.Id);
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+            AtomicWrite(path, []);
             var evicted = new List<string>();
             while (state.Partials.Count(p => p.Device == device) >= SyncProtocol.MaxPending)
             {
@@ -165,8 +168,7 @@ public sealed class SyncRepository
                 state.Partials.Remove(oldest);
                 evicted.Add(PartialPath(oldest.Device, oldest.Offer.Id));
             }
-            var path = PartialPath(device, offer.Id); Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
-            AtomicWrite(path, []); state.Partials.Add(new(device, offer, now));
+            state.Partials.Add(new(device, offer, now));
             try { Save(); }
             catch { try { File.Delete(path); } catch { } throw; }
             foreach (var oldPath in evicted) File.Delete(oldPath);
