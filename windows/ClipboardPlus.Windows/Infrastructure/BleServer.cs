@@ -140,7 +140,7 @@ internal sealed class BleServer : IAsyncDisposable
             {
                 log($"advertising status={args.Status} error={args.Error}");
                 Status(args.Status is GattServiceProviderAdvertisementStatus.Started or GattServiceProviderAdvertisementStatus.StartedWithoutAllAdvertisementData
-                    ? "iPadを待っています" : "Bluetoothの待ち受けを再開しています");
+                    ? "iPhone・iPadを待っています" : "Bluetoothの待ち受けを再開しています");
             }
             return Task.CompletedTask;
         });

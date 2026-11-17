@@ -91,7 +91,7 @@ final class PCSyncController: ObservableObject {
         do { value = try SyncPairing.parse(code) }
         catch { throw PCSyncPairError(message: "組にするコードを読み取れませんでした。PCに表示されたQRコードを読み直してください。") }
         do { try keyStore.write(value.key) }
-        catch { throw PCSyncPairError(message: "組にする鍵を保存できませんでした。iPadのロックを解除して、もう一度お試しください。") }
+        catch { throw PCSyncPairError(message: "組にする鍵を保存できませんでした。\(DeviceKind.current.name)のロックを解除して、もう一度お試しください。") }
         stopPairing()
         settings.save(value)
         pairing = value; pcName = value.name

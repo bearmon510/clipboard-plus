@@ -8,9 +8,14 @@ struct WelcomeView: View {
     /// Set once the guide has been closed, so it opens by itself only once.
     static let shownKey = "welcomeShown"
 
+    /// Set by the snapshot tests to draw the other device's guide; nil uses this device.
+    var deviceOverride: DeviceKind?
+
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var showCaptureGuide = false
+
+    private var device: DeviceKind { deviceOverride ?? .current }
 
     var body: some View {
         NavigationStack {
@@ -31,12 +36,21 @@ struct WelcomeView: View {
                         .buttonStyle(.bordered)
                         .frame(minHeight: 44)
                     }
-                    step(number: 2, symbol: "rectangle.righthalf.inset.filled", title: "画面に出して使う",
-                         text: "Slide OverやStage Managerの小窓でclipboard+を出しておくと、ほかのアプリでコピーしたものが次々に残ります。全画面で別のアプリを使っている間は集められません。clipboard+に戻ったときに、そのときの内容を1件取り込みます。") {
-                        EmptyView()
+                    if device == .phone {
+                        step(number: 2, symbol: "arrow.uturn.backward.circle", title: "clipboard+に戻って残す",
+                             text: "iPhoneでは、clipboard+を開いている間と、clipboard+に戻ったときに、コピーした内容を取り込みます。ほかのアプリでコピーしたら、clipboard+を開くと残ります。") {
+                            EmptyView()
+                        }
+                    } else {
+                        step(number: 2, symbol: "rectangle.righthalf.inset.filled", title: "画面に出して使う",
+                             text: "Slide OverやStage Managerの小窓でclipboard+を出しておくと、ほかのアプリでコピーしたものが次々に残ります。全画面で別のアプリを使っている間は集められません。clipboard+に戻ったときに、そのときの内容を1件取り込みます。") {
+                            EmptyView()
+                        }
                     }
                     step(number: 3, symbol: "camera.viewfinder", title: "画面の一部を切り取る",
-                         text: "スクリーンショットから範囲を選んで、文字か画像としてコピーできます。ショートカットとAssistiveTouchを使うと、ボタン1回で始められます。") {
+                         text: device == .phone
+                            ? "スクリーンショットから範囲を選んで、文字か画像としてコピーできます。ショートカットをアクションボタンに割り当てると、ボタン1回で始められます。"
+                            : "スクリーンショットから範囲を選んで、文字か画像としてコピーできます。ショートカットとAssistiveTouchを使うと、ボタン1回で始められます。") {
                         Button("切り取りの使い方") { showCaptureGuide = true }
                             .font(.subheadline.weight(.semibold))
                             .frame(minHeight: 44)
@@ -67,7 +81,7 @@ struct WelcomeView: View {
             }
             .navigationTitle("clipboard+へようこそ")
             .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showCaptureGuide) { CaptureGuideView() }
+            .sheet(isPresented: $showCaptureGuide) { CaptureGuideView(deviceOverride: deviceOverride) }
         }
         .tint(Theme.accent)
     }

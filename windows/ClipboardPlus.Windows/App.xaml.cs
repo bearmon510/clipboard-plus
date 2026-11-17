@@ -110,7 +110,7 @@ public partial class App : System.Windows.Application
     private async void RepairAsync()
     {
         if (window is null || exiting) return;
-        if (System.Windows.MessageBox.Show(window, "組にする鍵を作り直します。前のiPadはつながらなくなります。\n新しいQRコードをiPadで読み直してください。", "組み直す", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        if (System.Windows.MessageBox.Show(window, "組にする鍵を作り直します。いま組んでいるiPhone・iPadはつながらなくなります。\n新しいQRコードを読み直してください。", "組み直す", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
         window.SetBusy(true);
         try
         {

@@ -706,7 +706,7 @@ struct ContentView: View {
             Label("スクリーンショットから切り取る", systemImage: "camera.viewfinder")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Theme.accent)
-            Text("「ショートカット」でスクリーンショットを撮り、clipboard+の「画面を切り取る」に渡すと、範囲を選んで文字か画像をコピーできます。AssistiveTouchに割り当てると、1回押すだけで始められます。")
+            Text("「ショートカット」でスクリーンショットを撮り、clipboard+の「画面を切り取る」に渡すと、範囲を選んで文字か画像をコピーできます。" + (DeviceKind.current == .phone ? "アクションボタンに割り当てると、1回押すだけで始められます。" : "AssistiveTouchに割り当てると、1回押すだけで始められます。"))
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

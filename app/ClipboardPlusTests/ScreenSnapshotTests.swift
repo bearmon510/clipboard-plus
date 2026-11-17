@@ -21,6 +21,7 @@ final class ScreenSnapshotTests: XCTestCase {
 
     private static let narrow = CGSize(width: 360, height: 780)
     private static let wide = CGSize(width: 1_024, height: 768)
+    private static let phone = CGSize(width: 393, height: 852)
 
     /// The first-run guide would otherwise open over every main screen.
     override func setUp() {
@@ -32,6 +33,9 @@ final class ScreenSnapshotTests: XCTestCase {
     func testRenderWelcome() async throws {
         try save(render(WelcomeView(), size: Self.narrow, style: .light), "welcome-narrow-light")
         try save(render(WelcomeView(), size: Self.wide, style: .dark), "welcome-wide-dark")
+        // The tests run on an iPad, so the iPhone wording is drawn by asking for it.
+        try save(render(WelcomeView(deviceOverride: .phone), size: Self.phone, style: .light), "welcome-phone-light")
+        try save(render(CaptureGuideView(deviceOverride: .phone), size: Self.phone, style: .dark), "capture-guide-phone-dark")
     }
 
     /// The settings, with the Windows sync section unpaired as on a fresh install.

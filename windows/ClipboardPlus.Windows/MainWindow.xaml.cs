@@ -40,7 +40,7 @@ public partial class MainWindow : Window
         bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.StreamSource = stream; bitmap.EndInit(); bitmap.Freeze();
         QrImage.Source = bitmap;
         connected = 0; StatusText.Text = "Bluetoothを確認しています";
-        PairingTitle.Text = "iPadと組にする";
+        PairingTitle.Text = "iPhone・iPadと組にする";
         SentText.Text = ReceivedText.Text = "まだありません";
         PendingText.Text = "確認待ち 0 件";
     }
@@ -55,7 +55,7 @@ public partial class MainWindow : Window
         if (connected > 0) PairingTitle.Text = "組にするコード";
         UpdateStatus();
     }
-    private void UpdateStatus() => StatusText.Text = connected > 0 ? "iPadとつながっています" : bluetoothState;
+    private void UpdateStatus() => StatusText.Text = connected > 0 ? "iPhone・iPadとつながっています" : bluetoothState;
     public void SetBusy(bool busy) => RepairButton.IsEnabled = !busy;
     private void OnClosing(object? sender, CancelEventArgs e) { if (!preview) { e.Cancel = true; Hide(); } }
     private void OnRepair(object sender, RoutedEventArgs e) => RepairRequested?.Invoke();

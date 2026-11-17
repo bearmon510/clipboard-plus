@@ -5,7 +5,7 @@ Claude Codeが作業全体を管理し、Codex CLIを実装・レビューの担
 ## プロジェクトの前提
 
 - アプリ名はclipboard+（クリップボードプラス）。iPadのタッチ操作と小窓利用を重視する。
-- 現在は0.14.0（2026年11月17日、ビルド30）。審査に通すため、PiPでの裏の収集、画面録画（ScreenCaptureKit）での取り込み、「順に貼る」（iOSでは最後の1件しか貼れなかった）を完全に外し、初回の案内（`WelcomeView`）を足した。WindowsのPCとBluetooth LEで文章を両方向に送る試作も入った（下の「Windows同期」）。
+- 現在は0.14.1（2026年11月17日、ビルド31の予定）。QRコードを読む画面がすぐ閉じる不具合を直し（カメラをAVFoundationにして、並べて表示している間も使えるようにした）、iPhoneにも対応させた。0.14.0（ビルド30）で、審査に通すため、PiPでの裏の収集、画面録画（ScreenCaptureKit）での取り込み、「順に貼る」（iOSでは最後の1件しか貼れなかった）を完全に外し、初回の案内（`WelcomeView`）を足した。WindowsのPCとBluetooth LEで文章を両方向に送る試作も入った（下の「Windows同期」）。
 - 0.13.0（ビルド29）で履歴とテンプレートを分けた。上は「履歴｜テンプレート」の切り替えだけで、種類の絞り込みとピン留めはなくした。履歴の項目は「テンプレートに移動」でき、テンプレートはタグ1つでまとまり、自動削除と全消去の対象外。0.12.0（ビルド28）で、その前身のテンプレートと連続貼り付けが入った。方針は `docs/テンプレートと連続貼り付けの方針.md`。0.11.1（ビルド26）で文字のファイルもファイルとして残し、切り取り画面の文字/画像の選択を上の中央へ移した。0.10.0（ビルド24）でショートカットとSiriとの連携（`docs/ショートカット連携の方針.md`）が入った。0.11.0でファイルの履歴（`docs/ファイル履歴の実装方針.md`）が入り、画面録画での取り込みは開発者向けへ移った。TestFlightのワークフローは `APP_BUNDLE_ID` に本番のIDを渡す（拡張を足すときは、この値に接尾辞を付けてBundle IDにする）。
 - 利用者の判断（2026年11月16日）：切り取りのメインは、ショートカット「スクリーンショットを撮る」→clipboard+「画面を切り取る」をAssistiveTouchから呼ぶ形。文章・リンク・画像・ファイルの履歴、テンプレート、バックアップと復元、日数による自動削除、画面の切り取り（スクリーンショットから開く経路）が入っている。全体の説明は `README.md`、方針と順序の経緯は `docs/レビュー結果と試作方針.md`。
 - 主端末はiPad Air 13インチ、iPadOS 27.2.1（2026年11月14日に利用者が確認）。
@@ -13,6 +13,7 @@ Claude Codeが作業全体を管理し、Codex CLIを実装・レビューの担
 - 利用者の判断（2026年11月15日）：Slide Over、ウインドウ表示App、Stage Managerの小窓で、画面に出して使うのを基本にする（PiPは0.14.0で外した）。画面の切り取りは「文字か画像かを先に選ぶ → 切り取りモード → 範囲を選び終えたらクリップボードへ」の流れにする。方針は `docs/切り取りモードの実装方針.md`。0.8.0〜0.9.0で実装した。ビルド22の実機試験で、スクリーンショットから開く経路（試験D）が使いやすく、切り取る瞬間だけ取り込む方式（試験E）は毎回許可が出て使えなかった。スクリーンショットの経路をおすすめにし、Eは設定から外した。アプリからスクリーンショットを撮る公開APIはないので、AssistiveTouchのシングルタップを案内する。
 - 利用者の判断：専用キーボードは作らない（純正キーボードを使いたい）。バックアップ機能は残す。自動削除の初期値は30日。今後の優先順位はClaudeに一任（2026年11月15日）。
 - 利用者の判断（2026年11月17日）：いちばんやりたいのはWindowsのPCとの両方向の同期。カフェや学校のWi-Fiで毎回設定し直したくないので、Bluetooth LEにした。最終的にはPCでWin+Vを押すとclipboard+の履歴が開くようにする。App Storeへの公開は、すべてがそろってから。開発の道具は自由に入れてよい。TestFlightは段階ごとではなく、まとめて出す（1+2、3+4、5+6）。
+- 利用者の判断（2026年11月17日、ビルド30を試して）：iPhoneでも使う前提にする（0.14.1でiPhoneにも対応させた）。iPhoneではアクションボタンに切り取りのショートカットを割り当てて使っている。画面の文言は「iPad」と決め打ちせず、`DeviceKind` で端末に合わせる。PC側はWindowsのWin+Vの履歴に出すより、clipboard+専用の窓（Win+Vの窓くらいの大きさ）を作る。1台のPCにiPhoneとiPadの両方をつなぎたい。
 - 段階：1. 0.14.0の撤去と初回の案内 2. Bluetoothの試作（文章、両方向） 3. 同期の中身（つなぎ直したときの追いつき、画像、組むときの画面） 4. PCの履歴の窓とWin+V 5. 共有拡張 6. 公開の準備（プライバシーポリシーは、このGitHubと販売者名が結び付かない場所に置く）。1と2が0.14.0。
 - Windows同期。設計と通信の決まりは `docs/Windows同期の方針.md`、共通部品の一覧は `protocol/README.md`。iPadがcentral、PCがperipheral。QRコードで鍵を渡し、HMACで互いを確かめ、AES-256-GCMで暗号化する。通信の決まりの例 `protocol/test-vectors.json` は `node protocol/make-test-vectors.mjs` で作り、SwiftとC#の両方のテストで確かめる。PC側は `windows/`（.NET 10、WPF）。`"C:/Program Files/dotnet/dotnet.exe" test windows/ClipboardPlus.slnx` で確かめる（Codexの作業環境はNuGetへ出られないので、パッケージはキャッシュにあるものを使う）。試しに動かすPCアプリは `dotnet publish windows/ClipboardPlus.Windows/ClipboardPlus.Windows.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o "$LOCALAPPDATA/Programs/clipboardplus"` で入れ、記録は `%LOCALAPPDATA%\clipboardplus\logs\sync.log` に出る（中身や鍵は出さない）。
 - 収集の仕組み。`UIPasteboard.changedNotification` は他のアプリのコピーでは届かない。`changeCount` を定期確認し（初期値0.5秒）、変わったときだけ内容を読む。ウインドウ表示とSlide Overでは、画面に出ている間は全件取り込める。全画面の別アプリを使う間は止まる。`UIPasteboard.hasImages` はSafariが長押しのコピーで入れるWebPを画像と数えないので、形式の一覧で判定する。

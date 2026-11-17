@@ -2,7 +2,12 @@ import SwiftUI
 
 /// Explains how to cut out a part of the screen, and the other routes when the main one is unavailable.
 struct CaptureGuideView: View {
+    /// Set by the snapshot tests to draw the other device's guide; nil uses this device.
+    var deviceOverride: DeviceKind?
+
     @Environment(\.dismiss) private var dismiss
+
+    private var device: DeviceKind { deviceOverride ?? .current }
 
     var body: some View {
         NavigationStack {
@@ -14,18 +19,26 @@ struct CaptureGuideView: View {
                     section(
                         title: "ショートカットで切り取る（おすすめ）",
                         symbol: "camera.viewfinder",
-                        lead: "スクリーンショットを撮って、そのままclipboard+の切り取りを開くショートカットを作ります。AssistiveTouchに割り当てると、浮かぶボタンを1回押すだけで始められます。スクリーンショットは写真に残りません。",
+                        lead: device == .phone
+                            ? "スクリーンショットを撮って、そのままclipboard+の切り取りを開くショートカットを作ります。アクションボタンに割り当てると、ボタンを1回押すだけで始められます。スクリーンショットは写真に残りません。"
+                            : "スクリーンショットを撮って、そのままclipboard+の切り取りを開くショートカットを作ります。AssistiveTouchに割り当てると、浮かぶボタンを1回押すだけで始められます。スクリーンショットは写真に残りません。",
                         steps: [
                             "「ショートカット」アプリで新しいショートカットを作り、「スクリーンショットを撮る」を置きます。",
                             "続けてclipboard+の「画面を切り取る」を置き、方式を「文字」にします。名前は「文字を切り取る」などにします。",
-                            "「設定」→「アクセシビリティ」→「タッチ」→「AssistiveTouch」をオンにし、「カスタムアクション」の「シングルタップ」で、作ったショートカットを選びます。",
+                            device == .phone
+                                ? "「設定」→「アクションボタン」で「ショートカット」を選び、作ったショートカットを選びます。アクションボタンのない機種では、「設定」→「アクセシビリティ」→「タッチ」→「背面タップ」の「ダブルタップ」に割り当てます。"
+                                : "「設定」→「アクセシビリティ」→「タッチ」→「AssistiveTouch」をオンにし、「カスタムアクション」の「シングルタップ」で、作ったショートカットを選びます。",
                             "ボタンを押すと、clipboard+に切り取りの画面が開きます。ほしい範囲をドラッグし、指を離すとコピーされます。",
                         ]
                     )
                     VStack(alignment: .leading, spacing: 6) {
                         Label("もっと便利にする", systemImage: "hand.tap").font(.subheadline.weight(.semibold))
-                        Text("画像用も作る：方式を「画像」にしたショートカットを作り、AssistiveTouchの「ダブルタップ」に割り当てます。")
-                        Text("Apple Pencil Pro：「設定」→「Apple Pencil」→「握る」で「ショートカット」を選ぶと、握るだけで始められます。")
+                        if device == .phone {
+                            Text("画像用も作る：方式を「画像」にしたショートカットを作り、「背面タップ」の「ダブルタップ」か「トリプルタップ」に割り当てます。")
+                        } else {
+                            Text("画像用も作る：方式を「画像」にしたショートカットを作り、AssistiveTouchの「ダブルタップ」に割り当てます。")
+                            Text("Apple Pencil Pro：「設定」→「Apple Pencil」→「握る」で「ショートカット」を選ぶと、握るだけで始められます。")
+                        }
                         Text("コントロールセンター：「ショートカット」のボタンを置き、作ったショートカットを選びます。")
                         Text("Siri：ショートカットの名前で呼べます。「文字を切り取る」と話しかけます。")
                     }
@@ -37,7 +50,9 @@ struct CaptureGuideView: View {
                     section(
                         title: "アプリを開かずに、行を選んでコピー",
                         symbol: "list.bullet.rectangle",
-                        lead: "画面の文字を行ごとに一覧で出し、選んだ行をコピーします。clipboard+へ移りません。AssistiveTouchの「長押し」に割り当てると便利です。",
+                        lead: device == .phone
+                            ? "画面の文字を行ごとに一覧で出し、選んだ行をコピーします。clipboard+へ移りません。「背面タップ」に割り当てると便利です。"
+                            : "画面の文字を行ごとに一覧で出し、選んだ行をコピーします。clipboard+へ移りません。AssistiveTouchの「長押し」に割り当てると便利です。",
                         steps: [
                             "「スクリーンショットを撮る」を置きます。",
                             "clipboard+の「画像の文字を行ごとに取り出す」を置きます。",
@@ -46,16 +61,19 @@ struct CaptureGuideView: View {
                             "画面の文字を全部コピーするだけなら、2の代わりに「画像の文字を読み取る」を置き、「コピーして履歴に保存」をオンにします。",
                         ]
                     )
-                    section(
-                        title: "普段のスクリーンショットから",
-                        symbol: "photo.badge.checkmark",
-                        lead: "ショートカットを作らずに、iPadで撮ったスクリーンショットから切り取りを開きます。設定の「切り取り」で「スクリーンショットで切り取りを開く」をオンにします。写真へのアクセスが要ります。",
-                        steps: [
-                            "clipboard+をSlide Overや小窓で画面に出しておきます。",
-                            "iPadでスクリーンショットを撮ると、clipboard+に切り取りの画面が開きます。フルスクリーンのプレビューをオフにしておくと、すぐ移れます。",
-                            "使ったスクリーンショットは写真に残ります。設定の「切り取り」からまとめて削除できます。",
-                        ]
-                    )
+                    // Needs clipboard+ on screen beside the other app, which only an iPad can do.
+                    if device == .pad {
+                        section(
+                            title: "普段のスクリーンショットから",
+                            symbol: "photo.badge.checkmark",
+                            lead: "ショートカットを作らずに、iPadで撮ったスクリーンショットから切り取りを開きます。設定の「切り取り」で「スクリーンショットで切り取りを開く」をオンにします。写真へのアクセスが要ります。",
+                            steps: [
+                                "clipboard+をSlide Overや小窓で画面に出しておきます。",
+                                "iPadでスクリーンショットを撮ると、clipboard+に切り取りの画面が開きます。フルスクリーンのプレビューをオフにしておくと、すぐ移れます。",
+                                "使ったスクリーンショットは写真に残ります。設定の「切り取り」からまとめて削除できます。",
+                            ]
+                        )
+                    }
                     section(
                         title: "保存した画像から",
                         symbol: "photo.on.rectangle",
@@ -66,8 +84,10 @@ struct CaptureGuideView: View {
                     )
                     VStack(alignment: .leading, spacing: 6) {
                         Label("知っておくこと", systemImage: "info.circle").font(.subheadline.weight(.semibold))
-                        Text("文字の読み取りはiPadの中で行い、画面を外へ送りません。")
-                        Text("Slide Overで重ねているときは、clipboard+の下に隠れた部分は写りません。反対側へ動かしてから撮ってください。")
+                        Text("文字の読み取りは\(device.name)の中で行い、画面を外へ送りません。")
+                        if device == .pad {
+                            Text("Slide Overで重ねているときは、clipboard+の下に隠れた部分は写りません。反対側へ動かしてから撮ってください。")
+                        }
                     }
                     .font(.footnote)
                     .foregroundStyle(.secondary)

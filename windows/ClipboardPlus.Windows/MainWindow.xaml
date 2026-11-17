@@ -7,7 +7,7 @@
   <ScrollViewer VerticalScrollBarVisibility="Auto">
     <StackPanel Margin="30,26">
       <TextBlock Text="clipboard+" FontSize="30" FontWeight="SemiBold"/>
-      <TextBlock Text="iPad と Windows を、近くで同期" Foreground="#64748B" Margin="0,2,0,22"/>
+      <TextBlock Text="iPhone・iPad と Windows を、近くで同期" Foreground="#64748B" Margin="0,2,0,22"/>
       <Border Background="White" CornerRadius="12" Padding="20" BorderBrush="#E2E8F0" BorderThickness="1">
         <StackPanel>
           <TextBlock x:Name="StatusText" Text="Bluetoothを確認しています" FontSize="19" FontWeight="SemiBold"/>
@@ -22,8 +22,8 @@
       </Border>
       <Border Background="White" CornerRadius="12" Padding="20" Margin="0,16,0,18" BorderBrush="#E2E8F0" BorderThickness="1">
         <StackPanel>
-          <TextBlock x:Name="PairingTitle" Text="iPadと組にする" FontSize="18" FontWeight="SemiBold"/>
-          <TextBlock Text="iPadのclipboard+で、メニューの「設定」→「Windowsと同期」→「QRコードを読む」を選び、このコードを読んでください。" Margin="0,8,0,12"/>
+          <TextBlock x:Name="PairingTitle" Text="iPhone・iPadと組にする" FontSize="18" FontWeight="SemiBold"/>
+          <TextBlock Text="iPhoneかiPadのclipboard+で、メニューの「設定」→「Windowsと同期」→「QRコードを読む」を選び、このコードを読んでください。" Margin="0,8,0,12"/>
           <Border Background="White" Padding="8" HorizontalAlignment="Center">
             <Image x:Name="QrImage" Width="240" Height="240" RenderOptions.BitmapScalingMode="NearestNeighbor"/>
           </Border>
