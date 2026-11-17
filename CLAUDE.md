@@ -1,6 +1,6 @@
 # clipboard+ の作業方針
 
-Claude Codeが作業全体を管理し、Codex CLIを実装・レビューの担当として呼び出す。
+Claude Codeが作業全体を管理し、Codex CLI（実装・レビュー）、Gemini（agy、調べ物・レビュー）、Copilot CLI（雑用）を呼び出す。
 
 ## プロジェクトの前提
 
@@ -30,16 +30,28 @@ Claude Codeが作業全体を管理し、Codex CLIを実装・レビューの担
 
 - 次のものはコミットしない。個人を特定できる情報、Apple IDや証明書などの署名情報、APIキー、PCのユーザー名を含むパス、他社製品を名指しで評価する資料。
 - 公開しない資料は、リポジトリの外の `../iPadクリップボードアプリ-非公開資料/` に置く。競合調査、外部レビュー用ブリーフ、公開前の履歴一式（gitバンドル）がある。
-- Codexに非公開資料の内容が必要なときは、必要な要点だけをタスク文に書いて渡す。成果物へ写させない。
+- Codexに非公開資料の内容が必要なときは、必要な要点だけをタスク文に書いて渡す。成果物へ写させない。GeminiとCopilotには渡さない。
 - 署名情報がCIで必要になったら、GitHubのSecretsに入れる。値をログへ出力しない。
 - Team ID、正式なBundle ID、App Store Connectのアプリ名・アプリIDもリポジトリに書かず、GitHubのSecretsかVariablesに置く。Developer Programの販売者名とこのGitHubアカウントが結び付くのを避けるため。リポジトリ内のBundle IDは仮の値にする。
 - コミットの作者は、既存の履歴と同じGitHubの匿名アドレスにする。このPCのgitには作者が未設定なので、未指定のままコミットしない。
 - pushするのは `main` ブランチだけにする。`--mirror` と `--all` は使わない。ローカルには公開前の履歴を指す参照が残っている。
 - 公開前の履歴は、非公開のGitHubリポジトリ `ipad-clipboard` にも保管してある。そこへはpushしない。
 
-## ClaudeとCodexの役割
+## 役割の分担
 
-Claudeはユーザーとの相談、設計判断、タスクの切り分け、結果の確認、統合を担当する。Codexには具体的な範囲と完了条件を渡し、実装または独立したレビューを依頼する。
+Claudeはユーザーとの相談、設計判断、タスクの切り分け、結果の確認、統合を担当する。ほかの担当には、具体的な範囲と完了条件を渡す。分担は利用者と決めた（2026年11月18日）。
+
+| 担当 | 任せること |
+| --- | --- |
+| Claude | 相談、設計、画面の実装、差分の検収と適用、まとめ、最終確認 |
+| Gemini（agy） | 画面以外の実装（写しの中で行い、差分で返す）、作業前の下調べと指示書の下書き、iPadとPCの実装の突き合わせ、普段のレビュー、調べ物、CIの画面画像の下見 |
+| Codex（GPT） | 暗号・通信の状態の移り方の実装とレビュー、原因の分からない不具合、重要な変更の最終レビュー。Geminiで解けなかったもの |
+| Copilot | 雑用（pushの前の公開安全性の点検、ログの要約、機械的な点検）。読むだけ |
+
+- 迷ったらGeminiに任せる（利用者の判断、2026年11月18日）。Codexは枠がすぐ尽きるので、難所のために残す。Geminiは3つの中で利用枠がいちばん大きい。
+- Geminiのモデルは作業ごとに選ぶ。2026年11月18日の段階3のレビュー比較では、Carbonがいちばん広く重要な問題を拾い、Orchestratorは両側にまたがる問題を落とした。Codex（Sol）は件数は少ないが、再現とテストの実行で裏付けた。
+- ファイルを書き換えるのは同時に1つだけ。Geminiは本物の作業フォルダを書き換えない（実装は写しの中）。Copilotは書き換えない。
+- ほかの担当の答えや差分は、ファイル名と行番号かURL、テストの結果で裏を取ってから使う。
 
 Codexを呼ぶときは、プロジェクトルートから次を実行する。
 
@@ -96,11 +108,41 @@ node scripts/invoke-codex.mjs --mode implement --model gpt-6.1-sol --effort high
 - 本番操作、公開、送信、課金、不可逆な変更は既存のユーザー承認の範囲を確認する。
 - 起動確認の依頼ではアプリ実装を始めず、接続結果と未確認事項を返す。
 
+### GeminiとCopilotの呼び出し
+
+```sh
+node scripts/invoke-helper.mjs --tool gemini --task-file "C:/path/to/task.txt"
+node scripts/invoke-helper.mjs --tool copilot --task-file "C:/path/to/task.txt"
+node scripts/invoke-helper.mjs --tool gemini --mode implement --task-file "C:/path/to/task.txt" --patch-out "C:/path/to/change.patch"
+```
+
+- 既定は読むだけ（`--mode review`）。スクリプトが前置き（読むだけ、根拠の付け方、日本語で答える）を足し、プロジェクトの中のパスを相対パスに直して出力する。
+- 実装（`--mode implement`、Geminiだけ）。作業中のファイル（未コミットの変更と、無視されていない新しいファイルを含む）を一時フォルダへ写し、写しの中に最初の状態のコミットを作ってから、Geminiに編集・コマンド・テストをさせる。終わったら写しの変更を差分ファイルにして返し、写しは消す。Claudeが差分を読んで確かめ、`git -c core.autocrlf=false apply --check` のあと `apply` で本物へ当てる。時間切れや失敗でも、途中までの差分は残す。既定の制限時間は60分。
+- 実行の前後で本物の作業中のファイルを比べ、変わっていたら終了コード66で知らせる（同時に動いている別の担当の変更でも出る）。時間切れは124。読むだけの既定の制限時間は15分（`--timeout-minutes`）。
+- 作業フォルダの外のファイルを読ませるときは `--add-dir` で渡す。Copilotは一時フォルダも読める。
+- バックグラウンドで実行し、終わったら出力を読む。
+
+Gemini：
+
+- モデルは作業ごとに選ぶ。`gemini-4-hydrogen-xhigh`（既定。調べ物、下書き、実装）、`gemini-4-carbon-high`（レビュー、突き合わせ、込み入った推論）、`gemini-4-argon-high`（2人目のレビュー）、`gemini-pro-orchestrator`（いくつにも分かれる広い作業。補助のエージェントを使う）。思考のレベルはモデル名の末尾で決まり、`--effort` とは併用できない。low・mediumとGemini 3.8は正確さが足りないので、スクリプトが断る（利用者の判断、2026年11月18日）。
+- 読むだけのときの守り。agyの設定を実行ごとに上書きし、書き込みの道具、MCP、`gh`、`git push` を拒否の決まりで禁じ、端末のサンドボックスで作業フォルダを読み取り専用にする。2026年11月18日に、書き込みの道具、`gh`、コマンド経由の書き込みが止まり、`git --version` は動くこと、Orchestratorの補助のエージェントにも効くことを確かめた。Windowsではコマンドの前にPowerShellの前置きが付き、先頭一致の `command(gh)` は効かなかったので、コマンドの決まりは正規表現で書く。
+- 実装のときの守り。写しの中で動かし、サンドボックスは外す（入れるとビルドに要る書き込みまで止まる）。`always-proceed` でコマンドを確認なしに動かし、MCP、`gh`、`git push` を拒否の決まりで禁じる。2026年11月18日に、写しの中の編集とコマンドが通り、`gh` と `git push` が止まり、本物の作業フォルダが変わらないことを確かめた。
+- 許可の決まりに `command(*)` を入れると、拒否の決まりもサンドボックスの外での再実行の禁止も効かなくなった（2026年11月18日に確認。agyの説明とは食い違う）。コマンドを広く許すときは `command(*)` を使わず、`toolPermission` で許す。
+- コマンドはPowerShellで動く。パスを引用符で囲んだ実行ファイルは、先頭に `&` が要る。
+- agyの既定のモードはAuto（許可を求めずに書き込む）なので、スクリプトを通さずに `agy -p` で作業させない。
+- 枠の残りは `agy -p "/quota" --model gemini-4-hydrogen-xhigh` で、枠を使わずに見られる。Git Bashでは `MSYS_NO_PATHCONV=1` を付ける（付けないと `/quota` がパスに書き換わる）。
+
+Copilot：
+
+- `npm install -g @github/copilot` で入れた。npmの `copilot.cmd` はcmd.exeを通り、依頼文が解釈されてしまうので、スクリプトはnodeで `npm-loader.js` を直接動かす。
+- そのままでは `CLAUDE.md` を指示として読み込むので、`--no-custom-instructions` で外す。書き込み、コマンド、記憶の保存を拒否の決まりで禁じる。人の操作なしの実行では、許可の要る操作はもともと断られる。コマンドは使えないが、組み込みの検索（`rg`）とファイルの読み込みは使える。
+- モデルは既定で `auto`。
+
 ## 利用条件
 
-Node.jsとCodex CLIがこのPCにインストールされ、Codexにログイン済みであること。アカウントは既存設定を利用する。ClaudeとCodexはそれぞれの利用枠を消費する。
+Node.js、Codex CLI、Antigravity CLI（`agy`）、Copilot CLIがこのPCにインストールされ、それぞれログイン済みであること。アカウントは既存設定を利用する。どの担当もそれぞれの利用枠を消費する。
 
-スクリプトのテストは `node --test scripts/codex-limit.test.mjs scripts/apple-signing-certificates.test.mjs scripts/testflight-distribute.test.mjs` で実行する（このNode.jsではフォルダ指定が動かない）。
+スクリプトのテストは `node --test scripts/codex-limit.test.mjs scripts/apple-signing-certificates.test.mjs scripts/testflight-distribute.test.mjs scripts/helper-cli.test.mjs` で実行する（このNode.jsではフォルダ指定が動かない）。
 
 ## TestFlightへの送り方
 
