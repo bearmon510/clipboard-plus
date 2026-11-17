@@ -40,8 +40,20 @@ public static class SyncProtocol
     internal static string Id(Guid id) => id.ToString("D").ToUpperInvariant();
     internal static Guid ParseId(string? value)
     {
-        Require(value is { Length: 36 } && Guid.TryParseExact(value, "D", out _));
-        return Guid.ParseExact(value!, "D");
+        Require(value is { Length: 36 } && IsStandardUuid(value));
+        Require(Guid.TryParseExact(value, "D", out var result) &&
+            string.Equals(result.ToString("D"), value, StringComparison.OrdinalIgnoreCase));
+        return result;
+    }
+    private static bool IsStandardUuid(string value)
+    {
+        for (var i = 0; i < 36; i++)
+        {
+            var c = value[i];
+            if (i is 8 or 13 or 18 or 23) { if (c != '-') return false; }
+            else if (c is not ((>= '0' and <= '9') or (>= 'a' and <= 'f') or (>= 'A' and <= 'F'))) return false;
+        }
+        return true;
     }
     internal static byte[] IdBytes(Guid id) => id.ToByteArray(bigEndian: true);
     internal static byte[] Number(ulong sequence)

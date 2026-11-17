@@ -15,6 +15,7 @@ const key = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
 const ni = Buffer.alloc(32, 0x11), np = Buffer.alloc(32, 0x22);
 const padId = '00112233-4455-6677-8899-AABBCCDDEEFF';
 const pcId = '10213243-5465-7687-98A9-BACBDCEDFE0F';
+const otherPcId = '20314253-6475-8697-A8B9-CADBECFD0E1F';
 const id = 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE';
 const id2 = '11111111-2222-4333-8444-555555555555';
 const pcName = '試験 PC: +% / 💻';
@@ -37,6 +38,10 @@ const mac = label => createHmac('sha256', key).update(cat(bytes("02"), Buffer.fr
 const pcHmac = mac('pc'), padHmac = mac('pad');
 const hello = cat(bytes('0102'), uuidBytes(padId), ni);
 const welcome = cat(bytes('0202'), uuidBytes(pcId), np, pcHmac);
+const versionMismatchWelcome = cat(bytes('0202'), uuidBytes(pcId), Buffer.alloc(64));
+const versionMismatchSamePc = cat(bytes('0203'), uuidBytes(pcId), Buffer.alloc(64));
+const versionMismatchOtherPc = cat(bytes('0203'), uuidBytes(otherPcId), Buffer.alloc(64));
+const versionMismatchLegacyZeroId = cat(bytes('0201'), Buffer.alloc(16), Buffer.alloc(64));
 const auth = cat(bytes('03'), padHmac);
 const keys = Object.fromEntries(['pad->pc','pc->pad'].map(d => [d, Buffer.from(hkdfSync('sha256', key, cat(ni,np), `clipboardplus v2 ${d}`, 32))]));
 function plaintext(header, body = '') {
@@ -99,13 +104,16 @@ const vectors = {
   version:2, warning:'PUBLIC deterministic test secrets. Never use for real pairing or connections.',
   limits:{ maxFrameBytes, maxHeaderBytes:65535, maxNameUtf8Bytes:255, maxAckIds:1024, maxItemBytes:10*1024*1024, chunkBytes:32768, maxPending:100, pendingHours:24, duplicateMinutes:10, maxHistory:300 },
   pairing:{ qr, parsed:parsePair(qr) },
-  handshake:{ keyHex:hex(key), padId, pcId, niHex:hex(ni), npHex:hex(np), helloHex:hex(hello), welcomeHex:hex(welcome), authHex:hex(auth), pcHmacHex:hex(pcHmac), padHmacHex:hex(padHmac), padToPcKeyHex:hex(keys['pad->pc']), pcToPadKeyHex:hex(keys['pc->pad']) },
+  handshake:{ keyHex:hex(key), padId, pcId, niHex:hex(ni), npHex:hex(np), helloHex:hex(hello), welcomeHex:hex(welcome), versionMismatchWelcomeHex:hex(versionMismatchWelcome), authHex:hex(auth), pcHmacHex:hex(pcHmac), padHmacHex:hex(padHmac), padToPcKeyHex:hex(keys['pad->pc']), pcToPadKeyHex:hex(keys['pc->pad']) },
   messages, frames,
   fragmentation:[20,182,512].map(packetLimit => ({ frameIndex:0, packetLimit, packetsHex:split(bytes(frames[0].frameHex),packetLimit) })),
   failures:{
     tamperedTag:{ direction:'pad->pc', frameHex:hex(badTag), error:'authentication' },
     rollback:{ direction:'pad->pc', framesHex:[frames[1].frameHex,frames[0].frameHex], error:'sequence' },
     welcomeHmac:{ frameHex:hex(flipLast(welcome)), error:'authentication' },
+    versionMismatchSamePc:{ frameHex:hex(versionMismatchSamePc), error:'version' },
+    versionMismatchOtherPc:{ frameHex:hex(versionMismatchOtherPc), error:'identity' },
+    versionMismatchLegacyZeroId:{ frameHex:hex(versionMismatchLegacyZeroId), error:'identity' },
     authHmac:{ frameHex:hex(flipLast(auth)), error:'authentication' },
     oversizedFrame:{ byteLength:maxFrameBytes+1, fillByte:0, packetLimit:182, error:'limit', note:'Materialize repeated fillByte locally; no multi-megabyte hex fixture.' },
     unfinishedStart:{ packetsHex:['010102'], finish:true, error:'packet' },

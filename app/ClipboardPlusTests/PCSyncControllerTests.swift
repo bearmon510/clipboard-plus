@@ -82,6 +82,7 @@ private final class SyncTestLink: PCSyncTransport {
     var starts = 0
     var stops = 0
     var rejected: [Bool] = []
+    var retryDelays: [TimeInterval] = []
     var messages: [SyncMessage] = []
     var devices: [String] = []
     var packets: [Data] = []
@@ -89,6 +90,7 @@ private final class SyncTestLink: PCSyncTransport {
     var acceptedPadIds: [UUID] = []
     var corruptWelcome = false
     var welcomeVersion: UInt8?
+    var welcomePcId: UUID?
     var dropsNotifications = false
     var stopAfterPackets: Int?
     private var pc: SyncPcHandshake?
@@ -100,12 +102,15 @@ private final class SyncTestLink: PCSyncTransport {
     func start(remembered: UUID?) { starts += 1; self.remembered = remembered }
     func stop() { stops += 1; canSend = false }
     func authenticated(_ id: UUID) { authenticatedId = id }
-    func reconnect(rejectForTenMinutes: Bool) {
-        rejected.append(rejectForTenMinutes); disconnect()
+    func reconnect(rejectForTenMinutes: Bool, retryDelay: TimeInterval) {
+        rejected.append(rejectForTenMinutes)
+        retryDelays.append(retryDelay)
+        disconnect()
     }
     func disconnect() { canSend = false; onEvent?(.disconnected) }
     func connect(_ pairing: SyncPairing, limit: Int = 20) throws {
         self.limit = limit
+        stopAfterPackets = nil
         pc = try SyncPcHandshake(pairing: pairing)
         assembler = try SyncPacketAssembler(packetLimit: limit)
         sender = nil; receiver = nil; canSend = true
@@ -113,6 +118,7 @@ private final class SyncTestLink: PCSyncTransport {
     }
     func connectWithoutWelcome(limit: Int = 512) {
         self.limit = limit
+        stopAfterPackets = nil
         pc = nil; assembler = nil; sender = nil; receiver = nil; canSend = true
         onEvent?(.ready(id: id, writeLimit: limit, receiveLimit: 512))
     }
@@ -129,6 +135,7 @@ private final class SyncTestLink: PCSyncTransport {
             guard let frame = try assembler?.append(packet), let pc else { return }
             if frame.first == 1 {
                 var welcome = try pc.acceptHello(frame)
+                if let welcomePcId { welcome.replaceSubrange(2..<18, with: SyncProtocol.idBytes(welcomePcId)) }
                 if let welcomeVersion { welcome[1] = welcomeVersion }
                 if corruptWelcome { welcome[welcome.count - 1] ^= 1 }
                 try deliver(welcome)
@@ -144,9 +151,12 @@ private final class SyncTestLink: PCSyncTransport {
             }
         } catch { XCTFail("Fake PC protocol failure: \(error)") }
     }
-    func send(_ message: SyncMessage) throws {
+    func seal(_ message: SyncMessage) throws -> Data {
         let sender = try XCTUnwrap(sender)
-        let frame = try sender.seal(SyncMessageCodec.encode(message))
+        return try sender.seal(SyncMessageCodec.encode(message))
+    }
+    func send(_ message: SyncMessage) throws {
+        let frame = try seal(message)
         if !dropsNotifications { try deliver(frame) }
     }
     func sendInvalidPlaintext() throws {
@@ -837,46 +847,73 @@ final class PCSyncControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testThreeHandshakeFailuresAndTimeoutsPauseForUpdateAndPostHelloDisconnectDoesNot() async throws {
+    func testHandshakeTimeoutsAndDisconnectsBackOffWithoutStoppingWhileRepeatedHmacMismatchRequiresRepair() async throws {
+        // 1. Repeated HMAC mismatch with matching paired PC ID stops with requiresRepair (not requiresPeerUpdate).
         let f1 = try Fixture(test: self), pairing1 = try pair(f1)
         f1.link.corruptWelcome = true
         for _ in 0..<2 {
             try f1.link.connect(pairing1)
             XCTAssertFalse(f1.controller.requiresPeerUpdate)
+            XCTAssertFalse(f1.controller.requiresRepair)
         }
         try f1.link.connect(pairing1)
-        XCTAssertTrue(f1.controller.requiresPeerUpdate)
+        XCTAssertTrue(f1.controller.requiresRepair)
+        XCTAssertFalse(f1.controller.requiresPeerUpdate)
+        XCTAssertEqual(f1.controller.compatibilityMessage, "PCとの組が一致しません。PCのQRコードを読み直して組み直してください")
         XCTAssertEqual(f1.controller.status, .unsupported)
         XCTAssertEqual(f1.link.stops, 1)
         XCTAssertEqual(f1.link.rejected, [true, true])
 
         f1.link.corruptWelcome = false
-        f1.controller.retryAfterPeerUpdate()
+        f1.controller.retryAfterRepair()
+        XCTAssertFalse(f1.controller.requiresRepair)
+        XCTAssertNil(f1.controller.compatibilityMessage)
         try f1.link.connect(pairing1)
         XCTAssertEqual(f1.controller.status, .connected)
 
-        let f2 = try Fixture(test: self), _ = try pair(f2)
-        for _ in 0..<2 {
+        // 2. Handshake timeouts (no WELCOME / blocked write) never stop sync; they back off and reset on auth.
+        let f2 = try Fixture(test: self), pairing2 = try pair(f2)
+        f2.monitor.saveManually(["再接続後に送る項目"], receivedAt: f2.clock.date)
+        await drain(f2)
+        for _ in 0..<6 {
             f2.link.connectWithoutWelcome()
             f2.clock.date.addTimeInterval(31)
             f2.controller.checkTimeouts()
             XCTAssertFalse(f2.controller.requiresPeerUpdate)
+            XCTAssertFalse(f2.controller.requiresRepair)
+            XCTAssertEqual(f2.controller.status, .searching)
+            XCTAssertEqual(f2.link.stops, 0)
         }
+        XCTAssertEqual(f2.link.rejected, [false, false, false, false, false, false])
+        XCTAssertEqual(f2.link.retryDelays, [0, 30, 120, 300, 600, 600])
+        XCTAssertEqual(f2.controller.nextReconnectAt, f2.clock.date.addingTimeInterval(600))
+
+        f2.clock.date.addTimeInterval(600)
+        try f2.link.connect(pairing2)
+        XCTAssertEqual(f2.controller.status, .connected)
+        XCTAssertNil(f2.controller.nextReconnectAt)
+        XCTAssertEqual(f2.link.items.count, 1)
+        try f2.link.send(.ack(ids: [try itemID(try XCTUnwrap(f2.link.items.first))]))
+
+        // After successful authentication, the next handshake timeout starts back at delay 0.
+        f2.link.disconnect()
         f2.link.connectWithoutWelcome()
         f2.clock.date.addTimeInterval(31)
         f2.controller.checkTimeouts()
-        XCTAssertTrue(f2.controller.requiresPeerUpdate)
-        XCTAssertEqual(f2.controller.status, .unsupported)
-        XCTAssertEqual(f2.link.stops, 1)
+        XCTAssertEqual(f2.link.retryDelays.last, 0)
 
+        // 3. Pre-auth disconnects (before WELCOME) advance backoff without stopping and reset on auth.
         let f3 = try Fixture(test: self), pairing3 = try pair(f3)
         for _ in 0..<3 {
             f3.link.connectWithoutWelcome()
             f3.link.disconnect()
         }
         XCTAssertFalse(f3.controller.requiresPeerUpdate)
+        XCTAssertFalse(f3.controller.requiresRepair)
+        XCTAssertEqual(f3.controller.nextReconnectAt, f3.clock.date.addingTimeInterval(120))
         try f3.link.connect(pairing3)
         XCTAssertEqual(f3.controller.status, .connected)
+        XCTAssertNil(f3.controller.nextReconnectAt)
     }
 
     @MainActor
@@ -1320,6 +1357,251 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.transferProgress, expectedSend)
 
         try f.link.send(.ack(ids: [localOffer.id]))
+        XCTAssertNil(f.controller.transferProgress)
+    }
+
+    @MainActor
+    func testVersionMismatchChecksIdentityBeforeVersionAndIgnoresUnknownOrZeroPcId() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+
+        // Different PC returning a mismatched version must be ignored for 10 minutes without stopping sync.
+        f.link.welcomePcId = UUID()
+        f.link.welcomeVersion = 3
+        try f.link.connect(pairing)
+        XCTAssertEqual(f.link.rejected, [true])
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+        XCTAssertFalse(f.controller.requiresRepair)
+        XCTAssertEqual(f.link.stops, 0)
+        XCTAssertEqual(f.controller.status, .searching)
+
+        // Legacy all-zero PC ID in a version-mismatch frame also avoids stopping sync.
+        f.link.welcomePcId = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        f.link.welcomeVersion = 1
+        try f.link.connect(pairing)
+        XCTAssertEqual(f.link.rejected, [true, true])
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+        XCTAssertEqual(f.link.stops, 0)
+        XCTAssertEqual(f.controller.status, .searching)
+
+        // Real paired PC still connects normally.
+        f.link.welcomePcId = nil
+        f.link.welcomeVersion = nil
+        try f.link.connect(pairing)
+        XCTAssertEqual(f.controller.status, .connected)
+
+        // Paired PC ID with mismatched version stops sync with requiresPeerUpdate.
+        f.link.disconnect()
+        f.link.welcomeVersion = 3
+        try f.link.connect(pairing)
+        XCTAssertTrue(f.controller.requiresPeerUpdate)
+        XCTAssertFalse(f.controller.requiresRepair)
+        XCTAssertEqual(f.controller.compatibilityMessage, "相手のアプリを更新してください")
+        XCTAssertEqual(f.controller.status, .unsupported)
+        XCTAssertEqual(f.link.stops, 1)
+    }
+
+    @MainActor
+    func testIncomingMultiPacketProgressExtendsAckDeadlineWhileStalledAssemblyTimesOut() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        f.monitor.saveManually(["応答待ち"], receivedAt: f.clock.date)
+        await drain(f)
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.items.count, 1)
+        let sentId = try itemID(try XCTUnwrap(f.link.items.first))
+
+        let frame = try f.link.seal(.item(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                          from: "pc", text: String(repeating: "長", count: 500)))
+        let packets = try SyncPacketizer.split(frame, packetLimit: 182)
+        XCTAssertGreaterThanOrEqual(packets.count, 5)
+
+        f.clock.date.addTimeInterval(50)
+        f.link.onEvent?(.packet(packets[0]))
+        for packet in packets.dropFirst().dropLast() {
+            f.clock.date.addTimeInterval(20)
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+            f.link.onEvent?(.packet(packet))
+        }
+        f.clock.date.addTimeInterval(20)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        f.link.onEvent?(.packet(try XCTUnwrap(packets.last)))
+        await drain(f)
+        XCTAssertEqual(f.controller.status, .connected)
+
+        f.clock.date.addTimeInterval(5)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        try f.link.send(.ack(ids: [sentId]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+
+        // Single-packet ping does NOT extend the 60s reply deadline.
+        f.monitor.saveManually(["単発ping用"], receivedAt: f.clock.date)
+        await drain(f)
+        XCTAssertEqual(f.link.items.count, 2)
+        f.clock.date.addTimeInterval(50)
+        try f.link.send(.ping)
+        f.clock.date.addTimeInterval(15)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
+
+        // Reconnect resends "単発ping用" (items.count == 3); stalled partial assembly still drops at 60s.
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.items.count, 3)
+        f.link.onEvent?(.packet(packets[0]))
+        f.clock.date.addTimeInterval(61)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false, false])
+    }
+
+    @MainActor
+    func testAttachmentTimeoutReconnectsAndDuplicateUnseenOfferInSameConnectionDisconnects() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(repeating: 1, count: 10), name: "retry.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 1)
+        f.clock.date.addTimeInterval(61)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
+
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 2)
+        let offer = try XCTUnwrap(f.link.offers.last)
+        try f.link.send(.resume(id: offer.id, offset: 0))
+        try f.link.send(.ack(ids: [offer.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+
+        // Receiving the same unseen offer twice in the same connection disconnects without a second resume.
+        let incomingData = Data(repeating: 4, count: 100)
+        let incomingOffer = SyncOffer(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000), from: "pc", kind: "file",
+            size: incomingData.count, sha256: SyncEchoGuard.hash(incomingData),
+            name64: Data("in.bin".utf8).base64EncodedString(), type: "public.data")
+        try f.link.send(.offer(incomingOffer))
+        XCTAssertEqual(f.link.messages.filter { $0 == .resume(id: incomingOffer.id, offset: 0) }.count, 1)
+        try f.link.send(.offer(incomingOffer))
+        XCTAssertEqual(f.link.rejected, [false, false])
+        XCTAssertEqual(f.link.messages.filter { $0 == .resume(id: incomingOffer.id, offset: 0) }.count, 1)
+
+        // Reconnect resumes cleanly.
+        try f.link.connect(pairing, limit: 512)
+        try f.link.send(.offer(incomingOffer))
+        XCTAssertEqual(f.link.messages.filter { $0 == .resume(id: incomingOffer.id, offset: 0) }.count, 2)
+    }
+
+    @MainActor
+    func testIncomingItemsOverSixtyFourWhileWriteBlockedBatchIntoSingleAck() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        try f.link.connect(pairing, limit: 512)
+        f.controller.copiesReceivedToPasteboard = false
+        f.link.canSend = false
+
+        let ids = (0..<80).map { _ in UUID() }
+        for start in stride(from: 0, to: ids.count, by: 25) {
+            for index in start..<min(start + 25, ids.count) {
+                try f.link.send(.item(id: ids[index], at: Int64(index), from: "pc", text: "item-\(index)"))
+            }
+            await drain(f)
+        }
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+
+        f.link.resume()
+        let ackMessages = f.link.messages.filter { if case .ack = $0 { return true }; return false }
+        XCTAssertEqual(ackMessages.count, 1)
+        XCTAssertEqual(f.link.ackIDs, ids)
+    }
+
+    @MainActor
+    func testAttachmentAckBeforeFinalChunkCompletesDisconnectsAndPreservesPending() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        let data1 = Data(repeating: 1, count: SyncProtocol.chunkBytes + 7)
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data1, name: "seen.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+
+        // 1. Ack immediately after offer (no resume yet) is accepted.
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 1)
+        let seenOffer = try XCTUnwrap(f.link.offers.first)
+        try f.link.send(.ack(ids: [seenOffer.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+        f.link.disconnect()
+
+        // 2. Reject ack after resume before first chunk is sent.
+        let data2 = Data(repeating: 2, count: SyncProtocol.chunkBytes + 9)
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data2, name: "two.bin")], receivedAt: f.clock.date.addingTimeInterval(1))
+        await awaitSave(f, savedCount: 2)
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 2)
+        let offer2 = try XCTUnwrap(f.link.offers.last)
+        f.link.canSend = false
+        try f.link.send(.resume(id: offer2.id, offset: 0))
+        try f.link.send(.ack(ids: [offer2.id]))
+        XCTAssertEqual(f.link.rejected, [false])
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        // 3. Reconnect (resends offer2, offers.count == 3); reject ack after non-final chunk 1.
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 3)
+        try f.link.send(.resume(id: offer2.id, offset: 0))
+        XCTAssertEqual(f.link.chunks.count, 1)
+        try f.link.send(.ack(ids: [offer2.id]))
+        XCTAssertEqual(f.link.rejected, [false, false])
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        // 4. Reconnect (limit 20, offers.count == 4); reject ack while final chunk is mid-packet.
+        try f.link.connect(pairing, limit: 20)
+        XCTAssertEqual(f.link.offers.count, 4)
+        try f.link.send(.resume(id: offer2.id, offset: 0))
+        XCTAssertEqual(f.link.chunks.count, 2)
+        f.link.stopAfterPackets = 1
+        try f.link.send(.resume(id: offer2.id, offset: SyncProtocol.chunkBytes))
+        XCTAssertFalse(f.link.canSend)
+        try f.link.send(.ack(ids: [offer2.id]))
+        XCTAssertEqual(f.link.rejected, [false, false, false])
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        // 5. Reconnect (offers.count == 5), finish final chunk, and ack succeeds.
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 5)
+        try f.link.send(.resume(id: offer2.id, offset: 0))
+        try f.link.send(.resume(id: offer2.id, offset: SyncProtocol.chunkBytes))
+        try f.link.send(.ack(ids: [offer2.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+    }
+
+    @MainActor
+    func testPruningExpiredIncomingPartialAndDeletedPendingClearsTransferProgress() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        try f.link.connect(pairing, limit: 512)
+        let incomingData = Data(repeating: 3, count: 100)
+        let incomingOffer = SyncOffer(id: UUID(), at: Int64(f.clock.date.timeIntervalSince1970 * 1000), from: "pc", kind: "file",
+            size: incomingData.count, sha256: SyncEchoGuard.hash(incomingData),
+            name64: Data("expire.bin".utf8).base64EncodedString(), type: "public.data")
+        try f.link.send(.offer(incomingOffer))
+        XCTAssertEqual(f.controller.transferProgress?.direction, "receive")
+        XCTAssertEqual(f.controller.transferProgress?.itemID, incomingOffer.id)
+
+        f.clock.date.addTimeInterval(25 * 60 * 60)
+        f.controller.checkTimeouts()
+        XCTAssertNil(f.controller.transferProgress)
+
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(repeating: 5, count: 10), name: "delete.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+        let offer = try XCTUnwrap(f.link.offers.first)
+        try f.link.send(.resume(id: offer.id, offset: 0))
+        XCTAssertEqual(f.controller.transferProgress?.direction, "send")
+        XCTAssertEqual(f.controller.transferProgress?.itemID, offer.id)
+
+        let entry = try XCTUnwrap(f.monitor.entries.first)
+        let removed = expectation(description: "delete pending history")
+        f.monitor.delete(entry) { _ in removed.fulfill() }
+        await fulfillment(of: [removed], timeout: 5)
+        await drain(f)
+        XCTAssertEqual(f.controller.pendingCount, 0)
         XCTAssertNil(f.controller.transferProgress)
     }
 }

@@ -55,8 +55,10 @@ public sealed class SyncPadHandshake
     {
         var previous = state; state = -1;
         SyncProtocol.Require(previous == 1, SyncError.State);
-        SyncHandshakeWire.Check(frame, 82, 2);
-        SyncProtocol.Require(new Guid(frame.Slice(2, 16), bigEndian: true) == expectedPcId, SyncError.Identity);
+        SyncProtocol.Require(frame.Length == 82 && frame[0] == 2);
+        var peerPcId = new Guid(frame.Slice(2, 16), bigEndian: true);
+        SyncProtocol.Require(peerPcId != Guid.Empty && peerPcId == expectedPcId, SyncError.Identity);
+        SyncProtocol.Require(frame[1] == SyncProtocol.Version, SyncError.Version);
         var np = frame.Slice(18, 32).ToArray();
         SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[50..], SyncHandshakeWire.Mac(key, "pc", ni, np, expectedPcId, padId)), SyncError.Authentication);
         var result = new SyncPadAuthentication([3, .. SyncHandshakeWire.Mac(key, "pad", ni, np, expectedPcId, padId)], new SyncSessionKeys(key, ni, np));
@@ -79,6 +81,14 @@ public sealed class SyncPcHandshake
     {
         key = pairing.Key; pcId = pairing.PcId; this.expectedPadId = expectedPadId;
         np = testNonce is null ? RandomNumberGenerator.GetBytes(32) : SyncProtocol.Fixed(testNonce, 32);
+    }
+    public byte[] CreateVersionMismatch()
+    {
+        var frame = new byte[82];
+        frame[0] = 2;
+        frame[1] = SyncProtocol.Version;
+        SyncProtocol.IdBytes(pcId).CopyTo(frame, 2);
+        return frame;
     }
     public byte[] AcceptHello(ReadOnlySpan<byte> frame)
     {

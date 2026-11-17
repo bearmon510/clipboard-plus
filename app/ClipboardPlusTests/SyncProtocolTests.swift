@@ -47,6 +47,7 @@ final class SyncProtocolTests: XCTestCase {
         XCTAssertEqual(hello, try bytes(h, "helloHex"))
         let welcome = try pc.acceptHello(hello)
         XCTAssertEqual(welcome, try bytes(h, "welcomeHex"))
+        XCTAssertEqual(pc.createVersionMismatch(), try bytes(h, "versionMismatchWelcomeHex"))
         XCTAssertEqual(Data(welcome.suffix(32)), try bytes(h, "pcHmacHex"))
         XCTAssertNil(pc.authenticatedPadId)
         let authentication = try pad.acceptWelcome(welcome)
@@ -118,6 +119,12 @@ final class SyncProtocolTests: XCTestCase {
         let pad = try self.pad(v); _ = try pad.createHello()
         error(.authentication) { _ = try pad.acceptWelcome(bytes(object(failures, "welcomeHmac"), "frameHex")) }
         error(.state) { _ = try pad.acceptWelcome(bytes(h, "welcomeHex")) }
+        let samePcMismatch = try self.pad(v); _ = try samePcMismatch.createHello()
+        error(.version) { _ = try samePcMismatch.acceptWelcome(bytes(object(failures, "versionMismatchSamePc"), "frameHex")) }
+        let otherPcMismatch = try self.pad(v); _ = try otherPcMismatch.createHello()
+        error(.identity) { _ = try otherPcMismatch.acceptWelcome(bytes(object(failures, "versionMismatchOtherPc"), "frameHex")) }
+        let legacyZeroMismatch = try self.pad(v); _ = try legacyZeroMismatch.createHello()
+        error(.identity) { _ = try legacyZeroMismatch.acceptWelcome(bytes(object(failures, "versionMismatchLegacyZeroId"), "frameHex")) }
         let pc = try self.pc(v); _ = try pc.acceptHello(bytes(h, "helloHex"))
         error(.authentication) { _ = try pc.acceptAuth(bytes(object(failures, "authHmac"), "frameHex")) }
         XCTAssertNil(pc.authenticatedPadId)
@@ -189,9 +196,17 @@ final class SyncProtocolTests: XCTestCase {
         XCTAssertTrue(String(decoding: try SyncMessageCodec.encode(message), as: UTF8.self).contains(id.uppercased()))
         for header in ["{}", "[]", "{\"t\":\"image\"}", "{\"t\":\"ping\",\"extra\":0}", "{\"t\":\"ping\",\"t\":\"ping\"}",
                        "{\"t\":\"ping\",\"\\u0074\":\"ping\"}", "{\"t\":\"ping\",}", "{\"t\":\"ping\"} trailing",
-                       "{\"t\":\"p\\u00E9ng\"}", "{\"t\":\"ping\",\"日本語\":0}", "{\"ids\":[\"bad\"],\"t\":\"ack\"}"] {
+                       "{\"t\":\"p\\u00E9ng\"}", "{\"t\":\"ping\",\"日本語\":0}", "{\"ids\":[\"bad\"],\"t\":\"ack\"}",
+                       "{\"ids\":[\"+0112233-4455-6677-8899-AABBCCDDEEFF\"],\"t\":\"ack\"}",
+                       "{\"ids\":[\"00112233-+455-6677-8899-AABBCCDDEEFF\"],\"t\":\"ack\"}",
+                       "{\"ids\":[\"00112233-4455-6677-8899-AABBCCDDEE+F\"],\"t\":\"ack\"}",
+                       "{\"ids\":[\" 0112233-4455-6677-8899-AABBCCDDEEFF\"],\"t\":\"ack\"}",
+                       "{\"ids\":[\"00112233_4455_6677_8899_AABBCCDDEEFF\"],\"t\":\"ack\"}"] {
             error(.format) { _ = try SyncMessageCodec.decode(plain(header)) }
         }
+        let mixedCaseId = "aAbBcCdD-eEfF-4123-8456-001122334455"
+        XCTAssertEqual(try SyncMessageCodec.decode(plain("{\"t\":\"ack\",\"ids\":[\"\(mixedCaseId)\"]}")),
+                       .ack(ids: [try XCTUnwrap(UUID(uuidString: mixedCaseId))]))
         for at in ["true", "1.0", "1e3", "\"1\"", "9007199254740992", "-9007199254740992", "null"] {
             error(.format) { _ = try SyncMessageCodec.decode(plain("{\"t\":\"item\",\"kind\":\"text\",\"id\":\"\(id)\",\"from\":\"pad\",\"at\":\(at)}")) }
         }

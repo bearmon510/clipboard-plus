@@ -23,6 +23,8 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
     private var ready = false
     private var discoveryStarted: Date?
     private var timer: Timer?
+    private static let reconnectBackoff: [TimeInterval] = [0, 30, 120, 300, 600]
+    private var preAuthFailures = 0
 
     init(log: @escaping (String) -> Void) { self.log = log; super.init() }
     var canSend: Bool { ready && active?.canSendWriteWithoutResponse == true }
@@ -54,8 +56,9 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
         central = nil
         peers.removeAll(); cancelling.removeAll()
         candidateStarted.removeAll()
+        ignoredUntil.removeAll(); retryAfter.removeAll()
         active = nil; writeCharacteristic = nil; notifyCharacteristic = nil
-        ready = false; verified = false; discoveryStarted = nil
+        ready = false; verified = false; discoveryStarted = nil; preAuthFailures = 0
     }
 
     @objc private func foregroundChanged() { seek() }
@@ -65,6 +68,7 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
         for peer in peers.values where peer.identifier != remembered && peer.state == .connecting {
             if let start = candidateStarted[peer.identifier], Date().timeIntervalSince(start) > 20,
                !cancelling.contains(peer.identifier) {
+                retryAfter[peer.identifier] = Date().addingTimeInterval(3)
                 cancelling.insert(peer.identifier)
                 central?.cancelPeripheralConnection(peer)
                 log("候補への接続待ちを終了; 次の候補を探す")
@@ -72,7 +76,7 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
         }
         if let start = discoveryStarted, Date().timeIntervalSince(start) > 30 {
             log("切断; 理由=サービス・通知の準備期限")
-            reconnect(rejectForTenMinutes: false)
+            reconnectWithPreAuthBackoff()
         }
         seek()
     }
@@ -114,19 +118,47 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
             log("接続待ち開始")
         }
     }
+    private static func backoffDelay(forFailures count: Int) -> TimeInterval {
+        guard count > 0 else { return 0 }
+        return reconnectBackoff[min(count - 1, reconnectBackoff.count - 1)]
+    }
+    private static func backoffStep(forDelay delay: TimeInterval) -> Int {
+        reconnectBackoff.firstIndex(where: { $0 >= delay }).map { $0 + 1 } ?? reconnectBackoff.count
+    }
+    private func applyRetryDelay(_ delay: TimeInterval, for id: UUID) {
+        if delay > 0 {
+            retryAfter[id] = Date().addingTimeInterval(delay)
+        } else if id == remembered && UIApplication.shared.applicationState != .active {
+            retryAfter.removeValue(forKey: id)
+        } else {
+            retryAfter[id] = Date().addingTimeInterval(3)
+        }
+    }
+    private func reconnectWithPreAuthBackoff() {
+        preAuthFailures += 1
+        reconnect(rejectForTenMinutes: false, retryDelay: Self.backoffDelay(forFailures: preAuthFailures))
+    }
+
     func authenticated(_ id: UUID) {
         guard active?.identifier == id else { return }
-        verified = true; remembered = id
+        verified = true; remembered = id; preAuthFailures = 0
+        retryAfter.removeValue(forKey: id)
         stopScan()
         for peer in peers.values where peer.identifier != id && peer.state != .disconnected {
             cancelling.insert(peer.identifier)
             central?.cancelPeripheralConnection(peer)
         }
     }
-    func reconnect(rejectForTenMinutes: Bool) {
+    func reconnect(rejectForTenMinutes: Bool, retryDelay: TimeInterval) {
         guard let peer = active else { return }
-        if rejectForTenMinutes { ignoredUntil[peer.identifier] = Date().addingTimeInterval(600) }
-        else { retryAfter[peer.identifier] = Date().addingTimeInterval(3) }
+        if rejectForTenMinutes {
+            ignoredUntil[peer.identifier] = Date().addingTimeInterval(600)
+        } else {
+            if !verified {
+                preAuthFailures = max(preAuthFailures, Self.backoffStep(forDelay: retryDelay))
+            }
+            applyRetryDelay(retryDelay, for: peer.identifier)
+        }
         cancelling.insert(peer.identifier)
         clearActive()
         central?.cancelPeripheralConnection(peer)
@@ -203,15 +235,18 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
     private func lost(_ peer: CBPeripheral, error: Error?) {
         // Never log NSError descriptions/userInfo, peripheral names, addresses or UUIDs.
         log("切断; 理由コード=\((error as NSError?)?.code ?? 0)")
-        cancelling.remove(peer.identifier)
+        let wasCancelling = cancelling.remove(peer.identifier) != nil
         peers.removeValue(forKey: peer.identifier)
         candidateStarted.removeValue(forKey: peer.identifier)
-        // Re-arm the OS-owned pending connection before this background callback returns.
-        // A Timer may not get another turn after iOS suspends the app.
-        if peer.identifier == remembered && UIApplication.shared.applicationState != .active {
-            retryAfter.removeValue(forKey: peer.identifier)
-        } else {
-            retryAfter[peer.identifier] = Date().addingTimeInterval(3)
+        // Re-arm the OS-owned pending connection before this background callback returns,
+        // unless we are backing off repeated pre-authentication failures or already cancelled.
+        if !wasCancelling {
+            if active?.identifier == peer.identifier && !verified {
+                preAuthFailures += 1
+                applyRetryDelay(Self.backoffDelay(forFailures: preAuthFailures), for: peer.identifier)
+            } else {
+                applyRetryDelay(0, for: peer.identifier)
+            }
         }
         if active?.identifier == peer.identifier { clearActive(); onEvent?(.disconnected) }
         seek()
@@ -219,7 +254,7 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard peripheral === active else { return }
         guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == Self.service }) else {
-            log("切断; 理由=サービス確認失敗"); reconnect(rejectForTenMinutes: true); return
+            log("切断; 理由=サービス確認失敗"); reconnect(rejectForTenMinutes: true, retryDelay: 0); return
         }
         peripheral.discoverCharacteristics([Self.toPC, Self.toPad], for: service)
     }
@@ -229,7 +264,7 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
               let write = service.characteristics?.first(where: { $0.uuid == Self.toPC }),
               let notify = service.characteristics?.first(where: { $0.uuid == Self.toPad }),
               write.properties.contains(.writeWithoutResponse), notify.properties.contains(.notify) else {
-            log("切断; 理由=characteristic確認失敗"); reconnect(rejectForTenMinutes: true); return
+            log("切断; 理由=characteristic確認失敗"); reconnect(rejectForTenMinutes: true, retryDelay: 0); return
         }
         writeCharacteristic = write; notifyCharacteristic = notify
         peripheral.setNotifyValue(true, for: notify)
@@ -237,7 +272,7 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard peripheral === active, characteristic === notifyCharacteristic else { return }
         guard error == nil, characteristic.isNotifying else {
-            log("切断; 理由=通知設定失敗"); reconnect(rejectForTenMinutes: false); return
+            log("切断; 理由=通知設定失敗"); reconnectWithPreAuthBackoff(); return
         }
         guard !ready else { return }
         ready = true; discoveryStarted = nil
@@ -250,7 +285,9 @@ final class PCSyncBluetooth: NSObject, PCSyncTransport, CBCentralManagerDelegate
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard peripheral === active, characteristic === notifyCharacteristic, ready else { return }
         guard error == nil, let data = characteristic.value else {
-            log("切断; 理由=通知受信失敗"); reconnect(rejectForTenMinutes: false); return
+            log("切断; 理由=通知受信失敗")
+            if verified { reconnect(rejectForTenMinutes: false, retryDelay: 0) } else { reconnectWithPreAuthBackoff() }
+            return
         }
         onEvent?(.packet(data))
     }

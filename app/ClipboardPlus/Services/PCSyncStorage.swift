@@ -71,6 +71,10 @@ final class PCSyncSettings {
         get { defaults.bool(forKey: prefix + "requiresPeerUpdate") }
         set { defaults.set(newValue, forKey: prefix + "requiresPeerUpdate") }
     }
+    var requiresRepair: Bool {
+        get { defaults.bool(forKey: prefix + "requiresRepair") }
+        set { defaults.set(newValue, forKey: prefix + "requiresRepair") }
+    }
     // A deletion tombstone prevents loading a stale secret if Keychain is temporarily locked.
     var deletionPending: Bool {
         get { defaults.bool(forKey: prefix + "deletionPending") }
@@ -91,6 +95,8 @@ final class PCSyncSettings {
     func clearPairing() {
         defaults.removeObject(forKey: prefix + "pcId")
         defaults.removeObject(forKey: prefix + "pcName")
+        defaults.removeObject(forKey: prefix + "requiresPeerUpdate")
+        defaults.removeObject(forKey: prefix + "requiresRepair")
         peripheralId = nil
     }
 }

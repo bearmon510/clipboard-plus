@@ -18,5 +18,5 @@ protocol PCSyncTransport: AnyObject {
     func stop()
     func write(_ packet: Data)
     func authenticated(_ id: UUID)
-    func reconnect(rejectForTenMinutes: Bool)
+    func reconnect(rejectForTenMinutes: Bool, retryDelay: TimeInterval)
 }

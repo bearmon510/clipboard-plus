@@ -7,9 +7,9 @@
 GATTのUUID、パケット先頭の開始／終了ビット、512バイト上限、AES-256-GCMのフレーム構造は第1版のまま。フレーム全体は4MiB、平文最大4,194,279バイト。接続ごとに1つの送信処理を使い、フレームの途中へ別フレームを挟まない。ack/pong/resumeは次の項目より優先する。
 
 - HELLO: `0x01 | 0x02 | 端末ID(16) | Ni(32)`、計50バイト。
-- WELCOME: `0x02 | 0x02 | PC ID(16) | Np(32) | HMAC(32)`、計82バイト。
+- WELCOME: `0x02 | 0x02 | PC ID(16) | Np(32) | HMAC(32)`、計82バイト。版違い応答は `0x02 | 0x02 | PC ID(16) | ゼロ(64)` とし、iOSは版より先にPC IDを検証する（全ゼロや別PC IDなら停止せず10分除外、組にしたPC IDと一致して版が違う場合のみ停止）。
 - AUTH: `0x03 | HMAC(32)`、計33バイト。
-- HMAC-SHA256の入力は `0x02 | ASCIIのpcまたはpad | PC ID | 端末ID | Ni | Np`。IDも認証する。UUIDはRFC 4122の順。AUTH成功前に端末一覧へ登録しない。
+- HMAC-SHA256の入力は `0x02 | ASCIIのpcまたはpad | PC ID | 端末ID | Ni | Np`。IDも認証する。UUIDはRFC 4122の順（文字列表現は標準8-4-4-4-12の16進のみ受理、大文字・小文字不問）。AUTH成功前に端末一覧へ登録しない。
 - HKDF-SHA256は入力鍵K、salt `Ni | Np`、info `clipboardplus v2 pad->pc` または `clipboardplus v2 pc->pad`、32バイト。再接続ごとに新しい乱数と暗号状態を使う。
 - QRの書式は `clipboardplus-pair:1:...` のまま。QRの番号はペア情報の書式で、通信の版とは別。
 - 認証前の組み立てはPCで50／33バイト、iOSで82バイトまで。認証後にだけ4MiBを認める。
@@ -30,9 +30,9 @@ GATTのUUID、パケット先頭の開始／終了ビット、512バイト上限
 
 `size` は0〜10MiB。`sha256` は全体の小文字16進64文字。`name64` はUTF-8名の通常base64（パディングあり、正規形）、復号後最大1,024バイト。Unicode一般カテゴリ `Cc`（`U+0000`〜`U+001F`、`U+007F`〜`U+009F`）の制御文字は不可とし、`Cf`（ゼロ幅接合子 `U+200D` 等）は通信で許可する。画像なら空文字可、ファイルなら空でない名前。実際の保存名には相手のパスを使用しない。`type` はASCII印字文字1〜255バイト。画像はpublic.png / public.jpegだけ、ファイルはUTI（不明ならpublic.data）。
 
-送信側は1つの接続で添付の転送を1件ずつ進め、進行中の添付がある間は次の添付のofferを始めない（文章のitem・ack・ping/pongは挟んでよい）。手順はoffer→resumeを待つ→指定位置からchunkを1個→次のresumeを待つ。受信側はchunkをディスクへ同期書き込みした後だけresumeを返す。飛び位置・巻き戻し・サイズ以上（`offset >= size`、`0 <= offset < size` のみ有効）・文章へのresumeは拒否する。同じIDの再offerは見出し全体の一致を確認し、保存済みファイルの長さを返す。送信側は再接続ごとにofferから始め、古い送信offsetを信用しない。
+送信側は1つの接続で添付の転送を1件ずつ進め、進行中の添付がある間は次の添付のofferを始めない（文章のitem・ack・ping/pongは挟んでよい）。手順はoffer→resumeを待つ→指定位置からchunkを1個→次のresumeを待つ。受信側はchunkをディスクへ同期書き込みした後だけresumeを返す。飛び位置・巻き戻し・サイズ以上（`offset >= size`、`0 <= offset < size` のみ有効）・文章へのresume、および同一接続での未完了重複offerは拒否して切断する。再接続時はofferから始め、見出し全体の一致を確認して保存済みファイルの長さを返す。添付の60秒応答期限切れは同一接続内で再offerせず、接続を切って再接続でofferからやり直す（文章項目は同一接続で再送可）。またresumeを受理して転送を始めた添付については、最終chunkを送り終える前のackを状態誤り（state）として切断する（offer直後のackはこれまでどおり受理）。相手から受信中の複数パケットフレームが進んでいる間は返信の60秒期限を延長し、受信が止まった場合は組み立て期限（PC 20秒、iOS 60秒）で切断する。
 
-全バイトを保存したらSHA-256をストリームで確認し、履歴保存後にackを返す。最後のchunkにはresumeでなくack。空ファイルや全体保存済みの再offerも検証・履歴保存へ進む。SHA不一致は受信途中を消して切断する。画像の上限超過・形式不一致・破損など受け取れない内容は、受信途中を消して履歴に入れず、固定理由だけを記録してackを返す（相手が再送し続けないようにする）。その他の受け取り失敗でも、受信途中を消してから切断する。受信済みIDは内容を書かずackだけ返す。削除／期限切れに対する遅いresumeは無視する。例と暗号フレームは `protocol/test-vectors.json`。
+全バイトを保存したらSHA-256をストリームで確認し、履歴保存後にackを返す（PC側も専用ackキューへ溜め、1通に最大1,024件までまとめる）。最後のchunkにはresumeでなくack。空ファイルや全体保存済みの再offerも検証・履歴保存へ進む。SHA不一致は受信途中を消して切断する。画像の上限超過・形式不一致・破損など受け取れない内容は、受信途中を消して履歴に入れず、固定理由だけを記録してackを返す（相手が再送し続けないようにする）。その他の受け取り失敗でも、受信途中を消してから切断する。受信済みIDは内容を書かずackだけ返す。削除／期限切れに対する遅いresumeは無視する。例と暗号フレームは `protocol/test-vectors.json`。
 
 ## 保存と重複
 
@@ -70,23 +70,28 @@ PCは `Core/SyncCoordinator.cs` の公開APIを窓から使う。`App` が所有
 | TransferProgress | DeviceId / Direction（sendまたはreceive）/ ItemId / ItemNumber / ItemCount / Bytes / TotalBytes |
 | HistoryItem | Id / Kind / Text / Filename / Path / Size / At / Source（PC / iPhone / iPad）/ Hash / Type |
 
-Pairedはcoordinatorが有効な共有鍵を持つこと。個別の組はDevicesの登録数で確認する。PCには現在「未ペア」でもQR用の共有鍵がある。受信側の件数は、送信者の総キュー数を通信に含めないため1/1。送信側の件数はその時点の待ち列内の位置と件数。バイト進捗は送信時は送信へ渡すchunk末尾、受信時はディスクへ保存した長さ。転送方向の最新1件を接続ごとに表示する。
+Pairedはcoordinatorが有効な共有鍵を持つこと。個別の組はDevicesの登録数で確認する。PCには現在「未ペア」でもQR用の共有鍵がある。受信側の件数は、送信者の総キュー数を通信に含めないため1/1。送信側の件数はその時点の待ち列内の位置と件数。バイト進捗は送信時は送信へ渡すchunk末尾、受信時はディスクへ保存した長さ。転送方向の最新1件を接続ごとに表示し、送信待ちや途中受信の整理で表示中の項目が消えた場合はその方向の進捗表示を消す。
 
 iOS `PCSyncController` の追加API（既存Statusのcaseは増やさず、Viewsの網羅switchを維持）:
 
 - `@Published private(set) pendingCount: Int`
-- `@Published private(set) transferProgress: TransferProgress?`。direction（send / receive）、itemID、bytes、totalBytes。未転送／完了でnil。
+- `@Published private(set) transferProgress: TransferProgress?`。direction（send / receive）、itemID、bytes、totalBytes。未転送／完了／対象項目消去でnil。
 - `@Published private(set) requiresPeerUpdate: Bool`
+- `@Published private(set) requiresRepair: Bool`
 - `@Published private(set) compatibilityMessage: String?`
-- `retryAfterPeerUpdate()`。停止を解除して再接続。Claude側の画面では更新案内とこの操作を追加する。
+- `retryAfterPeerUpdate()` / `retryAfterRepair()`。停止を解除して再接続。Claude側の画面では更新案内・組み直し案内とこの操作を追加する。
 
 ## 版違いと移行
 
-第2版の端末は異なる版のWELCOMEを受けたら停止し、停止状態を保存する。利用者が更新後の再試行を行うまで再接続しない。応答しない旧PCにも認証前の失敗3回で停止し、PCの状態確認を含む案内を出す。これは認証エラーや不安定な回線にも適用されるため、回復後は再試行する。
+第2版の端末は、組にしたPC IDと一致する相手から異なる版のWELCOMEを受けた場合のみ停止（`requiresPeerUpdate = true`、`"相手のアプリを更新してください"`）し、停止状態を保存する。利用者が更新後の `retryAfterPeerUpdate()` を行うまで再接続しない。別PC IDまたは全ゼロIDの版違い応答は相手を特定できないため停止せず、そのperipheralだけを10分間避ける。組にしたPC IDと一致するのに認証（HMAC）不一致が3回続いた場合は、版違いではなく組み直しが必要な状態（`requiresRepair = true`、`"PCとの組が一致しません。PCのQRコードを読み直して組み直してください"`）で停止する。WELCOME未着や書き込み不可などの接続確認タイムアウト、およびHELLO前／認証前の切断では停止せず、連続失敗に応じて再接続間隔を段階的に延ばし（0秒→30秒→2分→5分、上限10分）、認証成功でリセットする。
 
-第2版のPCは異なる版のHELLOに版2のWELCOME形応答を返し、認証せず接続を失効させる。第2版で認証・登録済みの端末IDからの版違いHELLOに限り（最大100件記録）RequiresPeerUpdateを出し、同じIDで正しい認証ができればその更新要求を解除する（未登録IDからの未認証HELLOでは誤表示防止のため出さない）。
+第2版のPCは異なる版のHELLOに自局PC ID入りの版2のWELCOME形応答を返し、認証せず接続を失効させる。第2版で認証・登録済みの端末IDからの版違いHELLOに限り（最大100件記録）RequiresPeerUpdateを出し、同じIDで正しい認証ができればその更新要求を解除する（未登録IDからの未認証HELLOでは誤表示防止のため出さない）。
 
 **未更新の旧TestFlightアプリ自身の表示・再接続処理はPCから変更できない。** 第1版には登録端末の保存がないため、第1版からPCだけ更新した場合はPC側に更新案内は出ず、旧端末の10分後の再試行も旧実装のまま。両側の更新案内と自動停止を使うには第2版を両側へ導入する必要がある。旧版とのデータ互換はない。
+
+## 既知の制限
+
+- **iOSの受信コミット直後の終了による収集回数+1**: iOS側でPCからの受信項目（文章・画像・ファイル）を履歴DB（SQLite）へコミットした後、`SyncDiskStore.markSeen`（`state.json`）へ受信済みIDを保存する前にアプリが強制終了または異常終了した場合、PCには `ack` が返らず、iOS側にも受信済みIDが残りません。次回接続時にPCが同じIDで再送すると、iOS側の履歴DBは内容で重複統合するため重複行は作られませんが、収集回数（`collectionCount`）が1回多くカウントされます。解消には受信済みIDの記録を履歴DBの同一トランザクションに統合する必要があり、影響が限定的であるため既知の制限としています。
 
 ## 定数
 
@@ -103,7 +108,7 @@ iOS `PCSyncController` の追加API（既存Statusのcaseは増やさず、Views
 | 1回のCF_HDROP | 通常ファイル10件 |
 | 画像変換 | 40,000,000ピクセル |
 | ping / pong / ack・resume待ち | 30秒 / 10秒 / 60秒 |
-| 認証前失敗の停止 | 端末側3回 |
+| 認証HMAC不一致の停止 / 認証前バックオフ | 端末側3回 / 0→30秒→2分→5分→上限10分 |
 
 ## 検証と実機確認
 

@@ -21,6 +21,7 @@ final class PCSyncController: ObservableObject {
     @Published private(set) var transferProgress: TransferProgress?
     @Published private(set) var pendingCount = 0
     @Published private(set) var requiresPeerUpdate = false
+    @Published private(set) var requiresRepair = false
     @Published private(set) var compatibilityMessage: String?
     @Published var copiesReceivedToPasteboard: Bool {
         didSet { settings.copiesReceivedToPasteboard = copiesReceivedToPasteboard }
@@ -59,7 +60,13 @@ final class PCSyncController: ObservableObject {
     private var awaitingOffsets: [UUID: Int] = [:]
     private var replies: [SyncMessage] = []
     private var attempted: Set<UUID> = []
-    private var handshakeFailures = 0
+    private static let reconnectBackoff: [TimeInterval] = [0, 30, 120, 300, 600]
+    private var preAuthFailures = 0
+    private var authenticationFailures = 0
+    private(set) var nextReconnectAt: Date?
+    private var offeredThisConnection: Set<UUID> = []
+    private var resumedAttachments: Set<UUID> = []
+    private var finalChunkSentAttachments: Set<UUID> = []
     private var historyReady = false
     private var historyLoaded = false
     private var historyLoading = false
@@ -78,6 +85,7 @@ final class PCSyncController: ObservableObject {
         var progressed: Date
         let id: UUID?
         let isAuth: Bool
+        let finishesAttachment: Bool
         let bytes: Int
     }
 
@@ -212,8 +220,14 @@ final class PCSyncController: ObservableObject {
                 loadHistoryForSync()
             }
             requiresPeerUpdate = settings.requiresPeerUpdate
-            if requiresPeerUpdate { compatibilityMessage = "相手のアプリを更新してください"; status = .unsupported }
-            else { startTransport() }
+            requiresRepair = settings.requiresRepair
+            if requiresPeerUpdate {
+                compatibilityMessage = "相手のアプリを更新してください"; status = .unsupported
+            } else if requiresRepair {
+                compatibilityMessage = "PCとの組が一致しません。PCのQRコードを読み直して組み直してください"; status = .unsupported
+            } else {
+                startTransport()
+            }
         } catch { record("組にする情報の読み込み待ち; ロック解除後に再試行") }
     }
     private func startTransport() {
@@ -230,7 +244,9 @@ final class PCSyncController: ObservableObject {
         pairingGeneration = UUID()
         pairing = nil; pcName = nil; status = .unpaired; historyReady = false
         try? disk.clear(); monitor.clearPCFingerprints(); refreshPending(); receiving.removeAll()
-        requiresPeerUpdate = false; settings.requiresPeerUpdate = false; compatibilityMessage = nil; handshakeFailures = 0
+        requiresPeerUpdate = false; settings.requiresPeerUpdate = false
+        requiresRepair = false; settings.requiresRepair = false
+        compatibilityMessage = nil; preAuthFailures = 0; authenticationFailures = 0; nextReconnectAt = nil
         lastSentAt = nil; lastReceivedAt = nil
     }
     private func resetSession() {
@@ -244,11 +260,13 @@ final class PCSyncController: ObservableObject {
         lastActivity = nil; pingRequestedAt = nil; pingQueued = false
         output = nil; controlFrames.removeAll(); ackQueue.removeAll()
         sentThisConnection.removeAll(); sentAt.removeAll()
-        offsets.removeAll(); awaitingOffsets.removeAll(); replies.removeAll(); transferProgress = nil
+        offsets.removeAll(); awaitingOffsets.removeAll(); replies.removeAll()
+        offeredThisConnection.removeAll(); resumedAttachments.removeAll(); finalChunkSentAttachments.removeAll()
+        transferProgress = nil
     }
 
     private func handle(_ event: PCSyncTransportEvent) {
-        guard pairing != nil, !requiresPeerUpdate else { return }
+        guard pairing != nil, !requiresPeerUpdate, !requiresRepair else { return }
         switch event {
         case .status(let value):
             if status != .connected { status = value }
@@ -264,11 +282,15 @@ final class PCSyncController: ObservableObject {
                 controlFrames.append(try handshake!.createHello())
                 record("接続確認開始; GATT値上限=\(limit)")
                 pump()
-            } catch { fail(reject: true, reason: "接続確認の開始失敗") }
+            } catch { fail(reject: false, countBackoff: true, reason: "接続確認の開始失敗") }
         case .packet(let packet): receive(packet)
         case .writable: pump()
         case .disconnected:
+            let duringHandshake = (status == .connecting || handshakeStart != nil) && status != .connected
             resetSession(); status = .searching
+            if duringHandshake {
+                _ = recordPreAuthBackoff()
+            }
         }
     }
 
@@ -279,6 +301,17 @@ final class PCSyncController: ObservableObject {
         sentAt = sentAt.filter { ids.contains($0.key) }
         offsets = offsets.filter { ids.contains($0.key) }
         awaitingOffsets = awaitingOffsets.filter { ids.contains($0.key) }
+        resumedAttachments.formIntersection(ids)
+        finalChunkSentAttachments.formIntersection(ids)
+        if let progress = transferProgress {
+            if progress.direction == "send", !ids.contains(progress.itemID) {
+                transferProgress = nil
+            } else if progress.direction == "receive",
+                      !disk.state.partials.contains(where: { $0.offer.id == progress.itemID }),
+                      !receiving.contains(progress.itemID) {
+                transferProgress = nil
+            }
+        }
     }
     private func enqueue(_ entry: HistoryEntry, at date: Date) {
         guard pairing != nil else { return }
@@ -305,15 +338,33 @@ final class PCSyncController: ObservableObject {
     }
     func retryAfterPeerUpdate() {
         guard pairing != nil else { return }
-        requiresPeerUpdate = false; settings.requiresPeerUpdate = false; compatibilityMessage = nil; handshakeFailures = 0
+        requiresPeerUpdate = false; settings.requiresPeerUpdate = false
+        if !requiresRepair { compatibilityMessage = nil }
+        preAuthFailures = 0; authenticationFailures = 0; nextReconnectAt = nil
+        startTransport()
+    }
+    func retryAfterRepair() {
+        guard pairing != nil else { return }
+        requiresRepair = false; settings.requiresRepair = false
+        if !requiresPeerUpdate { compatibilityMessage = nil }
+        preAuthFailures = 0; authenticationFailures = 0; nextReconnectAt = nil
         startTransport()
     }
     private func pauseForUpdate() {
         resetSession(); requiresPeerUpdate = true; settings.requiresPeerUpdate = true
-        compatibilityMessage = "相手のアプリを更新してください（接続確認ができない場合はPCの状態も確認してください）"
+        requiresRepair = false; settings.requiresRepair = false
+        compatibilityMessage = "相手のアプリを更新してください"
         status = .unsupported
         transport?.onEvent = nil; transport?.stop(); transport = nil
-        record("接続停止; 理由=通信の版または接続確認の不一致")
+        record("接続停止; 理由=通信の版が不一致")
+    }
+    private func pauseForRepair() {
+        resetSession(); requiresRepair = true; settings.requiresRepair = true
+        requiresPeerUpdate = false; settings.requiresPeerUpdate = false
+        compatibilityMessage = "PCとの組が一致しません。PCのQRコードを読み直して組み直してください"
+        status = .unsupported
+        transport?.onEvent = nil; transport?.stop(); transport = nil
+        record("接続停止; 理由=認証の不一致")
     }
 
     private func nextPendingItem() -> SyncPending? {
@@ -337,6 +388,7 @@ final class PCSyncController: ObservableObject {
                     let frame: Data
                     var id: UUID?
                     var isAuth = false
+                    var finishesAttachment = false
                     if !controlFrames.isEmpty {
                         frame = controlFrames.removeFirst(); isAuth = frame.first == 3
                     } else if status == .connected, let sender {
@@ -362,6 +414,7 @@ final class PCSyncController: ObservableObject {
                                     try SyncProtocol.require(!data.isEmpty)
                                     message = .chunk(id: item.id, offset: offset, data: data)
                                     awaitingOffsets[item.id] = offset + data.count
+                                    finishesAttachment = offset + data.count == offer.size
                                     transferProgress = TransferProgress(direction: "send", itemID: item.id, bytes: offset + data.count, totalBytes: offer.size)
                                 } else { message = .offer(offer); awaitingOffsets[item.id] = -1 }
                             } else {
@@ -376,7 +429,8 @@ final class PCSyncController: ObservableObject {
                     } else { return }
                     let packets = try SyncPacketizer.split(frame, packetLimit: writeLimit)
                     output = Output(packets: packets, started: now(), progressed: now(), id: id,
-                                    isAuth: isAuth, bytes: packets.reduce(0) { $0 + $1.count })
+                                    isAuth: isAuth, finishesAttachment: finishesAttachment,
+                                    bytes: packets.reduce(0) { $0 + $1.count })
                 }
                 guard var current = output else { return }
                 let packet = current.packets[current.index]
@@ -387,6 +441,7 @@ final class PCSyncController: ObservableObject {
                 // Record completion before handing off; test transports may answer synchronously.
                 if finished, let id = current.id {
                     if pending.contains(where: { $0.id == id }) { sentAt[id] = now() }
+                    if current.finishesAttachment { finalChunkSentAttachments.insert(id) }
                     lastSentAt = now()
                 }
                 lastActivity = now()
@@ -394,7 +449,8 @@ final class PCSyncController: ObservableObject {
                 guard sessionGeneration == session else { return }
                 if finished {
                     if current.isAuth {
-                        status = .connected; handshakeStart = nil; handshake = nil; handshakeFailures = 0
+                        status = .connected; handshakeStart = nil; handshake = nil
+                        preAuthFailures = 0; authenticationFailures = 0; nextReconnectAt = nil
                         replies.insert(.device(kind: UIDevice.current.userInterfaceIdiom == .phone ? "phone" : "pad"), at: 0)
                         record("接続確認成功")
                         if let peerId { settings.peripheralId = peerId; transport.authenticated(peerId) }
@@ -409,7 +465,7 @@ final class PCSyncController: ObservableObject {
                 nextPendingItem() != nil {
                 writeBlockedSince = now()
             }
-        } catch { fail(reject: false, reason: "送信フレーム作成失敗") }
+        } catch { fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信フレーム作成失敗") }
     }
 
     private func receive(_ packet: Data) {
@@ -417,15 +473,25 @@ final class PCSyncController: ObservableObject {
         do {
             if receiveStart == nil { receiveStart = now(); receiveBytes = 0 }
             receiveBytes += packet.count
+            let wasPartial = assembler.hasPartialFrame
             let frame = try assembler.append(packet)
-            lastActivity = now()
-            partialStart = assembler.hasPartialFrame ? now() : nil
+            let current = now()
+            lastActivity = current
+            partialStart = assembler.hasPartialFrame ? current : nil
+            if status == .connected, wasPartial || assembler.hasPartialFrame {
+                for id in sentAt.keys {
+                    if let previous = sentAt[id], previous < current {
+                        sentAt[id] = current
+                    }
+                }
+            }
             guard let frame else { return }
-            let start = receiveStart ?? now(), bytes = receiveBytes
+            let start = receiveStart ?? current, bytes = receiveBytes
             receiveStart = nil; receiveBytes = 0
             if receiver == nil {
                 guard let handshake else { throw SyncProtocolError.state }
                 let result = try handshake.acceptWelcome(frame)
+                authenticationFailures = 0
                 self.assembler = try SyncPacketAssembler(packetLimit: receiveLimit)
                 sender = try SyncFrameSender(key: result.keys.padToPc)
                 receiver = try SyncFrameReceiver(key: result.keys.pcToPad)
@@ -460,6 +526,7 @@ final class PCSyncController: ObservableObject {
                 // The authenticated header can arrive before Apple shares the completed copy from another device.
                 monitor.rememberIncomingPC(kind: offer.kind, hash: offer.sha256)
                 if seen.contains(offer.id) { queueAck(offer.id); return }
+                guard offeredThisConnection.insert(offer.id).inserted else { throw SyncProtocolError.state }
                 guard !receiving.contains(offer.id) else { return }
                 let offset = try disk.begin(offer, now: now())
                 transferProgress = TransferProgress(direction: "receive", itemID: offer.id, bytes: offset, totalBytes: offer.size)
@@ -478,10 +545,19 @@ final class PCSyncController: ObservableObject {
                 guard let offer = item.offer, offset < offer.size, let expected = awaitingOffsets[id],
                       expected < 0 || expected == offset else { throw SyncProtocolError.state }
                 awaitingOffsets.removeValue(forKey: id); offsets[id] = offset
-                sentAt.removeValue(forKey: id); sentThisConnection.remove(id); pump()
+                sentAt.removeValue(forKey: id); sentThisConnection.remove(id)
+                resumedAttachments.insert(id); finalChunkSentAttachments.remove(id)
+                pump()
             case .ack(let ids):
+                for id in ids {
+                    if resumedAttachments.contains(id) && !finalChunkSentAttachments.contains(id) {
+                        throw SyncProtocolError.state
+                    }
+                }
                 let accepted = Set(ids.filter { sentAt[$0] != nil })
                 try disk.ack(accepted); refreshPending()
+                resumedAttachments.subtract(accepted)
+                finalChunkSentAttachments.subtract(accepted)
                 if let progress = transferProgress, progress.direction == "send", accepted.contains(progress.itemID) {
                     transferProgress = nil
                 }
@@ -492,10 +568,15 @@ final class PCSyncController: ObservableObject {
                 if !pingQueued { pingRequestedAt = nil }
             }
         } catch SyncProtocolError.version { pauseForUpdate() }
-        catch SyncProtocolError.identity { fail(reject: true, reason: "別のPC") }
+        catch SyncProtocolError.identity { fail(reject: true, countBackoff: false, reason: "別のPC") }
+        catch SyncProtocolError.authentication where receiver == nil {
+            authenticationFailures += 1
+            if authenticationFailures >= 3 { pauseForRepair(); return }
+            fail(reject: true, countBackoff: false, reason: "接続確認の認証不一致")
+        }
         catch {
             let duringHandshake = handshakeStart != nil && status != .connected
-            fail(reject: duringHandshake, countFailure: duringHandshake, reason: "受信・接続確認失敗")
+            fail(reject: false, countBackoff: duringHandshake, reason: "受信・接続確認失敗")
         }
     }
     private func finishIncoming(_ offer: SyncOffer) throws {
@@ -546,14 +627,20 @@ final class PCSyncController: ObservableObject {
     }
     private func queueAck(_ id: UUID) {
         if !ackQueue.contains(id) { ackQueue.append(id) }
-        if ackQueue.count > 500 { fail(reject: false, reason: "ack待ち上限"); return }
+        if ackQueue.count > SyncProtocol.maxAckIds * 4 { fail(reject: false, reason: "ack待ち上限"); return }
         pump()
     }
-    private func fail(reject: Bool, countFailure: Bool = false, reason: String) {
-        if countFailure { handshakeFailures += 1; if handshakeFailures >= 3 { pauseForUpdate(); return } }
-        record("切断; 理由=\(reason); 相手を10分無視=\(reject)")
+    private func recordPreAuthBackoff() -> TimeInterval {
+        preAuthFailures += 1
+        let delay = Self.reconnectBackoff[min(preAuthFailures - 1, Self.reconnectBackoff.count - 1)]
+        nextReconnectAt = delay > 0 ? now().addingTimeInterval(delay) : nil
+        return delay
+    }
+    private func fail(reject: Bool, countBackoff: Bool = false, reason: String) {
+        let delay = countBackoff ? recordPreAuthBackoff() : 0
+        record("切断; 理由=\(reason); 相手を10分無視=\(reject); 再接続待ち秒=\(Int(delay))")
         resetSession(); status = pairing == nil ? .unpaired : .searching
-        transport?.reconnect(rejectForTenMinutes: reject)
+        transport?.reconnect(rejectForTenMinutes: reject, retryDelay: delay)
     }
     func checkTimeouts() {
         deleteKeyIfPending()
@@ -566,13 +653,13 @@ final class PCSyncController: ObservableObject {
             }
         }
         if let start = handshakeStart, date.timeIntervalSince(start) > 30 {
-            fail(reject: true, countFailure: true, reason: "接続確認期限")
+            fail(reject: false, countBackoff: true, reason: "接続確認期限")
         } else if let start = partialStart, date.timeIntervalSince(start) > 60 {
-            fail(reject: false, reason: "受信組み立て期限")
+            fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "受信組み立て期限")
         } else if let current = output, date.timeIntervalSince(current.progressed) > 60 {
-            fail(reject: false, reason: "送信停止期限")
+            fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信停止期限")
         } else if let start = writeBlockedSince, date.timeIntervalSince(start) > 60 {
-            fail(reject: false, reason: "送信準備待ち期限")
+            fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信準備待ち期限")
         } else if sentAt.values.contains(where: { date.timeIntervalSince($0) > 60 }) {
             fail(reject: false, reason: "ack期限")
         } else if let start = pingRequestedAt, date.timeIntervalSince(start) >= 10 {

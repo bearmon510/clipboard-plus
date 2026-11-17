@@ -30,6 +30,7 @@ public sealed class SyncProtocolTests : IDisposable
         var pad = Pad(); var pc = Pc();
         var hello = pad.CreateHello(); Assert.Equal(Hex(H, "helloHex"), hello);
         var welcome = pc.AcceptHello(hello); Assert.Equal(Hex(H, "welcomeHex"), welcome);
+        Assert.Equal(Hex(H, "versionMismatchWelcomeHex"), pc.CreateVersionMismatch());
         Assert.Null(pc.AuthenticatedPadId);
         Assert.Equal(Hex(H, "pcHmacHex"), welcome[50..]);
         var authentication = pad.AcceptWelcome(welcome);
@@ -105,6 +106,12 @@ public sealed class SyncProtocolTests : IDisposable
         var pad = Pad(); pad.CreateHello();
         Error(SyncError.Authentication, () => pad.AcceptWelcome(Hex(failures.GetProperty("welcomeHmac"), "frameHex")));
         Error(SyncError.State, () => pad.AcceptWelcome(Hex(H, "welcomeHex")));
+        var samePcMismatch = Pad(); samePcMismatch.CreateHello();
+        Error(SyncError.Version, () => samePcMismatch.AcceptWelcome(Hex(failures.GetProperty("versionMismatchSamePc"), "frameHex")));
+        var otherPcMismatch = Pad(); otherPcMismatch.CreateHello();
+        Error(SyncError.Identity, () => otherPcMismatch.AcceptWelcome(Hex(failures.GetProperty("versionMismatchOtherPc"), "frameHex")));
+        var legacyZeroMismatch = Pad(); legacyZeroMismatch.CreateHello();
+        Error(SyncError.Identity, () => legacyZeroMismatch.AcceptWelcome(Hex(failures.GetProperty("versionMismatchLegacyZeroId"), "frameHex")));
         var pc = Pc(); pc.AcceptHello(Hex(H, "helloHex"));
         Error(SyncError.Authentication, () => pc.AcceptAuth(Hex(failures.GetProperty("authHmac"), "frameHex")));
         Assert.Null(pc.AuthenticatedPadId);
@@ -179,8 +186,16 @@ public sealed class SyncProtocolTests : IDisposable
         Assert.Equal(-123, item.At); Assert.Equal("日本語\n📋", item.Text);
         var encoded = SyncMessageCodec.Encode(item);
         Assert.Contains(id.ToUpperInvariant(), Encoding.ASCII.GetString(encoded));
-        foreach (var header in new[] { "{}", "[]", "{\"t\":\"image\"}", "{\"t\":\"ping\",\"extra\":0}", "{\"t\":\"ping\",\"t\":\"ping\"}", "{\"t\":\"ping\",}", "{\"t\":\"ping\"} trailing", "{\"t\":\"p\\u00E9ng\"}", "{\"t\":\"ping\",\"日本語\":0}", "{\"ids\":[\"bad\"],\"t\":\"ack\"}" })
+        foreach (var header in new[] { "{}", "[]", "{\"t\":\"image\"}", "{\"t\":\"ping\",\"extra\":0}", "{\"t\":\"ping\",\"t\":\"ping\"}", "{\"t\":\"ping\",}", "{\"t\":\"ping\"} trailing", "{\"t\":\"p\\u00E9ng\"}", "{\"t\":\"ping\",\"日本語\":0}", "{\"ids\":[\"bad\"],\"t\":\"ack\"}",
+            "{\"ids\":[\"+0112233-4455-6677-8899-AABBCCDDEEFF\"],\"t\":\"ack\"}",
+            "{\"ids\":[\"00112233-+455-6677-8899-AABBCCDDEEFF\"],\"t\":\"ack\"}",
+            "{\"ids\":[\"00112233-4455-6677-8899-AABBCCDDEE+F\"],\"t\":\"ack\"}",
+            "{\"ids\":[\" 0112233-4455-6677-8899-AABBCCDDEEFF\"],\"t\":\"ack\"}",
+            "{\"ids\":[\"00112233_4455_6677_8899_AABBCCDDEEFF\"],\"t\":\"ack\"}" })
             Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain(header)));
+        var mixedCaseId = "aAbBcCdD-eEfF-4123-8456-001122334455";
+        var mixedAck = Assert.IsType<SyncAck>(SyncMessageCodec.Decode(Plain($$"""{"t":"ack","ids":["{{mixedCaseId}}"]}""")));
+        Assert.Equal(Guid.Parse(mixedCaseId), Assert.Single(mixedAck.Ids));
         foreach (var at in new[] { "true", "1.0", "1e3", "\"1\"", "9007199254740992", "-9007199254740992", "null" })
             Error(SyncError.Format, () => SyncMessageCodec.Decode(Plain($$"""{"t":"item","kind":"text","id":"{{id}}","from":"pad","at":{{at}}} """)));
         foreach (var at in new[] { -SyncProtocol.MaxTimestamp, 0, SyncProtocol.MaxTimestamp })

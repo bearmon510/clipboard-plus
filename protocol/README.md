@@ -8,9 +8,9 @@
 node protocol/make-test-vectors.mjs
 ```
 
-`test-vectors.json` はQR、版2のHELLO/WELCOME/AUTH、両IDを含むHMAC、方向別の鍵、12個の平文例、7個の暗号フレーム、20/182/512バイト分割、改ざん・巻き戻し・Cc制御文字名等の失敗例を持つ。item / ack / ping / pong / device / offer / chunk / resume、日本語ファイル名、ゼロ幅接合子（`U+200D`）入りファイル名、画像、途中offsetからのchunkを含む。大きい境界例は長さとパターンからテスト内で生成する。
+`test-vectors.json` はQR、版2のHELLO/WELCOME/AUTH、PC ID入り版違い応答（同一PC／別PC／旧全ゼロID）、両IDを含むHMAC、方向別の鍵、12個の平文例、7個の暗号フレーム、20/182/512バイト分割、改ざん・巻き戻し・Cc制御文字名等の失敗例を持つ。item / ack / ping / pong / device / offer / chunk / resume、日本語ファイル名、ゼロ幅接合子（`U+200D`）入りファイル名、画像、途中offsetからのchunkを含む。大きい境界例は長さとパターンからテスト内で生成する。
 
-Swift/C#は同じJSONからQR、認証、HMAC、鍵、平文、暗号文、タグ、パケットのバイト一致を検証する。期待値を製品実装自身から計算しない。失敗後の再利用禁止、厳格な構文、4MiBちょうどの境界も検証する。
+Swift/C#は同じJSONからQR、認証、版違い応答、HMAC、鍵、平文、暗号文、タグ、パケットのバイト一致を検証する。期待値を製品実装自身から計算しない。失敗後の再利用禁止、厳格な構文（標準8-4-4-4-12 UUID表記を含む）、4MiBちょうどの境界も検証する。
 
 ## 共通API
 
@@ -19,8 +19,8 @@ Swiftのプロトコル型はFoundation/CryptoKitで動作する。状態を持�
 | 型 | APIと役割 |
 | --- | --- |
 | SyncPairing | init(pcId:key:name:)、create(name:)、parse、qrString、pcId/key/name。QRの読み書き |
-| SyncPadHandshake | init(pairing:padId:testNonce:) → createHello → acceptWelcome。authを先に送り、keysを使う。padIdという既存名は端末IDを指す |
-| SyncPcHandshake | init(pairing:expectedPadId:testNonce:) → acceptHello → acceptAuth。authenticatedPadIdはAUTH成功後だけ公開 |
+| SyncPadHandshake | init(pairing:padId:testNonce:) → createHello → acceptWelcome。authを先に送り、keysを使う。acceptWelcomeはPC ID（非ゼロかつ組にしたPC ID一致）を版より先に検証 |
+| SyncPcHandshake | init(pairing:expectedPadId:testNonce:) → acceptHello → acceptAuth / createVersionMismatch。authenticatedPadIdはAUTH成功後だけ公開 |
 | SyncSessionKeys | padToPc / pcToPad。HKDFのinfoはclipboardplus v2の方向別文字列 |
 | SyncFrameSender / SyncFrameReceiver | init(key:)、seal / open。AES-256-GCMと単調増加番号 |
 | SyncPacketizer | split(_:packetLimit:)。GATT値上限に分割 |
@@ -40,12 +40,12 @@ C#のメッセージはSyncItem / SyncAck / SyncPing / SyncPong / SyncDevice / S
 | 実装 | 部品 |
 | --- | --- |
 | iOS Core/SyncStorage.swift | SyncPending、SyncDiskStore（未ack・受信途中・受信ID）、SyncEchoGuard（PC受信内容の指紋、異なる内容を読むまで保持） |
-| iOS Services/PCSyncController.swift | 接続と永続キュー、ack優先、進捗、版違いでの停止。pendingCount / transferProgress / requiresPeerUpdate / compatibilityMessageをPublishedで提供 |
+| iOS Services/PCSyncController.swift | 接続と永続キュー、ack優先、進捗、確認済み版違い／HMAC不一致での停止と再接続バックオフ。pendingCount / transferProgress / requiresPeerUpdate / requiresRepair / compatibilityMessageをPublishedで提供 |
 | iOS Core/HistoryStore.swift | 保存済み履歴から送信データを作る。PNG/JPEG以外はPNGへ変換。PCからの項目はatで履歴へ保存 |
 | Windows Core/SyncRepository.cs | 端末別キュー、既知端末、履歴、受信途中、重複記録。原子的JSONと別ファイルの本体 |
-| Windows Core/SyncCoordinator.cs | 認証ID別の配送、進捗、履歴一覧／検索／通知／削除／コピー、状態API。Windows非依存Coreをテストにもリンク |
+| Windows Core/SyncCoordinator.cs | 認証ID別の配送、まとめackキュー、進捗、履歴一覧／検索／通知／削除／コピー、状態API。Windows非依存Coreをテストにもリンク |
 
-offer→resume→chunkを繰り返し、受信者はディスクへ保存した位置だけをresumeする。最後に全体SHA-256を確認し、履歴保存後に項目単位のack。再接続はofferから始める。1台のackで他端末のキューは消さない。端末間の中継はしない。
+offer→resume→chunkを繰り返し、受信者はディスクへ保存した位置だけをresumeする。最後に全体SHA-256を確認し、履歴保存後に項目単位のack（両側とも1通に最大1,024件までまとめる）。添付の60秒応答期限切れは接続を切って再接続でofferからやり直し、同一接続内で未完了の重複offerを受けた場合やresume後に最終chunk送信完了前のackを受けた場合は状態誤り（state）として切断する（offer直後のackは維持）。受信中の複数パケットフレームが進んでいる間は返信の60秒期限で切断せず、受信が止まった場合は組み立て期限で切断する。1台のackで他端末のキューは消さない。端末間の中継はしない。
 
 端末は最後のパケット送受信から30秒でping、キュー投入から10秒以内にpongがなければ再接続。PCだけがpingへpongを返し、pongには返信しない。ack/pong/resumeは次の項目より優先する。GATT値上限はWindowsでmax(20,min(512,MaxPduSize-3))、iOSでmin(512,maximumWriteValueLength)。Windowsの入口上限（全体64件・相手16件）、接続ごとの送信、認証前の制限を維持する。
 

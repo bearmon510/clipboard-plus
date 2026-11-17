@@ -56,8 +56,11 @@ public final class SyncPadHandshake {
         let previous = state; state = -1
         try SyncProtocol.require(previous == 1, .state)
         let frame = Data(input)
-        try SyncHandshakeWire.check(frame, count: 82, type: 2)
-        try SyncProtocol.require(try SyncProtocol.id(frame.subdata(in: 2..<18)) == expectedPcId, .identity)
+        try SyncProtocol.require(frame.count == 82 && frame.first == 2)
+        let peerPcIdBytes = frame.subdata(in: 2..<18)
+        try SyncProtocol.require(peerPcIdBytes != Data(repeating: 0, count: 16), .identity)
+        try SyncProtocol.require(try SyncProtocol.id(peerPcIdBytes) == expectedPcId, .identity)
+        try SyncProtocol.require(frame[1] == SyncProtocol.version, .version)
         let np = frame.subdata(in: 18..<50)
         try SyncHandshakeWire.verify(frame.subdata(in: 50..<82), key: key, label: "pc", ni: ni, np: np, pcId: expectedPcId, padId: padId)
         let result = SyncPadAuthentication(auth: Data([3]) + SyncHandshakeWire.mac(key: key, label: "pad", ni: ni, np: np, pcId: expectedPcId, padId: padId),
@@ -79,6 +82,9 @@ public final class SyncPcHandshake {
     public init(pairing: SyncPairing, expectedPadId: UUID? = nil, testNonce: Data? = nil) throws {
         key = pairing.key; pcId = pairing.pcId; self.expectedPadId = expectedPadId
         np = try SyncProtocol.fixed(testNonce ?? SyncHandshakeWire.randomNonce(), 32)
+    }
+    public func createVersionMismatch() -> Data {
+        Data([2, SyncProtocol.version]) + SyncProtocol.idBytes(pcId) + Data(repeating: 0, count: 64)
     }
     public func acceptHello(_ input: Data) throws -> Data {
         let previous = state; state = -1; authenticatedPadId = nil
