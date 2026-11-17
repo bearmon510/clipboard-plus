@@ -70,19 +70,19 @@ node scripts/invoke-codex.mjs --mode review --task-file "C:/path/to/task.txt"
 利用者はモデルの選択をClaudeに一任している。タスクごとに `--model` と `--effort` を指定する。
 
 ```sh
-node scripts/invoke-codex.mjs --mode implement --model gpt-6.1-sol --effort high --task-file "C:/path/to/task.txt"
+node scripts/invoke-codex.mjs --mode implement --model gpt-6.2-sol --effort high --task-file "C:/path/to/task.txt"
 ```
 
 | 作業 | モデル | effort |
 | --- | --- | --- |
 | 接続確認、誤記の確認、数行の修正、定型的な検査 | `gpt-6.1-terra` | low〜medium |
-| 通常の実装、差分のレビュー | `gpt-6.1-sol` | medium〜high |
-| 設計判断、原因の分からない不具合、複数ファイルにまたがる変更、重要な変更の最終レビュー | `gpt-6-astra` | high |
+| 通常の実装、差分のレビュー | `gpt-6.2-sol` | medium〜high |
+| 設計判断、原因の分からない不具合、複数ファイルにまたがる変更、重要な変更の最終レビュー | `gpt-6.2-astra` | high |
 
 - `xhigh` 以上は、一段低い指定で解けなかったときに使う。
 - 実装とそのレビューは、できれば別のモデルに依頼する。
 - 指定を省くとCodexの既定設定（2026年11月14日時点で `gpt-6.1-terra`、effortはhigh）で動く。
-- モデル名は2026年11月14日にCodexのモデル一覧で確認した。モデルが見つからないエラーが出たら `~/.codex/models_cache.json` の `slug` を確認する。
+- SolとAstraは6.2を使う（利用者の判断、2026年11月18日）。6.2はCodex CLI 0.169.0から使える（0.164.0では「Model metadata not found」となり、サーバーにも断られた）。Terraは6.2がまだないので6.1のまま。モデル名は2026年11月18日にCodexのモデル一覧で確認した。モデルが見つからないエラーが出たら `~/.codex/models_cache.json` の `slug` を確認する。
 
 ### 利用制限に達したとき
 
@@ -93,7 +93,7 @@ node scripts/invoke-codex.mjs --mode implement --model gpt-6.1-sol --effort high
 - implementモードが再開された場合、完了後の差分に重複や抜けがないか確認する。セッションの再開でも、操作が一度だけ実行される保証はない。
 - implementモードのセッションはCodexの履歴に保存される。reviewモードは保存しない。
 - 制限の判定は、出力の末尾にCodex自身のエラーとして出た場合に限っている。出力に制限のメッセージがあるのにスクリプトが待たずに失敗した場合は、解除時刻を読んで手動で実行し直す。
-- 実際に制限へ達した状態での動作は未確認。メッセージの形式はCodex 0.164.0の実行ファイルから読み取り、待機と再開は模擬のCodexで確認した。
+- 実際に制限へ達した状態での動作は未確認。メッセージの形式はCodex 0.164.0の実行ファイルから読み取り（0.169.0でも同じ文言を確認。モデルごとの制限「hit your usage limit for（モデル名）」も同じ先頭で始まる）、待機と再開は模擬のCodexで確認した。
 - 待機中にPCがスリープするとその間は進まず、復帰後に続行する。VS Codeを閉じると再開されない。
 - 待機させたくないときは `--no-wait` を付ける。制限に達していれば、すぐ終了コード75で終わる。
 
