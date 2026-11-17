@@ -319,7 +319,7 @@ final class ClipboardMonitorCopyTests: XCTestCase {
     }
 
     @MainActor
-    func testBackgroundPollHeartbeatIsThrottledAndAbsentWhileActive() throws {
+    func testBackgroundPollingDoesNotReadAndActivationCollectsOnlyLatestCopy() throws {
         let root = try ImageTestSupport.directory(self)
         let url = root.appendingPathComponent("history.sqlite")
         let pasteboard = TestClipboardPasteboard()
@@ -328,19 +328,42 @@ final class ClipboardMonitorCopyTests: XCTestCase {
         monitor.start()
         defer { monitor.stop() }
         monitor.updateScene("active")
-        monitor.pollPasteboard()
-        XCTAssertFalse(monitor.log.lines.contains { $0.primaryText.contains("裏での定期確認") })
         monitor.updateScene("background")
+        pasteboard.string = "earlier copy"
         monitor.pollPasteboard()
+        pasteboard.setData(ImageTestSupport.png(), forPasteboardType: "public.png")
         monitor.pollPasteboard()
-        let heartbeat = monitor.log.lines.filter { $0.primaryText.contains("裏での定期確認") }
-        XCTAssertEqual(heartbeat.count, 1)
-        XCTAssertTrue(heartbeat.first?.secondaryText.contains("scene=background") == true)
-        XCTAssertTrue(heartbeat.first?.secondaryText.contains("changeCount=0") == true)
+        pasteboard.string = "latest copy"
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertTrue(monitor.entries.isEmpty)
+        XCTAssertEqual(pasteboard.stringReadCount, 0)
+        XCTAssertEqual(pasteboard.imageReadCount, 0)
+        XCTAssertEqual(pasteboard.dataReadCount, 0)
+        XCTAssertFalse(monitor.log.lines.contains { $0.primaryText.contains("定期確認での検知") })
+        XCTAssertTrue(monitor.isRecording)
         monitor.updateScene("active")
         monitor.pollPasteboard()
-        XCTAssertEqual(monitor.log.lines.filter { $0.primaryText.contains("裏での定期確認") }.count, 1)
         drain(monitor)
+        XCTAssertEqual(monitor.entries.map(\.text), ["latest copy"])
+        XCTAssertEqual(monitor.entries.first?.collectionCount, 1)
+    }
+
+    @MainActor
+    func testPollingCollectsWhileSceneIsInactive() throws {
+        let root = try ImageTestSupport.directory(self)
+        let url = root.appendingPathComponent("history.sqlite")
+        let pasteboard = TestClipboardPasteboard()
+        let monitor = try self.monitor(root: root, pasteboard: pasteboard) { try HistoryDatabase(url: url) }
+        drain(monitor)
+        monitor.start()
+        defer { monitor.stop() }
+        monitor.updateScene("active")
+        monitor.updateScene("inactive")
+        pasteboard.string = "copy while visible"
+        monitor.pollPasteboard()
+        drain(monitor)
+        XCTAssertEqual(monitor.entries.map(\.text), ["copy while visible"])
     }
 
     @MainActor
@@ -352,20 +375,20 @@ final class ClipboardMonitorCopyTests: XCTestCase {
         drain(monitor)
         monitor.start()
         defer { monitor.stop() }
-        monitor.updateScene("background")
+        monitor.updateScene("inactive")
         pasteboard.extraTypes = ["public.utf8-plain-text"]
         pasteboard.reportsStrings = true
         pasteboard.string = nil
         monitor.pollPasteboard()
         let nilRead = try XCTUnwrap(monitor.log.lines.last { $0.primaryText.contains("取得できず・原因未確定") })
-        XCTAssertTrue(nilRead.secondaryText.contains("scene=background"))
+        XCTAssertTrue(nilRead.secondaryText.contains("scene=inactive"))
         XCTAssertTrue(nilRead.secondaryText.contains("hasStrings=true; string=nil=true; 形式一覧が空=false"))
         pasteboard.extraTypes = []
         pasteboard.reportsStrings = false
         pasteboard.string = nil
         monitor.pollPasteboard()
         let emptyTypes = try XCTUnwrap(monitor.log.lines.last { $0.primaryText.contains("文章以外のため読み取らず") })
-        XCTAssertTrue(emptyTypes.secondaryText.contains("scene=background"))
+        XCTAssertTrue(emptyTypes.secondaryText.contains("scene=inactive"))
         XCTAssertTrue(emptyTypes.secondaryText.contains("hasStrings=false; string=nil=true; 形式一覧が空=true"))
         drain(monitor)
     }

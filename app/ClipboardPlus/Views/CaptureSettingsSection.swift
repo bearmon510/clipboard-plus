@@ -1,11 +1,8 @@
 import SwiftUI
 import UIKit
 
-/// Settings for the capture mode: opening it from an iPad screenshot, and how direct capture behaves.
-/// The 0.9.0 "instant" capture was dropped after device testing, because iPadOS asked for
-/// permission every time.
+/// Settings for opening the capture mode from an iPad screenshot.
 struct CaptureSettingsSection: View {
-    @ObservedObject var screenCapture: ScreenCaptureController
     @ObservedObject var screenshots: ScreenshotWatcher
     @AppStorage(CaptureSettings.screenshotModeKey) private var screenshotMode = CaptureMode.text.rawValue
     @State private var deleteMessage: String?
@@ -102,9 +99,6 @@ struct CaptureSettingsSection: View {
 enum CaptureSettings {
     /// Which mode the capture screen starts in when opened from a screenshot.
     static let screenshotModeKey = "screenshotCaptureMode"
-    /// Taking the screen directly (ScreenCaptureKit) is hidden since 0.11.0, like PiP: the
-    /// shortcut with a screenshot became the main route. Off unless turned on for development.
-    static let directCaptureKey = "directCaptureEnabled"
 
     static func screenshotMode(_ defaults: UserDefaults = .standard) -> CaptureMode {
         defaults.string(forKey: screenshotModeKey).flatMap(CaptureMode.init(rawValue:)) ?? .text

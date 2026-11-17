@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Puts the templates of one tag in the order the user wants, which is also the order of 順に貼る.
+/// Puts the templates of one tag in the order the user wants.
 /// A list of its own, because the cards themselves drag out to other apps.
 struct TemplateOrderView: View {
     @Environment(\.dismiss) private var dismiss
@@ -23,7 +23,7 @@ struct TemplateOrderView: View {
                     }
                     .onMove { items.move(fromOffsets: $0, toOffset: $1) }
                 } footer: {
-                    Text("右端のつまみをドラッグして並べ替えます。「順に貼る」もこの順で貼ります。")
+                    Text("右端のつまみをドラッグして並べ替えます。")
                 }
             }
             .environment(\.editMode, .constant(.active))

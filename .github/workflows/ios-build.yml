@@ -76,8 +76,7 @@ jobs:
             -derivedDataPath DerivedData \
             CODE_SIGNING_ALLOWED=NO
 
-      # The device SDK can differ from the simulator SDK: in iOS 27.1 several
-      # ScreenCaptureKit settings compile for the simulator but not for a device.
+      # APIs can differ between the device SDK and the simulator SDK.
       # This catches that before a TestFlight upload does.
       - name: Build for a device without signing
         working-directory: app

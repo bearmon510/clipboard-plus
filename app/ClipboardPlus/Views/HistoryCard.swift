@@ -10,10 +10,6 @@ struct HistoryCard<Actions: View>: View {
     let isCopied: Bool
     let onCopy: () -> Void
     let dragProvider: () -> NSItemProvider
-    /// The place in the sequential paste, counted from 1, when the item is queued.
-    var queueNumber: Int? = nil
-    /// Whether this item is the one on the clipboard for the sequential paste right now.
-    var isQueueCurrent = false
     @ViewBuilder let actions: () -> Actions
 
     @State private var freshness: Double = 0
@@ -251,16 +247,6 @@ struct HistoryCard<Actions: View>: View {
                     .accessibilityLabel("\(entry.collectionCount)回コピー")
             }
             Spacer(minLength: 0)
-            if let queueNumber {
-                Text("\(queueNumber)")
-                    .font(.caption2.weight(.bold).monospacedDigit())
-                    .foregroundStyle(isQueueCurrent ? Color.white : Theme.accent)
-                    .frame(minWidth: 20, minHeight: 20)
-                    .padding(.horizontal, 2)
-                    .background(isQueueCurrent ? Theme.accent : Theme.accent.opacity(0.15), in: Capsule())
-                    .accessibilityLabel(isQueueCurrent ? "連続貼り付けの\(queueNumber)番目、コピー中"
-                                                       : "連続貼り付けの\(queueNumber)番目")
-            }
         }
         .font(.caption)
         .foregroundStyle(.secondary)

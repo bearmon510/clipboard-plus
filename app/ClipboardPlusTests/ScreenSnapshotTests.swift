@@ -22,6 +22,18 @@ final class ScreenSnapshotTests: XCTestCase {
     private static let narrow = CGSize(width: 360, height: 780)
     private static let wide = CGSize(width: 1_024, height: 768)
 
+    /// The first-run guide would otherwise open over every main screen.
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(true, forKey: WelcomeView.shownKey)
+    }
+
+    @MainActor
+    func testRenderWelcome() throws {
+        try save(render(WelcomeView(), size: Self.narrow, style: .light), "welcome-narrow-light")
+        try save(render(WelcomeView(), size: Self.wide, style: .dark), "welcome-wide-dark")
+    }
+
     @MainActor
     func testRenderMainScreens() throws {
         let monitor = try makeMonitor(populated: true)
@@ -56,18 +68,12 @@ final class ScreenSnapshotTests: XCTestCase {
     }
 
     @MainActor
-    func testRenderTemplatesAndPasteQueue() throws {
+    func testRenderTemplateEditorAndOrder() throws {
         let monitor = try makeMonitor(populated: true)
         monitor.start()
         defer { monitor.stop() }
         let groups = TemplateGroups.make(monitor.entries, search: "")
         let mail = try XCTUnwrap(groups.first { $0.tag == "メール" })
-        for entry in mail.entries where entry.kind == .text || entry.kind == .url {
-            monitor.enqueueForPaste(entry)
-        }
-        try save(render(ContentView(monitor: monitor, log: monitor.log, initialPane: .templates, initialOpenTags: ["メール"]),
-                        size: Self.narrow, style: .light), "queue-narrow-light")
-        try save(render(ContentView(monitor: monitor, log: monitor.log), size: Self.wide, style: .dark), "queue-wide-dark")
         let tags = TemplateGroups.tags(monitor.entries)
         let editing = try XCTUnwrap(mail.entries.first)
         try save(render(EntryEditorView(monitor: monitor, mode: .edit(editing), tags: tags) { _ in },

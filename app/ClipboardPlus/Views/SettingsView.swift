@@ -4,12 +4,9 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
-    @ObservedObject var pictureInPicture: PictureInPictureController
-    let screenCapture: ScreenCaptureController
     let screenshots: ScreenshotWatcher
     @State private var showLogs = false
     @State private var showDeveloperSettings = false
-    @AppStorage(CaptureSettings.directCaptureKey) private var directCaptureEnabled = false
     @State private var export: ExportSnapshot?
     @State private var exportedURL: URL?
     @State private var shareError: String?
@@ -34,7 +31,7 @@ struct SettingsView: View {
                     Text("0.1〜5.0秒。間隔と記録の状態は、アプリを開き直しても保持します。")
                         .font(.footnote)
                 }
-                CaptureSettingsSection(screenCapture: screenCapture, screenshots: screenshots)
+                CaptureSettingsSection(screenshots: screenshots)
                 Section("履歴の保存") {
                     Picker("自動削除", selection: Binding(
                         get: { monitor.historyRetention },
@@ -59,7 +56,7 @@ struct SettingsView: View {
                 }
                 Section("自動収集について") {
                     Text("他のアプリからのペースト許可が求められる場合があります。記録は初期状態で動いています。アプリの起動前や一時停止中からクリップボードにある内容は、自動では読みません。その内容を保存するには、絞り込みの右にあるペーストのボタンを使ってください。")
-                    Text("確認の間に複数回コピーされると、途中の内容は取り戻せません。通常は、clipboard+の小窓を隠している間や別のアプリを全画面で使っている間は収集せず、戻ったときに最後の1件だけ取り込みます。")
+                    Text("確認の間に複数回コピーされると、途中の内容は取り戻せません。clipboard+の小窓を隠している間や別のアプリを全画面で使っている間は収集せず、戻ったときに最後の1件だけ取り込みます。")
                     Text("同じ原文は1項目にまとめ、最後に収集した時刻と回数を更新します。履歴をコピーした直後の読み取りは更新しません。")
                     Text("自動収集では、秘密・一時的・自動生成の印が付いた内容は読まずに保存を見送ります。")
                     Text("印のない秘密情報は判別できないため、必要に応じて記録を停止し、保存済みの履歴を削除してください。")
@@ -86,39 +83,6 @@ struct SettingsView: View {
                 BackupSection(backup: monitor.backup)
                 Section {
                     DisclosureGroup("開発者向け", isExpanded: $showDeveloperSettings) {
-                        Toggle(isOn: Binding(
-                            get: { pictureInPicture.isEnabled },
-                            set: { pictureInPicture.setEnabled($0) }
-                        )) {
-                            Text("PiPで裏でも収集（試験的）")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(minHeight: 44)
-                        .disabled(!pictureInPicture.isSupported)
-                        Toggle(isOn: Binding(
-                            get: { pictureInPicture.automaticallyStarts },
-                            set: { pictureInPicture.setAutomaticallyStarts($0) }
-                        )) {
-                            Text("離れたら自動でPiPを出す")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(minHeight: 44)
-                        .disabled(!pictureInPicture.isSupported)
-                        if !pictureInPicture.isSupported {
-                            Text("この端末ではPiPを使えません。").font(.footnote)
-                        }
-                        Text("オンかつ記録中なら、離れたときにPiPで収集を続けられます。小窓には状態だけを表示し、電池を使います。")
-                            .font(.footnote)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Toggle(isOn: $directCaptureEnabled) {
-                            Text("画面を直接取り込んで切り取る（試験的）")
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(minHeight: 44)
-                        .disabled(!screenCapture.isSupported)
-                        Text("オンにすると、上に「文字」「画像」のボタンが出ます。画面の録画で今の画面を取り込みます。最初に許可が要り、最後の切り取りから5分たつか、clipboard+を隠すまで取り込みを続けます。")
-                            .font(.footnote)
-                            .fixedSize(horizontal: false, vertical: true)
                         Button("計測ログ", systemImage: "doc.text") { showLogs = true }
                             .frame(minHeight: 44)
                         Toggle(isOn: $log.includeTextPreview) {

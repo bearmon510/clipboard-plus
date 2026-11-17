@@ -24,13 +24,12 @@ struct CaptureSource: Identifiable {
     }
 }
 
-/// Hands a request from Shortcuts, Siri or Control Center to the screen. The intents run in the
-/// app's process. `source` is a picture to cut out; without one, the screen is taken directly.
+/// Hands a picture from Shortcuts or Siri to the screen. The intents run in the app's process.
 @MainActor
 final class CaptureInbox: ObservableObject {
     struct Request: Identifiable {
         let id = UUID()
-        let source: CaptureSource?
+        let source: CaptureSource
         /// nil uses the mode chosen in settings.
         let mode: CaptureMode?
     }
@@ -40,10 +39,6 @@ final class CaptureInbox: ObservableObject {
 
     func open(_ source: CaptureSource, mode: CaptureMode?) {
         request = Request(source: source, mode: mode)
-    }
-
-    func startDirect(_ mode: CaptureMode) {
-        request = Request(source: nil, mode: mode)
     }
 }
 

@@ -8,9 +8,6 @@ struct ContentView: View {
     /// Not observed as a whole: every log line would otherwise redraw this screen.
     let log: MeasurementLog
     @State private var logHasError = false
-    @StateObject private var pictureInPicture: PictureInPictureController
-    /// Hidden behind the developer settings since 0.11.0; see `CaptureSettings.directCaptureKey`.
-    @AppStorage(CaptureSettings.directCaptureKey) private var directCaptureEnabled = false
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
     @State private var searchText: String
@@ -31,16 +28,14 @@ struct ContentView: View {
     @State private var copiedID: Int?
     @State private var copiedTask: Task<Void, Never>?
     @State private var isDropTargeted = false
-    @StateObject private var screenCapture: ScreenCaptureController
     @StateObject private var screenshots: ScreenshotWatcher
     @State private var capture: CaptureRequest?
-    /// The mode whose button is waiting for a picture of the screen.
-    @State private var capturePending: CaptureMode?
     @State private var showCaptureGuide = false
+    /// The first-run guide. It opens by itself until it has been closed once.
+    @State private var showWelcome = false
+    @AppStorage(WelcomeView.shownKey) private var welcomeShown = false
     /// A capture waiting for an open sheet to finish closing. Opened from the sheet's onDismiss.
     @State private var queuedCapture: CaptureRequest?
-    /// A direct capture asked for from outside, waiting for the app to be active and uncovered.
-    @State private var queuedDirectMode: CaptureMode?
     /// The writing sheet: a new template, or a change to a template.
     @State private var editor: EntryEditorView.Mode?
 
@@ -59,8 +54,6 @@ struct ContentView: View {
          initialOpenTags: Set<String> = []) {
         self.monitor = monitor
         self.log = log
-        _pictureInPicture = StateObject(wrappedValue: PictureInPictureController(monitor: monitor))
-        _screenCapture = StateObject(wrappedValue: ScreenCaptureController(log: log))
         _screenshots = StateObject(wrappedValue: ScreenshotWatcher(log: log))
         _searchText = State(initialValue: initialSearch)
         _pane = State(initialValue: initialPane)
@@ -72,7 +65,7 @@ struct ContentView: View {
 
     /// Any sheet over the history. A capture from outside waits for it to close.
     private var isPresentingSheet: Bool {
-        showSettings || showCaptureGuide || detailEntry != nil || editor != nil
+        showSettings || showCaptureGuide || showWelcome || detailEntry != nil || editor != nil
             || reorderGroup != nil || renamingGroup != nil
     }
 
@@ -81,6 +74,7 @@ struct ContentView: View {
     private func closeSheets() {
         showSettings = false
         showCaptureGuide = false
+        showWelcome = false
         detailEntry = nil
         editor = nil
         reorderGroup = nil
@@ -90,6 +84,10 @@ struct ContentView: View {
     var body: some View {
         screen
             .sheet(isPresented: $showCaptureGuide, onDismiss: presentQueuedCapture) { CaptureGuideView() }
+            .sheet(isPresented: $showWelcome, onDismiss: {
+                welcomeShown = true
+                presentQueuedCapture()
+            }) { WelcomeView() }
             .fullScreenCover(item: $capture) { request in
                 CaptureView(
                     source: request.source,
@@ -99,34 +97,27 @@ struct ContentView: View {
                     onText: { text in
                         guard capture?.id == request.id else { return }
                         monitor.saveCaptured(text: text)
-                        screenCapture.noteCaptureUsed()
                         if let id = request.screenshotID { screenshots.markUsed(id) }
                         showToast("文字をコピーしました：" + Self.toastPreview(text))
                     },
                     onImage: { data in
                         guard capture?.id == request.id else { return }
                         monitor.saveCaptured(pngData: data)
-                        screenCapture.noteCaptureUsed()
                         if let id = request.screenshotID { screenshots.markUsed(id) }
                         showToast("画像をコピーしました")
                     },
                     onClose: { if capture?.id == request.id { capture = nil } }
                 )
             }
-            // Shortcuts, Siri and Control Center deliver here: a screenshot to cut out, or a
-            // request to take the screen directly.
+            // Shortcuts and Siri deliver a screenshot or image to cut out here.
             .onReceive(CaptureInbox.shared.$request) { request in
                 guard let request else { return }
                 // As below, clear it on the next turn, because @Published stores it after announcing.
                 DispatchQueue.main.async {
                     if CaptureInbox.shared.request?.id == request.id { CaptureInbox.shared.request = nil }
                 }
-                if let source = request.source {
-                    openFromOutside(CaptureRequest(source: source,
-                                                   mode: request.mode ?? CaptureSettings.screenshotMode()))
-                } else if let mode = request.mode {
-                    startFromOutside(mode)
-                }
+                openFromOutside(CaptureRequest(source: request.source,
+                                               mode: request.mode ?? CaptureSettings.screenshotMode()))
             }
             // An iPad screenshot, picked up from Photos when that experiment is on.
             .onReceive(screenshots.$delivered) { delivered in
@@ -159,43 +150,28 @@ struct ContentView: View {
             monitor.receiveDropped(providers, receivedAt: Date())
         }
         .onAppear {
-            // The instant (burst) capture asked for permission every time on device, so
-            // anyone who chose it in 0.9.0 goes back to continuous capture.
-            screenCapture.setStrategy(.continuous)
             updateScene(scenePhase)
             monitor.pendingDeletion { showUndo($0) }
+            if !welcomeShown { showWelcome = true }
         }
         .onChange(of: scenePhase) { _, phase in
             updateScene(phase)
             // A capture queued behind a sheet is dropped when the app leaves the screen.
             if phase == .background {
                 queuedCapture = nil
-                queuedDirectMode = nil
             }
             if phase == .active {
                 monitor.pendingDeletion { showUndo($0) }
-                // Marks the system permission screen going away, so that the first capture
-                // after approval shows the screen rather than the permission dialog.
-                screenCapture.sceneDidActivate()
             }
             // Only leaving the screen stops it: a side window turns inactive whenever
             // another app is touched, and the system picker does the same.
-            screenCapture.sceneDidChange(isActive: phase != .background)
             screenshots.sceneDidChange(isActive: phase != .background)
-            // After the capture side has heard that the scene is active, or it would refuse.
-            if phase == .active { startQueuedDirectCapture() }
         }
         // The badge belongs to the list the user tapped in, so it goes with that list.
         .onChange(of: pane) { _, _ in clearCopied() }
-        .onChange(of: directCaptureEnabled) { _, enabled in
-            guard !enabled else { return }
-            queuedDirectMode = nil
-            screenCapture.stop(reason: "開発者向けの設定でオフ")
-        }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings, onDismiss: presentQueuedCapture) {
-            SettingsView(monitor: monitor, log: log, pictureInPicture: pictureInPicture,
-                         screenCapture: screenCapture, screenshots: screenshots)
+            SettingsView(monitor: monitor, log: log, screenshots: screenshots)
         }
         .sheet(item: $detailEntry, onDismiss: presentQueuedCapture) { entry in detail(entry) }
         .sheet(item: $editor, onDismiss: presentQueuedCapture) { mode in
@@ -235,12 +211,6 @@ struct ContentView: View {
             // Priority lets the field take the width first; the spacer only fills a wide window.
             searchField.frame(maxWidth: 560).layoutPriority(1)
             Spacer(minLength: 4)
-            if directCaptureEnabled {
-                captureButton(.text)
-                captureButton(.image)
-            }
-            // PiP is set aside. Its button appears only when turned on under 開発者向け.
-            if pictureInPicture.isSupported && pictureInPicture.isEnabled { pictureInPictureButton }
             moreMenu
         }
         .padding(.leading, 12)
@@ -275,75 +245,6 @@ struct ContentView: View {
         .background(Theme.field, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 
-    /// Icon over a short word, so that the two capture buttons read clearly in a narrow window.
-    private func captureButton(_ mode: CaptureMode) -> some View {
-        let waiting = capturePending == mode
-        return Button {
-            startCapture(mode)
-        } label: {
-            VStack(spacing: 1) {
-                ZStack {
-                    if waiting {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: mode.symbolName).font(.body.weight(.semibold))
-                    }
-                }
-                .frame(height: 22)
-                Text(mode.title).font(.caption2.weight(.semibold))
-            }
-            .foregroundStyle(Theme.accent)
-            .frame(width: 46, height: 44)
-            .overlay(alignment: .topTrailing) {
-                // Shows that the screen is being taken in, so that it is never a secret.
-                if screenCapture.state == .running {
-                    Circle().fill(Color.green).frame(width: 7, height: 7).offset(x: -6, y: 3)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(capturePending != nil)
-        .accessibilityLabel(mode == .text ? "文字で切り取る" : "画像で切り取る")
-        .accessibilityHint("画面を止めて範囲を選ぶと、クリップボードにコピーします")
-    }
-
-    /// The button is a tiny screen. Once PiP is on, the live picture that feeds the
-    /// PiP window sits inside it, which AVKit needs to stay visible in the window.
-    private var pictureInPictureButton: some View {
-        Button {
-            pictureInPicture.togglePictureInPicture()
-        } label: {
-            ZStack {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(pictureInPicture.isEnabled ? Color.black : Theme.field)
-                if pictureInPicture.isEnabled {
-                    PictureInPicturePreview(displayLayer: pictureInPicture.displayLayer,
-                                            onReadinessChanged: pictureInPicture.sourceReadinessChanged)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-                if pictureInPicture.isStarting && !pictureInPicture.isActive {
-                    ProgressView().controlSize(.mini).tint(Color.white)
-                } else {
-                    Image(systemName: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(pictureInPicture.isEnabled ? Color.white : Theme.accent)
-                }
-            }
-            .frame(width: 40, height: 22.5)
-            .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .strokeBorder(pictureInPicture.isActive ? Theme.accent : Color.primary.opacity(0.15),
-                              lineWidth: pictureInPicture.isActive ? 2 : 1))
-            .frame(width: 46, height: 44)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(pictureInPicture.isStarting && !pictureInPicture.isActive)
-        .accessibilityLabel(pictureInPicture.isActive ? "PiPを終了" : "PiPを開始")
-        .accessibilityHint(pictureInPicture.isActive ? "小窓を閉じます。記録は続きます。" : "小窓を出して、ほかのアプリを使っている間も収集します。")
-    }
-
     private var moreMenu: some View {
         Menu {
             if monitor.isRecording {
@@ -351,13 +252,8 @@ struct ContentView: View {
             } else {
                 Button("記録を再開", systemImage: "play") { monitor.start() }
             }
-            if screenCapture.state != .idle && screenCapture.state != .unsupported {
-                Button("画面の取り込みを止める", systemImage: "stop.circle") {
-                    screenCapture.stop(reason: "メニューから停止")
-                }
-            }
             Button("テンプレートを書く", systemImage: "square.and.pencil") { editor = .create(tag: nil) }
-            Button("切り取りの使い方", systemImage: "questionmark.circle") { showCaptureGuide = true }
+            Button("使い方", systemImage: "questionmark.circle") { showWelcome = true }
             Button("設定", systemImage: "gearshape") { showSettings = true }
             Button("履歴を全消去…", systemImage: "trash", role: .destructive) {
                 confirmHistoryClear = true
@@ -377,12 +273,6 @@ struct ContentView: View {
     private var statusStrip: some View {
         VStack(spacing: 6) {
             if !monitor.isRecording { pausedBanner }
-            if pictureInPicture.isStarting && !pictureInPicture.isActive {
-                statusRow("PiPを準備中です", symbol: "pip", tint: Color.secondary)
-            }
-            if let message = pictureInPicture.failureMessage {
-                statusRow(message, symbol: "exclamationmark.triangle.fill", tint: Color.red)
-            }
             if let error = monitor.storageError {
                 statusRow(error, symbol: "exclamationmark.triangle.fill", tint: Color.red)
             }
@@ -511,8 +401,8 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Keeps the last card clear of the undo bar and the sequential paste bar.
-    private var bottomClearance: CGFloat { monitor.pasteQueue.entryIDs.isEmpty ? 96 : 220 }
+    /// Keeps the last card clear of the undo bar.
+    private var bottomClearance: CGFloat { 96 }
 
     @ViewBuilder
     private func historyList(_ entries: [HistoryEntry], now: Date, columnCount: Int) -> some View {
@@ -583,9 +473,7 @@ struct ContentView: View {
     }
 
     private func card(_ entry: HistoryEntry, timeLabel: String) -> some View {
-        let queue = monitor.pasteQueue
-        let place = queue.entryIDs.firstIndex(of: entry.id)
-        return HistoryCard(
+        HistoryCard(
             entry: entry,
             thumbnailURL: entry.image.map { monitor.imageURL($0, thumbnail: true) },
             timeLabel: timeLabel,
@@ -593,8 +481,6 @@ struct ContentView: View {
             isCopied: copiedID == entry.id,
             onCopy: { copy(entry) },
             dragProvider: { monitor.rowProvider(entry) },
-            queueNumber: place.map { $0 + 1 },
-            isQueueCurrent: place != nil && queue.isRunning && !queue.isPaused && queue.currentIndex == place,
             actions: { rowActions(entry) }
         )
     }
@@ -630,13 +516,11 @@ struct ContentView: View {
     }
 
     private func templateHeader(_ group: TemplateGroup, isOpen: Bool, groupCount: Int) -> some View {
-        let pastable = group.entries.filter { $0.kind == .text || $0.kind == .url }
-        return HStack(spacing: 2) {
+        HStack(spacing: 2) {
             Button {
                 toggle(group, groupCount: groupCount)
             } label: {
                 HStack(spacing: 8) {
-                    // On the left, so it stays in one place whether or not 順に貼る is shown.
                     Image(systemName: "chevron.right")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(.tertiary)
@@ -663,19 +547,6 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .accessibilityHint(isOpen ? "たたみます" : "開いて中身を表示します")
-            if pastable.count > 1 {
-                Button {
-                    monitor.pasteInOrder(pastable)
-                } label: {
-                    Label("順に貼る", systemImage: "list.number")
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                }
-                .buttonStyle(.bordered)
-                .buttonBorderShape(.capsule)
-                .controlSize(.small)
-                .accessibilityHint("中の文章とリンクを、この順で連続貼り付けに並べて始めます")
-            }
             Menu {
                 Button("このタグで書く", systemImage: "square.and.pencil") { editor = .create(tag: group.tag) }
                 // The whole group, even while a search hides part of it.
@@ -738,15 +609,6 @@ struct ContentView: View {
             Button("編集…", systemImage: "pencil") { editor = .edit(entry) }
         } else {
             Button("テンプレートに移動", systemImage: "square.stack") { moveToTemplates(entry) }
-        }
-        if entry.kind == .text || entry.kind == .url {
-            if monitor.pasteQueue.entryIDs.contains(entry.id) {
-                Button("連続貼り付けから外す", systemImage: "minus.circle") {
-                    monitor.removeFromPasteQueue(id: entry.id)
-                }
-            } else {
-                Button("連続貼り付けに追加", systemImage: "text.badge.plus") { monitor.enqueueForPaste(entry) }
-            }
         }
         Divider()
         Button("削除", systemImage: "trash", role: .destructive) {
@@ -872,18 +734,6 @@ struct ContentView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .allowsHitTesting(false)
             }
-            if !monitor.pasteQueue.entryIDs.isEmpty {
-                let queue = monitor.pasteQueue
-                PasteQueueBar(
-                    state: queue,
-                    entries: queue.entryIDs.compactMap { id in monitor.entries.first { $0.id == id } },
-                    onStart: { monitor.startPasteQueue() },
-                    onNext: { monitor.advancePasteQueue() },
-                    onBack: { monitor.rewindPasteQueue() },
-                    onStop: { monitor.stopPasteQueue() }
-                )
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
             if let deletion {
                 undoBar(deletion)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -893,7 +743,6 @@ struct ContentView: View {
         .padding(.bottom, 10)
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: toast)
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: deletion)
-        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: monitor.pasteQueue.entryIDs.isEmpty)
     }
 
     private func undoBar(_ deletion: HistoryDeletion) -> some View {
@@ -947,39 +796,11 @@ struct ContentView: View {
         }
     }
 
-    /// Freezes the screen and opens the capture mode. Without ScreenCaptureKit, explains the
-    /// screenshot route instead.
-    private func startCapture(_ mode: CaptureMode) {
-        guard capturePending == nil else { return }
-        guard screenCapture.isSupported else {
-            showCaptureGuide = true
-            return
-        }
-        capturePending = mode
-        screenCapture.requestFrame { result in
-            capturePending = nil
-            switch result {
-            case .success(let image):
-                // Something else may have opened while the screen was being taken in.
-                guard capture == nil, queuedCapture == nil else { return }
-                capture = CaptureRequest(source: CaptureSource(image: image), mode: mode)
-            case .failure(.unsupported):
-                showCaptureGuide = true
-            case .failure(.declined):
-                showToast("画面の取り込みが許可されませんでした")
-            case .failure(.timeout):
-                showToast("画面を取り込めませんでした。もう一度お試しください")
-            case .failure(.failed):
-                showToast("画面を取り込めませんでした")
-            }
-        }
-    }
-
     /// Opens a picture that arrived from outside the screen: a shortcut or a screenshot.
-    /// Nothing replaces a capture already on screen or one being taken in. When a sheet is
+    /// Nothing replaces a capture already on screen. When a sheet is
     /// open, the picture waits until that sheet has finished closing.
     private func openFromOutside(_ request: CaptureRequest) {
-        guard capture == nil, capturePending == nil else { return }
+        guard capture == nil else { return }
         guard isPresentingSheet else {
             queuedCapture = nil
             capture = request
@@ -987,55 +808,15 @@ struct ContentView: View {
         }
         // Only the newest arrival waits; an older one is simply replaced.
         queuedCapture = request
-        queuedDirectMode = nil
         closeSheets()
     }
 
     /// Called when a sheet has finished closing.
     private func presentQueuedCapture() {
-        if let request = queuedCapture {
-            queuedCapture = nil
-            guard capture == nil else { return }
-            capture = request
-            return
-        }
-        startQueuedDirectCapture()
-    }
-
-    /// Starts taking the screen for Shortcuts, Siri or Control Center. The app has usually just
-    /// come to the front, so this waits until it is active and no sheet covers it.
-    private func startFromOutside(_ mode: CaptureMode) {
-        guard capture == nil, capturePending == nil else { return }
-        // A shortcut or control made in 0.10.0 may still ask for the hidden direct capture.
-        guard directCaptureEnabled else {
-            openFromOutsideGuide()
-            return
-        }
+        guard let request = queuedCapture else { return }
         queuedCapture = nil
-        queuedDirectMode = mode
-        if isPresentingSheet {
-            closeSheets()
-            return
-        }
-        startQueuedDirectCapture()
-    }
-
-    /// Explains the screenshot shortcut instead, unless something else already covers the screen.
-    private func openFromOutsideGuide() {
-        guard !isPresentingSheet else { return }
-        showCaptureGuide = true
-    }
-
-    private func startQueuedDirectCapture() {
-        guard directCaptureEnabled else {
-            queuedDirectMode = nil
-            return
-        }
-        guard let mode = queuedDirectMode, scenePhase == .active else { return }
-        guard !isPresentingSheet else { return }
-        queuedDirectMode = nil
         guard capture == nil else { return }
-        startCapture(mode)
+        capture = request
     }
 
     /// Opens a saved picture so that a part of it can be cut out or read.

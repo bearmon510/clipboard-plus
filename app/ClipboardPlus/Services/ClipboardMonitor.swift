@@ -41,7 +41,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var sceneState = "inactive"
     @Published private(set) var entries: [HistoryEntry] = []
-    @Published private(set) var pasteQueue: PasteQueueState = PasteQueueState()
     @Published private(set) var pollingInterval: TimeInterval = 0.5
     @Published private(set) var historyRetention: HistoryRetention = .defaultValue
     @Published private(set) var storageError: String?
@@ -71,19 +70,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private var maintenancePending = false
     private var needsHistoryLoad = true
     private var admission = HistoryAdmission()
-    // Unlike eager self copies, lazy queue providers must never be read back at all.
-    private var queueSelfCopyChangeCount: Int?
-    private lazy var pasteEngine = PasteQueue(
-        entry: { [weak self] id in self?.entries.first { $0.id == id } },
-        write: { [weak self] provider in self?.writePasteQueueProvider(provider) },
-        changeCount: { [weak self] in self?.pasteboard.changeCount ?? -1 },
-        scene: { [weak self] in self?.sceneState ?? "inactive" },
-        changed: { [weak self] state in self?.pasteQueue = state },
-        log: { [weak self] kind, count, details in self?.record(kind, count: count, details: details) }
-    )
     private var lastObservedChangeCount = 0
     private var timer: Timer?
-    private var lastBackgroundPollUptime: TimeInterval?
     private var isReading = false
     private var isCopying = false
     private var isWriting = false
@@ -174,8 +162,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         let observedAt = Date()
         let previous = sceneState
         sceneState = value
-        if value == "background" { pasteEngine.sceneDidChange(value) }
-        lastBackgroundPollUptime = nil
         let count = pasteboard.changeCount
         let sceneEvent = MeasurementEvent(
             timestamp: observedAt, kind: "scene状態の変化", changeCount: count,
@@ -190,7 +176,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             log.append(sceneEvent)
         }
         if value == "active" {
-            pasteEngine.sceneDidChange(value)
             // Enqueue even while periodic maintenance/load is pending; foreground
             // transitions must never lose their forced age check.
             store.maintain(forceRetention: true) { result in
@@ -660,51 +645,11 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
-    func pasteInOrder(_ entries: [HistoryEntry]) {
-        pasteEngine.stop()
-        for entry in entries { enqueueForPaste(entry) }
-        self.record("順に貼る", details: "件数=\(pasteQueue.entryIDs.count)")
-        pasteEngine.start()
-    }
-
     private func recordEdit(_ operation: String, result: Result<HistoryEntry, HistoryEditError>) {
         switch result {
         case .success(let entry): record(operation, historyNumber: entry.id, details: "成功=true")
         case .failure(let error): record(operation, details: "成功=false; 理由=\(error.message)")
         }
-    }
-
-    func enqueueForPaste(_ entry: HistoryEntry) {
-        guard let current = entries.first(where: { $0.id == entry.id }) else { return }
-        pasteEngine.enqueue(current)
-    }
-
-    func removeFromPasteQueue(id: Int) { pasteEngine.remove(id: id) }
-    func startPasteQueue() { pasteEngine.start() }
-    func advancePasteQueue() { pasteEngine.advance() }
-    func rewindPasteQueue() { pasteEngine.rewind() }
-    func stopPasteQueue() { pasteEngine.stop() }
-
-    private func writePasteQueueProvider(_ provider: NSItemProvider) -> Int? {
-        guard !isWriting, !isReading, !isCopying else { return nil }
-        readBeforeCopy()
-        isWriting = true
-        let before = pasteboard.changeCount
-        let succeeded = pasteboard.writeFileProviders([provider])
-        let after = pasteboard.changeCount
-        if succeeded && after != before {
-            queueSelfCopyChangeCount = after
-            lastObservedChangeCount = after
-            admission.discardPendingSelfCopy()
-            store.resetImageAdmission()
-            store.resetFileAdmission()
-        }
-        isWriting = false
-        let detections = deferredDetections
-        deferredDetections.removeAll()
-        if isRecording { readIfChanged(count: after, source: "連続貼り付けの書き込み", detections: detections) }
-        else { detections.forEach { log.append($0) } }
-        return succeeded && after != before ? after : nil
     }
 
     func delete(_ entry: HistoryEntry, completion: @escaping (HistoryDeletion?) -> Void) {
@@ -809,7 +754,6 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     private func handleStorageEvent(_ event: HistoryStore.Event) {
-        defer { pasteEngine.reconcile(with: entries) }
         switch event {
         case .replace(let values): entries = values
         case .upsert(let entry): HistoryList.upsert(entry, into: &entries)
@@ -884,20 +828,10 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     func pollPasteboard() {
-        pasteEngine.observePasteboard()
-        guard isRecording, shortcutOperationCount == 0 else { return }
+        guard isRecording, shortcutOperationCount == 0,
+              sceneState == "active" || sceneState == "inactive" else { return }
         let detectedAt = Date()
         let count = pasteboard.changeCount
-        // Use the collection timer itself: a separate timer cannot prove it is running.
-        // Every 10 seconds served the PiP experiment; in daily use that filled the log,
-        // so the proof of life is now written when entering the background and every 10 minutes.
-        if sceneState == "background" {
-            let uptime = ProcessInfo.processInfo.systemUptime
-            if lastBackgroundPollUptime.map({ uptime - $0 >= 600 }) ?? true {
-                lastBackgroundPollUptime = uptime
-                record("裏での定期確認", count: count, timestamp: detectedAt)
-            }
-        }
         guard count != lastObservedChangeCount else { return }
         readIfChanged(count: count, source: "定期確認", detections: [
             MeasurementEvent(timestamp: detectedAt, kind: "定期確認での検知", changeCount: count, scene: sceneState)
@@ -905,18 +839,14 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     }
 
     private func readIfChanged(count: Int, source: String, detections: [MeasurementEvent]) {
-        guard shortcutOperationCount == 0 else {
+        // Copy completions and deferred detections can arrive after the app leaves the screen.
+        guard shortcutOperationCount == 0,
+              sceneState == "active" || sceneState == "inactive" else {
             detections.forEach { log.append($0) }
             return
         }
         if isReading || isWriting {
             deferredDetections.append(contentsOf: detections)
-            return
-        }
-        pasteEngine.observePasteboard()
-        if pasteboard.changeCount == queueSelfCopyChangeCount {
-            lastObservedChangeCount = pasteboard.changeCount
-            detections.forEach { log.append($0) }
             return
         }
         guard count != lastObservedChangeCount else {
