@@ -19,6 +19,25 @@ final class ScreenSnapshotTests: XCTestCase {
         func setData(_ data: Data, forPasteboardType pasteboardType: String) {}
     }
 
+    @MainActor
+    private final class SnapshotKeyStore: PCSyncKeyStore {
+        var key: Data?
+        func read() throws -> Data? { key }
+        func write(_ key: Data) throws { self.key = key }
+        func delete() throws { key = nil }
+    }
+
+    @MainActor
+    private final class SnapshotTransport: PCSyncTransport {
+        var onEvent: ((PCSyncTransportEvent) -> Void)?
+        var canSend = true
+        func start(remembered: UUID?) {}
+        func stop() {}
+        func write(_ packet: Data) {}
+        func authenticated(_ id: UUID) {}
+        @discardableResult func reconnect(reason: PCSyncDisconnectReason) -> TimeInterval { 0 }
+    }
+
     private static let narrow = CGSize(width: 360, height: 780)
     private static let wide = CGSize(width: 1_024, height: 768)
     private static let phone = CGSize(width: 393, height: 852)
@@ -106,6 +125,38 @@ final class ScreenSnapshotTests: XCTestCase {
                         size: Self.wide, style: .light), "templates-open-wide-light")
         try save(render(ContentView(monitor: monitor, log: monitor.log, initialSearch: "住所", initialPane: .templates),
                         size: Self.narrow, style: .light), "templates-search-narrow-light")
+    }
+
+    /// Templates paired with a PC so the template sync button appears beside the add button.
+    @MainActor
+    func testRenderTemplateSyncScreens() async throws {
+        let monitor = try await makeMonitor(populated: true)
+        monitor.start()
+        defer { monitor.stop() }
+        let sync = try makePairedSync(monitor: monitor)
+        try save(render(ContentView(monitor: monitor, log: monitor.log, sync: sync, initialPane: .templates,
+                                    deviceOverride: .phone),
+                        size: Self.phone, style: .light), "templates-sync-phone-light")
+        try save(render(ContentView(monitor: monitor, log: monitor.log, sync: sync, initialPane: .templates,
+                                    initialOpenTags: ["メール", ""], deviceOverride: .pad),
+                        size: Self.wide, style: .dark), "templates-sync-pad-dark")
+    }
+
+    @MainActor
+    private func makePairedSync(monitor: ClipboardMonitor) throws -> PCSyncController {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let keyStore = SnapshotKeyStore()
+        let transport = SnapshotTransport()
+        let controller = PCSyncController(
+            monitor: monitor, defaults: defaults, keyStore: keyStore,
+            schedulesTimeouts: false, makeTransport: { _ in transport }
+        )
+        let pairing = try SyncPairing.create(name: "DESK-PC")
+        try controller.pair(code: pairing.qrString())
+        transport.onEvent?(.status(.connected))
+        return controller
     }
 
     @MainActor

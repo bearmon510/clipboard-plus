@@ -36,7 +36,7 @@ final class TemplateHistoryTests: XCTestCase {
         try ImageTestSupport.sql(versionFourSQL, at: url)
         let now = Date(timeIntervalSince1970: 1000)
         var db: HistoryDatabase? = try HistoryDatabase(url: url, now: { now })
-        XCTAssertEqual(try db!.readSchemaVersion(), 5)
+        XCTAssertEqual(try db!.readSchemaVersion(), HistoryDatabase.schemaVersion)
         XCTAssertEqual(HistoryEntry.orderedTemplates(try db!.fetchAll().filter(\.isTemplate)).map(\.id), [2, 1])
         XCTAssertEqual(try ImageTestSupport.sql("SELECT pin_order FROM history WHERE id = 3", at: url), 1)
         XCTAssertEqual(try ImageTestSupport.sql("SELECT COUNT(*) FROM history WHERE deletion_id IS NOT NULL", at: url), 2)
@@ -401,5 +401,316 @@ final class TemplateHistoryTests: XCTestCase {
         XCTAssertEqual(encoded["isTemplate"] as? Bool, true)
         XCTAssertNil(encoded["isPinned"])
         XCTAssertNil(encoded["pinOrder"])
+    }
+
+    func testV5ToV6MigrationAssignsSyncIDsPreservesUndoTemplatesAndRollsBackOnFailure() throws {
+        let v5SQL = """
+            CREATE TABLE history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, text TEXT NOT NULL COLLATE BINARY,
+                saved_at REAL NOT NULL, collected_at REAL NOT NULL, collection_count INTEGER NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL, deletion_id TEXT, delete_after REAL,
+                image_hash TEXT, image_file TEXT, thumbnail_file TEXT, image_bytes INTEGER,
+                pixel_width INTEGER, pixel_height INTEGER, image_type TEXT,
+                file_hash TEXT, file_name TEXT, original_filename TEXT, file_bytes INTEGER, file_type TEXT,
+                title TEXT, pin_order INTEGER, tag TEXT
+            );
+            CREATE UNIQUE INDEX history_active_text ON history(text, pinned) WHERE deletion_id IS NULL AND kind NOT IN ('image', 'file');
+            CREATE UNIQUE INDEX history_active_image ON history(image_hash, pinned) WHERE deletion_id IS NULL AND kind = 'image';
+            CREATE UNIQUE INDEX history_active_file ON history(file_hash, pinned) WHERE deletion_id IS NULL AND kind = 'file';
+            INSERT INTO history(id, kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order, tag, deletion_id, delete_after)
+                VALUES (1, 'text', 'active-tpl', 1, 12.345, 1, 1, 'written', '定型1', 0, '仕事', NULL, NULL),
+                       (2, 'text', 'undo-tpl', 1, 20.0, 1, 1, 'manual', NULL, 1, NULL, 'undo-1', 1005),
+                       (3, 'text', 'history-only', 1, 30.0, 1, 0, 'automatic', NULL, NULL, NULL, NULL, NULL);
+            PRAGMA user_version = 5;
+            """
+        let root = try ImageTestSupport.directory(self)
+        let url = root.appendingPathComponent("v5.sqlite")
+        try ImageTestSupport.sql(v5SQL, at: url)
+        let db = try HistoryDatabase(url: url, now: { Date(timeIntervalSince1970: 1_000) })
+        XCTAssertEqual(try db.readSchemaVersion(), HistoryDatabase.schemaVersion)
+        let meta1 = try XCTUnwrap(try db.templateSyncMetadata(id: 1))
+        let meta2 = try XCTUnwrap(try db.templateSyncMetadata(id: 2))
+        let meta3 = try XCTUnwrap(try db.templateSyncMetadata(id: 3))
+        XCTAssertNotNil(meta1.syncId)
+        XCTAssertNotNil(meta2.syncId)
+        XCTAssertNotEqual(meta1.syncId, meta2.syncId)
+        XCTAssertEqual(meta1.updatedAt, 12_345)
+        XCTAssertEqual(meta2.updatedAt, 20_000)
+        XCTAssertNil(meta1.baseHash)
+        XCTAssertFalse(meta1.dirty)
+        XCTAssertNil(meta3.syncId)
+        XCTAssertNil(meta3.updatedAt)
+        XCTAssertTrue(try db.templateTombstones().isEmpty)
+
+        // Reopening preserves assigned sync IDs and timestamps.
+        let reopened = try HistoryDatabase(url: url, now: { Date(timeIntervalSince1970: 2_000) })
+        XCTAssertEqual(try reopened.templateSyncMetadata(id: 1)?.syncId, meta1.syncId)
+        XCTAssertEqual(try reopened.templateSyncMetadata(id: 1)?.updatedAt, 12_345)
+
+        // Migration rollback leaves user_version at 5 with no template_tombstones table or sync columns.
+        let failURL = root.appendingPathComponent("v5-fail.sqlite")
+        try ImageTestSupport.sql(v5SQL + "CREATE TRIGGER fail_v6 BEFORE UPDATE ON history BEGIN SELECT RAISE(ABORT, 'v6 failure'); END;", at: failURL)
+        XCTAssertThrowsError(try HistoryDatabase(url: failURL))
+        XCTAssertEqual(try ImageTestSupport.sql("PRAGMA user_version", at: failURL), 5)
+        XCTAssertEqual(try ImageTestSupport.sql("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'template_tombstones'", at: failURL), 0)
+        XCTAssertEqual(try ImageTestSupport.sql("SELECT COUNT(*) FROM pragma_table_info('history') WHERE name = 'template_sync_id'", at: failURL), 0)
+    }
+
+    func testTemplateSyncMetadataUpdatesMonotonicallyOnEditsAndIgnoresCopy() throws {
+        var now = Date(timeIntervalSince1970: 1_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("meta.sqlite"), now: { now })
+        let created = try db.createTemplate(text: "本文A", title: "題A", tag: "仕事")
+        let historyRow = try db.collect("本文B", source: .automatic)
+        let moved = try db.moveToTemplates(id: historyRow.id)
+        let createdMeta = try XCTUnwrap(try db.templateSyncMetadata(id: created.id))
+        let movedMeta = try XCTUnwrap(try db.templateSyncMetadata(id: moved.id))
+        XCTAssertNotNil(createdMeta.syncId)
+        XCTAssertEqual(createdMeta.updatedAt, 1_000_000)
+        XCTAssertNil(createdMeta.baseHash)
+        XCTAssertNotNil(movedMeta.syncId)
+        XCTAssertEqual(movedMeta.updatedAt, 1_000_000)
+
+        // Simulate baseline established by sync.
+        let initialSnap = try db.readTemplateSyncSnapshot()
+        let itemA = try XCTUnwrap(initialSnap.snapshot.templates.first { $0.id == createdMeta.syncId })
+        let itemB = try XCTUnwrap(initialSnap.snapshot.templates.first { $0.id == movedMeta.syncId })
+        _ = try db.applySyncedTemplates(
+            TemplateSyncSnapshot(sentAt: 1_000_000, templates: [itemA, itemB], tombstones: []),
+            pushed: initialSnap
+        )
+        let syncedA = try XCTUnwrap(try db.templateSyncMetadata(id: created.id))
+        XCTAssertNotNil(syncedA.baseHash)
+        XCTAssertFalse(syncedA.dirty)
+
+        // Clock moves backwards: updatedAt still bumps monotonically while keeping baseHash.
+        now = Date(timeIntervalSince1970: 500)
+        _ = try db.updateTemplate(id: created.id, text: "本文A更新", title: "題A", tag: "仕事")
+        let editedA = try XCTUnwrap(try db.templateSyncMetadata(id: created.id))
+        XCTAssertEqual(editedA.updatedAt, 1_000_001)
+        XCTAssertEqual(editedA.baseHash, syncedA.baseHash)
+        XCTAssertTrue(editedA.dirty)
+
+        // Reorder within same tag bumps only moved item(s), preserving baseHash.
+        now = Date(timeIntervalSince1970: 500)
+        _ = try db.updateTemplate(id: moved.id, text: moved.text, title: moved.title, tag: "仕事")
+        let editedB = try XCTUnwrap(try db.templateSyncMetadata(id: moved.id))
+        try db.reorderTemplates([moved.id, created.id])
+        let reorderedA = try XCTUnwrap(try db.templateSyncMetadata(id: created.id))
+        let reorderedB = try XCTUnwrap(try db.templateSyncMetadata(id: moved.id))
+        XCTAssertGreaterThan(reorderedA.updatedAt ?? 0, editedA.updatedAt ?? 0)
+        XCTAssertGreaterThan(reorderedB.updatedAt ?? 0, editedB.updatedAt ?? 0)
+        XCTAssertEqual(reorderedA.baseHash, syncedA.baseHash)
+
+        // Tag rename bumps affected templates only.
+        now = Date(timeIntervalSince1970: 1_200)
+        try db.renameTag("仕事", to: "私用")
+        let renamedA = try XCTUnwrap(try db.templateSyncMetadata(id: created.id))
+        XCTAssertEqual(renamedA.updatedAt, 1_200_000)
+        XCTAssertEqual(renamedA.baseHash, syncedA.baseHash)
+
+        // Collecting matching text as history must not mutate template sync metadata.
+        now = Date(timeIntervalSince1970: 2_000)
+        _ = try db.collect("本文A更新", source: .automatic)
+        _ = try db.collect("本文A更新", source: .manual)
+        XCTAssertEqual(try db.templateSyncMetadata(id: created.id), renamedA)
+    }
+
+    func testDeleteUndoPurgeTombstonesAndResetTemplateSyncState() throws {
+        var now = Date(timeIntervalSince1970: 1_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("tomb.sqlite"), now: { now })
+        let syncedEntry = try db.createTemplate(text: "同期済み削除", title: "タイトル", tag: nil)
+
+        // Sync syncedEntry before deleting.
+        let syncedMeta = try XCTUnwrap(try db.templateSyncMetadata(id: syncedEntry.id))
+        let localSnap = try db.readTemplateSyncSnapshot()
+        let syncedItem = try XCTUnwrap(localSnap.snapshot.templates.first { $0.id == syncedMeta.syncId })
+        _ = try db.applySyncedTemplates(
+            TemplateSyncSnapshot(sentAt: 1_000_000, templates: [syncedItem], tombstones: []),
+            pushed: localSnap
+        )
+        let freshLocal = try db.createTemplate(text: "完全未同期", title: nil, tag: nil)
+
+        // Delete unsynced template -> no tombstone; undo restores cleanly.
+        let localDel = try XCTUnwrap(try db.delete(id: freshLocal.id))
+        XCTAssertTrue(try db.templateTombstones().isEmpty)
+        XCTAssertTrue(try db.undo(localDel))
+
+        // Delete synced template -> creates tombstone with baseHash; undo deletes tombstone and bumps updatedAt.
+        now = Date(timeIntervalSince1970: 1_100)
+        let syncedDel = try XCTUnwrap(try db.delete(id: syncedEntry.id))
+        let tombsAfterDel = try db.templateTombstones()
+        XCTAssertEqual(tombsAfterDel.count, 1)
+        XCTAssertEqual(tombsAfterDel.first?.id, syncedItem.id)
+        XCTAssertEqual(tombsAfterDel.first?.deletedAt, 1_100_000)
+        XCTAssertNotNil(tombsAfterDel.first?.baseHash)
+
+        now = Date(timeIntervalSince1970: 1_101)
+        XCTAssertTrue(try db.undo(syncedDel))
+        XCTAssertTrue(try db.templateTombstones().isEmpty)
+        let restoredMeta = try XCTUnwrap(try db.templateSyncMetadata(id: syncedEntry.id))
+        XCTAssertGreaterThan(restoredMeta.updatedAt ?? 0, 1_100_000)
+        XCTAssertTrue(restoredMeta.dirty)
+
+        // Re-delete and purge after undo interval -> row removed, tombstone retained.
+        now = Date(timeIntervalSince1970: 1_200)
+        _ = try db.delete(id: syncedEntry.id)
+        now = Date(timeIntervalSince1970: 1_210)
+        _ = try db.purgeExpired()
+        XCTAssertFalse(try db.fetchAll().contains { $0.id == syncedEntry.id })
+        XCTAssertEqual(try db.templateTombstones().map(\.id), [syncedItem.id])
+
+        // Re-create another synced template, then resetTemplateSyncState clears tombstones and baseHash while keeping syncId.
+        let keep = try db.createTemplate(text: "残す", title: nil, tag: nil)
+        let keepMetaBefore = try XCTUnwrap(try db.templateSyncMetadata(id: keep.id))
+        let keepPush = try db.readTemplateSyncSnapshot()
+        _ = try db.applySyncedTemplates(keepPush.snapshot, pushed: keepPush)
+        XCTAssertNotNil(try db.templateSyncMetadata(id: keep.id)?.baseHash)
+        try db.resetTemplateSyncState()
+        XCTAssertTrue(try db.templateTombstones().isEmpty)
+        let keepMetaAfter = try XCTUnwrap(try db.templateSyncMetadata(id: keep.id))
+        XCTAssertEqual(keepMetaAfter.syncId, keepMetaBefore.syncId)
+        XCTAssertNil(keepMetaAfter.baseHash)
+        XCTAssertFalse(keepMetaAfter.dirty)
+    }
+
+    func testReadTemplateSyncSnapshotFiltersOversizedImagesAndPrunesOldTombstones() throws {
+        let now = Date(timeIntervalSince1970: 20_000_000)
+        let root = try ImageTestSupport.directory(self)
+        let dbURL = root.appendingPathComponent("snapshot.sqlite")
+        let db = try HistoryDatabase(url: dbURL, now: { now })
+
+        // Image template should stay invisible to template sync.
+        let img = try db.collectImage(
+            HistoryImage(hash: "img1", filename: "img1.png", thumbnailFilename: "img1_t.jpg",
+                         byteCount: 128, pixelWidth: 10, pixelHeight: 10, typeIdentifier: "public.png"),
+            source: .manual, at: now
+        )
+        _ = try db.moveToTemplates(id: img.id)
+
+        // > 64 KiB template stays locally but is skipped by sync.
+        let huge = String(repeating: "あ", count: 22_000)
+        let hugeEntry = try db.createTemplate(text: huge, title: "巨大", tag: nil)
+        let normalEntry = try db.createTemplate(text: "通常", title: "制御\n文字\t除外", tag: "タグ\n名")
+
+        let hugeMeta = try XCTUnwrap(try db.templateSyncMetadata(id: hugeEntry.id))
+        let normalMeta = try XCTUnwrap(try db.templateSyncMetadata(id: normalEntry.id))
+        let localSnap = try db.readTemplateSyncSnapshot()
+        XCTAssertEqual(localSnap.skippedOversizedCount, 1)
+        XCTAssertEqual(localSnap.skippedOversizedIDs, Set([hugeMeta.syncId!]))
+        XCTAssertEqual(localSnap.snapshot.templates.map(\.id), [normalMeta.syncId!])
+        XCTAssertFalse(localSnap.snapshot.templates[0].title?.contains("\n") ?? true)
+        XCTAssertFalse(localSnap.snapshot.templates[0].tag?.contains("\n") ?? true)
+
+        // Prune tombstones older than 180 days and cap at 1000.
+        let staleMs = Int64(now.timeIntervalSince1970 * 1000) - (181 * 86_400_000)
+        var inserts = [
+            "BEGIN;",
+            "INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced) VALUES ('\(UUID().uuidString)', \(staleMs), NULL, 0);"
+        ]
+        let baseMs = Int64(now.timeIntervalSince1970 * 1000)
+        for i in 0..<1_005 {
+            inserts.append("INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced) VALUES ('\(UUID().uuidString)', \(baseMs - Int64(i)), NULL, 0);")
+        }
+        inserts.append("COMMIT;")
+        try ImageTestSupport.sql(inserts.joined(separator: "\n"), at: dbURL)
+        let prunedSnap = try db.readTemplateSyncSnapshot()
+        XCTAssertEqual(prunedSnap.snapshot.tombstones.count, SyncProtocol.maxTemplateTombstones)
+        XCTAssertFalse(prunedSnap.snapshot.tombstones.contains { $0.deletedAt <= staleMs })
+    }
+
+    func testApplySyncedTemplatesPreservesIDsUnicodeSwapsAndExportsKeyboardHistory() throws {
+        let now = Date(timeIntervalSince1970: 5_000)
+        let root = try ImageTestSupport.directory(self)
+        let dbURL = root.appendingPathComponent("apply.sqlite")
+        let containerURL = root.appendingPathComponent("group", isDirectory: true)
+        let db = try HistoryDatabase(url: dbURL, now: { now })
+
+        // Image and >64 KiB templates must survive full remote replace/delete cycles.
+        let img = try db.collectImage(
+            HistoryImage(hash: "keepimg", filename: "keep.png", thumbnailFilename: "keep_t.jpg",
+                         byteCount: 64, pixelWidth: 8, pixelHeight: 8, typeIdentifier: "public.png"),
+            source: .manual, at: now
+        )
+        let imgTpl = try db.moveToTemplates(id: img.id)
+        let hugeTpl = try db.createTemplate(text: String(repeating: "X", count: 70_000), title: nil, tag: nil)
+
+        // Existing editable templates including canonical-distinct UTF-8 NFC/NFD pair and swap pair.
+        let first = try db.createTemplate(text: "alpha", title: "One", tag: "A")
+        let second = try db.createTemplate(text: "beta", title: "Two", tag: "A")
+        let deletedLocal = try db.createTemplate(text: "will-delete", title: nil, tag: nil)
+        let pushed = try db.readTemplateSyncSnapshot()
+
+        let id1 = try XCTUnwrap(try db.templateSyncMetadata(id: first.id)?.syncId)
+        let id2 = try XCTUnwrap(try db.templateSyncMetadata(id: second.id)?.syncId)
+        let idDel = try XCTUnwrap(try db.templateSyncMetadata(id: deletedLocal.id)?.syncId)
+        let addedID = UUID()
+        let nfcID = UUID()
+        let nfdID = UUID()
+        let conflictID = UUID()
+
+        // Swap texts ("beta" <-> "alpha") cleanly, add remote item + NFC/NFD + conflict copy, delete deletedLocal.
+        let serverSnapshot = TemplateSyncSnapshot(
+            sentAt: 5_400_000, // +400s clock skew
+            templates: [
+                TemplateSyncItem(id: id1, kind: .text, text: "beta", title: "Updated One", tag: "B", order: 0, updatedAt: 5_100_000),
+                TemplateSyncItem(id: id2, kind: .text, text: "alpha", title: "Two", tag: "A", order: 0, updatedAt: 5_100_000),
+                TemplateSyncItem(id: addedID, kind: .url, text: "https://example.org", title: "From PC", tag: "Web", order: 0, updatedAt: 5_100_000),
+                TemplateSyncItem(id: nfcID, kind: .text, text: "caf\u{00E9}", title: nil, tag: nil, order: 0, updatedAt: 5_100_000),
+                TemplateSyncItem(id: nfdID, kind: .text, text: "cafe\u{0301}", title: nil, tag: nil, order: 1, updatedAt: 5_100_000),
+                TemplateSyncItem(id: conflictID, kind: .text, text: "local conflict text", title: TemplateSyncMerge.makeConflictTitle("メモ"), tag: nil, order: 2, updatedAt: 5_100_000),
+            ],
+            tombstones: [
+                TemplateSyncTombstone(id: idDel, deletedAt: 5_100_000, baseHash: TemplateSyncMerge.contentHash(kind: .text, text: "will-delete", title: nil, tag: nil))
+            ]
+        )
+
+        let outcome = try db.applySyncedTemplates(serverSnapshot, pushed: pushed)
+        XCTAssertEqual(outcome.added, 4) // addedID, nfcID, nfdID, conflictID
+        XCTAssertEqual(outcome.updated, 2) // id1, id2
+        XCTAssertEqual(outcome.deleted, 1) // idDel
+        XCTAssertEqual(outcome.conflictCopyCount, 1)
+        XCTAssertEqual(outcome.skippedOversizedCount, 1)
+        XCTAssertNotNil(outcome.clockSkewSeconds)
+
+        let all = try db.fetchAll()
+        XCTAssertEqual(all.first { $0.id == first.id }?.text, "beta")
+        XCTAssertEqual(all.first { $0.id == first.id }?.title, "Updated One")
+        XCTAssertEqual(all.first { $0.id == first.id }?.tag, "B")
+        XCTAssertEqual(all.first { $0.id == second.id }?.text, "alpha")
+        XCTAssertNil(all.first { $0.id == deletedLocal.id })
+        XCTAssertNotNil(all.first { $0.id == imgTpl.id })
+        XCTAssertNotNil(all.first { $0.id == hugeTpl.id })
+        let addedRow = try XCTUnwrap(all.first { $0.text == "https://example.org" })
+        XCTAssertEqual(addedRow.kind, .url)
+        XCTAssertEqual(addedRow.source, .written)
+        XCTAssertTrue(all.contains { $0.text == "caf\u{00E9}" })
+        XCTAssertTrue(all.contains { $0.text == "cafe\u{0301}" })
+
+        // HistoryStore.applySyncedTemplates triggers keyboard-history.json export atomically.
+        let store = HistoryStore(
+            retention: .never,
+            makeDatabase: { try HistoryDatabase(url: dbURL, now: { now }) },
+            imageDirectory: root.appendingPathComponent("images"),
+            now: { now },
+            keyboardContainerURL: { containerURL }
+        ) { _ in }
+        store.load { _ in }
+        let syncApplied = expectation(description: "keyboard exported")
+        let pcOnlyID = UUID()
+        let nextServer = TemplateSyncSnapshot(
+            sentAt: 5_500_000,
+            templates: serverSnapshot.templates + [
+                TemplateSyncItem(id: pcOnlyID, kind: .text, text: "キーボード反映", title: "最新", tag: "Web", order: 1, updatedAt: 5_500_000)
+            ],
+            tombstones: serverSnapshot.tombstones
+        )
+        store.applySyncedTemplates(nextServer, pushed: nil) { result in
+            if case .failure(let error) = result { XCTFail("\(error)") }
+            syncApplied.fulfill()
+        }
+        wait(for: [syncApplied], timeout: 5)
+        let exported = try XCTUnwrap(KeyboardHistoryFile.read(from: SharedAppGroup.keyboardHistoryURL(in: containerURL)))
+        XCTAssertTrue(exported.entries.contains { $0.isTemplate && $0.text == "キーボード反映" && $0.title == "最新" })
+        XCTAssertFalse(exported.entries.contains { $0.text == "will-delete" })
     }
 }

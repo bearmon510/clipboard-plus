@@ -805,6 +805,22 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
+    func readTemplateSyncSnapshot(completion: @escaping (Result<LocalTemplateSyncSnapshot, Error>) -> Void) {
+        store.readTemplateSyncSnapshot(completion: completion)
+    }
+
+    func applySyncedTemplates(_ snapshot: TemplateSyncSnapshot, pushed: LocalTemplateSyncSnapshot?,
+                              completion: @escaping (Result<TemplateSyncOutcome, Error>) -> Void) {
+        store.applySyncedTemplates(snapshot, pushed: pushed) { result in
+            if case .failure = result { self.reportStorageFailure() }
+            completion(result)
+        }
+    }
+
+    func resetTemplateSyncState() {
+        store.resetTemplateSyncState()
+    }
+
     private func recordEdit(_ operation: String, result: Result<HistoryEntry, HistoryEditError>) {
         switch result {
         case .success(let entry): record(operation, historyNumber: entry.id, details: "成功=true")

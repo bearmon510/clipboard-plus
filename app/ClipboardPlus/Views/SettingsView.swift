@@ -7,6 +7,7 @@ struct SettingsView: View {
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
     let screenshots: ScreenshotWatcher
+    var sync: PCSyncController? = nil
     @State private var showLogs = false
     @State private var showDeveloperSettings = false
     @State private var export: ExportSnapshot?
@@ -33,7 +34,7 @@ struct SettingsView: View {
                     Text("0.1〜5.0秒。間隔と記録の状態は、アプリを開き直しても保持します。")
                         .font(.footnote)
                 }
-                SyncSettingsSection(sync: PCSyncController.shared)
+                SyncSettingsSection(sync: sync ?? .shared)
                 // Picking up screenshots needs clipboard+ on screen beside the other app.
                 if DeviceKind.current == .pad {
                     CaptureSettingsSection(screenshots: screenshots)

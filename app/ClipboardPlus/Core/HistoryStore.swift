@@ -24,6 +24,9 @@ protocol HistoryPersistence: AnyObject {
     func imageUsage() throws -> HistoryImageUsage
     func estimateBackup(_ entries: [HistoryEntry], retentionCutoff: Date?) throws -> RestoreCounts
     func mergeBackup(_ entries: [HistoryEntry], retentionCutoff: Date?, beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts
+    func readTemplateSyncSnapshot() throws -> LocalTemplateSyncSnapshot
+    func applySyncedTemplates(_ snapshot: TemplateSyncSnapshot, pushed: LocalTemplateSyncSnapshot?) throws -> TemplateSyncOutcome
+    func resetTemplateSyncState() throws
 }
 
 extension HistoryPersistence {
@@ -46,6 +49,11 @@ extension HistoryPersistence {
     func mergeBackup(_ entries: [HistoryEntry], retentionCutoff: Date? = nil, beforeCommit: ([HistoryEntry]) throws -> Void) throws -> RestoreCounts {
         throw BackupError.unavailable
     }
+    func readTemplateSyncSnapshot() throws -> LocalTemplateSyncSnapshot { throw HistoryEditError.failed }
+    func applySyncedTemplates(_ snapshot: TemplateSyncSnapshot, pushed: LocalTemplateSyncSnapshot?) throws -> TemplateSyncOutcome {
+        throw HistoryEditError.failed
+    }
+    func resetTemplateSyncState() throws {}
 }
 
 final class HistoryStore {
@@ -570,6 +578,30 @@ final class HistoryStore {
             self.needsKeyboardExport = true
             self.emit(.replace(try database.fetchAll()))
         }, completion: completion)
+    }
+
+    func readTemplateSyncSnapshot(completion: @escaping @MainActor (Result<LocalTemplateSyncSnapshot, Error>) -> Void) {
+        perform({ database in
+            try database.readTemplateSyncSnapshot()
+        }, completion: completion)
+    }
+
+    func applySyncedTemplates(_ snapshot: TemplateSyncSnapshot, pushed: LocalTemplateSyncSnapshot?,
+                              completion: @escaping @MainActor (Result<TemplateSyncOutcome, Error>) -> Void) {
+        perform({ database in
+            let outcome = try database.applySyncedTemplates(snapshot, pushed: pushed)
+            self.needsKeyboardExport = true
+            self.emit(.replace(try database.fetchAll()))
+            return outcome
+        }, completion: completion)
+    }
+
+    func resetTemplateSyncState(completion: (@MainActor (Result<Void, Error>) -> Void)? = nil) {
+        perform({ database in
+            try database.resetTemplateSyncState()
+        }, completion: { result in
+            completion?(result)
+        })
     }
 
     func export(completion: @escaping @MainActor (Result<URL, Error>) -> Void) {

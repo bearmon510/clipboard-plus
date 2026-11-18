@@ -7,6 +7,8 @@ struct ContentView: View {
     @ObservedObject var monitor: ClipboardMonitor
     /// Not observed as a whole: every log line would otherwise redraw this screen.
     let log: MeasurementLog
+    @ObservedObject var sync: PCSyncController
+    let deviceOverride: DeviceKind?
     @State private var logHasError = false
     @State private var showSettings = false
     @State private var confirmHistoryClear = false
@@ -50,15 +52,20 @@ struct ContentView: View {
 
     /// `initialSearch`, `initialPane` and `initialOpenTags` let previews and screenshot tests
     /// open the screen mid-search, on the templates, or with a group open.
-    init(monitor: ClipboardMonitor, log: MeasurementLog, initialSearch: String = "", initialPane: Pane = .history,
-         initialOpenTags: Set<String> = []) {
+    @MainActor init(monitor: ClipboardMonitor, log: MeasurementLog, sync: PCSyncController? = nil,
+                    initialSearch: String = "", initialPane: Pane = .history,
+                    initialOpenTags: Set<String> = [], deviceOverride: DeviceKind? = nil) {
         self.monitor = monitor
         self.log = log
+        _sync = ObservedObject(wrappedValue: sync ?? .shared)
+        self.deviceOverride = deviceOverride
         _screenshots = StateObject(wrappedValue: ScreenshotWatcher(log: log))
         _searchText = State(initialValue: initialSearch)
         _pane = State(initialValue: initialPane)
         _openTags = State(initialValue: initialOpenTags)
     }
+
+    private var device: DeviceKind { deviceOverride ?? .current }
 
     /// The search term without surrounding spaces, as used for filtering and highlighting.
     private var query: String { HistoryFilter.normalized(searchText) }
@@ -171,7 +178,7 @@ struct ContentView: View {
         .onChange(of: pane) { _, _ in clearCopied() }
         .onReceive(log.$errorMessage) { logHasError = $0 != nil }
         .sheet(isPresented: $showSettings, onDismiss: presentQueuedCapture) {
-            SettingsView(monitor: monitor, log: log, screenshots: screenshots)
+            SettingsView(monitor: monitor, log: log, screenshots: screenshots, sync: sync)
         }
         .sheet(item: $detailEntry, onDismiss: presentQueuedCapture) { entry in detail(entry) }
         .sheet(item: $editor, onDismiss: presentQueuedCapture) { mode in
@@ -350,16 +357,21 @@ struct ContentView: View {
             if pane == .history {
                 pasteButton
             } else {
-                Button {
-                    editor = .create(tag: nil)
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 36, height: 28)
+                HStack(spacing: 8) {
+                    if sync.status != .unpaired {
+                        templateSyncButton
+                    }
+                    Button {
+                        editor = .create(tag: nil)
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 36, height: 28)
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .accessibilityLabel("テンプレートを書く")
                 }
-                .buttonStyle(.bordered)
-                .buttonBorderShape(.capsule)
-                .accessibilityLabel("テンプレートを書く")
             }
         }
         .padding(.horizontal, 12)
@@ -375,6 +387,27 @@ struct ContentView: View {
         .labelStyle(.iconOnly)
         .buttonBorderShape(.capsule)
         .accessibilityLabel("今のクリップボードの内容を保存")
+    }
+
+    private var templateSyncButton: some View {
+        Button {
+            syncTemplates()
+        } label: {
+            Group {
+                if sync.isSyncingTemplates {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.body.weight(.semibold))
+                }
+            }
+            .frame(width: 36, height: 28)
+        }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.capsule)
+        .disabled(sync.isSyncingTemplates)
+        .accessibilityLabel("テンプレートを同期")
     }
 
     // MARK: Lists
@@ -727,6 +760,8 @@ struct ContentView: View {
             if let toast {
                 Text(toast)
                     .font(.subheadline.weight(.medium))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                     .background(.regularMaterial, in: Capsule())
@@ -792,6 +827,17 @@ struct ContentView: View {
                 showCopied(entry.id)
             } else {
                 showToast("コピーできませんでした")
+            }
+        }
+    }
+
+    private func syncTemplates() {
+        sync.syncTemplates { result in
+            switch result {
+            case .success(let outcome):
+                showToast(outcome.toastMessage(for: device))
+            case .failure(let error):
+                showToast(error.message(for: device))
             }
         }
     }

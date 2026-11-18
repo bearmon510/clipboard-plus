@@ -4,6 +4,50 @@ import UIKit
 
 struct PCSyncPairError: Error, Equatable { let message: String }
 
+enum TemplateSyncError: Error, Equatable {
+    case unpaired
+    case bluetoothOff
+    case unauthorized
+    case unsupported
+    case requiresPeerUpdate
+    case requiresRepair
+    case notConnected
+    case alreadyInProgress
+    case disconnected
+    case timedOut
+    case limitExceeded
+    case saveFailed
+
+    func message(for device: DeviceKind) -> String {
+        switch self {
+        case .unpaired:
+            return "PCと組んでいません"
+        case .bluetoothOff:
+            return "Bluetoothがオフです"
+        case .unauthorized:
+            return "Bluetoothが許可されていません"
+        case .unsupported:
+            return "この\(device.name)では使えません"
+        case .requiresPeerUpdate:
+            return "PCとこの\(device.name)のclipboard+を更新してください"
+        case .requiresRepair:
+            return "PCとの組み直しが必要です。設定で確認してください"
+        case .notConnected:
+            return "PCとつながっていません。PCの近くで試してください"
+        case .alreadyInProgress:
+            return "テンプレートを同期しています"
+        case .disconnected:
+            return "途中でPCとの接続が切れました"
+        case .timedOut:
+            return "PCからの応答がありませんでした"
+        case .limitExceeded:
+            return "テンプレートの件数または容量が上限を超えています"
+        case .saveFailed:
+            return "テンプレートを保存できませんでした"
+        }
+    }
+}
+
 @MainActor
 final class PCSyncController: ObservableObject {
     static let shared: PCSyncController = PCSyncController(monitor: .shared)
@@ -20,6 +64,7 @@ final class PCSyncController: ObservableObject {
     }
     @Published private(set) var transferProgress: TransferProgress?
     @Published private(set) var pendingCount = 0
+    @Published private(set) var isSyncingTemplates = false
     @Published private(set) var requiresPeerUpdate = false
     @Published private(set) var requiresRepair = false
     @Published private(set) var compatibilityMessage: String?
@@ -82,6 +127,7 @@ final class PCSyncController: ObservableObject {
     private var replies: [SyncMessage] = []
     private var attempted: Set<UUID> = []
     private static let replyTimeout: TimeInterval = 60
+    private static let templateSyncTimeout: TimeInterval = 30
     private static let maxReplyExtension: TimeInterval = 180
     private static let minExtendableFrameBytes = 64
     private var authenticationFailures = 0
@@ -98,12 +144,28 @@ final class PCSyncController: ObservableObject {
     private var pending: [SyncPending] { disk.state.pending }
     private var sentThisConnection: Set<UUID> = []
     private struct PendingReply {
-        let initialSentAt: Date
+        var initialSentAt: Date
         var deadline: Date
         var baselineDeadline: Date
         var activeFrameToken: UInt64?
     }
     private var sentAt: [UUID: PendingReply] = [:]
+    private struct ActiveTemplateSync {
+        let op: UUID
+        var reply: PendingReply
+        var pushed: LocalTemplateSyncSnapshot?
+        var awaitingSendCompletion = true
+        var isApplying = false
+        let completion: @MainActor (Result<TemplateSyncOutcome, TemplateSyncError>) -> Void
+    }
+    private var activeTemplateSync: ActiveTemplateSync?
+    private var templateAckQueue: [UUID] = []
+    private var templateOutgoing: [TemplateSyncMessage] = []
+    private var templateAssembler: TemplateSyncPageAssembler?
+    private var templateReceiveStart: Date?
+    private var templateReceiveBytes = 0
+    private var inFlightTemplatePulls: Set<UUID> = []
+    private var pendingPushedSnapshots: [(op: UUID, snapshot: LocalTemplateSyncSnapshot)] = []
     private var nextIncomingFrameToken: UInt64 = 0
     private var currentIncomingFrameToken: UInt64?
     private var incomingFrameBytes = 0
@@ -118,6 +180,8 @@ final class PCSyncController: ObservableObject {
         let isAuth: Bool
         let chunkEndOffset: Int?
         let finishesAttachment: Bool
+        let templatePushOp: UUID?
+        let finishesTemplatePush: Bool
         let bytes: Int
     }
 
@@ -158,7 +222,9 @@ final class PCSyncController: ObservableObject {
         catch { throw PCSyncPairError(message: "組にするコードを読み取れませんでした。PCに表示されたQRコードを読み直してください。") }
         do { try keyStore.write(value.key) }
         catch { throw PCSyncPairError(message: "組にする鍵を保存できませんでした。\(DeviceKind.current.name)のロックを解除して、もう一度お試しください。") }
+        let wasPaired = pairing != nil
         stopPairing()
+        if wasPaired { monitor.resetTemplateSyncState() }
         settings.save(value)
         pairing = value; pcName = value.name
         try disk.load(pairId: value.pcId, now: now()); refreshPending()
@@ -176,7 +242,105 @@ final class PCSyncController: ObservableObject {
         settings.deletionPending = true
         settings.clearPairing()
         deleteKeyIfPending()
+        monitor.resetTemplateSyncState()
         record("組を解除")
+    }
+
+    func syncTemplates(completion: @escaping @MainActor (Result<TemplateSyncOutcome, TemplateSyncError>) -> Void) {
+        guard status != .unpaired else {
+            completion(.failure(.unpaired))
+            return
+        }
+        guard !isSyncingTemplates else {
+            completion(.failure(.alreadyInProgress))
+            return
+        }
+        if requiresRepair {
+            completion(.failure(.requiresRepair))
+            return
+        }
+        if requiresPeerUpdate {
+            completion(.failure(.requiresPeerUpdate))
+            return
+        }
+        switch status {
+        case .unpaired:
+            completion(.failure(.unpaired))
+            return
+        case .bluetoothOff:
+            completion(.failure(.bluetoothOff))
+            return
+        case .unauthorized:
+            completion(.failure(.unauthorized))
+            return
+        case .unsupported:
+            completion(.failure(.unsupported))
+            return
+        case .searching, .connecting:
+            completion(.failure(.notConnected))
+            return
+        case .connected:
+            guard pairing != nil, sender != nil else {
+                completion(.failure(.notConnected))
+                return
+            }
+        }
+
+        let op = UUID()
+        let startedAt = now()
+        let initialDeadline = startedAt.addingTimeInterval(Self.templateSyncTimeout)
+        isSyncingTemplates = true
+        activeTemplateSync = ActiveTemplateSync(
+            op: op,
+            reply: PendingReply(
+                initialSentAt: startedAt,
+                deadline: initialDeadline,
+                baselineDeadline: initialDeadline,
+                activeFrameToken: nil
+            ),
+            pushed: nil,
+            awaitingSendCompletion: true,
+            isApplying: false,
+            completion: completion
+        )
+        let pairingGen = pairingGeneration
+        let sessionGen = sessionGeneration
+        monitor.readTemplateSyncSnapshot { [weak self] result in
+            guard let self, self.pairingGeneration == pairingGen, self.sessionGeneration == sessionGen,
+                  var active = self.activeTemplateSync, active.op == op else { return }
+            guard self.status == .connected else {
+                self.activeTemplateSync = nil
+                self.isSyncingTemplates = false
+                active.completion(.failure(.disconnected))
+                return
+            }
+            switch result {
+            case .failure:
+                self.activeTemplateSync = nil
+                self.isSyncingTemplates = false
+                self.record("テンプレート同期の読み込み失敗")
+                active.completion(.failure(.saveFailed))
+            case .success(let local):
+                do {
+                    let pages = try TemplateSyncMessageCodec.splitPages(op: op, snapshot: local.snapshot, isState: false)
+                    let pushNow = self.now()
+                    let pushDeadline = pushNow.addingTimeInterval(Self.templateSyncTimeout)
+                    active.pushed = local
+                    active.reply.initialSentAt = pushNow
+                    active.reply.deadline = pushDeadline
+                    active.reply.baselineDeadline = pushDeadline
+                    self.activeTemplateSync = active
+                    self.templateOutgoing.append(contentsOf: pages)
+                    self.record("テンプレート同期開始; 件数=\(local.snapshot.templates.count); 墓標=\(local.snapshot.tombstones.count)")
+                    self.pump()
+                } catch {
+                    self.activeTemplateSync = nil
+                    self.isSyncingTemplates = false
+                    self.record("テンプレート同期送信失敗")
+                    active.completion(.failure(.limitExceeded))
+                }
+            }
+        }
     }
     private func deleteKeyIfPending() {
         guard settings.deletionPending else { return }
@@ -285,18 +449,29 @@ final class PCSyncController: ObservableObject {
         if let assembler {
             do { try assembler.finish() } catch { record("受信組み立てを破棄") }
         }
-        assembler = nil; handshake = nil; sender = nil; receiver = nil; peerId = nil
+        if let templateAssembler {
+            do { try templateAssembler.finish() } catch { record("テンプレート受信組み立てを破棄") }
+        }
+        assembler = nil; templateAssembler = nil; handshake = nil; sender = nil; receiver = nil; peerId = nil
         sessionGeneration = UUID()
         handshakeStart = nil; partialStart = nil; receiveStart = nil; receiveBytes = 0
+        templateReceiveStart = nil; templateReceiveBytes = 0
         nextIncomingFrameToken = 0; currentIncomingFrameToken = nil; incomingFrameBytes = 0
         writeBlockedSince = nil
         lastActivity = nil; pingRequestedAt = nil; pingQueued = false
         output = nil; controlFrames.removeAll(); ackQueue.removeAll()
+        templateAckQueue.removeAll(); templateOutgoing.removeAll()
+        inFlightTemplatePulls.removeAll(); pendingPushedSnapshots.removeAll()
         sentThisConnection.removeAll(); sentAt.removeAll()
         closeReadHandle()
         activeAttachment = nil; attachmentReceives.removeAll(); replies.removeAll()
         offeredThisConnection.removeAll(); resumedAttachments.removeAll(); finalChunkSentAttachments.removeAll()
         transferProgress = nil
+        if let active = activeTemplateSync {
+            activeTemplateSync = nil
+            isSyncingTemplates = false
+            active.completion(.failure(.disconnected))
+        }
     }
 
     private func handle(_ event: PCSyncTransportEvent) {
@@ -423,6 +598,11 @@ final class PCSyncController: ObservableObject {
         }
     }
 
+    private var isMidTemplatePush: Bool {
+        guard let first = templateOutgoing.first, case let .push(_, part, _, _) = first else { return false }
+        return part > 0
+    }
+
     /// Only one frame is materialized at a time; AUTH always precedes encrypted data.
     private func pump() {
         guard !pumping, let transport else { return }
@@ -437,6 +617,8 @@ final class PCSyncController: ObservableObject {
                     var isAuth = false
                     var chunkEndOffset: Int?
                     var finishesAttachment = false
+                    var templatePushOp: UUID?
+                    var finishesTemplatePush = false
                     if !controlFrames.isEmpty {
                         frame = controlFrames.removeFirst(); isAuth = frame.first == 3
                     } else if status == .connected, let sender {
@@ -446,6 +628,16 @@ final class PCSyncController: ObservableObject {
                             frame = try sender.seal(SyncMessageCodec.encode(.ack(ids: ids)))
                         } else if !replies.isEmpty {
                             frame = try sender.seal(SyncMessageCodec.encode(replies.removeFirst()))
+                        } else if !templateAckQueue.isEmpty, !isMidTemplatePush {
+                            let ackOp = templateAckQueue.removeFirst()
+                            frame = try sender.seal(TemplateSyncMessageCodec.encode(.ack(op: ackOp)))
+                        } else if !templateOutgoing.isEmpty {
+                            let tplMessage = templateOutgoing.removeFirst()
+                            if case let .push(op, part, total, _) = tplMessage {
+                                templatePushOp = op
+                                finishesTemplatePush = (part + 1 == total)
+                            }
+                            frame = try sender.seal(TemplateSyncMessageCodec.encode(tplMessage))
                         } else if pingQueued {
                             pingQueued = false
                             frame = try sender.seal(SyncMessageCodec.encode(.ping))
@@ -496,6 +688,8 @@ final class PCSyncController: ObservableObject {
                     output = Output(packets: packets, started: now(), progressed: now(), id: id,
                                     isAuth: isAuth, chunkEndOffset: chunkEndOffset,
                                     finishesAttachment: finishesAttachment,
+                                    templatePushOp: templatePushOp,
+                                    finishesTemplatePush: finishesTemplatePush,
                                     bytes: packets.reduce(0) { $0 + $1.count })
                 }
                 guard var current = output else { return }
@@ -533,6 +727,18 @@ final class PCSyncController: ObservableObject {
                     if current.finishesAttachment { finalChunkSentAttachments.insert(id) }
                     lastSentAt = completedNow
                 }
+                if finished, let pushOp = current.templatePushOp, current.finishesTemplatePush {
+                    let completedNow = now()
+                    if var active = activeTemplateSync, active.op == pushOp {
+                        let deadline = completedNow.addingTimeInterval(Self.templateSyncTimeout)
+                        active.awaitingSendCompletion = false
+                        active.reply.initialSentAt = completedNow
+                        active.reply.deadline = deadline
+                        active.reply.baselineDeadline = deadline
+                        active.reply.activeFrameToken = nil
+                        activeTemplateSync = active
+                    }
+                }
                 lastActivity = now()
                 transport.write(packet)
                 guard sessionGeneration == session else { return }
@@ -547,14 +753,22 @@ final class PCSyncController: ObservableObject {
                     if current.id != nil && current.chunkEndOffset == nil {
                         record("送信; 件数=1; バイト数=\(current.bytes); 所要ms=\(milliseconds(since: current.started))")
                     }
+                    if current.templatePushOp != nil && current.finishesTemplatePush {
+                        record("テンプレート同期送信; バイト数=\(current.bytes); 所要ms=\(milliseconds(since: current.started))")
+                    }
                 }
             }
             if writeBlockedSince == nil,
-               output != nil || !controlFrames.isEmpty || !ackQueue.isEmpty || !replies.isEmpty || pingQueued ||
-                nextPendingItem() != nil {
+               output != nil || !controlFrames.isEmpty || !ackQueue.isEmpty || !replies.isEmpty ||
+                !templateAckQueue.isEmpty || !templateOutgoing.isEmpty || pingQueued || nextPendingItem() != nil {
                 writeBlockedSince = now()
             }
         } catch { fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信フレーム作成失敗") }
+    }
+
+    private enum IncomingMessage {
+        case sync(SyncMessage)
+        case template(TemplateSyncMessage)
     }
 
     private func receive(_ packet: Data) {
@@ -608,9 +822,15 @@ final class PCSyncController: ObservableObject {
             }
             // AUTH must already have been handed to Bluetooth before application data arrives.
             guard status == .connected, let receiver else { throw SyncProtocolError.state }
-            let message = try SyncMessageCodec.decode(receiver.open(frame))
-            switch message {
-            case .ping, .pong:
+            let plaintext = try receiver.open(frame)
+            let incoming: IncomingMessage
+            do {
+                incoming = .sync(try SyncMessageCodec.decode(plaintext))
+            } catch SyncProtocolError.format {
+                incoming = .template(try TemplateSyncMessageCodec.decode(plaintext))
+            }
+            switch incoming {
+            case .sync(.ping), .sync(.pong):
                 revertReplyExtension(for: frameToken)
             default:
                 if frameBytes > Self.minExtendableFrameBytes {
@@ -618,101 +838,106 @@ final class PCSyncController: ObservableObject {
                 }
                 confirmReplyExtension(for: frameToken)
             }
-            switch message {
-            case let .item(id, at, from, text):
-                guard from == "pc" else { throw SyncProtocolError.format }
-                if seen.contains(id) { queueAck(id); record("重複受信; 件数=1"); return }
-                // No premature ACK while the first occurrence is still being committed.
-                guard !receiving.contains(id) else { return }
-                guard receiving.count < 50 else { throw SyncProtocolError.limit }
-                receiving.insert(id)
-                let generation = pairingGeneration
-                monitor.receiveFromPC(text, copyToPasteboard: copiesReceivedToPasteboard, at: Date(timeIntervalSince1970: Double(at) / 1000),
-                    isCurrentPairing: { [weak self] in self?.pairingGeneration == generation }) { [weak self] success in
-                    guard let self, self.pairingGeneration == generation else { return }
-                    self.receiving.remove(id)
-                    guard success else { self.fail(reject: false, reason: "受信履歴保存失敗"); return }
-                    do { try self.disk.markSeen(id) } catch { self.fail(reject: false, reason: "受信確認保存失敗"); return }
-                    self.lastReceivedAt = self.now()
-                    self.record("受信; 件数=1; バイト数=\(bytes); 所要ms=\(self.milliseconds(since: start))")
-                    if self.status == .connected { self.queueAck(id) }
-                }
-            case .offer(let offer):
-                guard offer.from == "pc" else { throw SyncProtocolError.format }
-                // The authenticated header can arrive before Apple shares the completed copy from another device.
-                monitor.rememberIncomingPC(kind: offer.kind, hash: offer.sha256)
-                if seen.contains(offer.id) { queueAck(offer.id); return }
-                guard offeredThisConnection.insert(offer.id).inserted else { throw SyncProtocolError.state }
-                guard !receiving.contains(offer.id) else { return }
-                let offerNow = now()
-                let offset = try disk.begin(offer, now: offerNow)
-                transferProgress = TransferProgress(direction: "receive", itemID: offer.id, bytes: offset, totalBytes: offer.size)
-                attachmentReceives[offer.id] = (startedAt: offerNow, startOffset: offset)
-                if offset == offer.size { try finishIncoming(offer) }
-                else { try queueReply(.resume(id: offer.id, offset: offset)) }
-            case let .chunk(id, offset, data):
-                if seen.contains(id) { queueAck(id); return }
-                guard !receiving.contains(id) else { return }
-                guard let offer = disk.state.partials.first(where: { $0.offer.id == id })?.offer else { throw SyncProtocolError.state }
-                let saved = try disk.append(id: id, offset: offset, data: data)
-                transferProgress = TransferProgress(direction: "receive", itemID: id, bytes: saved, totalBytes: offer.size)
-                if saved == offer.size { try finishIncoming(offer) }
-                else { try queueReply(.resume(id: id, offset: saved)) }
-            case let .resume(id, offset):
-                guard let item = pending.first(where: { $0.id == id }) else { return }
-                guard let offer = item.offer, offset < offer.size,
-                      var active = activeAttachment, active.id == id else { throw SyncProtocolError.state }
-                if active.awaitingInitialResume {
-                    guard active.handedOffOfferLastPacket else { return }
-                    active.awaitingInitialResume = false
-                    active.ackedOffset = offset
-                    active.nextSendOffset = offset
-                    active.startOffset = offset
-                    sentAt.removeValue(forKey: id)
-                    finalChunkSentAttachments.remove(id)
-                } else {
-                    guard let idx = active.chunks.firstIndex(where: { $0.endOffset == offset }),
-                          active.chunks[idx].handedOffLastPacket else {
-                        throw SyncProtocolError.state
+            switch incoming {
+            case .template(let templateMessage):
+                try handleTemplateMessage(templateMessage, bytes: bytes, start: start, current: current)
+            case .sync(let message):
+                switch message {
+                case let .item(id, at, from, text):
+                    guard from == "pc" else { throw SyncProtocolError.format }
+                    if seen.contains(id) { queueAck(id); record("重複受信; 件数=1"); return }
+                    // No premature ACK while the first occurrence is still being committed.
+                    guard !receiving.contains(id) else { return }
+                    guard receiving.count < 50 else { throw SyncProtocolError.limit }
+                    receiving.insert(id)
+                    let generation = pairingGeneration
+                    monitor.receiveFromPC(text, copyToPasteboard: copiesReceivedToPasteboard, at: Date(timeIntervalSince1970: Double(at) / 1000),
+                        isCurrentPairing: { [weak self] in self?.pairingGeneration == generation }) { [weak self] success in
+                        guard let self, self.pairingGeneration == generation else { return }
+                        self.receiving.remove(id)
+                        guard success else { self.fail(reject: false, reason: "受信履歴保存失敗"); return }
+                        do { try self.disk.markSeen(id) } catch { self.fail(reject: false, reason: "受信確認保存失敗"); return }
+                        self.lastReceivedAt = self.now()
+                        self.record("受信; 件数=1; バイト数=\(bytes); 所要ms=\(self.milliseconds(since: start))")
+                        if self.status == .connected { self.queueAck(id) }
                     }
-                    active.chunks.removeFirst(idx + 1)
-                    active.ackedOffset = offset
-                }
-                activeAttachment = active
-                resumedAttachments.insert(id)
-                pump()
-            case .ack(let ids):
-                for id in ids {
-                    if resumedAttachments.contains(id) && !finalChunkSentAttachments.contains(id) {
-                        throw SyncProtocolError.state
+                case .offer(let offer):
+                    guard offer.from == "pc" else { throw SyncProtocolError.format }
+                    // The authenticated header can arrive before Apple shares the completed copy from another device.
+                    monitor.rememberIncomingPC(kind: offer.kind, hash: offer.sha256)
+                    if seen.contains(offer.id) { queueAck(offer.id); return }
+                    guard offeredThisConnection.insert(offer.id).inserted else { throw SyncProtocolError.state }
+                    guard !receiving.contains(offer.id) else { return }
+                    let offerNow = now()
+                    let offset = try disk.begin(offer, now: offerNow)
+                    transferProgress = TransferProgress(direction: "receive", itemID: offer.id, bytes: offset, totalBytes: offer.size)
+                    attachmentReceives[offer.id] = (startedAt: offerNow, startOffset: offset)
+                    if offset == offer.size { try finishIncoming(offer) }
+                    else { try queueReply(.resume(id: offer.id, offset: offset)) }
+                case let .chunk(id, offset, data):
+                    if seen.contains(id) { queueAck(id); return }
+                    guard !receiving.contains(id) else { return }
+                    guard let offer = disk.state.partials.first(where: { $0.offer.id == id })?.offer else { throw SyncProtocolError.state }
+                    let saved = try disk.append(id: id, offset: offset, data: data)
+                    transferProgress = TransferProgress(direction: "receive", itemID: id, bytes: saved, totalBytes: offer.size)
+                    if saved == offer.size { try finishIncoming(offer) }
+                    else { try queueReply(.resume(id: id, offset: saved)) }
+                case let .resume(id, offset):
+                    guard let item = pending.first(where: { $0.id == id }) else { return }
+                    guard let offer = item.offer, offset < offer.size,
+                          var active = activeAttachment, active.id == id else { throw SyncProtocolError.state }
+                    if active.awaitingInitialResume {
+                        guard active.handedOffOfferLastPacket else { return }
+                        active.awaitingInitialResume = false
+                        active.ackedOffset = offset
+                        active.nextSendOffset = offset
+                        active.startOffset = offset
+                        sentAt.removeValue(forKey: id)
+                        finalChunkSentAttachments.remove(id)
+                    } else {
+                        guard let idx = active.chunks.firstIndex(where: { $0.endOffset == offset }),
+                              active.chunks[idx].handedOffLastPacket else {
+                            throw SyncProtocolError.state
+                        }
+                        active.chunks.removeFirst(idx + 1)
+                        active.ackedOffset = offset
                     }
-                }
-                let accepted = Set(ids.filter { id in
-                    if let active = activeAttachment, active.id == id {
-                        return active.handedOffOfferLastPacket &&
-                            (sentAt[id] != nil || finalChunkSentAttachments.contains(id))
+                    activeAttachment = active
+                    resumedAttachments.insert(id)
+                    pump()
+                case .ack(let ids):
+                    for id in ids {
+                        if resumedAttachments.contains(id) && !finalChunkSentAttachments.contains(id) {
+                            throw SyncProtocolError.state
+                        }
                     }
-                    return sentAt[id] != nil
-                })
-                if let active = activeAttachment, accepted.contains(active.id) {
-                    closeReadHandle(for: active.id)
-                    let ms = milliseconds(since: active.startedAt)
-                    let transferred = resumedAttachments.contains(active.id) ? max(0, active.size - active.startOffset) : 0
-                    let kbps = ms > 0 ? (Double(transferred) / 1024.0) / (Double(ms) / 1000.0) : 0.0
-                    record("添付送信完了; バイト数=\(active.size); 所要ms=\(ms); KB秒=\(String(format: "%.1f", kbps))")
-                    activeAttachment = nil
+                    let accepted = Set(ids.filter { id in
+                        if let active = activeAttachment, active.id == id {
+                            return active.handedOffOfferLastPacket &&
+                                (sentAt[id] != nil || finalChunkSentAttachments.contains(id))
+                        }
+                        return sentAt[id] != nil
+                    })
+                    if let active = activeAttachment, accepted.contains(active.id) {
+                        closeReadHandle(for: active.id)
+                        let ms = milliseconds(since: active.startedAt)
+                        let transferred = resumedAttachments.contains(active.id) ? max(0, active.size - active.startOffset) : 0
+                        let kbps = ms > 0 ? (Double(transferred) / 1024.0) / (Double(ms) / 1000.0) : 0.0
+                        record("添付送信完了; バイト数=\(active.size); 所要ms=\(ms); KB秒=\(String(format: "%.1f", kbps))")
+                        activeAttachment = nil
+                    }
+                    try disk.ack(accepted); refreshPending()
+                    resumedAttachments.subtract(accepted)
+                    finalChunkSentAttachments.subtract(accepted)
+                    if let progress = transferProgress, progress.direction == "send", accepted.contains(progress.itemID) {
+                        transferProgress = nil
+                    }
+                    pump()
+                case .device: throw SyncProtocolError.format
+                case .ping: break
+                case .pong:
+                    if !pingQueued { pingRequestedAt = nil }
                 }
-                try disk.ack(accepted); refreshPending()
-                resumedAttachments.subtract(accepted)
-                finalChunkSentAttachments.subtract(accepted)
-                if let progress = transferProgress, progress.direction == "send", accepted.contains(progress.itemID) {
-                    transferProgress = nil
-                }
-                pump()
-            case .device: throw SyncProtocolError.format
-            case .ping: break
-            case .pong:
-                if !pingQueued { pingRequestedAt = nil }
             }
         } catch SyncProtocolError.version { pauseForUpdate() }
         catch SyncProtocolError.identity { fail(reject: true, countBackoff: false, reason: "別のPC") }
@@ -724,6 +949,122 @@ final class PCSyncController: ObservableObject {
         catch {
             let duringHandshake = handshakeStart != nil && status != .connected
             fail(reject: false, countBackoff: duringHandshake, reason: "受信・接続確認失敗")
+        }
+    }
+
+    private func rememberPushedSnapshot(_ snapshot: LocalTemplateSyncSnapshot, for op: UUID) {
+        pendingPushedSnapshots.removeAll { $0.op == op }
+        pendingPushedSnapshots.append((op: op, snapshot: snapshot))
+        if pendingPushedSnapshots.count > 8 {
+            pendingPushedSnapshots.removeFirst(pendingPushedSnapshots.count - 8)
+        }
+    }
+
+    private func takePushedSnapshot(for op: UUID) -> LocalTemplateSyncSnapshot? {
+        guard let index = pendingPushedSnapshots.firstIndex(where: { $0.op == op }) else { return nil }
+        return pendingPushedSnapshots.remove(at: index).snapshot
+    }
+
+    private func handleTemplateMessage(_ message: TemplateSyncMessage, bytes: Int, start: Date, current: Date) throws {
+        switch message {
+        case .pull(let op):
+            guard !inFlightTemplatePulls.contains(op) else { return }
+            guard inFlightTemplatePulls.count < 16 else { throw SyncProtocolError.limit }
+            inFlightTemplatePulls.insert(op)
+            let pairingGen = pairingGeneration
+            let sessionGen = sessionGeneration
+            monitor.readTemplateSyncSnapshot { [weak self] result in
+                guard let self, self.pairingGeneration == pairingGen, self.sessionGeneration == sessionGen else { return }
+                self.inFlightTemplatePulls.remove(op)
+                guard self.status == .connected else { return }
+                switch result {
+                case .failure:
+                    self.record("テンプレート同期の読み込み失敗")
+                    self.fail(reject: false, reason: "テンプレート同期の読み込み失敗")
+                case .success(let local):
+                    do {
+                        let pages = try TemplateSyncMessageCodec.splitPages(op: op, snapshot: local.snapshot, isState: false)
+                        self.rememberPushedSnapshot(local, for: op)
+                        self.templateOutgoing.append(contentsOf: pages)
+                        self.record("テンプレート要求に応答; 件数=\(local.snapshot.templates.count); 墓標=\(local.snapshot.tombstones.count)")
+                        self.pump()
+                    } catch {
+                        self.record("テンプレート同期送信失敗")
+                    }
+                }
+            }
+        case .state(let op, _, _, _):
+            if templateAssembler == nil {
+                templateAssembler = TemplateSyncPageAssembler(expectedOp: nil, expectedIsState: true)
+                templateReceiveStart = start
+                templateReceiveBytes = 0
+            }
+            templateReceiveBytes += bytes
+            let assembled = try templateAssembler!.append(message)
+            guard let snapshot = assembled else {
+                if var active = activeTemplateSync, active.op == op {
+                    let candidate = current.addingTimeInterval(Self.templateSyncTimeout)
+                    let maxDeadline = active.reply.initialSentAt.addingTimeInterval(Self.templateSyncTimeout + Self.maxReplyExtension)
+                    let updated = min(candidate, maxDeadline)
+                    if updated > active.reply.deadline {
+                        active.reply.deadline = updated
+                        active.reply.baselineDeadline = updated
+                    }
+                    activeTemplateSync = active
+                }
+                return
+            }
+            let totalStart = templateReceiveStart ?? start
+            let totalBytes = templateReceiveBytes
+            templateReceiveStart = nil
+            templateReceiveBytes = 0
+            try templateAssembler?.finish()
+            templateAssembler = nil
+
+            let pushed: LocalTemplateSyncSnapshot?
+            if var active = activeTemplateSync, active.op == op {
+                active.isApplying = true
+                activeTemplateSync = active
+                pushed = active.pushed
+            } else {
+                pushed = takePushedSnapshot(for: op)
+            }
+
+            let pairingGen = pairingGeneration
+            let sessionGen = sessionGeneration
+            monitor.applySyncedTemplates(snapshot, pushed: pushed) { [weak self] result in
+                guard let self, self.pairingGeneration == pairingGen else { return }
+                let completion: (@MainActor (Result<TemplateSyncOutcome, TemplateSyncError>) -> Void)?
+                if let active = self.activeTemplateSync, active.op == op, self.sessionGeneration == sessionGen {
+                    self.activeTemplateSync = nil
+                    self.isSyncingTemplates = false
+                    completion = active.completion
+                } else {
+                    completion = nil
+                }
+                switch result {
+                case .failure:
+                    self.record("テンプレート同期保存失敗")
+                    if self.sessionGeneration == sessionGen {
+                        self.fail(reject: false, reason: "テンプレート同期保存失敗")
+                    }
+                    completion?(.failure(.saveFailed))
+                case .success(let outcome):
+                    self.record("テンプレート同期完了; 追加=\(outcome.added); 更新=\(outcome.updated); 削除=\(outcome.deleted); 反映=\(outcome.pushedToPCCount); 競合写し=\(outcome.conflictCopyCount); バイト数=\(totalBytes); 所要ms=\(self.milliseconds(since: totalStart))")
+                    if let skew = outcome.clockSkewSeconds {
+                        self.record("PCとの時刻差を検知; ずれ秒=\(skew)")
+                    }
+                    if self.status == .connected && self.sessionGeneration == sessionGen {
+                        if !self.templateAckQueue.contains(op) {
+                            self.templateAckQueue.append(op)
+                        }
+                        self.pump()
+                    }
+                    completion?(.success(outcome))
+                }
+            }
+        case .push, .ack:
+            throw SyncProtocolError.format
         }
     }
     private func finishIncoming(_ offer: SyncOffer) throws {
@@ -811,6 +1152,19 @@ final class PCSyncController: ObservableObject {
                 entry.deadline = updated
             }
         }
+        if var active = activeTemplateSync, !active.isApplying {
+            let tplCandidate = now.addingTimeInterval(Self.templateSyncTimeout)
+            if active.reply.activeFrameToken != frameToken {
+                active.reply.baselineDeadline = active.reply.deadline
+                active.reply.activeFrameToken = frameToken
+            }
+            let maxDeadline = active.reply.initialSentAt.addingTimeInterval(Self.templateSyncTimeout + Self.maxReplyExtension)
+            let updated = min(tplCandidate, maxDeadline)
+            if updated > active.reply.deadline {
+                active.reply.deadline = updated
+            }
+            activeTemplateSync = active
+        }
     }
     private func revertReplyExtension(for frameToken: UInt64) {
         transformReplies { entry in
@@ -818,12 +1172,22 @@ final class PCSyncController: ObservableObject {
             entry.deadline = entry.baselineDeadline
             entry.activeFrameToken = nil
         }
+        if var active = activeTemplateSync, active.reply.activeFrameToken == frameToken {
+            active.reply.deadline = active.reply.baselineDeadline
+            active.reply.activeFrameToken = nil
+            activeTemplateSync = active
+        }
     }
     private func confirmReplyExtension(for frameToken: UInt64) {
         transformReplies { entry in
             guard entry.activeFrameToken == frameToken else { return }
             entry.baselineDeadline = entry.deadline
             entry.activeFrameToken = nil
+        }
+        if var active = activeTemplateSync, active.reply.activeFrameToken == frameToken {
+            active.reply.baselineDeadline = active.reply.deadline
+            active.reply.activeFrameToken = nil
+            activeTemplateSync = active
         }
     }
     private func fail(reject: Bool, countBackoff: Bool = false, reason: String) {
@@ -859,6 +1223,31 @@ final class PCSyncController: ObservableObject {
         } else if sentAt.values.contains(where: { date > $0.deadline }) ||
                   (activeAttachment?.chunks.contains(where: { chunk in chunk.reply.map { date > $0.deadline } ?? false }) ?? false) {
             fail(reject: false, reason: "ack期限")
+        } else if let active = activeTemplateSync, !active.isApplying, date > active.reply.deadline {
+            let hasRemainingPages = templateOutgoing.contains { msg in
+                if case let .push(op, _, _, _) = msg { return op == active.op }
+                return false
+            }
+            let startedSendingThisOp = output?.templatePushOp == active.op ||
+                (active.pushed != nil && hasRemainingPages &&
+                 !templateOutgoing.contains { if case let .push(op, part, _, _) = $0 { return op == active.op && part == 0 }; return false })
+            activeTemplateSync = nil
+            isSyncingTemplates = false
+            if startedSendingThisOp && hasRemainingPages {
+                fail(reject: false, reason: "テンプレート同期期限")
+                active.completion(.failure(.timedOut))
+            } else {
+                templateOutgoing.removeAll { msg in
+                    if case let .push(op, _, _, _) = msg { return op == active.op }
+                    return false
+                }
+                if output == nil && controlFrames.isEmpty && ackQueue.isEmpty && replies.isEmpty &&
+                    templateAckQueue.isEmpty && templateOutgoing.isEmpty && !pingQueued && nextPendingItem() == nil {
+                    writeBlockedSince = nil
+                }
+                record("テンプレート同期期限")
+                active.completion(.failure(.timedOut))
+            }
         } else if let start = pingRequestedAt, date.timeIntervalSince(start) >= 10 {
             fail(reject: false, reason: "pong期限")
         } else if status == .connected, pingRequestedAt == nil,

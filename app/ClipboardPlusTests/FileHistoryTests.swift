@@ -134,7 +134,7 @@ final class FileHistoryTests: XCTestCase {
             PRAGMA user_version = 2;
             """, at: url)
         let database = try HistoryDatabase(url: url, now: { Date(timeIntervalSince1970: 1000) })
-        XCTAssertEqual(try database.readSchemaVersion(), 5)
+        XCTAssertEqual(try database.readSchemaVersion(), HistoryDatabase.schemaVersion)
         XCTAssertEqual(try database.fetchAll().first?.id, 7)
         XCTAssertNotNil(try database.latestDeletion())
         let file = try FileTestSupport.input(in: root).file

@@ -84,6 +84,8 @@ private final class SyncTestLink: PCSyncTransport {
     var rejected: [Bool] = []
     var retryDelays: [TimeInterval] = []
     var messages: [SyncMessage] = []
+    var templateMessages: [TemplateSyncMessage] = []
+    var decryptedLog: [String] = []
     var devices: [String] = []
     var packets: [Data] = []
     var authenticatedId: UUID?
@@ -193,8 +195,30 @@ private final class SyncTestLink: PCSyncTransport {
                 if let id = pc.authenticatedPadId { acceptedPadIds.append(id) }
             } else {
                 let receiver = try XCTUnwrap(receiver, "Data must follow AUTH")
-                let message = try SyncMessageCodec.decode(receiver.open(frame))
-                if case .device(let kind) = message { devices.append(kind) } else { messages.append(message) }
+                let plaintext = try receiver.open(frame)
+                do {
+                    let message = try SyncMessageCodec.decode(plaintext)
+                    if case .device(let kind) = message {
+                        devices.append(kind)
+                        decryptedLog.append("device")
+                    } else {
+                        messages.append(message)
+                        if case .item(_, _, _, let text) = message {
+                            decryptedLog.append("item:\(text)")
+                        } else {
+                            decryptedLog.append("sync")
+                        }
+                    }
+                } catch SyncProtocolError.format {
+                    let decoded = try TemplateSyncMessageCodec.decode(plaintext)
+                    templateMessages.append(decoded)
+                    switch decoded {
+                    case .pull: decryptedLog.append("tpl_pull")
+                    case .push: decryptedLog.append("tpl_push")
+                    case .state: decryptedLog.append("tpl_state")
+                    case .ack: decryptedLog.append("tpl_ack")
+                    }
+                }
             }
         } catch { XCTFail("Fake PC protocol failure: \(error)") }
     }
@@ -202,11 +226,19 @@ private final class SyncTestLink: PCSyncTransport {
         let sender = try XCTUnwrap(sender)
         return try sender.seal(SyncMessageCodec.encode(message))
     }
+    func seal(_ message: TemplateSyncMessage) throws -> Data {
+        let sender = try XCTUnwrap(sender)
+        return try sender.seal(TemplateSyncMessageCodec.encode(message))
+    }
     func sealRawPlaintext(_ plaintext: Data) throws -> Data {
         let sender = try XCTUnwrap(sender)
         return try sender.seal(plaintext)
     }
     func send(_ message: SyncMessage) throws {
+        let frame = try seal(message)
+        if !dropsNotifications { try deliver(frame) }
+    }
+    func send(_ message: TemplateSyncMessage) throws {
         let frame = try seal(message)
         if !dropsNotifications { try deliver(frame) }
     }
@@ -243,6 +275,18 @@ private final class SyncTestLink: PCSyncTransport {
             return []
         }
     }
+    var templatePushes: [(op: UUID, part: Int, total: Int, page: TemplateSyncPage)] {
+        templateMessages.compactMap { message -> (UUID, Int, Int, TemplateSyncPage)? in
+            if case let .push(op, part, total, page) = message { return (op, part, total, page) }
+            return nil
+        }
+    }
+    var templateAckOps: [UUID] {
+        templateMessages.compactMap { message -> UUID? in
+            if case .ack(let op) = message { return op }
+            return nil
+        }
+    }
 }
 
 final class PCSyncControllerTests: XCTestCase {
@@ -260,7 +304,9 @@ final class PCSyncControllerTests: XCTestCase {
         var creations: Int { link.starts }
         init(test: XCTestCase, prepaired: SyncPairing? = nil, storageFails: Bool = false,
              readFails: Bool = false, retention: HistoryRetention = .never,
-             beforeInit: ((URL, URL) throws -> Void)? = nil) throws {
+             beforeInit: ((URL, URL) throws -> Void)? = nil,
+             databaseClock: (() -> Date)? = nil,
+             keyboardContainerURL: @escaping () -> URL? = { SharedAppGroup.containerURL() }) throws {
             root = try ImageTestSupport.directory(test)
             let suite = UUID().uuidString
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -285,10 +331,11 @@ final class PCSyncControllerTests: XCTestCase {
             monitor = ClipboardMonitor(defaults: defaults, log: log,
                 makeDatabase: {
                     if storage.fails { throw CocoaError(.fileWriteOutOfSpace) }
-                    return try HistoryDatabase(url: databaseURL)
+                    return try HistoryDatabase(url: databaseURL, now: databaseClock ?? Date.init)
                 }, schedulesMaintenance: false,
                 imageDirectory: imageDirectory, pasteboard: board,
-                resumesRecordingOnInit: false)
+                resumesRecordingOnInit: false,
+                keyboardContainerURL: keyboardContainerURL)
             let link = self.link
             controller = PCSyncController(monitor: monitor, defaults: defaults, keyStore: keys,
                 now: { clock.date }, schedulesTimeouts: false, makeTransport: { _ in link })
@@ -2424,5 +2471,304 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.send(.ack(ids: [offerID]))
         XCTAssertEqual(f.controller.pendingCount, 0)
         XCTAssertTrue(f.link.rejected.isEmpty)
+    }
+
+    @MainActor
+    func testTemplateSyncErrorStatesAndDeviceSpecificMessages() async throws {
+        XCTAssertEqual(TemplateSyncError.unsupported.message(for: .phone), "このiPhoneでは使えません")
+        XCTAssertEqual(TemplateSyncError.unsupported.message(for: .pad), "このiPadでは使えません")
+        XCTAssertEqual(TemplateSyncError.requiresPeerUpdate.message(for: .phone), "PCとこのiPhoneのclipboard+を更新してください")
+        XCTAssertEqual(TemplateSyncError.requiresPeerUpdate.message(for: .pad), "PCとこのiPadのclipboard+を更新してください")
+        let skewOutcome = TemplateSyncOutcome(added: 0, updated: 0, deleted: 0, pushedToPCCount: 0, conflictCopyCount: 0,
+                                                skippedOversizedCount: 0, skippedOverflowCount: 0, clockSkewSeconds: 400)
+        XCTAssertTrue(skewOutcome.toastMessage(for: .phone).contains("iPhoneの時計がずれています"))
+        XCTAssertTrue(skewOutcome.toastMessage(for: .pad).contains("iPadの時計がずれています"))
+
+        let f = try Fixture(test: self)
+        func runSync() -> Result<TemplateSyncOutcome, TemplateSyncError>? {
+            var outcome: Result<TemplateSyncOutcome, TemplateSyncError>?
+            f.controller.syncTemplates { outcome = $0 }
+            return outcome
+        }
+
+        // Unpaired
+        XCTAssertEqual(runSync(), .failure(.unpaired))
+        XCTAssertFalse(f.controller.isSyncingTemplates)
+
+        // Paired states before connected
+        let pairing = try pair(f)
+        XCTAssertEqual(runSync(), .failure(.notConnected))
+        f.link.simulateBluetoothOff()
+        XCTAssertEqual(runSync(), .failure(.bluetoothOff))
+        f.link.onEvent?(.status(.unauthorized))
+        XCTAssertEqual(runSync(), .failure(.unauthorized))
+        f.link.onEvent?(.status(.unsupported))
+        XCTAssertEqual(runSync(), .failure(.unsupported))
+        f.link.onEvent?(.status(.searching))
+
+        // Peer version mismatch -> requiresPeerUpdate
+        f.link.welcomeVersion = 2
+        try f.link.connect(pairing)
+        XCTAssertEqual(runSync(), .failure(.requiresPeerUpdate))
+        f.link.welcomeVersion = nil
+        f.controller.retryAfterPeerUpdate()
+
+        // Repeated auth mismatch -> requiresRepair
+        f.link.corruptWelcome = true
+        for _ in 0..<3 { try f.link.connect(pairing) }
+        XCTAssertTrue(f.controller.requiresRepair)
+        XCTAssertEqual(runSync(), .failure(.requiresRepair))
+    }
+
+    @MainActor
+    func testTemplateSyncRoundtripAppliesChangesExportsKeyboardHistoryAndLogsNoSecrets() async throws {
+        let root = try ImageTestSupport.directory(self)
+        let containerURL = root.appendingPathComponent("group", isDirectory: true)
+        let f = try Fixture(test: self, keyboardContainerURL: { containerURL })
+        let pairing = try pair(f)
+
+        var entry1: HistoryEntry?
+        var entry2: HistoryEntry?
+        let createdDone = expectation(description: "templates created")
+        createdDone.expectedFulfillmentCount = 2
+        f.monitor.createTemplate(text: "秘密本文アルファ", title: "秘密題名", tag: "秘密タグ") {
+            if case .success(let e) = $0 { entry1 = e }
+            createdDone.fulfill()
+        }
+        f.monitor.createTemplate(text: "削除される本文", title: nil, tag: nil) {
+            if case .success(let e) = $0 { entry2 = e }
+            createdDone.fulfill()
+        }
+        await fulfillment(of: [createdDone], timeout: 5)
+        await drain(f)
+
+        try f.link.connect(pairing, limit: 512)
+
+        var completionResult: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let finished = expectation(description: "syncTemplates finished")
+        f.controller.syncTemplates {
+            completionResult = $0
+            finished.fulfill()
+        }
+        XCTAssertTrue(f.controller.isSyncingTemplates)
+
+        // Second tap while active fails immediately with alreadyInProgress.
+        var concurrent: Result<TemplateSyncOutcome, TemplateSyncError>?
+        f.controller.syncTemplates { concurrent = $0 }
+        XCTAssertEqual(concurrent, .failure(.alreadyInProgress))
+
+        await drain(f)
+        let push = try XCTUnwrap(f.link.templatePushes.last)
+        XCTAssertEqual(push.part, 1)
+        XCTAssertEqual(push.total, 1)
+        XCTAssertEqual(push.page.templates.count, 2)
+        let id1 = try XCTUnwrap(push.page.templates.first { $0.text == "秘密本文アルファ" }?.id)
+        let id2 = try XCTUnwrap(push.page.templates.first { $0.text == "削除される本文" }?.id)
+
+        let pcAddedID = UUID()
+        let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
+        try f.link.send(.state(
+            op: push.op, part: 1, total: 1,
+            page: TemplateSyncPage(
+                version: SyncProtocol.version,
+                sentAt: nowMs,
+                templates: [
+                    TemplateSyncItem(id: id1, kind: .text, text: "同期後本文", title: "更新済題", tag: "別タグ", order: 0, updatedAt: nowMs + 100),
+                    TemplateSyncItem(id: pcAddedID, kind: .url, text: "https://pc-added.example", title: "PC側", tag: "Web", order: 0, updatedAt: nowMs + 200),
+                ],
+                tombstones: [
+                    TemplateSyncTombstone(id: id2, deletedAt: nowMs + 100)
+                ]
+            )
+        ))
+
+        await fulfillment(of: [finished], timeout: 5)
+        let outcome = try XCTUnwrap(completionResult?.get())
+        XCTAssertEqual(outcome.added, 1)
+        XCTAssertEqual(outcome.updated, 1)
+        XCTAssertEqual(outcome.deleted, 1)
+        XCTAssertFalse(f.controller.isSyncingTemplates)
+        XCTAssertEqual(f.link.templateAckOps, [push.op])
+
+        // UI list and keyboard-history.json both reflect synced templates with integer ID preserved.
+        await drain(f)
+        let templates = f.monitor.entries.filter(\.isTemplate)
+        XCTAssertEqual(templates.first { $0.id == entry1?.id }?.text, "同期後本文")
+        XCTAssertNil(templates.first { $0.id == entry2?.id })
+        XCTAssertTrue(templates.contains { $0.text == "https://pc-added.example" && $0.kind == .url })
+
+        let keyboard = try XCTUnwrap(KeyboardHistoryFile.read(from: SharedAppGroup.keyboardHistoryURL(in: containerURL)))
+        XCTAssertTrue(keyboard.entries.contains { $0.isTemplate && $0.text == "同期後本文" })
+        XCTAssertTrue(keyboard.entries.contains { $0.isTemplate && $0.text == "https://pc-added.example" })
+        XCTAssertFalse(keyboard.entries.contains { $0.text == "削除される本文" })
+
+        // Logs contain no plaintext, titles, tags, URLs, keys, or UUIDs.
+        let logDone = expectation(description: "logs flushed")
+        f.monitor.log.flush(context: f.monitor.logContext()) { logDone.fulfill() }
+        await fulfillment(of: [logDone], timeout: 5)
+        let logText = try String(contentsOf: f.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        for secret in ["秘密本文アルファ", "秘密題名", "秘密タグ", "削除される本文", "同期後本文",
+                       "pc-added.example", id1.uuidString, id2.uuidString, pcAddedID.uuidString, push.op.uuidString,
+                       pairing.key.base64EncodedString()] {
+            XCTAssertFalse(logText.contains(secret), "Unexpected sensitive token in log: \(secret)")
+        }
+    }
+
+    @MainActor
+    func testTemplateSyncDisconnectAndTimeoutAndLargeFrameExtension() async throws {
+        let f = try Fixture(test: self)
+        let pairing = try pair(f)
+        let tDone = expectation(description: "template ready")
+        f.monitor.createTemplate(text: "切断試験", title: nil, tag: nil) { _ in tDone.fulfill() }
+        await fulfillment(of: [tDone], timeout: 5)
+        await drain(f)
+
+        // 1. Mid-sync disconnect (while partial tpl_state already started) resolves failure & clears partial assembler.
+        try f.link.connect(pairing, limit: 512)
+        var res1: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp1 = expectation(description: "disconnect fails")
+        f.controller.syncTemplates { res1 = $0; exp1.fulfill() }
+        await drain(f)
+        let op1 = try XCTUnwrap(f.link.templatePushes.last?.op)
+        let partialItem = TemplateSyncItem(id: UUID(), kind: .text, text: "part1", title: nil, tag: nil, order: 0,
+                                           updatedAt: Int64(f.clock.date.timeIntervalSince1970 * 1000))
+        try f.link.send(.state(op: op1, part: 1, total: 2,
+                               page: TemplateSyncPage(version: SyncProtocol.version,
+                                                      sentAt: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                                                      templates: [partialItem], tombstones: [])))
+        f.link.disconnect()
+        await fulfillment(of: [exp1], timeout: 5)
+        XCTAssertEqual(res1, .failure(.disconnected))
+        XCTAssertFalse(f.controller.isSyncingTemplates)
+
+        // 2. Reconnect, stale part 2 of op1 is ignored, and 30s timeout triggers .timedOut.
+        try f.link.connect(pairing, limit: 512)
+        try f.link.send(.state(op: op1, part: 2, total: 2,
+                               page: TemplateSyncPage(templates: [partialItem], tombstones: [])))
+        var res2: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp2 = expectation(description: "timeout")
+        f.controller.syncTemplates { res2 = $0; exp2.fulfill() }
+        await drain(f)
+        let op2 = try XCTUnwrap(f.link.templatePushes.last?.op)
+        XCTAssertNotEqual(op2, op1)
+
+        // Padded >64B multi-packet ping must revert provisional extension so 30s timeout still fires at +31s.
+        let paddedHeader = Data(("{\"t\":\"ping\"" + String(repeating: " ", count: 150) + "}").utf8)
+        let paddedPlaintext = Data([UInt8(paddedHeader.count >> 8), UInt8(truncatingIfNeeded: paddedHeader.count)]) + paddedHeader
+        let pingPackets = try SyncPacketizer.split(f.link.sealRawPlaintext(paddedPlaintext), packetLimit: 100)
+        f.clock.date.addTimeInterval(15)
+        f.link.onEvent?(.packet(pingPackets[0]))
+        f.clock.date.addTimeInterval(10)
+        for packet in pingPackets.dropFirst() { f.link.onEvent?(.packet(packet)) }
+        f.clock.date.addTimeInterval(6) // +31s since op2 start
+        f.controller.checkTimeouts()
+        await fulfillment(of: [exp2], timeout: 5)
+        XCTAssertEqual(res2, .failure(.timedOut))
+        XCTAssertFalse(f.controller.isSyncingTemplates)
+        XCTAssertEqual(f.link.rejected, [false])
+
+        // 3. Large incoming tpl_state frame extends deadline beyond 30s so multi-packet delivery succeeds.
+        try f.link.connect(pairing, limit: 512)
+        var res3: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp3 = expectation(description: "extended succeeds")
+        f.controller.syncTemplates { res3 = $0; exp3.fulfill() }
+        await drain(f)
+        let op3 = try XCTUnwrap(f.link.templatePushes.last?.op)
+        let push3 = try XCTUnwrap(f.link.templatePushes.last?.page.templates.first)
+        let bigText = String(repeating: "延", count: 350)
+        let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
+        let bigState = try f.link.seal(.state(
+            op: op3, part: 1, total: 1,
+            page: TemplateSyncPage(version: SyncProtocol.version, sentAt: nowMs,
+                                   templates: [TemplateSyncItem(id: push3.id, kind: .text, text: bigText, title: nil, tag: nil, order: 0, updatedAt: nowMs)],
+                                   tombstones: [])
+        ))
+        let packets = try SyncPacketizer.split(bigState, packetLimit: 182)
+        XCTAssertGreaterThanOrEqual(packets.count, 3)
+        f.clock.date.addTimeInterval(20)
+        for packet in packets {
+            f.clock.date.addTimeInterval(10) // exceeds 30s baseline before completion
+            f.link.onEvent?(.packet(packet))
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        await fulfillment(of: [exp3], timeout: 5)
+        XCTAssertEqual(try XCTUnwrap(res3).get().updated, 1)
+    }
+
+    @MainActor
+    func testTemplateSyncPrioritizedBeforePendingHistoryAndHandlesMultiPagePCPullAndUnpair() async throws {
+        var dbNow = Date(timeIntervalSince1970: 10_000)
+        let f = try Fixture(test: self, databaseClock: { dbNow })
+        f.clock.date = dbNow
+        let pairing = try pair(f)
+
+        // Create 5 large templates (~60 KiB each -> >256 KiB JSON -> multi-page tpl_push).
+        for idx in 0..<5 {
+            let done = expectation(description: "big template \(idx)")
+            let prefix = "T\(idx)-"
+            let body = prefix + String(repeating: "A", count: 60_000 - prefix.utf8.count)
+            f.monitor.createTemplate(text: body, title: nil, tag: nil) { _ in done.fulfill() }
+            await fulfillment(of: [done], timeout: 5)
+        }
+        await drain(f)
+
+        // Connect, start a history item mid-frame so a second history item queues behind it, then receive tpl_pull.
+        try f.link.connect(pairing, limit: 512)
+        f.link.stopAfterPackets = 1
+        f.monitor.saveManually(["先頭フレーム"], receivedAt: f.clock.date)
+        await drain(f)
+        f.monitor.saveManually(["後ろになる履歴"], receivedAt: f.clock.date.addingTimeInterval(1))
+        await drain(f)
+
+        let pcOp = UUID()
+        try f.link.send(.pull(op: pcOp))
+        await drain(f)
+
+        // Resume BLE flow control so queued output, templateOutgoing, and pending history all drain.
+        f.link.resume()
+        let pushes = f.link.templatePushes.filter { $0.op == pcOp }
+        XCTAssertGreaterThanOrEqual(pushes.count, 2)
+        XCTAssertEqual(pushes.map(\.part), Array(1...pushes.count))
+
+        // All tpl_push pages must precede the queued pending history item.
+        let lastPushIdx = try XCTUnwrap(f.link.decryptedLog.lastIndex(of: "tpl_push"))
+        let queuedHistoryIdx = try XCTUnwrap(f.link.decryptedLog.firstIndex(of: "item:後ろになる履歴"))
+        XCTAssertLessThan(lastPushIdx, queuedHistoryIdx)
+
+        // PC replies with multi-page tpl_state for pcOp, clearing 4 templates and updating remaining one.
+        let kept = try XCTUnwrap(pushes.first?.page.templates.first)
+        let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
+        dbNow = dbNow.addingTimeInterval(10)
+        try f.link.send(.state(
+            op: pcOp, part: 1, total: 2,
+            page: TemplateSyncPage(version: SyncProtocol.version, sentAt: nowMs,
+                                   templates: [TemplateSyncItem(id: kept.id, kind: .text, text: "PC配信結果", title: "共有", tag: nil, order: 0, updatedAt: nowMs)],
+                                   tombstones: [])
+        ))
+        let page2Item = TemplateSyncItem(id: UUID(), kind: .text, text: "PC追加2ページ目", title: nil, tag: nil, order: 1, updatedAt: nowMs)
+        try f.link.send(.state(
+            op: pcOp, part: 2, total: 2,
+            page: TemplateSyncPage(templates: [page2Item], tombstones: [])
+        ))
+        await drain(f)
+        XCTAssertTrue(f.link.templateAckOps.contains(pcOp))
+        XCTAssertTrue(f.monitor.entries.contains { $0.isTemplate && $0.text == "PC配信結果" })
+        XCTAssertTrue(f.monitor.entries.contains { $0.isTemplate && $0.text == "PC追加2ページ目" })
+
+        // Deleting a synced template creates a tombstone; unpair clears tombstones & baseHash while keeping templates.
+        let syncedTarget = try XCTUnwrap(f.monitor.entries.first { $0.isTemplate && $0.text == "PC配信結果" })
+        let delExp = expectation(description: "deleted synced template")
+        f.monitor.delete(syncedTarget) { _ in delExp.fulfill() }
+        await fulfillment(of: [delExp], timeout: 5)
+        await drain(f)
+
+        f.controller.unpair()
+        await drain(f)
+        let remain = try XCTUnwrap(f.monitor.entries.first { $0.isTemplate && $0.text == "PC追加2ページ目" })
+        let db = try HistoryDatabase(url: f.root.appendingPathComponent("history.sqlite"))
+        XCTAssertTrue(try db.templateTombstones().isEmpty)
+        let metaAfterUnpair = try XCTUnwrap(try db.templateSyncMetadata(id: remain.id))
+        XCTAssertNil(metaAfterUnpair.baseHash)
     }
 }
