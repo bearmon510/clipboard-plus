@@ -282,4 +282,37 @@ public sealed class TemplateRepositoryTests : IDisposable
         Assert.DoesNotContain(repo.GetState().Tombstones, t => t.Id == excessTombs[0].Id);
         Assert.Contains(repo.GetState().Tombstones, t => t.Id == item.Id);
     }
+
+    [Fact]
+    public void ApplyMergedPreservingLocalRetainsExcludedItemsDropsConflictingTombstonesAndEnforcesLimit()
+    {
+        const long t0 = 1_794_873_600_000;
+        var repo = new TemplateRepository(root);
+
+        var synced = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "synced", null, "仕事", 0, t0);
+        var preserved1 = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "preserved-1", null, "仕事", 2, t0 + 1);
+        var preserved2 = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "preserved-2", null, "仕事", 1, t0 + 2);
+        var sameTextPreserved = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "synced", null, null, 0, t0 + 3);
+        var tombstoneForPreserved = new TemplateSyncTombstone(preserved1.Id, t0 + 10);
+        var validTombstone = new TemplateSyncTombstone(Guid.NewGuid(), t0 + 11);
+
+        var saved = repo.ApplyMerged(
+            [synced],
+            [tombstoneForPreserved, validTombstone],
+            [preserved1, preserved2, sameTextPreserved]);
+
+        Assert.Equal(3, saved.Count);
+        Assert.Equal([synced.Id, preserved2.Id, preserved1.Id], saved.Select(t => t.Id).ToArray());
+        Assert.Equal([0, 1, 2], saved.Select(t => t.Order).ToArray());
+        Assert.Equal([validTombstone], repo.GetState().Tombstones);
+
+        // Exceeding 300 total (synced + preserved) throws Limit without overwriting previous durable state.
+        var synced300 = Enumerable.Range(0, SyncProtocol.MaxTemplates)
+            .Select(i => new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, $"item-{i}", null, null, i, t0))
+            .ToArray();
+        var ex = Assert.Throws<SyncProtocolException>(() => repo.ApplyMerged(synced300, [], [preserved1]));
+        Assert.Equal(SyncError.Limit, ex.Code);
+        Assert.Equal(3, repo.Count);
+        Assert.Equal(3, new TemplateRepository(root).Count);
+    }
 }

@@ -112,6 +112,8 @@ public sealed class BleLimitsTests
         var delivered = new List<byte[]>();
         var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allowWork = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var expectedDelivered = 0;
         var characteristic = new object();
         var peerObj = new object();
         var retiredSync = 0;
@@ -129,6 +131,8 @@ public sealed class BleLimitsTests
                     await allowWork.Task;
                 }
                 delivered.Add(bytes);
+                if (delivered.Count == expectedDelivered)
+                    allDelivered.TrySetResult();
                 return true;
             },
             _ => { Interlocked.Increment(ref disconnected); return Task.CompletedTask; },
@@ -151,6 +155,7 @@ public sealed class BleLimitsTests
                 var frame = sender.Seal(SyncMessageCodec.Encode(new SyncChunk(Guid.NewGuid(), c * SyncProtocol.ChunkBytes, chunkData)));
                 packets.AddRange(SyncPacketizer.Split(frame, packetLimit));
             }
+            expectedDelivered = packets.Count;
 
             // Enqueue packet 0 and pause work inside deliverPacketAsync before sending the remaining packets.
             var completions = new int[packets.Count];
@@ -179,9 +184,8 @@ public sealed class BleLimitsTests
             Assert.InRange(admission.TotalBytes, 1, WriteAdmission.DefaultPeerBytes);
 
             allowWork.SetResult();
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            while ((delivered.Count < packets.Count || admission.TotalBytes > 0) && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
+            await allDelivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await pipeline.QueueWork(() => Task.CompletedTask);
 
             Assert.Equal(packets.Count, delivered.Count);
             Assert.All(completions, count => Assert.Equal(1, count));
@@ -271,6 +275,8 @@ public sealed class BleLimitsTests
         var characteristic = new object();
         var oldPeer = new object();
         var newPeer = new object();
+        var allStaleCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var pipeline = new BleWritePipeline(
             admission,
@@ -279,6 +285,7 @@ public sealed class BleLimitsTests
             (peer, offset, bytes) =>
             {
                 delivered.Add((peer, bytes));
+                newDelivered.TrySetResult();
                 return Task.FromResult(true);
             },
             _ => Task.CompletedTask);
@@ -296,12 +303,12 @@ public sealed class BleLimitsTests
             var staleCompleted = 0;
             pipeline.EnqueueWrite(characteristic, "same-device-id", oldSession, 64, false,
                 async ct => { firstEntered.TrySetResult(); await gateRequest.Task.WaitAsync(ct); return new(0, [1, 2], false, () => { }, _ => { }); },
-                () => Interlocked.Increment(ref staleCompleted), () => { });
+                () => { if (Interlocked.Increment(ref staleCompleted) == 2) allStaleCompleted.TrySetResult(); }, () => { });
             await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             pipeline.EnqueueWrite(characteristic, "same-device-id", oldSession, 64, false,
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [3, 4], false, () => { }, _ => { })),
-                () => Interlocked.Increment(ref staleCompleted), () => { });
+                () => { if (Interlocked.Increment(ref staleCompleted) == 2) allStaleCompleted.TrySetResult(); }, () => { });
 
             // Disconnect old session and re-subscribe with the SAME device ID before ingest drains.
             pipeline.InvalidateSlot(oldSlot);
@@ -312,17 +319,12 @@ public sealed class BleLimitsTests
             gateRequest.SetResult();
 
             // Send a valid write on the new subscription generation.
-            var newDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             pipeline.EnqueueWrite(characteristic, "same-device-id", newSession, 64, false,
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [5, 6], false, () => { }, _ => { })),
                 () => { }, () => { });
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            while (delivered.Count == 0 && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
-
-            // Wait briefly to ensure stale writes didn't execute afterward.
-            await Task.Delay(50);
+            await Task.WhenAll(allStaleCompleted.Task, newDelivered.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            await pipeline.QueueWork(() => Task.CompletedTask);
 
             var single = Assert.Single(delivered);
             Assert.Same(newPeer, single.peer);
@@ -346,12 +348,13 @@ public sealed class BleLimitsTests
         var characteristic = new object();
         var peerObj = new object();
         var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var peer2Delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var pipeline = new BleWritePipeline(
             admission,
             logs.Enqueue,
             () => Task.CompletedTask,
-            (peer, offset, bytes) => { delivered.Add(bytes); return Task.FromResult(true); },
+            (peer, offset, bytes) => { delivered.Add(bytes); peer2Delivered.TrySetResult(); return Task.FromResult(true); },
             _ => { disconnected.TrySetResult(); return Task.CompletedTask; });
 
         var session1 = new object();
@@ -381,9 +384,8 @@ public sealed class BleLimitsTests
             () => { Interlocked.Increment(ref okCompleteAttempts); throw new InvalidOperationException("complete failed"); },
             () => { });
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while ((delivered.Count == 0 || admission.TotalBytes > 0) && DateTime.UtcNow < deadline)
-            await Task.Delay(10);
+        await peer2Delivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await pipeline.QueueWork(() => Task.CompletedTask);
 
         Assert.Equal(1, okCompleteAttempts);
         Assert.Equal(new byte[] { 9, 8, 7 }, Assert.Single(delivered));
@@ -433,12 +435,23 @@ public sealed class BleLimitsTests
         var newSession = new object();
         var sameSessionPeer = new object();
         var newPeer = new object();
+        var oldDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var pipeline = new BleWritePipeline(
             admission,
             logs.Enqueue,
             () => Task.CompletedTask,
-            (peer, _, bytes) => { delivered.Add((peer, bytes)); return Task.FromResult(true); },
+            (peer, _, bytes) =>
+            {
+                delivered.Add((peer, bytes));
+                if (ReferenceEquals(peer, newPeer))
+                    firstDelivered.TrySetResult();
+                else if (ReferenceEquals(peer, sameSessionPeer))
+                    secondDelivered.TrySetResult();
+                return Task.FromResult(true);
+            },
             _ => Task.CompletedTask);
 
         try
@@ -450,7 +463,7 @@ public sealed class BleLimitsTests
             var oldRejected = 0;
             pipeline.EnqueueWrite(inbound, "same-pad", oldSession, 64, false,
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [1, 2], false, () => { }, _ => { })),
-                () => Interlocked.Increment(ref oldCompleted),
+                () => { Interlocked.Increment(ref oldCompleted); oldDone.TrySetResult(); },
                 () => Interlocked.Increment(ref oldRejected));
 
             // New session subscribes for the same device ID -> must NOT inherit old provisional slot.
@@ -463,11 +476,9 @@ public sealed class BleLimitsTests
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [3, 4], false, () => { }, _ => { })),
                 () => { }, () => { });
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            while ((delivered.Count == 0 || admission.TotalBytes > 0 || Volatile.Read(ref oldCompleted) == 0) && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
+            await Task.WhenAll(oldDone.Task, firstDelivered.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            await pipeline.QueueWork(() => Task.CompletedTask);
 
-            await Task.Delay(30);
             var item = Assert.Single(delivered);
             Assert.Same(newPeer, item.peer);
             Assert.Equal(new byte[] { 3, 4 }, item.bytes);
@@ -484,9 +495,8 @@ public sealed class BleLimitsTests
             Assert.NotNull(bound);
             Assert.Same(sameSessionPeer, bound.Peer);
 
-            deadline = DateTime.UtcNow.AddSeconds(5);
-            while ((delivered.Count == 0 || admission.TotalBytes > 0) && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
+            await secondDelivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await pipeline.QueueWork(() => Task.CompletedTask);
 
             var sameItem = Assert.Single(delivered);
             Assert.Same(sameSessionPeer, sameItem.peer);
@@ -516,12 +526,15 @@ public sealed class BleLimitsTests
 
         var blockWork = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var workBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staleDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var addSnapshotDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var validDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         pipeline = new BleWritePipeline(
             admission,
             logs.Enqueue,
             () => Task.CompletedTask,
-            (peer, _, bytes) => { delivered.Add((peer, bytes)); return Task.FromResult(true); },
+            (peer, _, bytes) => { delivered.Add((peer, bytes)); validDelivered.TrySetResult(); return Task.FromResult(true); },
             _ => Task.CompletedTask,
             applySubscriptionsAsync: (clients, gen) =>
             {
@@ -536,6 +549,7 @@ public sealed class BleLimitsTests
                     var c = clients[0];
                     activePeer = peer2;
                     pipeline!.BindPeer(inbound, c.PeerId, c.Session, peer2, c.SubscriptionGeneration);
+                    addSnapshotDone.TrySetResult();
                 }
                 return Task.CompletedTask;
             });
@@ -559,7 +573,7 @@ public sealed class BleLimitsTests
             var staleCompleted = 0;
             pipeline.EnqueueWrite(inbound, "same-pad", session, 64, false,
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [9, 9], false, () => { }, _ => { })),
-                () => Interlocked.Increment(ref staleCompleted), () => { });
+                () => { Interlocked.Increment(ref staleCompleted); staleDone.TrySetResult(); }, () => { });
 
             // Event 1: unsubscribe (empty client list). Event 2: resubscribe (same device ID & even same session!).
             pipeline.CaptureSubscriptionsChanged(outbound, () => []);
@@ -576,9 +590,8 @@ public sealed class BleLimitsTests
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [1, 1], false, () => { }, _ => { })),
                 () => { }, () => { });
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            while ((delivered.Count == 0 || snapshotEvents.Count < 2 || admission.TotalBytes > 0) && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
+            await Task.WhenAll(staleDone.Task, addSnapshotDone.Task, validDelivered.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            await pipeline.QueueWork(() => Task.CompletedTask);
 
             Assert.Equal(2, snapshotEvents.Count);
             Assert.StartsWith("remove:", snapshotEvents[0]);
@@ -948,12 +961,13 @@ public sealed class BleLimitsTests
 
         var blockWork = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var workBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var helloDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         pipeline = new BleWritePipeline(
             admission,
             logs.Enqueue,
             () => Task.CompletedTask,
-            (peer, _, bytes) => { delivered.Add((peer, bytes)); return Task.FromResult(true); },
+            (peer, _, bytes) => { delivered.Add((peer, bytes)); helloDelivered.TrySetResult(); return Task.FromResult(true); },
             _ => Task.CompletedTask,
             applySubscriptionsAsync: (clients, snapshotGen) =>
             {
@@ -1032,9 +1046,8 @@ public sealed class BleLimitsTests
             blockWork.SetResult();
             await blockerTask.WaitAsync(TimeSpan.FromSeconds(5));
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            while ((delivered.Count == 0 || admission.TotalBytes > 0) && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
+            await helloDelivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await pipeline.QueueWork(() => Task.CompletedTask);
 
             var activePadA = registry.GetValueOrDefault("pad-a");
             Assert.NotNull(activePadA);
@@ -1202,16 +1215,19 @@ public sealed class BleLimitsTests
     {
         var packets = SyncPacketizer.Split(frame, packetLimit);
         var done = 0;
+        var allDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         foreach (var pkt in packets)
         {
             pipeline.EnqueueWrite(characteristic, peerId, session, pkt.Length, false,
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, pkt, false, () => { }, _ => { })),
-                () => Interlocked.Increment(ref done),
+                () =>
+                {
+                    if (Interlocked.Increment(ref done) == packets.Count)
+                        allDone.TrySetResult();
+                },
                 () => throw new InvalidOperationException("Unexpected sync rejection"));
         }
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (Volatile.Read(ref done) < packets.Count && DateTime.UtcNow < deadline)
-            await Task.Delay(10);
+        await allDone.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(packets.Count, done);
         // Ensure queued work items on work channel have also drained.
         await pipeline.QueueWork(() => Task.CompletedTask);
@@ -1283,11 +1299,17 @@ public sealed class BleLimitsTests
             var session = new object();
             var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var logCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var refreshEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var allowRefresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var peerRejectedSync = 0;
             var pipeline = new BleWritePipeline(
                 admission,
                 msg => { if (msg.Contains("write limit exceeded")) logCalled.TrySetResult(); },
-                () => Task.CompletedTask,
+                async () =>
+                {
+                    refreshEntered.TrySetResult();
+                    await allowRefresh.Task;
+                },
                 (_, _, _) => Task.FromResult(true),
                 _ => { disconnected.TrySetResult(); return Task.CompletedTask; },
                 _ => Interlocked.Increment(ref peerRejectedSync));
@@ -1300,14 +1322,17 @@ public sealed class BleLimitsTests
                     () => { }, () => { });
 
                 await logCalled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await refreshEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 var slot = pipeline.BindPeer(characteristic, "prov", session, new object());
                 Assert.NotNull(slot);
                 Assert.True(slot.Rejected);
                 Assert.True(Volatile.Read(ref peerRejectedSync) >= 1);
+                allowRefresh.TrySetResult();
                 await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
             }
             finally
             {
+                allowRefresh.TrySetResult();
                 await pipeline.ShutdownAsync(() => Task.CompletedTask);
             }
         }

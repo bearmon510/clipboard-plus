@@ -382,14 +382,26 @@ public sealed class TemplateRepository
         return sourceItems.Count;
     }
 
-    public void ApplyMerged(IReadOnlyList<TemplateSyncItem> templates, IReadOnlyList<TemplateSyncTombstone> tombstones)
+    public void ApplyMerged(IReadOnlyList<TemplateSyncItem> templates, IReadOnlyList<TemplateSyncTombstone> tombstones) =>
+        ApplyMerged(templates, tombstones, []);
+
+    public IReadOnlyList<TemplateSyncItem> ApplyMerged(
+        IReadOnlyList<TemplateSyncItem> templates,
+        IReadOnlyList<TemplateSyncTombstone> tombstones,
+        IReadOnlyList<TemplateSyncItem> preservedLocal)
     {
         ArgumentNullException.ThrowIfNull(templates);
         ArgumentNullException.ThrowIfNull(tombstones);
+        ArgumentNullException.ThrowIfNull(preservedLocal);
         if (templates.Count > SyncProtocol.MaxTemplates) throw new SyncProtocolException(SyncError.Limit);
         if (tombstones.Count > SyncProtocol.MaxTemplateTombstones) throw new SyncProtocolException(SyncError.Limit);
 
-        var nextTemplates = new List<TemplateSyncItem>(templates.Count);
+        var nextTemplates = new List<TemplateSyncItem>(templates.Count + preservedLocal.Count);
+        var activeIds = new HashSet<Guid>();
+        var activeTexts = new HashSet<string>(StringComparer.Ordinal);
+        var untaggedNextOrder = 0;
+        var nextOrderByTag = new Dictionary<string, int>(StringComparer.Ordinal);
+
         foreach (var item in templates)
         {
             var clean = item with
@@ -400,12 +412,63 @@ public sealed class TemplateRepository
             };
             TemplateSyncMessageCodec.ValidateItem(clean, allowBaseHash: false);
             nextTemplates.Add(clean);
+            activeIds.Add(clean.Id);
+            activeTexts.Add(clean.Text);
+            if (clean.Tag is null)
+            {
+                if (clean.Order >= untaggedNextOrder)
+                    untaggedNextOrder = clean.Order + 1;
+            }
+            else
+            {
+                var current = nextOrderByTag.GetValueOrDefault(clean.Tag);
+                if (clean.Order >= current)
+                    nextOrderByTag[clean.Tag] = clean.Order + 1;
+            }
+        }
+
+        if (preservedLocal.Count > 0)
+        {
+            foreach (var item in SortGroupItems(preservedLocal))
+            {
+                var cleanTitle = SanitizeTitle(item.Title);
+                var cleanTag = SanitizeTag(item.Tag);
+                if (activeIds.Contains(item.Id) || activeTexts.Contains(item.Text))
+                    continue;
+                if (nextTemplates.Count >= SyncProtocol.MaxTemplates)
+                    throw new SyncProtocolException(SyncError.Limit);
+
+                int order;
+                if (cleanTag is null)
+                {
+                    order = untaggedNextOrder++;
+                }
+                else
+                {
+                    order = nextOrderByTag.GetValueOrDefault(cleanTag);
+                    nextOrderByTag[cleanTag] = order + 1;
+                }
+
+                var clean = item with
+                {
+                    Title = cleanTitle,
+                    Tag = cleanTag,
+                    Order = order,
+                    BaseHash = null,
+                };
+                TemplateSyncMessageCodec.ValidateItem(clean, allowBaseHash: false);
+                nextTemplates.Add(clean);
+                activeIds.Add(clean.Id);
+                activeTexts.Add(clean.Text);
+            }
         }
 
         var nextTombstones = new List<TemplateSyncTombstone>(tombstones.Count);
         foreach (var tomb in tombstones)
         {
             TemplateSyncMessageCodec.ValidateTombstone(tomb);
+            if (activeIds.Contains(tomb.Id))
+                continue;
             nextTombstones.Add(tomb);
         }
 
@@ -415,6 +478,7 @@ public sealed class TemplateRepository
             Tombstones = nextTombstones,
         };
         Save();
+        return nextTemplates.ToArray();
     }
 
     public bool PruneTombstones(long nowMillis)

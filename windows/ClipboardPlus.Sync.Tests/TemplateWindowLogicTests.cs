@@ -186,5 +186,13 @@ public sealed class TemplateWindowLogicTests
         Assert.Contains("別端末の編集 1件", pcChangedWithConflictAndPartial.Message);
         Assert.Contains("1台完了・1台は未完了", pcChangedWithConflictAndPartial.Message);
         Assert.Contains("時計がずれています", pcChangedWithConflictAndPartial.Message);
+
+        var excludedNotice = Notice(new TemplateSyncRunResult(
+            TemplateSyncRunStatus.Completed,
+            TargetDevices: 1,
+            SucceededDevices: 1,
+            ExcludedTemplateCount: 4));
+        Assert.True(excludedNotice.IsWarning);
+        Assert.Contains("4件は対象外", excludedNotice.Message);
     }
 }

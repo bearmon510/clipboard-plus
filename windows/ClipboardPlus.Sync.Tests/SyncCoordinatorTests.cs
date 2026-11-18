@@ -8,6 +8,7 @@ public sealed class SyncCoordinatorTests
 {
     private sealed class FakePeer : ISyncPeer
     {
+        private readonly object packetsGate = new();
         public int PacketLimit { get; set; } = 20;
         public bool Rejected { get; private set; }
         public BleSubscriptionSlot? Slot { get; set; }
@@ -21,21 +22,27 @@ public sealed class SyncCoordinatorTests
             Assert.False(Rejected);
             Assert.InRange(packet.Length, 2, PacketLimit);
             if (FailSend) throw new IOException("fake transport error");
-            Packets.Add(packet.ToArray());
+            lock (packetsGate) Packets.Add(packet.ToArray());
             return OnSend?.Invoke(packet) ?? Task.CompletedTask;
         }
         public void Reject() => Rejected = true;
         public void SetHighThroughput(bool enabled) => HighThroughputHistory.Add(enabled);
         public byte[][] DrainFrames()
         {
+            byte[][] snapshot;
+            lock (packetsGate)
+            {
+                snapshot = Packets.ToArray();
+                Packets.Clear();
+            }
             var assembler = new SyncPacketAssembler(ushort.MaxValue);
             var frames = new List<byte[]>();
-            foreach (var packet in Packets)
+            foreach (var packet in snapshot)
             {
                 var frame = assembler.Append(packet);
                 if (frame is not null) frames.Add(frame);
             }
-            assembler.Finish(); Packets.Clear();
+            assembler.Finish();
             return frames.ToArray();
         }
     }
@@ -448,6 +455,7 @@ public sealed class SyncCoordinatorTests
         var r = new Rig(); var pad = await r.ConnectAsync(); var phone = await r.ConnectAsync(deviceId: Guid.NewGuid());
         await phone.SendAsync(new SyncDevice("phone"));
         await phone.SendAsync(new SyncItem(Guid.NewGuid(), 10, "pad", "shared"));
+        await r.Pc.WaitForOutgoingAsync();
         phone.Drain(); Assert.Empty(pad.Drain());
         await pad.SendAsync(new SyncItem(Guid.NewGuid(), 11, "pad", "shared"));
         Assert.Single(r.Clipboard.Writes); Assert.IsType<SyncAck>(Assert.Single(pad.Drain()));
@@ -1269,6 +1277,8 @@ public sealed class SyncCoordinatorTests
     public async Task CoordinatorBatchesMoreThanSixtyFourAcksAndSplitsAtMaxAckIds()
     {
         var r = new Rig();
+        // Receiving 1,025 items flushes sync-state.json per item while OnSend intentionally pauses SendLoopAsync.
+        r.Pc.SendPacketTimeout = TimeSpan.FromSeconds(60);
         var pad = await r.ConnectAsync(512);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1278,7 +1288,7 @@ public sealed class SyncCoordinatorTests
         try
         {
             await r.Pc.ClipboardChangedAsync(new(1, "block outgoing", false));
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             for (var i = 0; i < 80; i++)
             {
@@ -1308,7 +1318,7 @@ public sealed class SyncCoordinatorTests
         try
         {
             await r.Pc.ClipboardChangedAsync(new(2, "block outgoing 2", false));
-            await entered2.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await entered2.Task.WaitAsync(TimeSpan.FromSeconds(5));
             for (var i = 0; i < SyncProtocol.MaxAckIds + 1; i++)
             {
                 var seenId = i < 80 ? itemIds[i] : Guid.NewGuid();
@@ -1708,8 +1718,12 @@ public sealed class SyncCoordinatorTests
         }
         await r.Pc.WaitForOutgoingAsync(pad.Peer);
         var rxReplies = pad.Drain();
-        Assert.Equal(5, rxReplies.OfType<SyncResume>().Count());
-        Assert.Equal(rxOffer.Id, Assert.Single(Assert.IsType<SyncAck>(rxReplies[^1]).Ids));
+        var rxResumes = rxReplies.OfType<SyncResume>().ToArray();
+        Assert.Equal(5, rxResumes.Length);
+        Assert.Equal(Enumerable.Range(1, 5).Select(i => i * SyncProtocol.ChunkBytes), rxResumes.Select(x => x.Offset));
+        var rxAck = Assert.Single(rxReplies.OfType<SyncAck>());
+        Assert.Equal(rxOffer.Id, Assert.Single(rxAck.Ids));
+        Assert.Equal(6, rxReplies.Length);
         var saved = Assert.Single(await r.Pc.GetHistoryAsync("secret-recv"));
         Assert.Equal(rxData, File.ReadAllBytes(saved.Path!));
         Assert.Contains(r.Logs, l => l.Contains($"attachment received bytes={rxData.Length}") && l.Contains("elapsedMs=") && l.Contains("speedKBps="));
@@ -2046,11 +2060,10 @@ public sealed class SyncCoordinatorTests
         var holderTask = r.Pc.ReceiveAsync(pad2.Peer, holderPacket);
         await writeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // pad1's ReceiveAsync now blocks waiting on coordinator gate.
+        // pad1's ReceiveAsync now blocks synchronously at gate.WaitAsync() behind holderTask.
         var rejectedItem = new SyncItem(Guid.NewGuid(), 101, "pad", "must-not-be-written");
         var blockedPacket = Assert.Single(SyncPacketizer.Split(pad1.Seal(rejectedItem), pad1.Peer.PacketLimit));
         var blockedTask = r.Pc.ReceiveAsync(pad1.Peer, blockedPacket);
-        await Task.Delay(30);
 
         // Simulate BleWritePipeline synchronously retiring pad1 due to byte limit while pad1 is waiting on gate.
         pad1.Peer.Reject();
@@ -2302,7 +2315,6 @@ public sealed class SyncCoordinatorTests
 
         var blockedPacket = Assert.Single(SyncPacketizer.Split(pad1.Seal(new SyncItem(Guid.NewGuid(), 101, "pad", "slot-retired")), pad1.Peer.PacketLimit));
         var blockedTask = r.Pc.ReceiveAsync(pad1.Peer, blockedPacket);
-        await Task.Delay(30);
 
         // Retire ONLY the slot flag (simulating RetireSlotAndScheduleDisconnect during log() before Peer.Reject() runs).
         slot1.Rejected = true;

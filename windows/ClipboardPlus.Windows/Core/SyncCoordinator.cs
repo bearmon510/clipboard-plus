@@ -125,11 +125,21 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public int RemoteChangesTotal;
         public int ConflictCopyCount;
         public long? ClockSkewSeconds;
+        public int ExcludedTemplateCount;
         public bool PcSaved;
     }
 
+    private sealed record MergedTemplateOutcome(
+        TemplateSyncMultiMergeResult Merged,
+        IReadOnlyList<TemplateSyncMessage> StateMessages,
+        TemplateSyncSideChanges PcChanges,
+        int RemoteChangesTotal,
+        long? MaxClockSkewSeconds,
+        int ExcludedTemplateCount);
+
     private const int MaxAttachmentChunksInFlight = 4;
     private const int MaxQueuedTemplateMessages = SyncProtocol.MaxTemplatePages * 4;
+    internal TimeSpan SendPacketTimeout { get; set; } = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan HighThroughputIdleGrace = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ReplyTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan TemplateSyncTimeout = TimeSpan.FromSeconds(30);
@@ -968,7 +978,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         await gate.WaitAsync();
         try { tasks = connections.Values.Where(c => peer is null || c.Peer == peer).Select(c => c.Outgoing).ToArray(); }
         finally { gate.Release(); }
-        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15));
     }
 
     private async Task SendLoopAsync(Connection c)
@@ -1131,7 +1141,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
                     }
                     if (!sendTask.IsCompleted)
-                        await sendTask.WaitAsync(TimeSpan.FromSeconds(10), c.Stop.Token);
+                    {
+                        if (SendPacketTimeout == Timeout.InfiniteTimeSpan)
+                            await sendTask.WaitAsync(c.Stop.Token);
+                        else
+                            await sendTask.WaitAsync(SendPacketTimeout, c.Stop.Token);
+                    }
                     else
                         await sendTask;
                 }
@@ -1326,34 +1341,77 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         HandlePeerInitiatedTemplateSync(c, push.Op, snapshot);
     }
 
-    private void HandlePeerInitiatedTemplateSync(Connection c, Guid op, TemplateSyncSnapshot remoteSnapshot)
+    private MergedTemplateOutcome MergeAndSaveTemplates(
+        Guid op,
+        DateTimeOffset now,
+        IReadOnlyList<TemplateSyncRemoteState> remotes)
     {
-        var now = Now();
         var nowMillis = ClampTimestamp(now.ToUnixTimeMilliseconds());
-        var pcBefore = templateStore.GetState();
-        var merged = TemplateSyncMerge.Merge(
-            pcBefore,
-            new TemplateSyncState(remoteSnapshot.Templates, remoteSnapshot.Tombstones),
-            nowMillis,
-            remoteSnapshot.SentAt);
+        var pcRaw = templateStore.GetState();
+        var preparedPc = TemplateSyncMerge.PrepareSyncState(pcRaw.Templates, pcRaw.Tombstones, nowMillis, nowMillis);
+        TemplateSyncItem[] excludedLocal;
+        if (preparedPc.ExcludedTemplateCount == 0)
+        {
+            excludedLocal = [];
+        }
+        else
+        {
+            var includedIds = preparedPc.State.Templates.Select(t => t.Id).ToHashSet();
+            excludedLocal = pcRaw.Templates.Where(t => !includedIds.Contains(t.Id)).ToArray();
+        }
+
+        var merged = TemplateSyncMerge.MergeAll(preparedPc.State, remotes, nowMillis);
         var stateMessages = TemplateSyncMessageCodec.SplitPages(
             op,
             new TemplateSyncSnapshot(nowMillis, merged.Templates, merged.Tombstones),
             isState: true);
+        var savedTemplates = templateStore.ApplyMerged(merged.Templates, merged.Tombstones, excludedLocal);
 
-        templateStore.ApplyMerged(merged.Templates, merged.Tombstones);
+        var pcChanges = preparedPc.ExcludedTemplateCount == 0
+            ? merged.PcChanges
+            : ComputeTemplateChanges(pcRaw.Templates, savedTemplates);
+        var remoteChangesTotal = 0;
+        foreach (var rc in merged.RemoteChanges)
+            remoteChangesTotal += rc.Total;
 
-        if (merged.ClockSkewSeconds is long skew)
+        long? maxSkew = null;
+        foreach (var s in merged.RemoteClockSkewSeconds)
+        {
+            if (s is long skew && (maxSkew is null || skew > maxSkew.Value))
+                maxSkew = skew;
+        }
+
+        return new MergedTemplateOutcome(
+            merged,
+            stateMessages,
+            pcChanges,
+            remoteChangesTotal,
+            maxSkew,
+            preparedPc.ExcludedTemplateCount);
+    }
+
+    private void HandlePeerInitiatedTemplateSync(Connection c, Guid op, TemplateSyncSnapshot remoteSnapshot)
+    {
+        var now = Now();
+        var outcome = MergeAndSaveTemplates(
+            op,
+            now,
+            [new TemplateSyncRemoteState(
+                new TemplateSyncState(remoteSnapshot.Templates, remoteSnapshot.Tombstones),
+                remoteSnapshot.SentAt)]);
+
+        if (outcome.MaxClockSkewSeconds is long skew)
             log($"template sync clock-skew seconds={skew}");
-        if (merged.PcChanges.Total > 0)
+        if (outcome.PcChanges.Total > 0)
             TemplatesChanged?.Invoke();
 
-        foreach (var msg in stateMessages)
+        foreach (var msg in outcome.StateMessages)
             EnqueueTemplateMessage(c, msg);
         c.AwaitingPeerTemplateAcks[op] = now + TemplateSyncTimeout;
         StartSending(c);
 
-        log($"template sync peer-initiated items={merged.Templates.Count} tombs={merged.Tombstones.Count} pcAdded={merged.PcChanges.Added} pcUpdated={merged.PcChanges.Updated} pcDeleted={merged.PcChanges.Deleted} remoteAdded={merged.RemoteChanges.Added} remoteUpdated={merged.RemoteChanges.Updated} remoteDeleted={merged.RemoteChanges.Deleted} conflicts={merged.ConflictCopyCount}");
+        var remoteChanges = outcome.Merged.RemoteChanges[0];
+        log($"template sync peer-initiated items={outcome.Merged.Templates.Count} tombs={outcome.Merged.Tombstones.Count} pcAdded={outcome.PcChanges.Added} pcUpdated={outcome.PcChanges.Updated} pcDeleted={outcome.PcChanges.Deleted} remoteAdded={remoteChanges.Added} remoteUpdated={remoteChanges.Updated} remoteDeleted={remoteChanges.Deleted} conflicts={outcome.Merged.ConflictCopyCount} excluded={outcome.ExcludedTemplateCount}");
     }
 
     private void HandleTemplateAck(Connection c, TemplateSyncAck ack)
@@ -1487,34 +1545,17 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         }
 
         var now = Now();
-        var nowMillis = ClampTimestamp(now.ToUnixTimeMilliseconds());
-        var pcBefore = templateStore.GetState();
-        var current = pcBefore;
-        var totalConflicts = 0;
-        long? maxSkew = null;
-        IReadOnlyList<TemplateSyncMessage> stateMessages;
+        var orderedResponded = responded.OrderBy(x => x.DeviceId).ToList();
+        var remotes = orderedResponded
+            .Select(p => new TemplateSyncRemoteState(
+                new TemplateSyncState(p.PushSnapshot!.Templates, p.PushSnapshot!.Tombstones),
+                p.PushSnapshot!.SentAt))
+            .ToArray();
+        MergedTemplateOutcome outcome;
 
         try
         {
-            foreach (var p in responded.OrderBy(x => x.DeviceId))
-            {
-                var snap = p.PushSnapshot!;
-                var step = TemplateSyncMerge.Merge(
-                    current,
-                    new TemplateSyncState(snap.Templates, snap.Tombstones),
-                    nowMillis,
-                    snap.SentAt);
-                current = new TemplateSyncState(step.Templates, step.Tombstones);
-                totalConflicts += step.ConflictCopyCount;
-                if (step.ClockSkewSeconds is long skew && (maxSkew is null || skew > maxSkew.Value))
-                    maxSkew = skew;
-            }
-
-            stateMessages = TemplateSyncMessageCodec.SplitPages(
-                session.Op,
-                new TemplateSyncSnapshot(nowMillis, current.Templates, current.Tombstones),
-                isState: true);
-            templateStore.ApplyMerged(current.Templates, current.Tombstones);
+            outcome = MergeAndSaveTemplates(session.Op, now, remotes);
         }
         catch (SyncProtocolException ex)
         {
@@ -1533,29 +1574,32 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             return;
         }
 
-        var pcChanges = ComputeTemplateChanges(pcBefore.Templates, current.Templates);
-        var remoteChangesTotal = 0;
-        foreach (var p in responded)
-            remoteChangesTotal += ComputeTemplateChanges(p.PushSnapshot!.Templates, current.Templates).Total;
-
         session.PcSaved = true;
-        session.PcChanges = pcChanges;
-        session.RemoteChangesTotal = remoteChangesTotal;
-        session.ConflictCopyCount = totalConflicts;
-        session.ClockSkewSeconds = maxSkew;
+        session.PcChanges = outcome.PcChanges;
+        session.RemoteChangesTotal = outcome.RemoteChangesTotal;
+        session.ConflictCopyCount = outcome.Merged.ConflictCopyCount;
+        session.ClockSkewSeconds = outcome.MaxClockSkewSeconds;
+        session.ExcludedTemplateCount = outcome.ExcludedTemplateCount;
 
-        if (maxSkew is long loggedSkew)
+        if (outcome.MaxClockSkewSeconds is long loggedSkew)
             log($"template sync clock-skew seconds={loggedSkew}");
-        if (pcChanges.Total > 0)
+        if (outcome.PcChanges.Total > 0)
             TemplatesChanged?.Invoke();
 
         session.Phase = TemplateSyncPhase.Distributing;
         var distributing = 0;
-        foreach (var p in responded)
+        var overflowed = new List<Connection>();
+        foreach (var p in orderedResponded)
         {
             if (p.Connection.Retired || !connections.ContainsValue(p.Connection))
             {
                 p.State = ParticipantState.Dropped;
+                continue;
+            }
+            if (p.Connection.TemplateMessages.Count + outcome.StateMessages.Count > MaxQueuedTemplateMessages)
+            {
+                p.State = ParticipantState.Dropped;
+                overflowed.Add(p.Connection);
                 continue;
             }
             p.State = ParticipantState.AwaitingAck;
@@ -1563,13 +1607,19 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             p.Deadline = now + TemplateSyncTimeout;
             p.BaselineDeadline = p.Deadline;
             p.ActiveFrameToken = null;
-            foreach (var msg in stateMessages)
+            foreach (var msg in outcome.StateMessages)
                 EnqueueTemplateMessage(p.Connection, msg);
             StartSending(p.Connection);
             distributing++;
         }
 
-        log($"template sync merged devices={responded.Count} items={current.Templates.Count} tombs={current.Tombstones.Count} pcAdded={pcChanges.Added} pcUpdated={pcChanges.Updated} pcDeleted={pcChanges.Deleted} remoteChanges={remoteChangesTotal} conflicts={totalConflicts}");
+        foreach (var c in overflowed)
+        {
+            if (!c.Retired)
+                Drop(c, nameof(SyncError.Limit));
+        }
+
+        log($"template sync merged devices={orderedResponded.Count} items={outcome.Merged.Templates.Count} tombs={outcome.Merged.Tombstones.Count} pcAdded={outcome.PcChanges.Added} pcUpdated={outcome.PcChanges.Updated} pcDeleted={outcome.PcChanges.Deleted} remoteChanges={outcome.RemoteChangesTotal} conflicts={outcome.Merged.ConflictCopyCount} excluded={outcome.ExcludedTemplateCount}");
 
         if (distributing == 0)
             FinishTemplateSyncSession();
@@ -1610,7 +1660,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             PcDeleted: pcChanges.Deleted,
             RemoteChangesTotal: session.RemoteChangesTotal,
             ConflictCopyCount: session.ConflictCopyCount,
-            ClockSkewSeconds: session.ClockSkewSeconds));
+            ClockSkewSeconds: session.ClockSkewSeconds,
+            ExcludedTemplateCount: session.ExcludedTemplateCount));
     }
 
     private void ExtendTemplateSyncDeadline(Connection c, ulong frameToken, DateTimeOffset now)

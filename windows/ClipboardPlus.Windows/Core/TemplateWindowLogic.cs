@@ -31,7 +31,8 @@ public sealed record TemplateSyncRunResult(
     int PcDeleted = 0,
     int RemoteChangesTotal = 0,
     int ConflictCopyCount = 0,
-    long? ClockSkewSeconds = null)
+    long? ClockSkewSeconds = null,
+    int ExcludedTemplateCount = 0)
 {
     public static TemplateSyncRunResult NoConnectedDevicesResult() => new(TemplateSyncRunStatus.NoConnectedDevices);
     public static TemplateSyncRunResult PeerUpdateRequiredResult() => new(TemplateSyncRunStatus.PeerUpdateRequired);
@@ -253,6 +254,8 @@ public static class TemplateWindowLogic
         var suffixes = new List<string>();
         if (result.ConflictCopyCount > 0)
             suffixes.Add($"別端末の編集 {result.ConflictCopyCount}件を「その他」へ");
+        if (result.ExcludedTemplateCount > 0)
+            suffixes.Add($"上限超 {result.ExcludedTemplateCount}件は対象外");
         if (result.FailedDevices > 0)
             suffixes.Add($"（{result.SucceededDevices}台完了・{result.FailedDevices}台は未完了）");
         if (result.ClockSkewSeconds is not null)
@@ -261,7 +264,7 @@ public static class TemplateWindowLogic
         var message = suffixes.Count == 0
             ? main
             : $"{main}　{string.Join("　", suffixes)}";
-        var isWarning = result.FailedDevices > 0 || result.ClockSkewSeconds is not null;
+        var isWarning = result.FailedDevices > 0 || result.ClockSkewSeconds is not null || result.ExcludedTemplateCount > 0;
         return new TemplateSyncNotice(message, isWarning);
     }
 }
