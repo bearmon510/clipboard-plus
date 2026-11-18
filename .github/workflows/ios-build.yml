@@ -46,6 +46,15 @@ jobs:
         working-directory: app
         run: xcodegen generate
 
+      - name: Resolve Swift packages
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project ClipboardPlus.xcodeproj \
+            -scheme ClipboardPlus \
+            -clonedSourcePackagesDirPath build/SourcePackages
+
       - name: Select an available iPad simulator
         id: simulator
         env:
@@ -74,6 +83,7 @@ jobs:
             -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath DerivedData \
+            -clonedSourcePackagesDirPath build/SourcePackages \
             CODE_SIGNING_ALLOWED=NO
 
       - name: Verify embedded extensions (Simulator)
@@ -89,6 +99,8 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$keyboard_path/Info.plist")" = "com.apple.keyboard-service"
           test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:RequestsOpenAccess' "$keyboard_path/Info.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c 'Print :ClipboardPlusAppGroup' "$keyboard_path/Info.plist")" = "group.example.clipboardplus"
+          test -d "$keyboard_path/AzooKeyKanaKanjiConverter_KanaKanjiConverterModuleWithDefaultDictionary.bundle/Dictionary"
+          test -f "$keyboard_path/AzooKeyKanaKanjiConverter_KanaKanjiConverterModuleWithDefaultDictionary.bundle/Dictionary/louds/charID.chid"
 
           share_path="$app_path/PlugIns/ClipboardPlusShare.appex"
           test -d "$share_path"
@@ -102,19 +114,21 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
-          xcodebuild build \
+          if xcodebuild build \
             -project ClipboardPlus.xcodeproj \
             -scheme ClipboardPlus \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath DerivedData-device \
+            -clonedSourcePackagesDirPath build/SourcePackages \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" > device-build.log 2>&1 || {
-              grep -E "error:" device-build.log | sort -u | head -40
-              exit 1
-            }
-          echo "Device build succeeded."
+            CODE_SIGN_IDENTITY="" > device-build.log 2>&1; then
+            echo "Device build succeeded."
+          else
+            grep -E "error:" device-build.log | sort -u | head -40
+            exit 1
+          fi
 
       - name: Verify embedded extensions (Device)
         working-directory: app
@@ -123,6 +137,8 @@ jobs:
           app_path="DerivedData-device/Build/Products/Release-iphoneos/ClipboardPlus.app"
           test -d "$app_path/PlugIns/ClipboardPlusKeyboard.appex"
           test -f "$app_path/PlugIns/ClipboardPlusKeyboard.appex/ClipboardPlusKeyboard"
+          test -d "$app_path/PlugIns/ClipboardPlusKeyboard.appex/AzooKeyKanaKanjiConverter_KanaKanjiConverterModuleWithDefaultDictionary.bundle/Dictionary"
+          test -f "$app_path/PlugIns/ClipboardPlusKeyboard.appex/AzooKeyKanaKanjiConverter_KanaKanjiConverterModuleWithDefaultDictionary.bundle/Dictionary/louds/charID.chid"
           test -d "$app_path/PlugIns/ClipboardPlusShare.appex"
           test -f "$app_path/PlugIns/ClipboardPlusShare.appex/ClipboardPlusShare"
 
@@ -145,6 +161,7 @@ jobs:
             -default-test-execution-time-allowance 60 \
             -maximum-test-execution-time-allowance 180 \
             -derivedDataPath DerivedData \
+            -clonedSourcePackagesDirPath build/SourcePackages \
             -resultBundlePath build/ClipboardPlusTests.xcresult \
             CODE_SIGNING_ALLOWED=NO
 
