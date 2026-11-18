@@ -21,10 +21,15 @@ public partial class App : System.Windows.Application
     private SyncCoordinator? coordinator;
     private AppLog? log;
     private MainWindow? window;
+    private KeyboardHook? keyboardHook;
+    private IHistoryPresenter? historyPresenter;
+    private HistoryWindow? historyWindow;
     private bool exiting;
     private bool repairing;
     private Task? repairTask;
     private const string InstanceName = @"Local\clipboardplus.windows.instance.v1";
+
+    internal AppSettings Settings { get; private set; } = null!;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -34,7 +39,10 @@ public partial class App : System.Windows.Application
             // A UI-only mode: no store, registry access, IPC, clipboard listener,
             // tray icon or Bluetooth. Pairing lives only in this process's memory.
             ShutdownMode = ShutdownMode.OnMainWindowClose;
-            MainWindow = new MainWindow(SyncPairing.Create("プレビュー"), _ => { }, preview: true);
+            Settings = new AppSettings(load: false);
+            var previewWindow = new MainWindow(SyncPairing.Create("プレビュー"), _ => { }, preview: true);
+            previewWindow.ConfigureHotkey(Settings, _ => Task.FromResult<HotkeyChord?>(null), () => { });
+            MainWindow = previewWindow;
             MainWindow.Show();
             return;
         }
@@ -61,6 +69,7 @@ public partial class App : System.Windows.Application
         try
         {
             log = new AppLog(); log.Write("application starting");
+            Settings = new AppSettings(log: log.Write);
             var pairing = LocalStore.LoadOrCreate();
             window = new MainWindow(pairing, log.Write);
             MainWindow = window;
@@ -70,7 +79,13 @@ public partial class App : System.Windows.Application
             activationWait = ThreadPool.RegisterWaitForSingleObject(activation, (_, _) => Dispatcher.BeginInvoke(OpenWindow), null, Timeout.Infinite, false);
             clipboard = new ClipboardMonitor(Dispatcher, log.Write);
             clipboard.Changed += ClipboardChanged;
+            historyWindow = new HistoryWindow(log.Write, () => Settings.PasteOnSelect, ForegroundContext.PasteAsync, OpenWindow);
+            historyPresenter = historyWindow;
             StartSync(pairing);
+            keyboardHook = new KeyboardHook(OpenHistory, action => Dispatcher.BeginInvoke(action), log.Write);
+            ApplyHotkeySettings();
+            window.ConfigureHotkey(Settings, RecordHotkeyAsync, ApplyHotkeySettings);
+            window.HistoryRequested += OpenHistory;
             tray = new Forms.NotifyIcon
             {
                 Text = "clipboard+ for Windows",
@@ -78,6 +93,7 @@ public partial class App : System.Windows.Application
                 Visible = true,
                 ContextMenuStrip = new Forms.ContextMenuStrip()
             };
+            tray.ContextMenuStrip.Items.Add("履歴を開く", null, (_, _) => OpenHistory());
             tray.ContextMenuStrip.Items.Add("開く", null, (_, _) => OpenWindow());
             tray.ContextMenuStrip.Items.Add("終了", null, async (_, _) => await ExitAsync());
             tray.DoubleClick += (_, _) => OpenWindow();
@@ -95,6 +111,7 @@ public partial class App : System.Windows.Application
     {
         coordinator = new(pairing, clipboard!, log!.Write, new SyncRepository(LocalStore.Root, pairing.PcId));
         var current = coordinator;
+        historyWindow?.Attach(current);
         coordinator.Changed += state => Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(state); });
         // Devices paired in an earlier run show before anything changes.
         _ = current.GetStatusAsync().ContinueWith(task =>
@@ -175,11 +192,39 @@ public partial class App : System.Windows.Application
         window.Topmost = true; window.Topmost = false;
     }
 
+    private void OpenHistory()
+    {
+        if (exiting) return;
+        var invocation = ForegroundContext.Capture();
+        if (historyPresenter is null)
+        {
+            log?.Write("history presenter not ready");
+            return;
+        }
+        historyPresenter.Present(invocation);
+    }
+
+    internal void ApplyHotkeySettings()
+    {
+        if (exiting || keyboardHook is null) return;
+        if (Settings.HotkeyEnabled)
+            keyboardHook.Enable(Settings.ParsedHotkey);
+        else
+            keyboardHook.Disable();
+    }
+
+    internal Task<HotkeyChord?> RecordHotkeyAsync(CancellationToken cancellationToken = default)
+    {
+        if (exiting || keyboardHook is null) return Task.FromResult<HotkeyChord?>(null);
+        return keyboardHook.RecordAsync(cancellationToken);
+    }
+
     private async Task ExitAsync()
     {
         if (exiting) return;
         exiting = true;
         tray!.Visible = false;
+        keyboardHook?.Dispose();
         clipboard?.Dispose();
         if (repairTask is { } running) await running;
         var currentServer = server;
@@ -200,6 +245,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        keyboardHook?.Dispose();
         tray?.Dispose();
         activationWait?.Unregister(null); activation?.Dispose();
         mutex?.Dispose();

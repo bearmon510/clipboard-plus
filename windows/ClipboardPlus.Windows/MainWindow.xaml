@@ -32,7 +32,34 @@
           <TextBlock Text="このコードには組にするための鍵が含まれます。他の人に見せないでください。" FontSize="12" Foreground="#64748B" Margin="0,10,0,0"/>
         </StackPanel>
       </Border>
-      <WrapPanel Margin="0,0,0,16">
+      <Border Background="White" CornerRadius="12" Padding="20" Margin="0,0,0,18" BorderBrush="#E2E8F0" BorderThickness="1">
+        <StackPanel>
+          <TextBlock Text="履歴の窓" FontSize="18" FontWeight="SemiBold"/>
+          <TextBlock Text="キーを押すと、PCとiPhone・iPadの履歴が開きます。選ぶと、元のアプリに貼り付けます。" Margin="0,8,0,12" TextWrapping="Wrap"/>
+          <CheckBox x:Name="HotkeyCheck" Content="キーで履歴の窓を開く" Click="OnHotkeyEnabledChanged"/>
+          <Grid Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="HotkeyText" Text="Win + V" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            <Button x:Name="RecordButton" Grid.Column="1" Content="キーを変える" Padding="10,4" Margin="8,0,0,0" Click="OnRecordHotkey"/>
+            <Button x:Name="ResetHotkeyButton" Grid.Column="2" Content="Win + V に戻す" Padding="10,4" Margin="8,0,0,0" Click="OnResetHotkey"/>
+          </Grid>
+          <TextBlock x:Name="HotkeyMessage" Foreground="#B45309" TextWrapping="Wrap" Margin="0,8,0,0" Visibility="Collapsed"/>
+          <CheckBox x:Name="PasteCheck" Content="選んだら、元のアプリに貼り付ける" Margin="0,12,0,0" Click="OnPasteChanged"/>
+          <TextBlock Text="キーは、修飾キー（Win・Ctrl・Alt・Shift）とほかのキー1つの、2つで決めます。管理者として動いているアプリが手前にあるときは、Windowsの決まりでキーを受け取れず、Windowsの履歴が開きます。" FontSize="12" Foreground="#64748B" Margin="0,10,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+      </Border>
+      <WrapPanel Margin="0,0,0,8">
+        <WrapPanel.Resources>
+          <Style TargetType="Button">
+            <Setter Property="Margin" Value="0,0,8,8"/>
+            <Setter Property="Padding" Value="10,4"/>
+          </Style>
+        </WrapPanel.Resources>
+        <Button x:Name="HistoryButton" Content="履歴の窓を開く" Click="OnOpenHistory"/>
         <Button x:Name="RepairButton" Content="組み直す" Click="OnRepair"/>
         <Button x:Name="LogsButton" Content="ログのフォルダを開く" Click="OnOpenLogs"/>
       </WrapPanel>

@@ -16,7 +16,12 @@ public partial class MainWindow : Window
     private string? connectedText;
     private bool requiresPeerUpdate;
     private readonly bool preview;
+    private AppSettings? settings;
+    private Func<CancellationToken, Task<HotkeyChord?>>? recordHotkey;
+    private Action? applyHotkey;
+    private CancellationTokenSource? recording;
     public event Action? RepairRequested;
+    public event Action? HistoryRequested;
 
     public MainWindow(SyncPairing pairing, Action<string> log, bool preview = false)
     {
@@ -64,6 +69,79 @@ public partial class MainWindow : Window
         StatusText.Text = requiresPeerUpdate ? $"{baseStatus}\n相手のアプリを更新してください" : baseStatus;
     }
     public void SetBusy(bool busy) => RepairButton.IsEnabled = !busy;
+
+    /// <summary>Connects the history window settings. Recording swallows the next chord pressed anywhere.</summary>
+    internal void ConfigureHotkey(AppSettings value, Func<CancellationToken, Task<HotkeyChord?>> record, Action apply)
+    {
+        settings = value; recordHotkey = record; applyHotkey = apply;
+        if (preview) HotkeyCheck.IsEnabled = RecordButton.IsEnabled = PasteCheck.IsEnabled = HistoryButton.IsEnabled = false;
+        ShowHotkey();
+    }
+
+    private void ShowHotkey()
+    {
+        if (settings is null) return;
+        HotkeyCheck.IsChecked = settings.HotkeyEnabled;
+        HotkeyText.Text = settings.ParsedHotkey.DisplayName;
+        PasteCheck.IsChecked = settings.PasteOnSelect;
+        ResetHotkeyButton.IsEnabled = !preview && settings.ParsedHotkey != HotkeyChord.Default;
+    }
+
+    private void ShowHotkeyMessage(string? text)
+    {
+        HotkeyMessage.Text = text ?? "";
+        HotkeyMessage.Visibility = text is null ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void SaveHotkey(Action<AppSettings> change)
+    {
+        if (settings is null) return;
+        change(settings);
+        try { settings.Save(); }
+        catch (Exception ex)
+        {
+            log($"settings save error={ex.GetType().Name}");
+            ShowHotkeyMessage("設定を保存できませんでした。今回だけ、この設定で動きます。");
+        }
+        applyHotkey?.Invoke();
+        ShowHotkey();
+    }
+
+    private void OnHotkeyEnabledChanged(object sender, RoutedEventArgs e) => SaveHotkey(s => s.HotkeyEnabled = HotkeyCheck.IsChecked == true);
+    private void OnPasteChanged(object sender, RoutedEventArgs e) => SaveHotkey(s => s.PasteOnSelect = PasteCheck.IsChecked == true);
+    private void OnResetHotkey(object sender, RoutedEventArgs e)
+    {
+        ShowHotkeyMessage(null);
+        SaveHotkey(s => s.Hotkey = HotkeyChord.Default.ToString());
+    }
+
+    private async void OnRecordHotkey(object sender, RoutedEventArgs e)
+    {
+        if (recordHotkey is null) return;
+        if (recording is not null) { recording.Cancel(); return; } // The button reads "やめる" while recording.
+        recording = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        RecordButton.Content = "やめる";
+        HotkeyText.Text = "新しい組み合わせを押してください…";
+        ShowHotkeyMessage(null);
+        try
+        {
+            if (await recordHotkey(recording.Token) is HotkeyChord chord)
+            {
+                if (HotkeyRules.Problem(chord) is { } problem) ShowHotkeyMessage(problem);
+                else SaveHotkey(s => s.Hotkey = chord.ToString());
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { log($"hotkey record error={ex.GetType().Name}"); }
+        finally
+        {
+            recording.Dispose(); recording = null;
+            RecordButton.Content = "キーを変える";
+            ShowHotkey();
+        }
+    }
+
+    private void OnOpenHistory(object sender, RoutedEventArgs e) => HistoryRequested?.Invoke();
     private void OnClosing(object? sender, CancelEventArgs e) { if (!preview) { e.Cancel = true; Hide(); } }
     private void OnRepair(object sender, RoutedEventArgs e) => RepairRequested?.Invoke();
     private void OnOpenLogs(object sender, RoutedEventArgs e)
