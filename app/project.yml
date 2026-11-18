@@ -14,10 +14,6 @@ settings:
     APP_GROUP_ID: group.$(APP_BUNDLE_ID)
     MARKETING_VERSION: "0.16.0"
     CURRENT_PROJECT_VERSION: "1"
-packages:
-  AzooKeyKanaKanjiConverter:
-    url: https://github.com/azooKey/AzooKeyKanaKanjiConverter
-    exactVersion: "0.11.2"
 targets:
   ClipboardPlus:
     type: application
@@ -80,9 +76,6 @@ targets:
       - path: Shared
         excludes:
           - CaptureIntents.swift
-    dependencies:
-      - package: AzooKeyKanaKanjiConverter
-        product: KanaKanjiConverterModuleWithDefaultDictionary
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).keyboard
@@ -147,8 +140,6 @@ targets:
       - ClipboardPlusTests
     dependencies:
       - target: ClipboardPlus
-      - package: AzooKeyKanaKanjiConverter
-        product: KanaKanjiConverterModuleWithDefaultDictionary
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).tests
