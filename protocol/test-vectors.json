@@ -22,7 +22,9 @@
     "maxTemplateTagUtf8Bytes": 120,
     "maxTemplatePageBodyBytes": 262144,
     "maxTemplatePages": 80,
-    "maxTemplateTotalBytes": 20971520
+    "maxTemplateTotalBytes": 20971520,
+    "maxTemplateOrder": 2147483647,
+    "emptyContinuationPageBytes": 32
   },
   "pairing": {
     "qr": "clipboardplus-pair:1:ECEyQ1RldoeYqbrL3O3-Dw:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8:%E8%A9%A6%E9%A8%93%20PC%3A%20%2B%25%20%2F%20%F0%9F%92%BB",
@@ -314,6 +316,11 @@
       "headerJson": "{\"op\":\"22222222-3333-4444-8555-666666666666\",\"t\":\"tpl_ack\"}",
       "bodyUtf8": "",
       "plaintextHex": "003b7b226f70223a2232323232323232322d333333332d343434342d383535352d363636363636363636363636222c2274223a2274706c5f61636b227d"
+    },
+    "maxOrderTemplate": {
+      "headerJson": "{\"op\":\"22222222-3333-4444-8555-666666666666\",\"part\":0,\"t\":\"tpl_push\",\"total\":1}",
+      "bodyUtf8": "{\"sentAt\":1794873601200,\"templates\":[{\"id\":\"44444444-5555-4666-8777-888888888883\",\"kind\":\"text\",\"order\":2147483647,\"text\":\"order上限\",\"updatedAt\":1794873601200}],\"tombstones\":[],\"v\":1}",
+      "plaintextHex": "004f7b226f70223a2232323232323232322d333333332d343434342d383535352d363636363636363636363636222c2270617274223a302c2274223a2274706c5f70757368222c22746f74616c223a317d7b2273656e744174223a313739343837333630313230302c2274656d706c61746573223a5b7b226964223a2234343434343434342d353535352d343636362d383737372d383838383838383838383833222c226b696e64223a2274657874222c226f72646572223a323134373438333634372c2274657874223a226f72646572e4b88ae99990222c22757064617465644174223a313739343837333630313230307d5d2c22746f6d6273746f6e6573223a5b5d2c2276223a317d"
     }
   },
   "templateFrames": [
@@ -582,6 +589,12 @@
       "plaintextHex": "004f7b226f70223a2232323232323232322d333333332d343434342d383535352d363636363636363636363636222c2270617274223a302c2274223a2274706c5f70757368222c22746f74616c223a317d7b2273656e744174223a313739343837333630303030302c2274656d706c61746573223a5b7b226964223a2234343434343434342d353535352d343636362d383737372d383838383838383838383831222c226b696e64223a2274657874222c226f72646572223a2d312c2274657874223a2261222c22757064617465644174223a317d5d2c22746f6d6273746f6e6573223a5b5d2c2276223a317d",
       "error": "format"
     },
+    "orderTooLarge": {
+      "headerJson": "{\"op\":\"22222222-3333-4444-8555-666666666666\",\"part\":0,\"t\":\"tpl_push\",\"total\":1}",
+      "bodyUtf8": "{\"sentAt\":1794873600000,\"templates\":[{\"id\":\"44444444-5555-4666-8777-888888888881\",\"kind\":\"text\",\"order\":2147483648,\"text\":\"a\",\"updatedAt\":1}],\"tombstones\":[],\"v\":1}",
+      "plaintextHex": "004f7b226f70223a2232323232323232322d333333332d343434342d383535352d363636363636363636363636222c2270617274223a302c2274223a2274706c5f70757368222c22746f74616c223a317d7b2273656e744174223a313739343837333630303030302c2274656d706c61746573223a5b7b226964223a2234343434343434342d353535352d343636362d383737372d383838383838383838383831222c226b696e64223a2274657874222c226f72646572223a323134373438333634382c2274657874223a2261222c22757064617465644174223a317d5d2c22746f6d6273746f6e6573223a5b5d2c2276223a317d",
+      "error": "format"
+    },
     "oversizedTemplateText": {
       "textBytes": 65537,
       "error": "limit",
@@ -787,14 +800,14 @@
         ],
         "tombstones": [
           {
-            "baseHash": "91cda522412c84f9308c2ce7ec09ffb02ff60a71bd3fff5449a3ecf7241d190f",
-            "deletedAt": 1794870000000,
-            "id": "44444444-5555-4666-8777-888888888883"
-          },
-          {
             "baseHash": "62e8043794477a2685d19cbcdc9c8c3073f0138d81759d70ede81b559c3ac33a",
             "deletedAt": 1794873500000,
             "id": "44444444-5555-4666-8777-888888888882"
+          },
+          {
+            "baseHash": "91cda522412c84f9308c2ce7ec09ffb02ff60a71bd3fff5449a3ecf7241d190f",
+            "deletedAt": 1794873600000,
+            "id": "44444444-5555-4666-8777-888888888883"
           }
         ]
       },
@@ -1581,6 +1594,757 @@
         ],
         "tombstones": []
       }
+    },
+    {
+      "alsoCheckIdempotent": true,
+      "expected": {
+        "conflictCopyCount": 1,
+        "pcChanges": {
+          "added": 2,
+          "deleted": 0,
+          "updated": 0
+        },
+        "remoteChanges": {
+          "added": 2,
+          "deleted": 0,
+          "updated": 1
+        },
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 0,
+            "tag": "é",
+            "text": "é",
+            "updatedAt": 1794873560000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "é",
+            "text": "é",
+            "updatedAt": 1794873550000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 0,
+            "text": "café",
+            "updatedAt": 1794873590000
+          },
+          {
+            "id": "6D74B38F-46B6-48B3-BE68-3F60DD30EF6E",
+            "kind": "text",
+            "order": 1,
+            "text": "café",
+            "title": "別の端末の編集",
+            "updatedAt": 1794873580000
+          }
+        ],
+        "tombstones": []
+      },
+      "name": "unicodeNormalizationPreservesBothItemsAndTags",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "é",
+            "text": "é",
+            "updatedAt": 1794873550000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 0,
+            "text": "café",
+            "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": []
+      },
+      "remote": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 0,
+            "tag": "é",
+            "text": "é",
+            "updatedAt": 1794873560000
+          },
+          {
+            "baseHash": "5f13ca79e0fca6c6e2b8352e5073ca1ac1319de3efb6b7ba09b4101f071b88a2",
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 0,
+            "text": "café",
+            "updatedAt": 1794873580000
+          }
+        ],
+        "tombstones": []
+      }
+    },
+    {
+      "alsoCheckIdempotent": true,
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 0
+        },
+        "remoteChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 1
+        },
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "Bの勝ち本文",
+            "title": "題名",
+            "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": [
+          {
+            "baseHash": "04bc01f81e5c41935c1e83bbbde2dd8c54a1918d80a9a3a9de9ab8d190e3bbb8",
+            "deletedAt": 1794873595000,
+            "id": "5E6258E7-D4CF-418C-8A0F-030D02986C83"
+          }
+        ]
+      },
+      "name": "deletedConflictCopyNotRecreated",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "Bの勝ち本文",
+            "title": "題名",
+            "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": [
+          {
+            "baseHash": "04bc01f81e5c41935c1e83bbbde2dd8c54a1918d80a9a3a9de9ab8d190e3bbb8",
+            "deletedAt": 1794873595000,
+            "id": "5E6258E7-D4CF-418C-8A0F-030D02986C83"
+          }
+        ]
+      },
+      "remote": {
+        "templates": [
+          {
+            "baseHash": "92ba6dfd4342c25d6b974cde06682a9742c16fedba4731c09d4a264267a25f76",
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "Aの負け本文",
+            "title": "題名",
+            "updatedAt": 1794873550000
+          }
+        ],
+        "tombstones": []
+      }
+    },
+    {
+      "alsoCheckSlowClockResendNotExtended": true,
+      "expected": {
+        "clockSkewSeconds": 15638400,
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 1,
+          "updated": 0
+        },
+        "remoteChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 0
+        },
+        "subsumedDuplicateCount": 0,
+        "templates": [],
+        "tombstones": [
+          {
+            "baseHash": "ebf3c99e8a5d4d9dd4f62e1c4024ecad75a6fa1242aedf221a13792242e15ea7",
+            "deletedAt": 1794873595000,
+            "id": "44444444-5555-4666-8777-888888888881"
+          }
+        ]
+      },
+      "name": "slowClock181DaysTombstoneConvertedAndNotExtended",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "初期1",
+            "updatedAt": 1760313600000
+          }
+        ],
+        "tombstones": []
+      },
+      "remote": {
+        "templates": [],
+        "tombstones": [
+          {
+            "baseHash": "ebf3c99e8a5d4d9dd4f62e1c4024ecad75a6fa1242aedf221a13792242e15ea7",
+            "deletedAt": 1779235195000,
+            "id": "44444444-5555-4666-8777-888888888881"
+          }
+        ]
+      },
+      "remoteSentAtMillis": 1779235200000
+    },
+    {
+      "alsoCheckIdempotent": true,
+      "expected": {
+        "clockSkewSeconds": 15638400,
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 0
+        },
+        "remoteChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 0
+        },
+        "subsumedDuplicateCount": 0,
+        "templates": [],
+        "tombstones": [
+          {
+            "baseHash": "ebf3c99e8a5d4d9dd4f62e1c4024ecad75a6fa1242aedf221a13792242e15ea7",
+            "deletedAt": 1794009600000,
+            "id": "55555555-6666-4777-8888-999999999991"
+          }
+        ]
+      },
+      "name": "alreadyImportedTombstoneNotExtendedOnResend",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [],
+        "tombstones": [
+          {
+            "baseHash": "ebf3c99e8a5d4d9dd4f62e1c4024ecad75a6fa1242aedf221a13792242e15ea7",
+            "deletedAt": 1794009600000,
+            "id": "55555555-6666-4777-8888-999999999991"
+          }
+        ]
+      },
+      "remote": {
+        "templates": [],
+        "tombstones": [
+          {
+            "baseHash": "ebf3c99e8a5d4d9dd4f62e1c4024ecad75a6fa1242aedf221a13792242e15ea7",
+            "deletedAt": 1794009600000,
+            "id": "55555555-6666-4777-8888-999999999991"
+          }
+        ]
+      },
+      "remoteSentAtMillis": 1779235200000
+    }
+  ],
+  "templateMultiMergeCases": [
+    {
+      "alsoCheckAllPermutations": true,
+      "expected": {
+        "conflictCopyCount": 1,
+        "pcChanges": {
+          "added": 1,
+          "deleted": 0,
+          "updated": 1
+        },
+        "remoteChanges": [
+          {
+            "added": 2,
+            "deleted": 0,
+            "updated": 1
+          },
+          {
+            "added": 1,
+            "deleted": 0,
+            "updated": 1
+          }
+        ],
+        "remoteClockSkewSeconds": [
+          null,
+          null
+        ],
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "textPC",
+            "updatedAt": 1794873580000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 1,
+            "text": "textB",
+            "updatedAt": 1794873590000
+          },
+          {
+            "id": "6A964F57-2272-4070-9F37-7A47EF8F5D67",
+            "kind": "text",
+            "order": 2,
+            "text": "textA",
+            "title": "別の端末の編集",
+            "updatedAt": 1794873570000
+          }
+        ],
+        "tombstones": []
+      },
+      "name": "multiDevicePreservesLoserTextWhenOtherDeviceOverwrites",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "textPC",
+            "updatedAt": 1794873580000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 1,
+            "text": "textA",
+            "updatedAt": 1794873500000
+          }
+        ],
+        "tombstones": []
+      },
+      "remotes": [
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "baseHash": "e3867887836d02c5c0bd9a52bc730fd87bb03c3aa57693244aef7df61d5cf3ad",
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "text": "textA",
+                "updatedAt": 1794873570000
+              }
+            ],
+            "tombstones": []
+          }
+        },
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "baseHash": "e3867887836d02c5c0bd9a52bc730fd87bb03c3aa57693244aef7df61d5cf3ad",
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "text": "orig1",
+                "updatedAt": 1794873500000
+              },
+              {
+                "baseHash": "8fbd808823d1bdc09528d2e18f801eb4a991b99f0e8ecea2e509b2438e634529",
+                "id": "44444444-5555-4666-8777-888888888882",
+                "kind": "text",
+                "order": 1,
+                "text": "textB",
+                "updatedAt": 1794873590000
+              }
+            ],
+            "tombstones": []
+          }
+        }
+      ]
+    },
+    {
+      "alsoCheckAllPermutations": true,
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 1
+        },
+        "remoteChanges": [
+          {
+            "added": 0,
+            "deleted": 0,
+            "updated": 0
+          },
+          {
+            "added": 1,
+            "deleted": 0,
+            "updated": 0
+          }
+        ],
+        "remoteClockSkewSeconds": [
+          null,
+          null
+        ],
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "editedByR1",
+            "updatedAt": 1794873580000
+          }
+        ],
+        "tombstones": []
+      },
+      "name": "multiDeviceUneditedAndDeletedWithConcurrentEdit",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "orig1",
+            "updatedAt": 1794873500000
+          }
+        ],
+        "tombstones": []
+      },
+      "remotes": [
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "baseHash": "e3867887836d02c5c0bd9a52bc730fd87bb03c3aa57693244aef7df61d5cf3ad",
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "text": "editedByR1",
+                "updatedAt": 1794873580000
+              }
+            ],
+            "tombstones": []
+          }
+        },
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [],
+            "tombstones": [
+              {
+                "baseHash": "e3867887836d02c5c0bd9a52bc730fd87bb03c3aa57693244aef7df61d5cf3ad",
+                "deletedAt": 1794873585000,
+                "id": "44444444-5555-4666-8777-888888888881"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 1,
+          "updated": 1
+        },
+        "remoteChanges": [],
+        "remoteClockSkewSeconds": [],
+        "subsumedDuplicateCount": 1,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 0,
+            "text": "同じ文",
+            "title": "見出し",
+            "updatedAt": 1794873580000
+          }
+        ],
+        "tombstones": [
+          {
+            "baseHash": "ddc77ffe03cd60c7b4c89f7307a2a00cb8fec034d0d161a78f07e53efd8734bd",
+            "deletedAt": 1794873600000,
+            "id": "44444444-5555-4666-8777-888888888881"
+          }
+        ]
+      },
+      "name": "multiDeviceZeroRemotesNormalizesPc",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 5,
+            "text": "同じ文",
+            "updatedAt": 1794873580000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 2,
+            "text": "同じ文",
+            "title": "見出し",
+            "updatedAt": 1794873560000
+          }
+        ],
+        "tombstones": []
+      },
+      "remotes": []
+    }
+  ],
+  "templatePageSplitCases": [
+    {
+      "expectedPageBodyBytes": [
+        196986,
+        196957,
+        65267
+      ],
+      "expectedPageItemCounts": [
+        3,
+        3,
+        1
+      ],
+      "isState": false,
+      "items": [
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888800",
+          "order": 0,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888801",
+          "order": 1,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888802",
+          "order": 2,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888803",
+          "order": 3,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888804",
+          "order": 4,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888805",
+          "order": 5,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "b",
+          "id": "44444444-5555-4666-8777-888888888806",
+          "order": 6,
+          "textBytes": 65130,
+          "updatedAt": 1794873600000
+        }
+      ],
+      "name": "six64KiBPlusOne65130BytesContinuation32",
+      "sentAt": 1794873600000
+    },
+    {
+      "expectedPageBodyBytes": [
+        196986,
+        262144
+      ],
+      "expectedPageItemCounts": [
+        3,
+        4
+      ],
+      "isState": true,
+      "items": [
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888800",
+          "order": 0,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888801",
+          "order": 1,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888802",
+          "order": 2,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888803",
+          "order": 3,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888804",
+          "order": 4,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888805",
+          "order": 5,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "b",
+          "id": "44444444-5555-4666-8777-888888888806",
+          "order": 6,
+          "textBytes": 65081,
+          "updatedAt": 1794873600000
+        }
+      ],
+      "name": "exact256KiBContinuationPageBoundary",
+      "sentAt": 1794873600000
+    },
+    {
+      "expectedPageBodyBytes": [
+        196986,
+        196957,
+        65219
+      ],
+      "expectedPageItemCounts": [
+        3,
+        3,
+        1
+      ],
+      "isState": true,
+      "items": [
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888800",
+          "order": 0,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888801",
+          "order": 1,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888802",
+          "order": 2,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888803",
+          "order": 3,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888804",
+          "order": 4,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "a",
+          "id": "44444444-5555-4666-8777-888888888805",
+          "order": 5,
+          "textBytes": 65536,
+          "updatedAt": 1794873600000
+        },
+        {
+          "fillChar": "b",
+          "id": "44444444-5555-4666-8777-888888888806",
+          "order": 6,
+          "textBytes": 65082,
+          "updatedAt": 1794873600000
+        }
+      ],
+      "name": "oneByteOver256KiBContinuationPageMovesToNextPage",
+      "sentAt": 1794873600000
+    }
+  ],
+  "templatePrepareCases": [
+    {
+      "expectedExcludedCount": 60,
+      "expectedKeptCount": 240,
+      "expectedPageCount": 80,
+      "expectedTombstoneCount": 0,
+      "itemCount": 300,
+      "name": "threeHundred64KiBItemsCappedAt240",
+      "nowMillis": 1794873600000,
+      "sentAtMillis": 1794873600000,
+      "textBytes": 65536,
+      "tombstoneCount": 0
+    },
+    {
+      "expectedExcludedCount": 2,
+      "expectedKeptIds": [
+        "44444444-5555-4666-8777-888888888881",
+        "44444444-5555-4666-8777-888888888884"
+      ],
+      "name": "oversizedTextAndControlEscapedExcluded",
+      "nowMillis": 1794873600000,
+      "sentAtMillis": 1794873600000
+    },
+    {
+      "expectedExcludedCount": 2,
+      "expectedFirstTombstoneDeletedAt": 1794873590005,
+      "expectedKeptCount": 300,
+      "expectedLastTombstoneDeletedAt": 1794873591004,
+      "expectedTombstoneCount": 1000,
+      "itemCount": 302,
+      "name": "over300TemplatesAndOver1000Tombstones",
+      "nowMillis": 1794873600000,
+      "sentAtMillis": 1794873600000,
+      "tombstoneCount": 1005
     }
   ]
 }

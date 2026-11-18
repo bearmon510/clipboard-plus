@@ -26,6 +26,25 @@ public struct TemplateSyncItem: Codable, Equatable {
         self.updatedAt = updatedAt
         self.baseHash = baseHash
     }
+
+    public static func == (lhs: TemplateSyncItem, rhs: TemplateSyncItem) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.kind == rhs.kind &&
+        lhs.text.utf8.elementsEqual(rhs.text.utf8) &&
+        optionalUtf8Equals(lhs.title, rhs.title) &&
+        optionalUtf8Equals(lhs.tag, rhs.tag) &&
+        lhs.order == rhs.order &&
+        lhs.updatedAt == rhs.updatedAt &&
+        optionalUtf8Equals(lhs.baseHash, rhs.baseHash)
+    }
+
+    private static func optionalUtf8Equals(_ lhs: String?, _ rhs: String?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case let (a?, b?): return a.utf8.elementsEqual(b.utf8)
+        default: return false
+        }
+    }
 }
 
 public struct TemplateSyncTombstone: Codable, Equatable {
@@ -74,70 +93,188 @@ public enum TemplateSyncMessage: Equatable {
     case ack(op: UUID)
 }
 
-enum TemplateCanonicalJson {
-    static func serializeString(_ value: String) -> String {
-        var result = "\""
-        result.reserveCapacity(value.count + 2)
+struct BoundedUtf8Sink {
+    private var buffer: [UInt8]?
+    private let maxBytes: Int
+    private(set) var count: Int = 0
+
+    init(maxBytes: Int, writeBytes: Bool) {
+        self.maxBytes = maxBytes
+        if writeBytes {
+            var arr: [UInt8] = []
+            arr.reserveCapacity(min(maxBytes, 4096))
+            self.buffer = arr
+        } else {
+            self.buffer = nil
+        }
+    }
+
+    mutating func writeByte(_ byte: UInt8) throws {
+        try ensureCapacity(1)
+        buffer?.append(byte)
+        count += 1
+    }
+
+    mutating func writeBytes<C: Collection>(_ bytes: C) throws where C.Element == UInt8 {
+        let n = bytes.count
+        try ensureCapacity(n)
+        buffer?.append(contentsOf: bytes)
+        count += n
+    }
+
+    mutating func writeInt64(_ value: Int64) throws {
+        try writeBytes(String(value).utf8)
+    }
+
+    mutating func writeEscapedJsonString(_ value: String) throws {
+        try writeByte(0x22)
         for scalar in value.unicodeScalars {
             switch scalar.value {
-            case 0x22: result.append("\\\"")
-            case 0x5C: result.append("\\\\")
-            case 0x08: result.append("\\b")
-            case 0x0C: result.append("\\f")
-            case 0x0A: result.append("\\n")
-            case 0x0D: result.append("\\r")
-            case 0x09: result.append("\\t")
+            case 0x22: try writeBytes("\\\"".utf8)
+            case 0x5C: try writeBytes("\\\\".utf8)
+            case 0x08: try writeBytes("\\b".utf8)
+            case 0x0C: try writeBytes("\\f".utf8)
+            case 0x0A: try writeBytes("\\n".utf8)
+            case 0x0D: try writeBytes("\\r".utf8)
+            case 0x09: try writeBytes("\\t".utf8)
             case 0x00...0x1F:
-                result.append(String(format: "\\u%04x", scalar.value))
+                let hi = UInt8((scalar.value >> 4) & 0xF)
+                let lo = UInt8(scalar.value & 0xF)
+                try writeBytes([0x5C, 0x75, 0x30, 0x30, Self.hexDigit(hi), Self.hexDigit(lo)])
             default:
-                result.unicodeScalars.append(scalar)
+                try writeBytes(scalar.utf8)
             }
         }
-        result.append("\"")
-        return result
+        try writeByte(0x22)
     }
 
-    static func serializeItem(_ item: TemplateSyncItem, includeBaseHash: Bool) -> String {
-        var parts: [String] = []
+    private static func hexDigit(_ nibble: UInt8) -> UInt8 {
+        nibble < 10 ? 0x30 + nibble : 0x61 + (nibble - 10)
+    }
+
+    private func ensureCapacity(_ add: Int) throws {
+        if add > maxBytes - count {
+            throw SyncProtocolError.limit
+        }
+    }
+
+    func data() -> Data {
+        Data(buffer ?? [])
+    }
+}
+
+enum TemplateCanonicalJson {
+    static func serializeContentHashInput(kind: TemplateSyncKind, text: String, normTitle: String?, normTag: String?) throws -> Data {
+        var sink = BoundedUtf8Sink(maxBytes: Int.max, writeBytes: true)
+        try sink.writeByte(0x5B) // [
+        try sink.writeBytes((kind == .url ? "\"url\"" : "\"text\"").utf8)
+        try sink.writeByte(0x2C) // ,
+        try sink.writeEscapedJsonString(text)
+        try sink.writeByte(0x2C) // ,
+        if let normTitle {
+            try sink.writeEscapedJsonString(normTitle)
+        } else {
+            try sink.writeBytes("null".utf8)
+        }
+        try sink.writeByte(0x2C) // ,
+        if let normTag {
+            try sink.writeEscapedJsonString(normTag)
+        } else {
+            try sink.writeBytes("null".utf8)
+        }
+        try sink.writeByte(0x5D) // ]
+        return sink.data()
+    }
+
+    static func writeItem(_ item: TemplateSyncItem, includeBaseHash: Bool, to sink: inout BoundedUtf8Sink) throws {
+        try sink.writeByte(0x7B) // {
         if includeBaseHash, let baseHash = item.baseHash {
-            parts.append("\"baseHash\":" + serializeString(baseHash))
+            try sink.writeBytes("\"baseHash\":".utf8)
+            try sink.writeEscapedJsonString(baseHash)
+            try sink.writeByte(0x2C)
         }
-        parts.append("\"id\":" + serializeString(item.id.uuidString))
-        parts.append("\"kind\":\"" + item.kind.rawValue + "\"")
-        parts.append("\"order\":" + String(item.order))
+        try sink.writeBytes("\"id\":".utf8)
+        try sink.writeEscapedJsonString(item.id.uuidString)
+        try sink.writeBytes(",\"kind\":\"".utf8)
+        try sink.writeBytes(item.kind.rawValue.utf8)
+        try sink.writeBytes("\",\"order\":".utf8)
+        try sink.writeInt64(Int64(item.order))
         if let tag = item.tag {
-            parts.append("\"tag\":" + serializeString(tag))
+            try sink.writeBytes(",\"tag\":".utf8)
+            try sink.writeEscapedJsonString(tag)
         }
-        parts.append("\"text\":" + serializeString(item.text))
+        try sink.writeBytes(",\"text\":".utf8)
+        try sink.writeEscapedJsonString(item.text)
         if let title = item.title {
-            parts.append("\"title\":" + serializeString(title))
+            try sink.writeBytes(",\"title\":".utf8)
+            try sink.writeEscapedJsonString(title)
         }
-        parts.append("\"updatedAt\":" + String(item.updatedAt))
-        return "{" + parts.joined(separator: ",") + "}"
+        try sink.writeBytes(",\"updatedAt\":".utf8)
+        try sink.writeInt64(item.updatedAt)
+        try sink.writeByte(0x7D) // }
     }
 
-    static func serializeTombstone(_ tomb: TemplateSyncTombstone) -> String {
-        var parts: [String] = []
+    static func writeTombstone(_ tomb: TemplateSyncTombstone, to sink: inout BoundedUtf8Sink) throws {
+        try sink.writeByte(0x7B) // {
         if let baseHash = tomb.baseHash {
-            parts.append("\"baseHash\":" + serializeString(baseHash))
+            try sink.writeBytes("\"baseHash\":".utf8)
+            try sink.writeEscapedJsonString(baseHash)
+            try sink.writeByte(0x2C)
         }
-        parts.append("\"deletedAt\":" + String(tomb.deletedAt))
-        parts.append("\"id\":" + serializeString(tomb.id.uuidString))
-        return "{" + parts.joined(separator: ",") + "}"
+        try sink.writeBytes("\"deletedAt\":".utf8)
+        try sink.writeInt64(tomb.deletedAt)
+        try sink.writeBytes(",\"id\":".utf8)
+        try sink.writeEscapedJsonString(tomb.id.uuidString)
+        try sink.writeByte(0x7D) // }
     }
 
-    static func serializePage(_ page: TemplateSyncPage, isFirstPage: Bool, includeItemBaseHash: Bool) -> String {
-        var result = "{"
+    static func writePage(_ page: TemplateSyncPage, isFirstPage: Bool, includeItemBaseHash: Bool, to sink: inout BoundedUtf8Sink) throws {
+        try sink.writeByte(0x7B) // {
         if isFirstPage {
-            result += "\"sentAt\":" + String(page.sentAt ?? 0) + ","
+            try sink.writeBytes("\"sentAt\":".utf8)
+            try sink.writeInt64(page.sentAt ?? 0)
+            try sink.writeByte(0x2C)
         }
-        result += "\"templates\":[" + page.templates.map { serializeItem($0, includeBaseHash: includeItemBaseHash) }.joined(separator: ",") + "]"
-        result += ",\"tombstones\":[" + page.tombstones.map { serializeTombstone($0) }.joined(separator: ",") + "]"
+        try sink.writeBytes("\"templates\":[".utf8)
+        for (index, item) in page.templates.enumerated() {
+            if index > 0 { try sink.writeByte(0x2C) }
+            try writeItem(item, includeBaseHash: includeItemBaseHash, to: &sink)
+        }
+        try sink.writeBytes("],\"tombstones\":[".utf8)
+        for (index, tomb) in page.tombstones.enumerated() {
+            if index > 0 { try sink.writeByte(0x2C) }
+            try writeTombstone(tomb, to: &sink)
+        }
+        try sink.writeByte(0x5D) // ]
         if isFirstPage {
-            result += ",\"v\":" + String(page.version ?? 1)
+            try sink.writeBytes(",\"v\":".utf8)
+            try sink.writeInt64(Int64(page.version ?? 1))
         }
-        result += "}"
-        return result
+        try sink.writeByte(0x7D) // }
+    }
+
+    static func measureItemUtf8Bytes(_ item: TemplateSyncItem, includeBaseHash: Bool, maxBytes: Int) throws -> Int {
+        var sink = BoundedUtf8Sink(maxBytes: maxBytes, writeBytes: false)
+        try writeItem(item, includeBaseHash: includeBaseHash, to: &sink)
+        return sink.count
+    }
+
+    static func measureTombstoneUtf8Bytes(_ tomb: TemplateSyncTombstone, maxBytes: Int) throws -> Int {
+        var sink = BoundedUtf8Sink(maxBytes: maxBytes, writeBytes: false)
+        try writeTombstone(tomb, to: &sink)
+        return sink.count
+    }
+
+    static func measurePageUtf8Bytes(_ page: TemplateSyncPage, isFirstPage: Bool, includeItemBaseHash: Bool, maxBytes: Int) throws -> Int {
+        var sink = BoundedUtf8Sink(maxBytes: maxBytes, writeBytes: false)
+        try writePage(page, isFirstPage: isFirstPage, includeItemBaseHash: includeItemBaseHash, to: &sink)
+        return sink.count
+    }
+
+    static func serializePageToData(_ page: TemplateSyncPage, isFirstPage: Bool, includeItemBaseHash: Bool, maxBytes: Int) throws -> Data {
+        var sink = BoundedUtf8Sink(maxBytes: maxBytes, writeBytes: true)
+        try writePage(page, isFirstPage: isFirstPage, includeItemBaseHash: includeItemBaseHash, to: &sink)
+        return sink.data()
     }
 }
 
@@ -365,6 +502,8 @@ enum TemplateStrictJson {
 }
 
 public enum TemplateSyncMessageCodec {
+    public static let maxOrder = 2_147_483_647
+
     static func validateTextString(_ text: String, maxBytes: Int) throws {
         try SyncProtocol.require(text.utf8.count <= maxBytes, .limit)
     }
@@ -383,7 +522,7 @@ public enum TemplateSyncMessageCodec {
         if let tag = item.tag {
             try validateLabelString(tag, maxChars: SyncProtocol.maxTemplateTagCharacters, maxBytes: SyncProtocol.maxTemplateTagBytes)
         }
-        try SyncProtocol.require(item.order >= 0)
+        try SyncProtocol.require(item.order >= 0 && item.order <= maxOrder)
         try SyncProtocol.require(item.updatedAt >= -SyncProtocol.maxTimestamp && item.updatedAt <= SyncProtocol.maxTimestamp)
         if !allowBaseHash {
             try SyncProtocol.require(item.baseHash == nil)
@@ -439,13 +578,21 @@ public enum TemplateSyncMessageCodec {
         case let .push(op, part, total, page):
             try validatePage(page, part: part, total: total, isState: false)
             header = "{\"op\":\"\(op.uuidString)\",\"part\":\(part),\"t\":\"tpl_push\",\"total\":\(total)}"
-            body = Data(TemplateCanonicalJson.serializePage(page, isFirstPage: part == 0, includeItemBaseHash: true).utf8)
-            try SyncProtocol.require(body.count <= SyncProtocol.maxTemplatePageBodyBytes, .limit)
+            body = try TemplateCanonicalJson.serializePageToData(
+                page,
+                isFirstPage: part == 0,
+                includeItemBaseHash: true,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+            )
         case let .state(op, part, total, page):
             try validatePage(page, part: part, total: total, isState: true)
             header = "{\"op\":\"\(op.uuidString)\",\"part\":\(part),\"t\":\"tpl_state\",\"total\":\(total)}"
-            body = Data(TemplateCanonicalJson.serializePage(page, isFirstPage: part == 0, includeItemBaseHash: false).utf8)
-            try SyncProtocol.require(body.count <= SyncProtocol.maxTemplatePageBodyBytes, .limit)
+            body = try TemplateCanonicalJson.serializePageToData(
+                page,
+                isFirstPage: part == 0,
+                includeItemBaseHash: false,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+            )
         }
         return try SyncMessageCodec.framePlaintext(header: Data(header.utf8), body: body)
     }
@@ -545,7 +692,7 @@ public enum TemplateSyncMessageCodec {
               let kind = TemplateSyncKind(rawValue: kindStr),
               case let .string(text)? = obj["text"],
               case let .integer(orderLong)? = obj["order"],
-              orderLong >= 0 && orderLong <= Int64(Int.max),
+              orderLong >= 0 && orderLong <= Int64(maxOrder),
               case let .integer(updatedAt)? = obj["updatedAt"] else {
             throw SyncProtocolError.format
         }
@@ -611,8 +758,18 @@ public enum TemplateSyncMessageCodec {
             try SyncProtocol.require(seenIds.insert(tomb.id).inserted)
         }
 
-        let continuationOverhead = 28 // {"templates":[],"tombstones":[]}
-        let firstHeaderBytes = "{\"sentAt\":\(snapshot.sentAt),\"templates\":[],\"tombstones\":[],\"v\":1}".utf8.count
+        let continuationOverhead = try TemplateCanonicalJson.measurePageUtf8Bytes(
+            TemplateSyncPage(templates: [], tombstones: []),
+            isFirstPage: false,
+            includeItemBaseHash: !isState,
+            maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+        )
+        let firstHeaderBytes = try TemplateCanonicalJson.measurePageUtf8Bytes(
+            TemplateSyncPage(version: 1, sentAt: snapshot.sentAt, templates: [], tombstones: []),
+            isFirstPage: true,
+            includeItemBaseHash: !isState,
+            maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+        )
 
         var pages: [TemplateSyncPage] = []
         var currentTemplates: [TemplateSyncItem] = []
@@ -637,7 +794,11 @@ public enum TemplateSyncMessageCodec {
         }
 
         for item in snapshot.templates {
-            let itemBytes = TemplateCanonicalJson.serializeItem(item, includeBaseHash: !isState).utf8.count
+            let itemBytes = try TemplateCanonicalJson.measureItemUtf8Bytes(
+                item,
+                includeBaseHash: !isState,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes - continuationOverhead
+            )
             var commaBytes = currentTemplates.isEmpty ? 0 : 1
             if currentBytes + commaBytes + itemBytes > SyncProtocol.maxTemplatePageBodyBytes {
                 try SyncProtocol.require(!currentTemplates.isEmpty || !currentTombstones.isEmpty, .limit)
@@ -650,7 +811,10 @@ public enum TemplateSyncMessageCodec {
         }
 
         for tomb in snapshot.tombstones {
-            let tombBytes = TemplateCanonicalJson.serializeTombstone(tomb).utf8.count
+            let tombBytes = try TemplateCanonicalJson.measureTombstoneUtf8Bytes(
+                tomb,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes - continuationOverhead
+            )
             var commaBytes = currentTombstones.isEmpty ? 0 : 1
             if currentBytes + commaBytes + tombBytes > SyncProtocol.maxTemplatePageBodyBytes {
                 try SyncProtocol.require(!currentTemplates.isEmpty || !currentTombstones.isEmpty, .limit)
@@ -730,8 +894,12 @@ public final class TemplateSyncPageAssembler {
                 try SyncProtocol.require(msgOp == op! && msgIsState == isState! && msgTotal == total! && part == nextPart, .state)
             }
 
-            let pageBytes = TemplateCanonicalJson.serializePage(page, isFirstPage: part == 0, includeItemBaseHash: !msgIsState).utf8.count
-            try SyncProtocol.require(pageBytes <= SyncProtocol.maxTemplatePageBodyBytes, .limit)
+            let pageBytes = try TemplateCanonicalJson.measurePageUtf8Bytes(
+                page,
+                isFirstPage: part == 0,
+                includeItemBaseHash: !msgIsState,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+            )
             totalBodyBytes += pageBytes
             try SyncProtocol.require(totalBodyBytes <= SyncProtocol.maxTemplateTotalBytes, .limit)
             try SyncProtocol.require(templates.count + page.templates.count <= SyncProtocol.maxTemplates, .limit)

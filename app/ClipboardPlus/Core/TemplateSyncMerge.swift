@@ -11,6 +11,16 @@ public struct TemplateSyncState: Equatable {
     }
 }
 
+public struct TemplateSyncRemoteState: Equatable {
+    public let state: TemplateSyncState
+    public let sentAtMillis: Int64?
+
+    public init(state: TemplateSyncState, sentAtMillis: Int64? = nil) {
+        self.state = state
+        self.sentAtMillis = sentAtMillis
+    }
+}
+
 public struct TemplateSyncSideChanges: Equatable {
     public let added: Int
     public let updated: Int
@@ -45,6 +55,39 @@ public struct TemplateSyncMergeResult: Equatable {
         self.pcChanges = pcChanges
         self.remoteChanges = remoteChanges
         self.clockSkewSeconds = clockSkewSeconds
+    }
+}
+
+public struct TemplateSyncMultiMergeResult: Equatable {
+    public let templates: [TemplateSyncItem]
+    public let tombstones: [TemplateSyncTombstone]
+    public let conflictCopyCount: Int
+    public let subsumedDuplicateCount: Int
+    public let pcChanges: TemplateSyncSideChanges
+    public let remoteChanges: [TemplateSyncSideChanges]
+    public let remoteClockSkewSeconds: [Int64?]
+
+    public init(templates: [TemplateSyncItem], tombstones: [TemplateSyncTombstone],
+                conflictCopyCount: Int, subsumedDuplicateCount: Int,
+                pcChanges: TemplateSyncSideChanges, remoteChanges: [TemplateSyncSideChanges],
+                remoteClockSkewSeconds: [Int64?]) {
+        self.templates = templates
+        self.tombstones = tombstones
+        self.conflictCopyCount = conflictCopyCount
+        self.subsumedDuplicateCount = subsumedDuplicateCount
+        self.pcChanges = pcChanges
+        self.remoteChanges = remoteChanges
+        self.remoteClockSkewSeconds = remoteClockSkewSeconds
+    }
+}
+
+public struct TemplateSyncPreparedState: Equatable {
+    public let state: TemplateSyncState
+    public let excludedTemplateCount: Int
+
+    public init(state: TemplateSyncState, excludedTemplateCount: Int) {
+        self.state = state
+        self.excludedTemplateCount = excludedTemplateCount
     }
 }
 
@@ -88,24 +131,8 @@ public enum TemplateSyncMerge {
     public static func contentHash(kind: TemplateSyncKind, text: String, title: String?, tag: String?) -> String {
         let normTitle = normalizedTitle(title)
         let normTag = normalizedTag(tag)
-        var json = "["
-        json += TemplateCanonicalJson.serializeString(kind.rawValue)
-        json += ","
-        json += TemplateCanonicalJson.serializeString(text)
-        json += ","
-        if let normTitle {
-            json += TemplateCanonicalJson.serializeString(normTitle)
-        } else {
-            json += "null"
-        }
-        json += ","
-        if let normTag {
-            json += TemplateCanonicalJson.serializeString(normTag)
-        } else {
-            json += "null"
-        }
-        json += "]"
-        let digest = SHA256.hash(data: Data(json.utf8))
+        let data = (try? TemplateCanonicalJson.serializeContentHashInput(kind: kind, text: text, normTitle: normTitle, normTag: normTag)) ?? Data()
+        let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
@@ -139,29 +166,67 @@ public enum TemplateSyncMerge {
         return rawPrefix.trimmingCharacters(in: .whitespacesAndNewlines) + suffix
     }
 
+    private static let placeholderBaseHash = String(repeating: "0", count: 64)
+
+    private static func utf8Equals(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.elementsEqual(rhs.utf8)
+    }
+
+    private static func utf8EqualsOptional(_ lhs: String?, _ rhs: String?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case let (a?, b?): return a.utf8.elementsEqual(b.utf8)
+        default: return false
+        }
+    }
+
     public static func deterministicConflictId(originalId: UUID, loserContentHash: String, usedIds: inout Set<UUID>) -> UUID {
         var counter = 0
         while true {
-            let input: String
-            if counter == 0 {
-                input = "clipboardplus-tpl-conflict-v1:\(originalId.uuidString):\(loserContentHash)"
-            } else {
-                input = "clipboardplus-tpl-conflict-v1:\(originalId.uuidString):\(loserContentHash):\(counter)"
-            }
-            var bytes = Array(SHA256.hash(data: Data(input.utf8)).prefix(16))
-            bytes[6] = (bytes[6] & 0x0F) | 0x40
-            bytes[8] = (bytes[8] & 0x3F) | 0x80
-            let candidate = UUID(uuid: (
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9], bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15]
-            ))
+            let candidate = conflictUuid(originalId: originalId, loserContentHash: loserContentHash, counter: counter)
             if usedIds.insert(candidate).inserted {
                 return candidate
             }
             counter += 1
         }
+    }
+
+    private static func resolveConflictId(
+        originalId: UUID,
+        loserContentHash: String,
+        activeIds: inout Set<UUID>,
+        tombstoneIds: Set<UUID>
+    ) -> UUID? {
+        var counter = 0
+        while true {
+            let candidate = conflictUuid(originalId: originalId, loserContentHash: loserContentHash, counter: counter)
+            // Suppress recreation if this conflict copy was already deleted (tombstone present).
+            if tombstoneIds.contains(candidate) {
+                return nil
+            }
+            if activeIds.insert(candidate).inserted {
+                return candidate
+            }
+            counter += 1
+        }
+    }
+
+    private static func conflictUuid(originalId: UUID, loserContentHash: String, counter: Int) -> UUID {
+        let input: String
+        if counter == 0 {
+            input = "clipboardplus-tpl-conflict-v1:\(originalId.uuidString):\(loserContentHash)"
+        } else {
+            input = "clipboardplus-tpl-conflict-v1:\(originalId.uuidString):\(loserContentHash):\(counter)"
+        }
+        var bytes = Array(SHA256.hash(data: Data(input.utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x40
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 
     private struct NormalizedEntry {
@@ -175,61 +240,333 @@ public enum TemplateSyncMerge {
         let loserHash: String
     }
 
+    private struct PagePackerState {
+        let flushedPages: Int
+        let flushedTotalBytes: Int
+        let currentPageBytes: Int
+        let currentHasItems: Bool
+
+        static func initial(firstPageEmptyBytes: Int) -> PagePackerState {
+            PagePackerState(flushedPages: 0, flushedTotalBytes: 0, currentPageBytes: firstPageEmptyBytes, currentHasItems: false)
+        }
+
+        func addingItem(_ itemBytes: Int, continuationEmptyBytes: Int) -> PagePackerState? {
+            let commaBytes = currentHasItems ? 1 : 0
+            if currentPageBytes + commaBytes + itemBytes <= SyncProtocol.maxTemplatePageBodyBytes {
+                return PagePackerState(
+                    flushedPages: flushedPages,
+                    flushedTotalBytes: flushedTotalBytes,
+                    currentPageBytes: currentPageBytes + commaBytes + itemBytes,
+                    currentHasItems: true
+                )
+            }
+            guard currentHasItems, flushedPages + 1 < SyncProtocol.maxTemplatePages else {
+                return nil
+            }
+            let newTotal = flushedTotalBytes + currentPageBytes
+            guard newTotal <= SyncProtocol.maxTemplateTotalBytes,
+                  continuationEmptyBytes + itemBytes <= SyncProtocol.maxTemplatePageBodyBytes else {
+                return nil
+            }
+            return PagePackerState(
+                flushedPages: flushedPages + 1,
+                flushedTotalBytes: newTotal,
+                currentPageBytes: continuationEmptyBytes + itemBytes,
+                currentHasItems: true
+            )
+        }
+
+        func canFinishWithTombstones(_ tombstoneByteSizes: [Int], continuationEmptyBytes: Int) -> Bool {
+            var pages = flushedPages
+            var totalBytes = flushedTotalBytes
+            var currentBytes = currentPageBytes
+            var hasItems = currentHasItems
+            var hasTombstones = false
+
+            for tombBytes in tombstoneByteSizes {
+                var commaBytes = hasTombstones ? 1 : 0
+                if currentBytes + commaBytes + tombBytes > SyncProtocol.maxTemplatePageBodyBytes {
+                    guard hasItems || hasTombstones else { return false }
+                    guard pages + 1 < SyncProtocol.maxTemplatePages else { return false }
+                    totalBytes += currentBytes
+                    guard totalBytes <= SyncProtocol.maxTemplateTotalBytes else { return false }
+                    pages += 1
+                    currentBytes = continuationEmptyBytes
+                    hasItems = false
+                    hasTombstones = false
+                    commaBytes = 0
+                    guard currentBytes + tombBytes <= SyncProtocol.maxTemplatePageBodyBytes else { return false }
+                }
+                hasTombstones = true
+                currentBytes += commaBytes + tombBytes
+            }
+
+            return pages + 1 <= SyncProtocol.maxTemplatePages &&
+                totalBytes + currentBytes <= SyncProtocol.maxTemplateTotalBytes
+        }
+    }
+
+    public static func prepareSyncState(
+        templates: [TemplateSyncItem],
+        tombstones: [TemplateSyncTombstone],
+        nowMillis: Int64,
+        sentAtMillis: Int64? = nil
+    ) throws -> TemplateSyncPreparedState {
+        try SyncProtocol.require(nowMillis >= -SyncProtocol.maxTimestamp && nowMillis <= SyncProtocol.maxTimestamp)
+        let effectiveSentAt = sentAtMillis ?? nowMillis
+        try SyncProtocol.require(effectiveSentAt >= -SyncProtocol.maxTimestamp && effectiveSentAt <= SyncProtocol.maxTimestamp)
+
+        let firstPageEmptyBytes = try TemplateCanonicalJson.measurePageUtf8Bytes(
+            TemplateSyncPage(version: 1, sentAt: effectiveSentAt, templates: [], tombstones: []),
+            isFirstPage: true,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+        )
+        let continuationEmptyBytes = try TemplateCanonicalJson.measurePageUtf8Bytes(
+            TemplateSyncPage(templates: [], tombstones: []),
+            isFirstPage: false,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+        )
+
+        let inputTemplateIds = Set(templates.map(\.id))
+        var validTombs: [UUID: TemplateSyncTombstone] = [:]
+        for tomb in tombstones {
+            if inputTemplateIds.contains(tomb.id) { continue }
+            if tomb.deletedAt < -SyncProtocol.maxTimestamp || tomb.deletedAt > SyncProtocol.maxTimestamp { continue }
+            if let baseHash = tomb.baseHash, !SyncProtocol.isLowerHex64(baseHash) { continue }
+            if isExpiredTombstone(deletedAt: tomb.deletedAt, nowMillis: nowMillis) { continue }
+            if let existing = validTombs[tomb.id] {
+                validTombs[tomb.id] = mergeTombstones(existing, tomb)
+            } else {
+                validTombs[tomb.id] = tomb
+            }
+        }
+
+        let cappedTombstones = pruneAndSortTombstones(Array(validTombs.values), nowMillis: nowMillis)
+        let tombByteSizes = try cappedTombstones.map {
+            try TemplateCanonicalJson.measureTombstoneUtf8Bytes(
+                $0,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes - continuationEmptyBytes
+            )
+        }
+
+        var accepted: [TemplateSyncItem] = []
+        var seenItemIds = Set<UUID>()
+        var excluded = 0
+        var packer = PagePackerState.initial(firstPageEmptyBytes: firstPageEmptyBytes)
+
+        for raw in templates {
+            guard seenItemIds.insert(raw.id).inserted else {
+                excluded += 1
+                continue
+            }
+            let normalized = normalizeInputItem(raw)
+            guard let itemBytes = measureSyncableItemBytes(normalized, firstPageEmptyBytes: firstPageEmptyBytes) else {
+                excluded += 1
+                continue
+            }
+            guard accepted.count < SyncProtocol.maxTemplates,
+                  let nextPacker = packer.addingItem(itemBytes, continuationEmptyBytes: continuationEmptyBytes),
+                  nextPacker.canFinishWithTombstones(tombByteSizes, continuationEmptyBytes: continuationEmptyBytes) else {
+                excluded += 1
+                continue
+            }
+            accepted.append(normalized)
+            packer = nextPacker
+        }
+
+        return TemplateSyncPreparedState(
+            state: TemplateSyncState(templates: accepted, tombstones: cappedTombstones),
+            excludedTemplateCount: excluded
+        )
+    }
+
+    private static func measureSyncableItemBytes(_ item: TemplateSyncItem, firstPageEmptyBytes: Int) -> Int? {
+        guard item.order >= 0 && item.order <= TemplateSyncMessageCodec.maxOrder,
+              item.updatedAt >= -SyncProtocol.maxTimestamp && item.updatedAt <= SyncProtocol.maxTimestamp else {
+            return nil
+        }
+        if let baseHash = item.baseHash, !SyncProtocol.isLowerHex64(baseHash) {
+            return nil
+        }
+        do {
+            try TemplateSyncMessageCodec.validateItem(item, allowBaseHash: true)
+            // Reserve space for a 64-hex baseHash so items selected by PC remain syncable after iOS computes baseHash.
+            let sizingItem = item.baseHash != nil ? item : TemplateSyncItem(
+                id: item.id,
+                kind: item.kind,
+                text: item.text,
+                title: item.title,
+                tag: item.tag,
+                order: item.order,
+                updatedAt: item.updatedAt,
+                baseHash: placeholderBaseHash
+            )
+            return try TemplateCanonicalJson.measureItemUtf8Bytes(
+                sizingItem,
+                includeBaseHash: true,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes - firstPageEmptyBytes
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private static func fitsWithinSyncBudget(templates: [TemplateSyncItem], tombstones: [TemplateSyncTombstone]) throws -> Bool {
+        let firstPageEmptyBytes = try TemplateCanonicalJson.measurePageUtf8Bytes(
+            TemplateSyncPage(version: 1, sentAt: -SyncProtocol.maxTimestamp, templates: [], tombstones: []),
+            isFirstPage: true,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+        )
+        let continuationEmptyBytes = try TemplateCanonicalJson.measurePageUtf8Bytes(
+            TemplateSyncPage(templates: [], tombstones: []),
+            isFirstPage: false,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.maxTemplatePageBodyBytes
+        )
+
+        var packer = PagePackerState.initial(firstPageEmptyBytes: firstPageEmptyBytes)
+        for item in templates {
+            let sizingItem = item.baseHash != nil ? item : TemplateSyncItem(
+                id: item.id,
+                kind: item.kind,
+                text: item.text,
+                title: item.title,
+                tag: item.tag,
+                order: item.order,
+                updatedAt: item.updatedAt,
+                baseHash: placeholderBaseHash
+            )
+            let itemBytes = try TemplateCanonicalJson.measureItemUtf8Bytes(
+                sizingItem,
+                includeBaseHash: true,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes - continuationEmptyBytes
+            )
+            guard let nextPacker = packer.addingItem(itemBytes, continuationEmptyBytes: continuationEmptyBytes) else {
+                return false
+            }
+            packer = nextPacker
+        }
+
+        let tombByteSizes = try tombstones.map {
+            try TemplateCanonicalJson.measureTombstoneUtf8Bytes(
+                $0,
+                maxBytes: SyncProtocol.maxTemplatePageBodyBytes - continuationEmptyBytes
+            )
+        }
+        return packer.canFinishWithTombstones(tombByteSizes, continuationEmptyBytes: continuationEmptyBytes)
+    }
+
     public static func merge(
         pc: TemplateSyncState,
         remote: TemplateSyncState,
         nowMillis: Int64,
         remoteSentAtMillis: Int64? = nil
     ) throws -> TemplateSyncMergeResult {
-        try SyncProtocol.require(nowMillis >= -SyncProtocol.maxTimestamp && nowMillis <= SyncProtocol.maxTimestamp)
-        let clockSkew: Int64?
-        if let remoteSentAtMillis {
-            clockSkew = try clockSkewSeconds(remoteSentAtMillis: remoteSentAtMillis, nowMillis: nowMillis)
-        } else {
-            clockSkew = nil
-        }
+        let multi = try mergeAll(
+            pc: pc,
+            remotes: [TemplateSyncRemoteState(state: remote, sentAtMillis: remoteSentAtMillis)],
+            nowMillis: nowMillis
+        )
+        return TemplateSyncMergeResult(
+            templates: multi.templates,
+            tombstones: multi.tombstones,
+            conflictCopyCount: multi.conflictCopyCount,
+            subsumedDuplicateCount: multi.subsumedDuplicateCount,
+            pcChanges: multi.pcChanges,
+            remoteChanges: multi.remoteChanges[0],
+            clockSkewSeconds: multi.remoteClockSkewSeconds[0]
+        )
+    }
 
-        var usedIds = Set<UUID>()
-        let (pcItems, pcTombs) = try indexSide(pc, nowMillis: nowMillis, usedIds: &usedIds)
-        let (remoteItems, remoteTombs) = try indexSide(remote, nowMillis: nowMillis, usedIds: &usedIds)
+    public static func mergeAll(
+        pc: TemplateSyncState,
+        remotes: [TemplateSyncRemoteState],
+        nowMillis: Int64
+    ) throws -> TemplateSyncMultiMergeResult {
+        try SyncProtocol.require(nowMillis >= -SyncProtocol.maxTimestamp && nowMillis <= SyncProtocol.maxTimestamp)
+
+        let (pcItems, pcTombs) = try indexSide(pc, nowMillis: nowMillis, sentAtMillis: nil, knownPcTombs: nil)
+
+        var remoteItemsList: [[UUID: NormalizedEntry]] = []
+        remoteItemsList.reserveCapacity(remotes.count)
+        var remoteTombsList: [[UUID: TemplateSyncTombstone]] = []
+        remoteTombsList.reserveCapacity(remotes.count)
+        var remoteClockSkews: [Int64?] = []
+        remoteClockSkews.reserveCapacity(remotes.count)
 
         var allIds = Set<UUID>(pcItems.keys)
         allIds.formUnion(pcTombs.keys)
-        allIds.formUnion(remoteItems.keys)
-        allIds.formUnion(remoteTombs.keys)
+
+        for remote in remotes {
+            let skew: Int64?
+            if let sentAt = remote.sentAtMillis {
+                skew = try clockSkewSeconds(remoteSentAtMillis: sentAt, nowMillis: nowMillis)
+            } else {
+                skew = nil
+            }
+            remoteClockSkews.append(skew)
+            let (rItems, rTombs) = try indexSide(
+                remote.state,
+                nowMillis: nowMillis,
+                sentAtMillis: remote.sentAtMillis,
+                knownPcTombs: pcTombs
+            )
+            remoteItemsList.append(rItems)
+            remoteTombsList.append(rTombs)
+            allIds.formUnion(rItems.keys)
+            allIds.formUnion(rTombs.keys)
+        }
 
         var survivingItems: [NormalizedEntry] = []
         var survivingTombs: [UUID: TemplateSyncTombstone] = [:]
         var conflictCandidates: [ConflictCandidate] = []
 
         for id in allIds {
-            let pcEntry = pcItems[id]
-            let remoteEntry = remoteItems[id]
-            let pcTomb = pcTombs[id]
-            let remoteTomb = remoteTombs[id]
+            var activeEntries: [NormalizedEntry] = []
+            if let pcEntry = pcItems[id] {
+                activeEntries.append(pcEntry)
+            }
+            for rItems in remoteItemsList {
+                if let rEntry = rItems[id] {
+                    activeEntries.append(rEntry)
+                }
+            }
 
-            if let pcEntry, let remoteEntry {
-                resolveBothActive(pc: pcEntry, remote: remoteEntry, survivingItems: &survivingItems, conflictCandidates: &conflictCandidates)
-            } else if let pcEntry, let remoteTomb {
-                resolveActiveVsTombstone(survivor: pcEntry, tomb: remoteTomb, survivingItems: &survivingItems, survivingTombs: &survivingTombs)
-            } else if let remoteEntry, let pcTomb {
-                resolveActiveVsTombstone(survivor: remoteEntry, tomb: pcTomb, survivingItems: &survivingItems, survivingTombs: &survivingTombs)
-            } else if let pcEntry {
-                survivingItems.append(pcEntry)
-            } else if let remoteEntry {
-                survivingItems.append(remoteEntry)
-            } else if let pcTomb, let remoteTomb {
-                survivingTombs[id] = mergeTombstones(pcTomb, remoteTomb)
-            } else if let pcTomb {
-                survivingTombs[id] = pcTomb
-            } else if let remoteTomb {
-                survivingTombs[id] = remoteTomb
+            let pcTomb = pcTombs[id]
+            var tombs: [TemplateSyncTombstone] = []
+            if let pcTomb {
+                tombs.append(pcTomb)
+            }
+            for rTombs in remoteTombsList {
+                if let rTomb = rTombs[id] {
+                    tombs.append(rTomb)
+                }
+            }
+
+            if !tombs.isEmpty {
+                let remainingActive = activeEntries.filter { !isKilledByTombstones($0, pcTomb: pcTomb, allTombs: tombs) }
+                if remainingActive.isEmpty {
+                    var mergedTomb = tombs[0]
+                    for tomb in tombs.dropFirst() {
+                        mergedTomb = mergeTombstones(mergedTomb, tomb)
+                    }
+                    survivingTombs[id] = mergedTomb
+                } else {
+                    resolveActiveEntries(remainingActive, survivingItems: &survivingItems, conflictCandidates: &conflictCandidates)
+                }
+            } else if !activeEntries.isEmpty {
+                resolveActiveEntries(activeEntries, survivingItems: &survivingItems, conflictCandidates: &conflictCandidates)
             }
         }
 
         let (dedupedItems, subsumedCount) = deduplicateSameText(items: survivingItems, tombs: &survivingTombs, nowMillis: nowMillis)
 
-        var activeTexts = Set(dedupedItems.map(\.item.text))
+        var activeIds = Set(dedupedItems.map(\.item.id))
+        let tombstoneIds = Set(survivingTombs.keys)
+        var activeTexts = Set(dedupedItems.map { Data($0.item.text.utf8) })
         var conflictCopies: [TemplateSyncItem] = []
         let sortedConflicts = conflictCandidates.sorted { lhs, rhs in
             if lhs.loser.updatedAt != rhs.loser.updatedAt { return lhs.loser.updatedAt < rhs.loser.updatedAt }
@@ -237,15 +574,22 @@ public enum TemplateSyncMerge {
             return lhs.originalId.uuidString < rhs.originalId.uuidString
         }
         for candidate in sortedConflicts {
-            if !activeTexts.insert(candidate.loser.text).inserted { continue }
-            let newId = deterministicConflictId(originalId: candidate.originalId, loserContentHash: candidate.loserHash, usedIds: &usedIds)
+            let textKey = Data(candidate.loser.text.utf8)
+            if activeTexts.contains(textKey) { continue }
+            guard let newId = resolveConflictId(
+                originalId: candidate.originalId,
+                loserContentHash: candidate.loserHash,
+                activeIds: &activeIds,
+                tombstoneIds: tombstoneIds
+            ) else { continue }
+            activeTexts.insert(textKey)
             conflictCopies.append(TemplateSyncItem(
                 id: newId,
                 kind: candidate.loser.kind,
                 text: candidate.loser.text,
                 title: makeConflictTitle(candidate.loser.title),
                 tag: nil,
-                order: Int.max,
+                order: TemplateSyncMessageCodec.maxOrder,
                 updatedAt: candidate.loser.updatedAt,
                 baseHash: nil
             ))
@@ -255,25 +599,29 @@ public enum TemplateSyncMerge {
 
         let finalTemplates = orderAndRenumber(normalItems: dedupedItems.map(\.item), conflictCopies: conflictCopies)
         let finalTombstones = pruneAndSortTombstones(Array(survivingTombs.values), nowMillis: nowMillis)
+        try SyncProtocol.require(try fitsWithinSyncBudget(templates: finalTemplates, tombstones: finalTombstones), .limit)
 
         let pcChanges = computeChanges(before: pcItems.values.map(\.item), after: finalTemplates)
-        let remoteChanges = computeChanges(before: remoteItems.values.map(\.item), after: finalTemplates)
+        let remoteChanges = remoteItemsList.map { rItems in
+            computeChanges(before: rItems.values.map(\.item), after: finalTemplates)
+        }
 
-        return TemplateSyncMergeResult(
+        return TemplateSyncMultiMergeResult(
             templates: finalTemplates,
             tombstones: finalTombstones,
             conflictCopyCount: conflictCopies.count,
             subsumedDuplicateCount: subsumedCount,
             pcChanges: pcChanges,
             remoteChanges: remoteChanges,
-            clockSkewSeconds: clockSkew
+            remoteClockSkewSeconds: remoteClockSkews
         )
     }
 
     private static func indexSide(
         _ side: TemplateSyncState,
         nowMillis: Int64,
-        usedIds: inout Set<UUID>
+        sentAtMillis: Int64?,
+        knownPcTombs: [UUID: TemplateSyncTombstone]?
     ) throws -> ([UUID: NormalizedEntry], [UUID: TemplateSyncTombstone]) {
         try SyncProtocol.require(side.templates.count <= SyncProtocol.maxTemplates, .limit)
         var sideIds = Set<UUID>()
@@ -283,7 +631,6 @@ public enum TemplateSyncMerge {
             let normalized = normalizeInputItem(raw)
             try TemplateSyncMessageCodec.validateItem(normalized, allowBaseHash: true)
             try SyncProtocol.require(sideIds.insert(normalized.id).inserted)
-            usedIds.insert(normalized.id)
             items[normalized.id] = NormalizedEntry(item: normalized, hash: contentHash(normalized))
         }
 
@@ -291,8 +638,19 @@ public enum TemplateSyncMerge {
         for tomb in side.tombstones {
             try TemplateSyncMessageCodec.validateTombstone(tomb)
             try SyncProtocol.require(sideIds.insert(tomb.id).inserted)
-            usedIds.insert(tomb.id)
-            if !isExpiredTombstone(tomb, nowMillis: nowMillis) {
+            if let sentAt = sentAtMillis {
+                if let existingPcTomb = knownPcTombs?[tomb.id] {
+                    // Already recorded on PC: preserve PC's deletedAt so resends never extend retention.
+                    tombs[tomb.id] = TemplateSyncTombstone(id: tomb.id, deletedAt: existingPcTomb.deletedAt, baseHash: tomb.baseHash)
+                    continue
+                }
+                let adjustedRaw = tomb.deletedAt + (nowMillis - sentAt)
+                let clamped = min(SyncProtocol.maxTimestamp, max(-SyncProtocol.maxTimestamp, adjustedRaw))
+                let adjusted = min(nowMillis, clamped)
+                if !isExpiredTombstone(deletedAt: adjusted, nowMillis: nowMillis) {
+                    tombs[tomb.id] = TemplateSyncTombstone(id: tomb.id, deletedAt: adjusted, baseHash: tomb.baseHash)
+                }
+            } else if !isExpiredTombstone(deletedAt: tomb.deletedAt, nowMillis: nowMillis) {
                 tombs[tomb.id] = tomb
             }
         }
@@ -325,79 +683,89 @@ public enum TemplateSyncMerge {
         )
     }
 
-    private static func isExpiredTombstone(_ tomb: TemplateSyncTombstone, nowMillis: Int64) -> Bool {
-        nowMillis - tomb.deletedAt > SyncProtocol.templateTombstoneLifetimeMillis
+    private static func isExpiredTombstone(deletedAt: Int64, nowMillis: Int64) -> Bool {
+        nowMillis - deletedAt > SyncProtocol.templateTombstoneLifetimeMillis
     }
 
-    private static func resolveBothActive(
-        pc: NormalizedEntry,
-        remote: NormalizedEntry,
+    private static func isKilledByTombstones(
+        _ entry: NormalizedEntry,
+        pcTomb: TemplateSyncTombstone?,
+        allTombs: [TemplateSyncTombstone]
+    ) -> Bool {
+        for tomb in allTombs {
+            if let tombBaseHash = tomb.baseHash, tombBaseHash == entry.hash {
+                return true
+            }
+        }
+        if let itemBaseHash = entry.item.baseHash, itemBaseHash == entry.hash {
+            if pcTomb != nil { return true }
+            if allTombs.contains(where: { $0.baseHash == nil }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func resolveActiveEntries(
+        _ entries: [NormalizedEntry],
         survivingItems: inout [NormalizedEntry],
         conflictCandidates: inout [ConflictCandidate]
     ) {
-        if pc.hash == remote.hash {
-            let order: Int
-            if remote.item.updatedAt > pc.item.updatedAt {
-                order = remote.item.order
-            } else if pc.item.updatedAt > remote.item.updatedAt {
-                order = pc.item.order
-            } else {
-                order = min(pc.item.order, remote.item.order)
+        if entries.count == 1 {
+            survivingItems.append(NormalizedEntry(item: withoutBaseHash(entries[0].item), hash: entries[0].hash))
+            return
+        }
+
+        let firstHash = entries[0].hash
+        if entries.allSatisfy({ $0.hash == firstHash }) {
+            survivingItems.append(combineMatchingEntries(entries))
+            return
+        }
+
+        let editedBaseHashes = Set(entries.compactMap { e -> String? in
+            guard let baseHash = e.item.baseHash, baseHash != e.hash else { return nil }
+            return baseHash
+        })
+        let edited = entries.filter { e in
+            if let baseHash = e.item.baseHash {
+                return baseHash != e.hash
             }
-            let updatedAt = max(pc.item.updatedAt, remote.item.updatedAt)
-            let chosen = withoutBaseHash(pc.item, order: order, updatedAt: updatedAt)
-            survivingItems.append(NormalizedEntry(item: chosen, hash: pc.hash))
+            return !editedBaseHashes.contains(e.hash)
+        }
+        let pool = edited.isEmpty ? entries : edited
+
+        let groupedByHash = Dictionary(grouping: pool, by: \.hash)
+        var byHash = groupedByHash.values.map { combineMatchingEntries($0) }
+        if byHash.count == 1 {
+            let winnerHash = byHash[0].hash
+            survivingItems.append(combineMatchingEntries(entries.filter { $0.hash == winnerHash }))
             return
         }
 
-        let remoteUnedited = remote.item.baseHash != nil && remote.item.baseHash == remote.hash
-        let pcUnedited = remote.item.baseHash != nil && remote.item.baseHash == pc.hash
-
-        if remoteUnedited && !pcUnedited {
-            survivingItems.append(NormalizedEntry(item: withoutBaseHash(pc.item), hash: pc.hash))
-            return
-        }
-        if pcUnedited && !remoteUnedited {
-            survivingItems.append(NormalizedEntry(item: withoutBaseHash(remote.item), hash: remote.hash))
-            return
+        byHash.sort { a, b in
+            if a.item.updatedAt != b.item.updatedAt { return a.item.updatedAt > b.item.updatedAt }
+            return a.hash < b.hash
         }
 
-        let winner: NormalizedEntry
-        let loser: NormalizedEntry
-        if pc.item.updatedAt > remote.item.updatedAt {
-            winner = pc; loser = remote
-        } else if remote.item.updatedAt > pc.item.updatedAt {
-            winner = remote; loser = pc
-        } else if pc.hash <= remote.hash {
-            winner = pc; loser = remote
-        } else {
-            winner = remote; loser = pc
-        }
-
-        survivingItems.append(NormalizedEntry(item: withoutBaseHash(winner.item), hash: winner.hash))
-        if winner.item.text != loser.item.text {
-            conflictCandidates.append(ConflictCandidate(originalId: winner.item.id, loser: withoutBaseHash(loser.item), loserHash: loser.hash))
+        let winnerHash = byHash[0].hash
+        let winner = combineMatchingEntries(entries.filter { $0.hash == winnerHash })
+        survivingItems.append(winner)
+        for loser in byHash.dropFirst() {
+            if !utf8Equals(winner.item.text, loser.item.text) {
+                conflictCandidates.append(ConflictCandidate(originalId: winner.item.id, loser: loser.item, loserHash: loser.hash))
+            }
         }
     }
 
-    private static func resolveActiveVsTombstone(
-        survivor: NormalizedEntry,
-        tomb: TemplateSyncTombstone,
-        survivingItems: inout [NormalizedEntry],
-        survivingTombs: inout [UUID: TemplateSyncTombstone]
-    ) {
-        let survivorUnedited =
-            (survivor.item.baseHash != nil && survivor.item.baseHash == survivor.hash) ||
-            (tomb.baseHash != nil && tomb.baseHash == survivor.hash)
-        if survivorUnedited {
-            survivingTombs[tomb.id] = TemplateSyncTombstone(
-                id: tomb.id,
-                deletedAt: tomb.deletedAt,
-                baseHash: tomb.baseHash ?? survivor.hash
-            )
-        } else {
-            survivingItems.append(NormalizedEntry(item: withoutBaseHash(survivor.item), hash: survivor.hash))
+    private static func combineMatchingEntries(_ entries: [NormalizedEntry]) -> NormalizedEntry {
+        var best = entries[0]
+        for e in entries.dropFirst() {
+            if e.item.updatedAt > best.item.updatedAt ||
+                (e.item.updatedAt == best.item.updatedAt && e.item.order < best.item.order) {
+                best = e
+            }
         }
+        return NormalizedEntry(item: withoutBaseHash(best.item), hash: best.hash)
     }
 
     private static func mergeTombstones(_ a: TemplateSyncTombstone, _ b: TemplateSyncTombstone) -> TemplateSyncTombstone {
@@ -421,7 +789,7 @@ public enum TemplateSyncMerge {
         tombs: inout [UUID: TemplateSyncTombstone],
         nowMillis: Int64
     ) -> ([NormalizedEntry], Int) {
-        let grouped = Dictionary(grouping: items, by: { $0.item.text })
+        let grouped = Dictionary(grouping: items, by: { Data($0.item.text.utf8) })
         var result: [NormalizedEntry] = []
         var subsumed = 0
         for group in grouped.values {
@@ -462,12 +830,18 @@ public enum TemplateSyncMerge {
         normalItems: [TemplateSyncItem],
         conflictCopies: [TemplateSyncItem]
     ) -> [TemplateSyncItem] {
-        var byTag: [String: [(item: TemplateSyncItem, isConflict: Bool)]] = [:]
+        var byTag: [Data: (tag: String, entries: [(item: TemplateSyncItem, isConflict: Bool)])] = [:]
         var untagged: [(item: TemplateSyncItem, isConflict: Bool)] = []
 
         for item in normalItems {
             if let tag = item.tag {
-                byTag[tag, default: []].append((item, false))
+                let tagKey = Data(tag.utf8)
+                if var group = byTag[tagKey] {
+                    group.entries.append((item, false))
+                    byTag[tagKey] = group
+                } else {
+                    byTag[tagKey] = (tag, [(item, false)])
+                }
             } else {
                 untagged.append((item, false))
             }
@@ -477,9 +851,9 @@ public enum TemplateSyncMerge {
         }
 
         var output: [TemplateSyncItem] = []
-        let sortedTags = byTag.keys.sorted(by: precedesByUnicodeScalars)
-        for tag in sortedTags {
-            appendTagGroup(byTag[tag]!, to: &output)
+        let sortedGroups = byTag.values.sorted { precedesByUnicodeScalars($0.tag, $1.tag) }
+        for group in sortedGroups {
+            appendTagGroup(group.entries, to: &output)
         }
         appendTagGroup(untagged, to: &output)
         return output
@@ -499,7 +873,7 @@ public enum TemplateSyncMerge {
 
     private static func pruneAndSortTombstones(_ tombs: [TemplateSyncTombstone], nowMillis: Int64) -> [TemplateSyncTombstone] {
         var sorted = tombs
-            .filter { !isExpiredTombstone($0, nowMillis: nowMillis) }
+            .filter { !isExpiredTombstone(deletedAt: $0.deletedAt, nowMillis: nowMillis) }
             .sorted { lhs, rhs in
                 if lhs.deletedAt != rhs.deletedAt { return lhs.deletedAt < rhs.deletedAt }
                 return lhs.id.uuidString < rhs.id.uuidString
@@ -523,9 +897,9 @@ public enum TemplateSyncMerge {
                 continue
             }
             if beforeItem.kind != afterItem.kind ||
-                beforeItem.text != afterItem.text ||
-                beforeItem.title != afterItem.title ||
-                beforeItem.tag != afterItem.tag ||
+                !utf8Equals(beforeItem.text, afterItem.text) ||
+                !utf8EqualsOptional(beforeItem.title, afterItem.title) ||
+                !utf8EqualsOptional(beforeItem.tag, afterItem.tag) ||
                 beforeItem.order != afterItem.order {
                 updated += 1
             }

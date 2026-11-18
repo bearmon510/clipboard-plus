@@ -8,6 +8,10 @@ public sealed record TemplateSyncState(
     IReadOnlyList<TemplateSyncItem> Templates,
     IReadOnlyList<TemplateSyncTombstone> Tombstones);
 
+public sealed record TemplateSyncRemoteState(
+    TemplateSyncState State,
+    long? SentAtMillis = null);
+
 public sealed record TemplateSyncSideChanges(int Added, int Updated, int Deleted)
 {
     public int Total => Added + Updated + Deleted;
@@ -21,6 +25,19 @@ public sealed record TemplateSyncMergeResult(
     TemplateSyncSideChanges PcChanges,
     TemplateSyncSideChanges RemoteChanges,
     long? ClockSkewSeconds);
+
+public sealed record TemplateSyncMultiMergeResult(
+    IReadOnlyList<TemplateSyncItem> Templates,
+    IReadOnlyList<TemplateSyncTombstone> Tombstones,
+    int ConflictCopyCount,
+    int SubsumedDuplicateCount,
+    TemplateSyncSideChanges PcChanges,
+    IReadOnlyList<TemplateSyncSideChanges> RemoteChanges,
+    IReadOnlyList<long?> RemoteClockSkewSeconds);
+
+public sealed record TemplateSyncPreparedState(
+    TemplateSyncState State,
+    int ExcludedTemplateCount);
 
 public static class TemplateSyncMerge
 {
@@ -64,21 +81,10 @@ public static class TemplateSyncMerge
     public static string ContentHash(TemplateSyncKind kind, string text, string? title, string? tag)
     {
         SyncProtocol.Require(text is not null);
-        var kindStr = kind == TemplateSyncKind.Url ? "url" : "text";
         var normTitle = NormalizedTitle(title);
         var normTag = NormalizedTag(tag);
-        var json = new StringBuilder();
-        json.Append('[');
-        json.Append(TemplateCanonicalJson.SerializeString(kindStr));
-        json.Append(',');
-        json.Append(TemplateCanonicalJson.SerializeString(text));
-        json.Append(',');
-        json.Append(normTitle is null ? "null" : TemplateCanonicalJson.SerializeString(normTitle));
-        json.Append(',');
-        json.Append(normTag is null ? "null" : TemplateCanonicalJson.SerializeString(normTag));
-        json.Append(']');
-        var hash = SHA256.HashData(SyncProtocol.Utf8.GetBytes(json.ToString()));
-        return Convert.ToHexStringLower(hash);
+        var bytes = TemplateCanonicalJson.SerializeContentHashInput(kind, text, normTitle, normTag);
+        return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 
     public static long NextUpdatedAt(long nowMillis, long? existingUpdatedAt)
@@ -113,25 +119,252 @@ public static class TemplateSyncMerge
         return prefix + suffix;
     }
 
+    private static readonly string PlaceholderBaseHash = new('0', 64);
+
     public static Guid DeterministicConflictId(Guid originalId, string loserContentHash, ISet<Guid> usedIds)
     {
-        Span<byte> uuid = stackalloc byte[16];
         for (var counter = 0; ; counter++)
         {
-            var input = counter == 0
-                ? $"clipboardplus-tpl-conflict-v1:{SyncProtocol.Id(originalId)}:{loserContentHash}"
-                : $"clipboardplus-tpl-conflict-v1:{SyncProtocol.Id(originalId)}:{loserContentHash}:{counter}";
-            var digest = SHA256.HashData(SyncProtocol.Utf8.GetBytes(input));
-            digest.AsSpan(0, 16).CopyTo(uuid);
-            uuid[6] = (byte)((uuid[6] & 0x0F) | 0x40);
-            uuid[8] = (byte)((uuid[8] & 0x3F) | 0x80);
-            var candidate = new Guid(uuid, bigEndian: true);
+            var candidate = ConflictUuid(originalId, loserContentHash, counter);
             if (usedIds.Add(candidate)) return candidate;
         }
     }
 
+    private static Guid? ResolveConflictId(
+        Guid originalId,
+        string loserContentHash,
+        ISet<Guid> activeIds,
+        IReadOnlySet<Guid> tombstoneIds)
+    {
+        for (var counter = 0; ; counter++)
+        {
+            var candidate = ConflictUuid(originalId, loserContentHash, counter);
+            // Suppress recreation if this conflict copy was already deleted (tombstone present).
+            if (tombstoneIds.Contains(candidate)) return null;
+            if (activeIds.Add(candidate)) return candidate;
+        }
+    }
+
+    private static Guid ConflictUuid(Guid originalId, string loserContentHash, int counter)
+    {
+        Span<byte> uuid = stackalloc byte[16];
+        var input = counter == 0
+            ? $"clipboardplus-tpl-conflict-v1:{SyncProtocol.Id(originalId)}:{loserContentHash}"
+            : $"clipboardplus-tpl-conflict-v1:{SyncProtocol.Id(originalId)}:{loserContentHash}:{counter}";
+        var digest = SHA256.HashData(SyncProtocol.Utf8.GetBytes(input));
+        digest.AsSpan(0, 16).CopyTo(uuid);
+        uuid[6] = (byte)((uuid[6] & 0x0F) | 0x40);
+        uuid[8] = (byte)((uuid[8] & 0x3F) | 0x80);
+        return new Guid(uuid, bigEndian: true);
+    }
+
     private sealed record NormalizedEntry(TemplateSyncItem Item, string Hash);
     private sealed record ConflictCandidate(Guid OriginalId, TemplateSyncItem Loser, string LoserHash);
+
+    private readonly record struct PagePackerState(int FlushedPages, int FlushedTotalBytes, int CurrentPageBytes, bool CurrentHasItems)
+    {
+        public static PagePackerState Initial(int firstPageEmptyBytes) =>
+            new(0, 0, firstPageEmptyBytes, false);
+
+        public bool TryAddItem(int itemBytes, int continuationEmptyBytes, out PagePackerState next)
+        {
+            var commaBytes = CurrentHasItems ? 1 : 0;
+            if (CurrentPageBytes + commaBytes + itemBytes <= SyncProtocol.MaxTemplatePageBodyBytes)
+            {
+                next = new PagePackerState(FlushedPages, FlushedTotalBytes, CurrentPageBytes + commaBytes + itemBytes, true);
+                return true;
+            }
+            if (!CurrentHasItems || FlushedPages + 1 >= SyncProtocol.MaxTemplatePages)
+            {
+                next = default;
+                return false;
+            }
+            var newTotal = FlushedTotalBytes + CurrentPageBytes;
+            if (newTotal > SyncProtocol.MaxTemplateTotalBytes || continuationEmptyBytes + itemBytes > SyncProtocol.MaxTemplatePageBodyBytes)
+            {
+                next = default;
+                return false;
+            }
+            next = new PagePackerState(FlushedPages + 1, newTotal, continuationEmptyBytes + itemBytes, true);
+            return true;
+        }
+
+        public bool CanFinishWithTombstones(IReadOnlyList<int> tombstoneByteSizes, int continuationEmptyBytes)
+        {
+            var pages = FlushedPages;
+            var totalBytes = FlushedTotalBytes;
+            var currentBytes = CurrentPageBytes;
+            var hasItems = CurrentHasItems;
+            var hasTombstones = false;
+
+            foreach (var tombBytes in tombstoneByteSizes)
+            {
+                var commaBytes = hasTombstones ? 1 : 0;
+                if (currentBytes + commaBytes + tombBytes > SyncProtocol.MaxTemplatePageBodyBytes)
+                {
+                    if (!hasItems && !hasTombstones) return false;
+                    if (pages + 1 >= SyncProtocol.MaxTemplatePages) return false;
+                    totalBytes += currentBytes;
+                    if (totalBytes > SyncProtocol.MaxTemplateTotalBytes) return false;
+                    pages += 1;
+                    currentBytes = continuationEmptyBytes;
+                    hasItems = false;
+                    hasTombstones = false;
+                    commaBytes = 0;
+                    if (currentBytes + tombBytes > SyncProtocol.MaxTemplatePageBodyBytes) return false;
+                }
+                hasTombstones = true;
+                currentBytes += commaBytes + tombBytes;
+            }
+
+            return pages + 1 <= SyncProtocol.MaxTemplatePages &&
+                   totalBytes + currentBytes <= SyncProtocol.MaxTemplateTotalBytes;
+        }
+    }
+
+    public static TemplateSyncPreparedState PrepareSyncState(
+        IReadOnlyList<TemplateSyncItem> templates,
+        IReadOnlyList<TemplateSyncTombstone> tombstones,
+        long nowMillis,
+        long? sentAtMillis = null)
+    {
+        SyncProtocol.Require(templates is not null && tombstones is not null);
+        SyncProtocol.Require(nowMillis is >= -SyncProtocol.MaxTimestamp and <= SyncProtocol.MaxTimestamp);
+        var effectiveSentAt = sentAtMillis ?? nowMillis;
+        SyncProtocol.Require(effectiveSentAt is >= -SyncProtocol.MaxTimestamp and <= SyncProtocol.MaxTimestamp);
+
+        var firstPageEmptyBytes = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+            new TemplateSyncPage(1, effectiveSentAt, [], []),
+            isFirstPage: true,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
+        var continuationEmptyBytes = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+            new TemplateSyncPage(null, null, [], []),
+            isFirstPage: false,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
+
+        var inputTemplateIds = new HashSet<Guid>();
+        foreach (var t in templates)
+        {
+            if (t is not null) inputTemplateIds.Add(t.Id);
+        }
+
+        var validTombs = new Dictionary<Guid, TemplateSyncTombstone>();
+        foreach (var tomb in tombstones)
+        {
+            if (tomb is null) continue;
+            if (inputTemplateIds.Contains(tomb.Id)) continue;
+            if (tomb.DeletedAt is < -SyncProtocol.MaxTimestamp or > SyncProtocol.MaxTimestamp) continue;
+            if (tomb.BaseHash is not null && !SyncProtocol.IsLowerHex64(tomb.BaseHash)) continue;
+            if (IsExpiredTombstone(tomb.DeletedAt, nowMillis)) continue;
+            validTombs[tomb.Id] = validTombs.TryGetValue(tomb.Id, out var existing)
+                ? MergeTombstones(existing, tomb)
+                : tomb;
+        }
+
+        var cappedTombstones = PruneAndSortTombstones(validTombs.Values, nowMillis);
+        var tombByteSizes = new int[cappedTombstones.Count];
+        for (var i = 0; i < cappedTombstones.Count; i++)
+        {
+            tombByteSizes[i] = TemplateCanonicalJson.MeasureTombstoneUtf8Bytes(
+                cappedTombstones[i],
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes - continuationEmptyBytes);
+        }
+
+        var accepted = new List<TemplateSyncItem>();
+        var seenItemIds = new HashSet<Guid>();
+        var excluded = 0;
+        var packer = PagePackerState.Initial(firstPageEmptyBytes);
+
+        foreach (var raw in templates)
+        {
+            if (raw is null || !seenItemIds.Add(raw.Id))
+            {
+                excluded++;
+                continue;
+            }
+            var normalized = NormalizeInputItem(raw);
+            if (!TryMeasureSyncableItemBytes(normalized, firstPageEmptyBytes, out var itemBytes))
+            {
+                excluded++;
+                continue;
+            }
+            if (accepted.Count >= SyncProtocol.MaxTemplates ||
+                !packer.TryAddItem(itemBytes, continuationEmptyBytes, out var nextPacker) ||
+                !nextPacker.CanFinishWithTombstones(tombByteSizes, continuationEmptyBytes))
+            {
+                excluded++;
+                continue;
+            }
+            accepted.Add(normalized);
+            packer = nextPacker;
+        }
+
+        return new TemplateSyncPreparedState(
+            new TemplateSyncState(accepted, cappedTombstones),
+            excluded);
+    }
+
+    private static bool TryMeasureSyncableItemBytes(TemplateSyncItem item, int firstPageEmptyBytes, out int itemBytes)
+    {
+        itemBytes = 0;
+        if (item.Kind is not (TemplateSyncKind.Text or TemplateSyncKind.Url)) return false;
+        if (item.Order is < 0 or > TemplateSyncMessageCodec.MaxOrder) return false;
+        if (item.UpdatedAt is < -SyncProtocol.MaxTimestamp or > SyncProtocol.MaxTimestamp) return false;
+        if (item.BaseHash is not null && !SyncProtocol.IsLowerHex64(item.BaseHash)) return false;
+
+        try
+        {
+            TemplateSyncMessageCodec.ValidateItem(item, allowBaseHash: true);
+            // Reserve space for a 64-hex baseHash so items selected by PC remain syncable after iOS computes baseHash.
+            var sizingItem = item.BaseHash is not null ? item : item with { BaseHash = PlaceholderBaseHash };
+            itemBytes = TemplateCanonicalJson.MeasureItemUtf8Bytes(
+                sizingItem,
+                includeBaseHash: true,
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes - firstPageEmptyBytes);
+            return true;
+        }
+        catch (SyncProtocolException)
+        {
+            return false;
+        }
+    }
+
+    private static bool FitsWithinSyncBudget(IReadOnlyList<TemplateSyncItem> templates, IReadOnlyList<TemplateSyncTombstone> tombstones)
+    {
+        var firstPageEmptyBytes = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+            new TemplateSyncPage(1, -SyncProtocol.MaxTimestamp, [], []),
+            isFirstPage: true,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
+        var continuationEmptyBytes = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+            new TemplateSyncPage(null, null, [], []),
+            isFirstPage: false,
+            includeItemBaseHash: true,
+            maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
+
+        var packer = PagePackerState.Initial(firstPageEmptyBytes);
+        foreach (var item in templates)
+        {
+            var sizingItem = item.BaseHash is not null ? item : item with { BaseHash = PlaceholderBaseHash };
+            var itemBytes = TemplateCanonicalJson.MeasureItemUtf8Bytes(
+                sizingItem,
+                includeBaseHash: true,
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes - continuationEmptyBytes);
+            if (!packer.TryAddItem(itemBytes, continuationEmptyBytes, out packer))
+                return false;
+        }
+
+        var tombByteSizes = new int[tombstones.Count];
+        for (var i = 0; i < tombstones.Count; i++)
+        {
+            tombByteSizes[i] = TemplateCanonicalJson.MeasureTombstoneUtf8Bytes(
+                tombstones[i],
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes - continuationEmptyBytes);
+        }
+        return packer.CanFinishWithTombstones(tombByteSizes, continuationEmptyBytes);
+    }
 
     public static TemplateSyncMergeResult Merge(
         TemplateSyncState pc,
@@ -139,18 +372,46 @@ public static class TemplateSyncMerge
         long nowMillis,
         long? remoteSentAtMillis = null)
     {
-        SyncProtocol.Require(pc is not null && remote is not null);
-        SyncProtocol.Require(nowMillis is >= -SyncProtocol.MaxTimestamp and <= SyncProtocol.MaxTimestamp);
-        long? clockSkew = remoteSentAtMillis is long sentAt ? ClockSkewSeconds(sentAt, nowMillis) : null;
+        SyncProtocol.Require(remote is not null);
+        var multi = MergeAll(pc, [new TemplateSyncRemoteState(remote, remoteSentAtMillis)], nowMillis);
+        return new TemplateSyncMergeResult(
+            multi.Templates,
+            multi.Tombstones,
+            multi.ConflictCopyCount,
+            multi.SubsumedDuplicateCount,
+            multi.PcChanges,
+            multi.RemoteChanges[0],
+            multi.RemoteClockSkewSeconds[0]);
+    }
 
-        var usedIds = new HashSet<Guid>();
-        var (pcItems, pcTombs) = IndexSide(pc, nowMillis, usedIds);
-        var (remoteItems, remoteTombs) = IndexSide(remote, nowMillis, usedIds);
+    public static TemplateSyncMultiMergeResult MergeAll(
+        TemplateSyncState pc,
+        IReadOnlyList<TemplateSyncRemoteState> remotes,
+        long nowMillis)
+    {
+        SyncProtocol.Require(pc is not null && remotes is not null);
+        SyncProtocol.Require(nowMillis is >= -SyncProtocol.MaxTimestamp and <= SyncProtocol.MaxTimestamp);
+
+        var (pcItems, pcTombs) = IndexSide(pc, nowMillis, sentAtMillis: null, knownPcTombs: null);
+
+        var remoteItemsList = new List<Dictionary<Guid, NormalizedEntry>>(remotes.Count);
+        var remoteTombsList = new List<Dictionary<Guid, TemplateSyncTombstone>>(remotes.Count);
+        var remoteClockSkews = new List<long?>(remotes.Count);
 
         var allIds = new HashSet<Guid>(pcItems.Keys);
         allIds.UnionWith(pcTombs.Keys);
-        allIds.UnionWith(remoteItems.Keys);
-        allIds.UnionWith(remoteTombs.Keys);
+
+        foreach (var remote in remotes)
+        {
+            SyncProtocol.Require(remote is not null && remote.State is not null);
+            long? skew = remote.SentAtMillis is long sentAt ? ClockSkewSeconds(sentAt, nowMillis) : null;
+            remoteClockSkews.Add(skew);
+            var (rItems, rTombs) = IndexSide(remote.State, nowMillis, remote.SentAtMillis, pcTombs);
+            remoteItemsList.Add(rItems);
+            remoteTombsList.Add(rTombs);
+            allIds.UnionWith(rItems.Keys);
+            allIds.UnionWith(rTombs.Keys);
+        }
 
         var survivingItems = new List<NormalizedEntry>();
         var survivingTombs = new Dictionary<Guid, TemplateSyncTombstone>();
@@ -158,60 +419,70 @@ public static class TemplateSyncMerge
 
         foreach (var id in allIds)
         {
-            pcItems.TryGetValue(id, out var pcEntry);
-            remoteItems.TryGetValue(id, out var remoteEntry);
-            pcTombs.TryGetValue(id, out var pcTomb);
-            remoteTombs.TryGetValue(id, out var remoteTomb);
+            var activeEntries = new List<NormalizedEntry>();
+            if (pcItems.TryGetValue(id, out var pcEntry))
+                activeEntries.Add(pcEntry);
+            foreach (var rItems in remoteItemsList)
+            {
+                if (rItems.TryGetValue(id, out var rEntry))
+                    activeEntries.Add(rEntry);
+            }
 
-            if (pcEntry is not null && remoteEntry is not null)
+            pcTombs.TryGetValue(id, out var pcTomb);
+            var tombs = new List<TemplateSyncTombstone>();
+            if (pcTomb is not null)
+                tombs.Add(pcTomb);
+            foreach (var rTombs in remoteTombsList)
             {
-                ResolveBothActive(pcEntry, remoteEntry, survivingItems, conflictCandidates);
+                if (rTombs.TryGetValue(id, out var rTomb))
+                    tombs.Add(rTomb);
             }
-            else if (pcEntry is not null && remoteTomb is not null)
+
+            if (tombs.Count > 0)
             {
-                ResolveActiveVsTombstone(pcEntry, remoteTomb, survivingItems, survivingTombs);
+                var remainingActive = activeEntries
+                    .Where(e => !IsKilledByTombstones(e, pcTomb, tombs))
+                    .ToList();
+                if (remainingActive.Count == 0)
+                {
+                    var mergedTomb = tombs[0];
+                    for (var i = 1; i < tombs.Count; i++)
+                        mergedTomb = MergeTombstones(mergedTomb, tombs[i]);
+                    survivingTombs[id] = mergedTomb;
+                }
+                else
+                {
+                    ResolveActiveEntries(remainingActive, survivingItems, conflictCandidates);
+                }
             }
-            else if (remoteEntry is not null && pcTomb is not null)
+            else if (activeEntries.Count > 0)
             {
-                ResolveActiveVsTombstone(remoteEntry, pcTomb, survivingItems, survivingTombs);
-            }
-            else if (pcEntry is not null)
-            {
-                survivingItems.Add(pcEntry);
-            }
-            else if (remoteEntry is not null)
-            {
-                survivingItems.Add(remoteEntry);
-            }
-            else if (pcTomb is not null && remoteTomb is not null)
-            {
-                survivingTombs[id] = MergeTombstones(pcTomb, remoteTomb);
-            }
-            else if (pcTomb is not null)
-            {
-                survivingTombs[id] = pcTomb;
-            }
-            else if (remoteTomb is not null)
-            {
-                survivingTombs[id] = remoteTomb;
+                ResolveActiveEntries(activeEntries, survivingItems, conflictCandidates);
             }
         }
 
         var (dedupedItems, subsumedCount) = DeduplicateSameText(survivingItems, survivingTombs, nowMillis);
 
+        var activeIds = new HashSet<Guid>(dedupedItems.Select(x => x.Item.Id));
+        var tombstoneIds = new HashSet<Guid>(survivingTombs.Keys);
         var activeTexts = new HashSet<string>(dedupedItems.Select(x => x.Item.Text), StringComparer.Ordinal);
         var conflictCopies = new List<TemplateSyncItem>();
-        foreach (var candidate in conflictCandidates.OrderBy(c => c.Loser.UpdatedAt).ThenBy(c => c.LoserHash, StringComparer.Ordinal).ThenBy(c => SyncProtocol.Id(c.OriginalId), StringComparer.Ordinal))
+        foreach (var candidate in conflictCandidates
+            .OrderBy(c => c.Loser.UpdatedAt)
+            .ThenBy(c => c.LoserHash, StringComparer.Ordinal)
+            .ThenBy(c => SyncProtocol.Id(c.OriginalId), StringComparer.Ordinal))
         {
-            if (!activeTexts.Add(candidate.Loser.Text)) continue;
-            var newId = DeterministicConflictId(candidate.OriginalId, candidate.LoserHash, usedIds);
+            if (activeTexts.Contains(candidate.Loser.Text)) continue;
+            var newId = ResolveConflictId(candidate.OriginalId, candidate.LoserHash, activeIds, tombstoneIds);
+            if (newId is null) continue;
+            activeTexts.Add(candidate.Loser.Text);
             conflictCopies.Add(new TemplateSyncItem(
-                newId,
+                newId.Value,
                 candidate.Loser.Kind,
                 candidate.Loser.Text,
                 MakeConflictTitle(candidate.Loser.Title),
                 null,
-                int.MaxValue,
+                TemplateSyncMessageCodec.MaxOrder,
                 candidate.Loser.UpdatedAt,
                 null));
         }
@@ -220,22 +491,28 @@ public static class TemplateSyncMerge
 
         var finalTemplates = OrderAndRenumber(dedupedItems.Select(x => x.Item), conflictCopies);
         var finalTombstones = PruneAndSortTombstones(survivingTombs.Values, nowMillis);
+        SyncProtocol.Require(FitsWithinSyncBudget(finalTemplates, finalTombstones), SyncError.Limit);
 
         var pcChanges = ComputeChanges(pcItems.Values.Select(x => x.Item), finalTemplates);
-        var remoteChanges = ComputeChanges(remoteItems.Values.Select(x => x.Item), finalTemplates);
+        var remoteChanges = new List<TemplateSyncSideChanges>(remoteItemsList.Count);
+        foreach (var rItems in remoteItemsList)
+            remoteChanges.Add(ComputeChanges(rItems.Values.Select(x => x.Item), finalTemplates));
 
-        return new TemplateSyncMergeResult(
+        return new TemplateSyncMultiMergeResult(
             finalTemplates,
             finalTombstones,
             conflictCopies.Count,
             subsumedCount,
             pcChanges,
             remoteChanges,
-            clockSkew);
+            remoteClockSkews);
     }
 
     private static (Dictionary<Guid, NormalizedEntry> Items, Dictionary<Guid, TemplateSyncTombstone> Tombs) IndexSide(
-        TemplateSyncState side, long nowMillis, HashSet<Guid> usedIds)
+        TemplateSyncState side,
+        long nowMillis,
+        long? sentAtMillis,
+        IReadOnlyDictionary<Guid, TemplateSyncTombstone>? knownPcTombs)
     {
         SyncProtocol.Require(side.Templates is not null && side.Tombstones is not null);
         SyncProtocol.Require(side.Templates.Count <= SyncProtocol.MaxTemplates, SyncError.Limit);
@@ -246,7 +523,6 @@ public static class TemplateSyncMerge
             var normalized = NormalizeInputItem(raw);
             TemplateSyncMessageCodec.ValidateItem(normalized, allowBaseHash: true);
             SyncProtocol.Require(sideIds.Add(normalized.Id));
-            usedIds.Add(normalized.Id);
             items[normalized.Id] = new NormalizedEntry(normalized, ContentHash(normalized));
         }
 
@@ -255,9 +531,24 @@ public static class TemplateSyncMerge
         {
             TemplateSyncMessageCodec.ValidateTombstone(tomb);
             SyncProtocol.Require(sideIds.Add(tomb.Id));
-            usedIds.Add(tomb.Id);
-            if (!IsExpiredTombstone(tomb, nowMillis))
+            if (sentAtMillis is long sentAt)
+            {
+                if (knownPcTombs is not null && knownPcTombs.TryGetValue(tomb.Id, out var existingPcTomb))
+                {
+                    // Already recorded on PC: preserve PC's deletedAt so resends never extend retention.
+                    tombs[tomb.Id] = tomb with { DeletedAt = existingPcTomb.DeletedAt };
+                    continue;
+                }
+                var adjustedRaw = tomb.DeletedAt + (nowMillis - sentAt);
+                var clamped = Math.Clamp(adjustedRaw, -SyncProtocol.MaxTimestamp, SyncProtocol.MaxTimestamp);
+                var adjusted = Math.Min(nowMillis, clamped);
+                if (!IsExpiredTombstone(adjusted, nowMillis))
+                    tombs[tomb.Id] = tomb with { DeletedAt = adjusted };
+            }
+            else if (!IsExpiredTombstone(tomb.DeletedAt, nowMillis))
+            {
                 tombs[tomb.Id] = tomb;
+            }
         }
         return (items, tombs);
     }
@@ -270,80 +561,101 @@ public static class TemplateSyncMerge
         return raw with { Title = title, Tag = tag };
     }
 
-    private static bool IsExpiredTombstone(TemplateSyncTombstone tomb, long nowMillis) =>
-        nowMillis - tomb.DeletedAt > SyncProtocol.TemplateTombstoneLifetimeMillis;
+    private static bool IsExpiredTombstone(long deletedAt, long nowMillis) =>
+        nowMillis - deletedAt > SyncProtocol.TemplateTombstoneLifetimeMillis;
 
-    private static void ResolveBothActive(
-        NormalizedEntry pc,
-        NormalizedEntry remote,
+    private static bool IsKilledByTombstones(
+        NormalizedEntry entry,
+        TemplateSyncTombstone? pcTomb,
+        List<TemplateSyncTombstone> allTombs)
+    {
+        foreach (var tomb in allTombs)
+        {
+            if (tomb.BaseHash is not null && tomb.BaseHash == entry.Hash)
+                return true;
+        }
+        if (entry.Item.BaseHash is not null && entry.Item.BaseHash == entry.Hash)
+        {
+            if (pcTomb is not null) return true;
+            foreach (var tomb in allTombs)
+            {
+                if (tomb.BaseHash is null) return true;
+            }
+        }
+        return false;
+    }
+
+    private static void ResolveActiveEntries(
+        List<NormalizedEntry> entries,
         List<NormalizedEntry> survivingItems,
         List<ConflictCandidate> conflictCandidates)
     {
-        if (pc.Hash == remote.Hash)
+        if (entries.Count == 1)
         {
-            var order = remote.Item.UpdatedAt > pc.Item.UpdatedAt
-                ? remote.Item.Order
-                : pc.Item.UpdatedAt > remote.Item.UpdatedAt
-                    ? pc.Item.Order
-                    : Math.Min(pc.Item.Order, remote.Item.Order);
-            var updatedAt = Math.Max(pc.Item.UpdatedAt, remote.Item.UpdatedAt);
-            var chosen = pc.Item with { Order = order, UpdatedAt = updatedAt, BaseHash = null };
-            survivingItems.Add(new NormalizedEntry(chosen, pc.Hash));
+            survivingItems.Add(new NormalizedEntry(entries[0].Item with { BaseHash = null }, entries[0].Hash));
             return;
         }
 
-        var remoteUnedited = remote.Item.BaseHash is not null && remote.Item.BaseHash == remote.Hash;
-        var pcUnedited = remote.Item.BaseHash is not null && remote.Item.BaseHash == pc.Hash;
-
-        if (remoteUnedited && !pcUnedited)
+        var firstHash = entries[0].Hash;
+        if (entries.All(e => e.Hash == firstHash))
         {
-            survivingItems.Add(new NormalizedEntry(pc.Item with { BaseHash = null }, pc.Hash));
-            return;
-        }
-        if (pcUnedited && !remoteUnedited)
-        {
-            survivingItems.Add(new NormalizedEntry(remote.Item with { BaseHash = null }, remote.Hash));
+            survivingItems.Add(CombineMatchingEntries(entries));
             return;
         }
 
-        NormalizedEntry winner, loser;
-        if (pc.Item.UpdatedAt > remote.Item.UpdatedAt)
+        var editedBaseHashes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var e in entries)
         {
-            winner = pc; loser = remote;
-        }
-        else if (remote.Item.UpdatedAt > pc.Item.UpdatedAt)
-        {
-            winner = remote; loser = pc;
-        }
-        else if (string.CompareOrdinal(pc.Hash, remote.Hash) <= 0)
-        {
-            winner = pc; loser = remote;
-        }
-        else
-        {
-            winner = remote; loser = pc;
+            if (e.Item.BaseHash is not null && e.Item.BaseHash != e.Hash)
+                editedBaseHashes.Add(e.Item.BaseHash);
         }
 
-        survivingItems.Add(new NormalizedEntry(winner.Item with { BaseHash = null }, winner.Hash));
-        if (!string.Equals(winner.Item.Text, loser.Item.Text, StringComparison.Ordinal))
+        var edited = entries.Where(e =>
+            e.Item.BaseHash is not null
+                ? e.Item.BaseHash != e.Hash
+                : !editedBaseHashes.Contains(e.Hash)).ToList();
+        var pool = edited.Count > 0 ? edited : entries;
+
+        var byHash = pool
+            .GroupBy(e => e.Hash, StringComparer.Ordinal)
+            .Select(g => CombineMatchingEntries(g))
+            .ToList();
+
+        if (byHash.Count == 1)
         {
-            conflictCandidates.Add(new ConflictCandidate(winner.Item.Id, loser.Item with { BaseHash = null }, loser.Hash));
+            survivingItems.Add(CombineMatchingEntries(entries.Where(e => e.Hash == byHash[0].Hash)));
+            return;
+        }
+
+        byHash.Sort((a, b) =>
+        {
+            var cmp = b.Item.UpdatedAt.CompareTo(a.Item.UpdatedAt);
+            return cmp != 0 ? cmp : string.CompareOrdinal(a.Hash, b.Hash);
+        });
+
+        var winner = CombineMatchingEntries(entries.Where(e => e.Hash == byHash[0].Hash));
+        survivingItems.Add(winner);
+        for (var i = 1; i < byHash.Count; i++)
+        {
+            var loser = byHash[i];
+            if (!string.Equals(winner.Item.Text, loser.Item.Text, StringComparison.Ordinal))
+                conflictCandidates.Add(new ConflictCandidate(winner.Item.Id, loser.Item, loser.Hash));
         }
     }
 
-    private static void ResolveActiveVsTombstone(
-        NormalizedEntry survivor,
-        TemplateSyncTombstone tomb,
-        List<NormalizedEntry> survivingItems,
-        Dictionary<Guid, TemplateSyncTombstone> survivingTombs)
+    private static NormalizedEntry CombineMatchingEntries(IEnumerable<NormalizedEntry> entries)
     {
-        var survivorUnedited =
-            (survivor.Item.BaseHash is not null && survivor.Item.BaseHash == survivor.Hash) ||
-            (tomb.BaseHash is not null && tomb.BaseHash == survivor.Hash);
-        if (survivorUnedited)
-            survivingTombs[tomb.Id] = tomb with { BaseHash = tomb.BaseHash ?? survivor.Hash };
-        else
-            survivingItems.Add(new NormalizedEntry(survivor.Item with { BaseHash = null }, survivor.Hash));
+        NormalizedEntry? best = null;
+        foreach (var e in entries)
+        {
+            if (best is null ||
+                e.Item.UpdatedAt > best.Item.UpdatedAt ||
+                (e.Item.UpdatedAt == best.Item.UpdatedAt && e.Item.Order < best.Item.Order))
+            {
+                best = e;
+            }
+        }
+        return new NormalizedEntry(best!.Item with { BaseHash = null }, best.Hash);
     }
 
     private static TemplateSyncTombstone MergeTombstones(TemplateSyncTombstone a, TemplateSyncTombstone b)
@@ -430,7 +742,7 @@ public static class TemplateSyncMerge
         IEnumerable<TemplateSyncTombstone> tombs, long nowMillis)
     {
         var sorted = tombs
-            .Where(t => !IsExpiredTombstone(t, nowMillis))
+            .Where(t => !IsExpiredTombstone(t.DeletedAt, nowMillis))
             .OrderBy(t => t.DeletedAt)
             .ThenBy(t => SyncProtocol.Id(t.Id), StringComparer.Ordinal)
             .ToList();

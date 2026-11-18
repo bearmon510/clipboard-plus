@@ -225,5 +225,47 @@ public sealed class TemplateSyncTests
             now);
         Assert.Equal(0, conflictWithExistingText.ConflictCopyCount);
         Assert.Equal(2, conflictWithExistingText.Templates.Count);
+
+        // Merged 150 + 150 = 300 x 64KiB distinct items (needs 100 pages > 80) throws Limit in Merge/MergeAll
+        var pc150 = Enumerable.Range(0, 150)
+            .Select(i => new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, $"pc-{i:D3}-" + new string('a', SyncProtocol.MaxTemplateTextBytes - 7), null, null, i, now)).ToArray();
+        var remote150 = Enumerable.Range(0, 150)
+            .Select(i => new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, $"rm-{i:D3}-" + new string('b', SyncProtocol.MaxTemplateTextBytes - 7), null, null, i, now)).ToArray();
+        Error(SyncError.Limit, () => TemplateSyncMerge.Merge(
+            new TemplateSyncState(pc150, []),
+            new TemplateSyncState(remote150, []),
+            now));
+
+        // Bounded writer rejects oversized pages during Encode and Assembler.Append
+        var op = Guid.NewGuid();
+        var maxOrderItem = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "max-order", null, null, TemplateSyncMessageCodec.MaxOrder, 1);
+        var encodedMaxOrder = TemplateSyncMessageCodec.Encode(new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, [maxOrderItem], [])));
+        var decodedMaxOrder = Assert.IsType<TemplateSyncPush>(TemplateSyncMessageCodec.Decode(encodedMaxOrder));
+        Assert.Equal(TemplateSyncMessageCodec.MaxOrder, decodedMaxOrder.Page.Templates[0].Order);
+
+        var oversizedPage = new TemplateSyncPage(1, 0, [
+            new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, new string('\u0001', SyncProtocol.MaxTemplateTextBytes), null, null, 0, 1)
+        ], []);
+        Error(SyncError.Limit, () => TemplateSyncMessageCodec.Encode(new TemplateSyncPush(op, 0, 1, oversizedPage)));
+        var manyLargeItems = Enumerable.Range(0, 10)
+            .Select(i => new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, new string((char)('a' + i), SyncProtocol.MaxTemplateTextBytes), null, null, i, 1)).ToArray();
+        Error(SyncError.Limit, () => TemplateSyncMessageCodec.Encode(new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, manyLargeItems, []))));
+        var assembler = new TemplateSyncPageAssembler();
+        Error(SyncError.Limit, () => assembler.Append(new TemplateSyncPush(op, 0, 1, oversizedPage)));
+
+        // PrepareSyncState excludes invalid/dirty local entries (control chars, duplicates) and preserves local active item over same-ID tombstone
+        var keepId = Guid.NewGuid();
+        var ctrlId = Guid.NewGuid();
+        var preparedDirty = TemplateSyncMerge.PrepareSyncState([
+            new TemplateSyncItem(keepId, TemplateSyncKind.Text, "valid", "ok", "tag", 0, now),
+            new TemplateSyncItem(keepId, TemplateSyncKind.Text, "duplicate-id", null, null, 1, now),
+            new TemplateSyncItem(ctrlId, TemplateSyncKind.Text, "bad-title", "a\u0007b", null, 2, now),
+        ], [
+            new TemplateSyncTombstone(keepId, now - 1000),
+        ], now);
+        Assert.Single(preparedDirty.State.Templates);
+        Assert.Equal(keepId, preparedDirty.State.Templates[0].Id);
+        Assert.Empty(preparedDirty.State.Tombstones);
+        Assert.Equal(2, preparedDirty.ExcludedTemplateCount);
     }
 }

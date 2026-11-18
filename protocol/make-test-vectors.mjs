@@ -24,6 +24,9 @@ const maxTemplateTagBytes = 120;
 const maxTemplatePageBodyBytes = 256 * 1024;
 const maxTemplatePages = 80;
 const maxTemplateTotalBytes = 20 * 1024 * 1024;
+const maxTemplateOrder = 2147483647;
+const maxTimestamp = 9007199254740991;
+const emptyContinuationPageBytes = Buffer.byteLength(JSON.stringify({ templates: [], tombstones: [] }));
 
 const key = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
 const ni = Buffer.alloc(32, 0x11), np = Buffer.alloc(32, 0x22);
@@ -191,17 +194,32 @@ function makeConflictTitle(originalTitle) {
   return prefix + suffix;
 }
 
+function conflictUuid(originalId, loserHash, counter) {
+  const input = counter === 0
+    ? `clipboardplus-tpl-conflict-v1:${originalId.toUpperCase()}:${loserHash}`
+    : `clipboardplus-tpl-conflict-v1:${originalId.toUpperCase()}:${loserHash}:${counter}`;
+  const digest = createHash('sha256').update(Buffer.from(input, 'utf8')).digest().subarray(0, 16);
+  digest[6] = (digest[6] & 0x0F) | 0x40;
+  digest[8] = (digest[8] & 0x3F) | 0x80;
+  return uuid(digest);
+}
+
 function deterministicConflictId(originalId, loserHash, usedIds) {
   for (let counter = 0; ; counter++) {
-    const input = counter === 0
-      ? `clipboardplus-tpl-conflict-v1:${originalId.toUpperCase()}:${loserHash}`
-      : `clipboardplus-tpl-conflict-v1:${originalId.toUpperCase()}:${loserHash}:${counter}`;
-    const digest = createHash('sha256').update(Buffer.from(input, 'utf8')).digest().subarray(0, 16);
-    digest[6] = (digest[6] & 0x0F) | 0x40;
-    digest[8] = (digest[8] & 0x3F) | 0x80;
-    const candidate = uuid(digest);
+    const candidate = conflictUuid(originalId, loserHash, counter);
     if (!usedIds.has(candidate)) {
       usedIds.add(candidate);
+      return candidate;
+    }
+  }
+}
+
+function resolveConflictId(originalId, loserHash, activeIds, tombstoneIds) {
+  for (let counter = 0; ; counter++) {
+    const candidate = conflictUuid(originalId, loserHash, counter);
+    if (tombstoneIds.has(candidate)) return undefined;
+    if (!activeIds.has(candidate)) {
+      activeIds.add(candidate);
       return candidate;
     }
   }
@@ -242,31 +260,219 @@ function cleanTombstone(t) {
   });
 }
 
-function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
-  const clockSkewSeconds = remoteSentAtMillis !== undefined && Math.abs(remoteSentAtMillis - nowMillis) >= 300_000
-    ? Math.trunc(Math.abs(remoteSentAtMillis - nowMillis) / 1000)
-    : undefined;
+const placeholderBaseHash = '0'.repeat(64);
 
-  const usedIds = new Set();
-  const indexSide = side => {
+function splitTemplatePages(op, snapshot, isState) {
+  const contOverhead = Buffer.byteLength(JSON.stringify({ templates: [], tombstones: [] }));
+  const firstOverhead = Buffer.byteLength(JSON.stringify({ sentAt: snapshot.sentAt, templates: [], tombstones: [], v: 1 }));
+  const pages = [];
+  let curTpls = [];
+  let curTombs = [];
+  let curBytes = firstOverhead;
+  let totalBytes = 0;
+  const flush = () => {
+    const isFirst = pages.length === 0;
+    if (pages.length >= maxTemplatePages) throw Error('limit: pages');
+    totalBytes += curBytes;
+    if (totalBytes > maxTemplateTotalBytes) throw Error('limit: totalBytes');
+    pages.push({
+      op, part: pages.length, isState,
+      page: isFirst
+        ? { v: 1, sentAt: snapshot.sentAt, templates: curTpls, tombstones: curTombs }
+        : { templates: curTpls, tombstones: curTombs },
+      bodyBytes: curBytes,
+    });
+    curTpls = [];
+    curTombs = [];
+    curBytes = contOverhead;
+  };
+  for (const item of snapshot.templates) {
+    const obj = isState ? cleanItem(item) : sortKeys({ ...cleanItem(item), baseHash: item.baseHash });
+    const itemBytes = Buffer.byteLength(JSON.stringify(obj));
+    let comma = curTpls.length > 0 ? 1 : 0;
+    if (curBytes + comma + itemBytes > maxTemplatePageBodyBytes) {
+      if (curTpls.length === 0 && curTombs.length === 0) throw Error('limit: single item');
+      flush();
+      comma = 0;
+      if (curBytes + itemBytes > maxTemplatePageBodyBytes) throw Error('limit: single item');
+    }
+    curTpls.push(obj);
+    curBytes += comma + itemBytes;
+  }
+  for (const tomb of snapshot.tombstones) {
+    const obj = cleanTombstone(tomb);
+    const tombBytes = Buffer.byteLength(JSON.stringify(obj));
+    let comma = curTombs.length > 0 ? 1 : 0;
+    if (curBytes + comma + tombBytes > maxTemplatePageBodyBytes) {
+      if (curTpls.length === 0 && curTombs.length === 0) throw Error('limit: single tomb');
+      flush();
+      comma = 0;
+      if (curBytes + tombBytes > maxTemplatePageBodyBytes) throw Error('limit: single tomb');
+    }
+    curTombs.push(obj);
+    curBytes += comma + tombBytes;
+  }
+  if (pages.length === 0 || curTpls.length > 0 || curTombs.length > 0) flush();
+  const total = pages.length;
+  return pages.map(p => ({ ...p, total }));
+}
+
+function prepareSyncState(templates, tombstones, nowMillis, sentAtMillis = undefined) {
+  const effectiveSentAt = sentAtMillis ?? nowMillis;
+  const firstEmpty = Buffer.byteLength(JSON.stringify({ sentAt: effectiveSentAt, templates: [], tombstones: [], v: 1 }));
+  const contEmpty = emptyContinuationPageBytes;
+
+  const inputTplIds = new Set(templates.map(t => t.id.toUpperCase()));
+  const mergeTomb = (a, b) => {
+    if (a.deletedAt > b.deletedAt) return cleanTombstone({ ...a, baseHash: a.baseHash ?? b.baseHash });
+    if (b.deletedAt > a.deletedAt) return cleanTombstone({ ...b, baseHash: b.baseHash ?? a.baseHash });
+    const bh = !a.baseHash ? b.baseHash : !b.baseHash ? a.baseHash : (a.baseHash <= b.baseHash ? a.baseHash : b.baseHash);
+    return cleanTombstone({ id: a.id, deletedAt: a.deletedAt, baseHash: bh });
+  };
+  const validTombs = new Map();
+  for (const rawT of tombstones) {
+    const t = cleanTombstone(rawT);
+    if (inputTplIds.has(t.id)) continue;
+    if (nowMillis - t.deletedAt > tombstoneLifetimeMillis) continue;
+    validTombs.set(t.id, validTombs.has(t.id) ? mergeTomb(validTombs.get(t.id), t) : t);
+  }
+  let cappedTombs = [...validTombs.values()]
+    .sort((a, b) => (a.deletedAt !== b.deletedAt ? a.deletedAt - b.deletedAt : (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
+  if (cappedTombs.length > maxTemplateTombstones) cappedTombs = cappedTombs.slice(-maxTemplateTombstones);
+  const tombSizes = cappedTombs.map(t => Buffer.byteLength(JSON.stringify(t)));
+
+  const canFinishWithTombs = (flushedPages, flushedTotalBytes, currentBytes, currentHasItems) => {
+    let pages = flushedPages;
+    let totalBytes = flushedTotalBytes;
+    let cur = currentBytes;
+    let hasItems = currentHasItems;
+    let hasTombs = false;
+    for (const tb of tombSizes) {
+      let comma = hasTombs ? 1 : 0;
+      if (cur + comma + tb > maxTemplatePageBodyBytes) {
+        if (!hasItems && !hasTombs) return false;
+        if (pages + 1 >= maxTemplatePages) return false;
+        totalBytes += cur;
+        if (totalBytes > maxTemplateTotalBytes) return false;
+        pages += 1;
+        cur = contEmpty;
+        hasItems = false;
+        hasTombs = false;
+        comma = 0;
+        if (cur + tb > maxTemplatePageBodyBytes) return false;
+      }
+      hasTombs = true;
+      cur += comma + tb;
+    }
+    return pages + 1 <= maxTemplatePages && totalBytes + cur <= maxTemplateTotalBytes;
+  };
+
+  const accepted = [];
+  const seenIds = new Set();
+  let excludedTemplateCount = 0;
+  let flushedPages = 0, flushedTotalBytes = 0, currentBytes = firstEmpty, currentHasItems = false;
+
+  for (const raw of templates) {
+    const item = cleanItem(raw);
+    if (seenIds.has(item.id)) { excludedTemplateCount++; continue; }
+    seenIds.add(item.id);
+    if (item.order < 0 || item.order > maxTemplateOrder || Buffer.byteLength(item.text) > maxTemplateTextBytes) {
+      excludedTemplateCount++; continue;
+    }
+    if ((item.title && /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(item.title)) ||
+        (item.tag && /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(item.tag))) {
+      excludedTemplateCount++; continue;
+    }
+    const sizingItem = sortKeys({ ...item, baseHash: raw.baseHash ?? placeholderBaseHash });
+    const itemBytes = Buffer.byteLength(JSON.stringify(sizingItem));
+    if (firstEmpty + itemBytes > maxTemplatePageBodyBytes) {
+      excludedTemplateCount++; continue;
+    }
+    if (accepted.length >= maxTemplates) { excludedTemplateCount++; continue; }
+
+    let nextFlushed = flushedPages, nextTotal = flushedTotalBytes, nextCur = currentBytes;
+    const comma = currentHasItems ? 1 : 0;
+    if (currentBytes + comma + itemBytes <= maxTemplatePageBodyBytes) {
+      nextCur = currentBytes + comma + itemBytes;
+    } else {
+      if (!currentHasItems || flushedPages + 1 >= maxTemplatePages) { excludedTemplateCount++; continue; }
+      nextTotal = flushedTotalBytes + currentBytes;
+      if (nextTotal > maxTemplateTotalBytes || contEmpty + itemBytes > maxTemplatePageBodyBytes) { excludedTemplateCount++; continue; }
+      nextFlushed = flushedPages + 1;
+      nextCur = contEmpty + itemBytes;
+    }
+    if (!canFinishWithTombs(nextFlushed, nextTotal, nextCur, true)) {
+      excludedTemplateCount++; continue;
+    }
+    accepted.push(sortKeys({ ...item, baseHash: raw.baseHash }));
+    flushedPages = nextFlushed;
+    flushedTotalBytes = nextTotal;
+    currentBytes = nextCur;
+    currentHasItems = true;
+  }
+
+  return sortKeys({
+    state: { templates: accepted, tombstones: cappedTombs },
+    excludedTemplateCount,
+  });
+}
+
+function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
+  const multi = mergeTemplatesAll(pc, [{ state: remote, sentAtMillis: remoteSentAtMillis }], nowMillis);
+  return sortKeys({
+    templates: multi.templates,
+    tombstones: multi.tombstones,
+    conflictCopyCount: multi.conflictCopyCount,
+    subsumedDuplicateCount: multi.subsumedDuplicateCount,
+    pcChanges: multi.pcChanges,
+    remoteChanges: multi.remoteChanges[0],
+    clockSkewSeconds: multi.remoteClockSkewSeconds[0],
+  });
+}
+
+function mergeTemplatesAll(pc, remotes, nowMillis) {
+  const indexSide = (side, sentAtMillis, knownPcTombs) => {
     const items = new Map();
     const tombs = new Map();
     for (const raw of side.templates) {
       const item = { ...cleanItem(raw), baseHash: raw.baseHash };
-      usedIds.add(item.id);
       items.set(item.id, { item, hash: contentHash(item) });
     }
     for (const rawTomb of side.tombstones) {
       const t = cleanTombstone(rawTomb);
-      usedIds.add(t.id);
-      if (nowMillis - t.deletedAt <= tombstoneLifetimeMillis) tombs.set(t.id, t);
+      if (sentAtMillis !== undefined) {
+        if (knownPcTombs && knownPcTombs.has(t.id)) {
+          tombs.set(t.id, cleanTombstone({ ...t, deletedAt: knownPcTombs.get(t.id).deletedAt }));
+          continue;
+        }
+        const adjustedRaw = t.deletedAt + (nowMillis - sentAtMillis);
+        const clamped = Math.max(-maxTimestamp, Math.min(maxTimestamp, adjustedRaw));
+        const adjusted = Math.min(nowMillis, clamped);
+        if (nowMillis - adjusted <= tombstoneLifetimeMillis) {
+          tombs.set(t.id, cleanTombstone({ ...t, deletedAt: adjusted }));
+        }
+      } else if (nowMillis - t.deletedAt <= tombstoneLifetimeMillis) {
+        tombs.set(t.id, t);
+      }
     }
     return { items, tombs };
   };
 
-  const pcIdx = indexSide(pc);
-  const remoteIdx = indexSide(remote);
-  const allIds = new Set([...pcIdx.items.keys(), ...pcIdx.tombs.keys(), ...remoteIdx.items.keys(), ...remoteIdx.tombs.keys()]);
+  const pcIdx = indexSide(pc, undefined, undefined);
+  const remoteIndices = [];
+  const remoteClockSkewSeconds = [];
+  const allIds = new Set([...pcIdx.items.keys(), ...pcIdx.tombs.keys()]);
+
+  for (const r of remotes) {
+    const skew = r.sentAtMillis !== undefined && Math.abs(r.sentAtMillis - nowMillis) >= 300_000
+      ? Math.trunc(Math.abs(r.sentAtMillis - nowMillis) / 1000)
+      : undefined;
+    remoteClockSkewSeconds.push(skew);
+    const rIdx = indexSide(r.state, r.sentAtMillis, pcIdx.tombs);
+    remoteIndices.push(rIdx);
+    for (const k of rIdx.items.keys()) allIds.add(k);
+    for (const k of rIdx.tombs.keys()) allIds.add(k);
+  }
 
   const survivingItems = [];
   const survivingTombs = new Map();
@@ -279,58 +485,90 @@ function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
     return cleanTombstone({ id: a.id, deletedAt: a.deletedAt, baseHash: bh });
   };
 
-  for (const itemId of allIds) {
-    const pe = pcIdx.items.get(itemId);
-    const re = remoteIdx.items.get(itemId);
-    const pt = pcIdx.tombs.get(itemId);
-    const rt = remoteIdx.tombs.get(itemId);
+  const isKilled = (entry, pcTomb, allTombs) => {
+    for (const t of allTombs) {
+      if (t.baseHash !== undefined && t.baseHash === entry.hash) return true;
+    }
+    if (entry.item.baseHash !== undefined && entry.item.baseHash === entry.hash) {
+      if (pcTomb !== undefined) return true;
+      if (allTombs.some(t => t.baseHash === undefined)) return true;
+    }
+    return false;
+  };
 
-    if (pe && re) {
-      if (pe.hash === re.hash) {
-        const order = re.item.updatedAt > pe.item.updatedAt ? re.item.order
-          : pe.item.updatedAt > re.item.updatedAt ? pe.item.order
-          : Math.min(pe.item.order, re.item.order);
-        const updatedAt = Math.max(pe.item.updatedAt, re.item.updatedAt);
-        survivingItems.push({ item: cleanItem({ ...pe.item, order, updatedAt }), hash: pe.hash });
-      } else {
-        const remoteUnedited = re.item.baseHash !== undefined && re.item.baseHash === re.hash;
-        const pcUnedited = re.item.baseHash !== undefined && re.item.baseHash === pe.hash;
-        if (remoteUnedited && !pcUnedited) {
-          survivingItems.push({ item: cleanItem(pe.item), hash: pe.hash });
-        } else if (pcUnedited && !remoteUnedited) {
-          survivingItems.push({ item: cleanItem(re.item), hash: re.hash });
-        } else {
-          let winner, loser;
-          if (pe.item.updatedAt > re.item.updatedAt) { winner = pe; loser = re; }
-          else if (re.item.updatedAt > pe.item.updatedAt) { winner = re; loser = pe; }
-          else if (pe.hash <= re.hash) { winner = pe; loser = re; }
-          else { winner = re; loser = pe; }
-          survivingItems.push({ item: cleanItem(winner.item), hash: winner.hash });
-          if (winner.item.text !== loser.item.text) {
-            conflictCandidates.push({ originalId: winner.item.id, loser: cleanItem(loser.item), loserHash: loser.hash });
-          }
-        }
+  const combineMatching = entries => {
+    let best = entries[0];
+    for (let i = 1; i < entries.length; i++) {
+      const e = entries[i];
+      if (e.item.updatedAt > best.item.updatedAt ||
+          (e.item.updatedAt === best.item.updatedAt && e.item.order < best.item.order)) {
+        best = e;
       }
-    } else if ((pe && rt) || (re && pt)) {
-      const survivor = pe ?? re;
-      const tomb = rt ?? pt;
-      const unedited = (survivor.item.baseHash !== undefined && survivor.item.baseHash === survivor.hash) ||
-        (tomb.baseHash !== undefined && tomb.baseHash === survivor.hash);
-      if (unedited) {
-        survivingTombs.set(tomb.id, cleanTombstone({ ...tomb, baseHash: tomb.baseHash ?? survivor.hash }));
-      } else {
-        survivingItems.push({ item: cleanItem(survivor.item), hash: survivor.hash });
+    }
+    return { item: cleanItem(best.item), hash: best.hash };
+  };
+
+  const resolveActive = entries => {
+    if (entries.length === 1) {
+      survivingItems.push({ item: cleanItem(entries[0].item), hash: entries[0].hash });
+      return;
+    }
+    if (entries.every(e => e.hash === entries[0].hash)) {
+      survivingItems.push(combineMatching(entries));
+      return;
+    }
+    const editedBaseHashes = new Set();
+    for (const e of entries) {
+      if (e.item.baseHash !== undefined && e.item.baseHash !== e.hash) editedBaseHashes.add(e.item.baseHash);
+    }
+    const edited = entries.filter(e =>
+      e.item.baseHash !== undefined ? e.item.baseHash !== e.hash : !editedBaseHashes.has(e.hash)
+    );
+    const pool = edited.length > 0 ? edited : entries;
+    const byHashMap = new Map();
+    for (const e of pool) {
+      if (!byHashMap.has(e.hash)) byHashMap.set(e.hash, []);
+      byHashMap.get(e.hash).push(e);
+    }
+    const byHash = [...byHashMap.values()].map(combineMatching);
+    if (byHash.length === 1) {
+      survivingItems.push(combineMatching(entries.filter(e => e.hash === byHash[0].hash)));
+      return;
+    }
+    byHash.sort((a, b) => (a.item.updatedAt !== b.item.updatedAt ? b.item.updatedAt - a.item.updatedAt : (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0)));
+    const winner = combineMatching(entries.filter(e => e.hash === byHash[0].hash));
+    survivingItems.push(winner);
+    for (let i = 1; i < byHash.length; i++) {
+      const loser = byHash[i];
+      if (winner.item.text !== loser.item.text) {
+        conflictCandidates.push({ originalId: winner.item.id, loser: cleanItem(loser.item), loserHash: loser.hash });
       }
-    } else if (pe) {
-      survivingItems.push({ item: cleanItem(pe.item), hash: pe.hash });
-    } else if (re) {
-      survivingItems.push({ item: cleanItem(re.item), hash: re.hash });
-    } else if (pt && rt) {
-      survivingTombs.set(itemId, mergeTomb(pt, rt));
-    } else if (pt) {
-      survivingTombs.set(itemId, pt);
-    } else if (rt) {
-      survivingTombs.set(itemId, rt);
+    }
+  };
+
+  for (const itemId of allIds) {
+    const activeEntries = [];
+    if (pcIdx.items.has(itemId)) activeEntries.push(pcIdx.items.get(itemId));
+    for (const rIdx of remoteIndices) {
+      if (rIdx.items.has(itemId)) activeEntries.push(rIdx.items.get(itemId));
+    }
+    const pcTomb = pcIdx.tombs.get(itemId);
+    const tombs = [];
+    if (pcTomb) tombs.push(pcTomb);
+    for (const rIdx of remoteIndices) {
+      if (rIdx.tombs.has(itemId)) tombs.push(rIdx.tombs.get(itemId));
+    }
+    if (tombs.length > 0) {
+      const remainingActive = activeEntries.filter(e => !isKilled(e, pcTomb, tombs));
+      if (remainingActive.length === 0) {
+        let merged = tombs[0];
+        for (let i = 1; i < tombs.length; i++) merged = mergeTomb(merged, tombs[i]);
+        survivingTombs.set(itemId, merged);
+      } else {
+        resolveActive(remainingActive);
+      }
+    } else if (activeEntries.length > 0) {
+      resolveActive(activeEntries);
     }
   }
 
@@ -357,6 +595,8 @@ function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
     deduped.push({ item: merged, hash: contentHash(merged) });
   }
 
+  const activeIds = new Set(deduped.map(x => x.item.id));
+  const tombstoneIds = new Set(survivingTombs.keys());
   const activeTexts = new Set(deduped.map(x => x.item.text));
   const conflictCopies = [];
   conflictCandidates.sort((a, b) => {
@@ -366,15 +606,16 @@ function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
   });
   for (const c of conflictCandidates) {
     if (activeTexts.has(c.loser.text)) continue;
+    const newId = resolveConflictId(c.originalId, c.loserHash, activeIds, tombstoneIds);
+    if (newId === undefined) continue;
     activeTexts.add(c.loser.text);
-    const newId = deterministicConflictId(c.originalId, c.loserHash, usedIds);
     conflictCopies.push(cleanItem({
       id: newId,
       kind: c.loser.kind,
       text: c.loser.text,
       title: makeConflictTitle(c.loser.title),
       tag: undefined,
-      order: Number.MAX_SAFE_INTEGER,
+      order: maxTemplateOrder,
       updatedAt: c.loser.updatedAt,
     }));
   }
@@ -430,8 +671,8 @@ function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
     conflictCopyCount: conflictCopies.length,
     subsumedDuplicateCount,
     pcChanges: computeChanges(pcIdx.items, templates),
-    remoteChanges: computeChanges(remoteIdx.items, templates),
-    clockSkewSeconds,
+    remoteChanges: remoteIndices.map(rIdx => computeChanges(rIdx.items, templates)),
+    remoteClockSkewSeconds,
   });
 }
 
@@ -484,6 +725,12 @@ const templateMessages = {
     tombstones: [sampleTomb1, sampleTomb2],
   }),
   tplAck: plaintext({ t: 'tpl_ack', op: op1 }),
+  maxOrderTemplate: jsonBodyPlaintext({ t: 'tpl_push', op: op1, part: 0, total: 1 }, {
+    v: 1,
+    sentAt: 1794873601200,
+    templates: [{ id: tplId3, kind: 'text', text: 'order上限', order: maxTemplateOrder, updatedAt: 1794873601200 }],
+    tombstones: [],
+  }),
 };
 
 // Independent sequence starting at 0 per direction for templateFrames.
@@ -596,6 +843,11 @@ const templateFailures = {
     templates: [{ id: tplId1, kind: 'text', text: 'a', order: -1, updatedAt: 1 }],
     tombstones: [],
   }), error: 'format' },
+  orderTooLarge: { ...jsonBodyPlaintext({ t: 'tpl_push', op: op1, part: 0, total: 1 }, {
+    v: 1, sentAt: 1794873600000,
+    templates: [{ id: tplId1, kind: 'text', text: 'a', order: maxTemplateOrder + 1, updatedAt: 1 }],
+    tombstones: [],
+  }), error: 'format' },
   oversizedTemplateText: { textBytes: maxTemplateTextBytes + 1, error: 'limit', note: 'Materialize oversized text locally.' },
   tooManyTemplates: { count: maxTemplates + 1, error: 'limit', note: 'Materialize 301 templates locally.' },
   tooManyTombstones: { count: maxTemplateTombstones + 1, error: 'limit', note: 'Materialize 1001 tombstones locally.' },
@@ -604,6 +856,7 @@ const templateFailures = {
 
 // --- Merge Test Cases ---
 const baseNow = 1794873600000;
+const dayMillis = 24 * 60 * 60 * 1000;
 function makeMergeCase(name, nowMillis, pc, remote, opts = {}) {
   const expected = mergeTemplates(pc, remote, nowMillis, opts.remoteSentAtMillis);
   if (opts.alsoCheckCommutative) {
@@ -626,6 +879,24 @@ function makeMergeCase(name, nowMillis, pc, remote, opts = {}) {
       throw Error(`idempotency failed for ${name}`);
     }
   }
+  if (opts.alsoCheckSlowClockResendNotExtended && opts.remoteSentAtMillis !== undefined) {
+    const laterNow = nowMillis + 10 * dayMillis;
+    const laterSentAt = opts.remoteSentAtMillis + 10 * dayMillis;
+    const pc2 = { templates: expected.templates, tombstones: expected.tombstones };
+    const remoteSynced = {
+      templates: expected.templates.map(t => ({ ...t, baseHash: contentHash(t) })),
+      tombstones: expected.tombstones,
+    };
+    const resync1 = mergeTemplates(pc2, remoteSynced, laterNow, laterSentAt);
+    if (JSON.stringify(resync1.tombstones) !== JSON.stringify(expected.tombstones) ||
+        resync1.pcChanges.added + resync1.pcChanges.updated + resync1.pcChanges.deleted !== 0) {
+      throw Error(`slow clock resend (synced) extended tombstone for ${name}`);
+    }
+    const resync2 = mergeTemplates(pc2, remote, laterNow, laterSentAt - 3000);
+    if (JSON.stringify(resync2.tombstones) !== JSON.stringify(expected.tombstones)) {
+      throw Error(`slow clock resend (unacked) extended tombstone for ${name}`);
+    }
+  }
   return sortKeys({
     name,
     nowMillis,
@@ -634,6 +905,7 @@ function makeMergeCase(name, nowMillis, pc, remote, opts = {}) {
     remote: sortKeys(remote),
     alsoCheckCommutative: opts.alsoCheckCommutative || undefined,
     alsoCheckIdempotent: opts.alsoCheckIdempotent || undefined,
+    alsoCheckSlowClockResendNotExtended: opts.alsoCheckSlowClockResendNotExtended || undefined,
     expected,
   });
 }
@@ -815,6 +1087,298 @@ const templateMergeCases = [
     ],
     tombstones: [],
   }),
+
+  makeMergeCase('unicodeNormalizationPreservesBothItemsAndTags', baseNow, {
+    templates: [
+      { id: tplId1, kind: 'text', text: '\u00e9', tag: '\u00e9', order: 0, updatedAt: baseNow - 50_000 },
+      { id: tplId3, kind: 'text', text: 'caf\u00e9', order: 0, updatedAt: baseNow - 10_000 },
+    ],
+    tombstones: [],
+  }, {
+    templates: [
+      { id: tplId2, kind: 'text', text: 'e\u0301', tag: 'e\u0301', order: 0, updatedAt: baseNow - 40_000 },
+      { id: tplId3, kind: 'text', text: 'cafe\u0301', order: 0, updatedAt: baseNow - 20_000, baseHash: contentHash({ kind: 'text', text: 'base' }) },
+    ],
+    tombstones: [],
+  }, { alsoCheckIdempotent: true }),
+
+  (() => {
+    const hOrigConflict = contentHash({ kind: 'text', text: '元の内容' });
+    const loserItem = { kind: 'text', text: 'Aの負け本文', title: '題名' };
+    const loserHash = contentHash(loserItem);
+    const conflictCopyId = conflictUuid(tplId1, loserHash, 0);
+    const conflictCopyHash = contentHash({ kind: 'text', text: 'Aの負け本文', title: makeConflictTitle('題名') });
+    return makeMergeCase('deletedConflictCopyNotRecreated', baseNow, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'Bの勝ち本文', title: '題名', order: 0, updatedAt: baseNow - 10_000 },
+      ],
+      tombstones: [
+        { id: conflictCopyId, deletedAt: baseNow - 5_000, baseHash: conflictCopyHash },
+      ],
+    }, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'Aの負け本文', title: '題名', order: 0, updatedAt: baseNow - 50_000, baseHash: hOrigConflict },
+      ],
+      tombstones: [],
+    }, { alsoCheckIdempotent: true });
+  })(),
+
+  makeMergeCase('slowClock181DaysTombstoneConvertedAndNotExtended', baseNow, {
+    templates: [
+      { id: tplId1, kind: 'text', text: '初期1', order: 0, updatedAt: baseNow - 400 * dayMillis },
+    ],
+    tombstones: [],
+  }, {
+    templates: [],
+    tombstones: [
+      { id: tplId1, deletedAt: baseNow - 181 * dayMillis - 5_000, baseHash: h1Init },
+    ],
+  }, { remoteSentAtMillis: baseNow - 181 * dayMillis, alsoCheckSlowClockResendNotExtended: true }),
+
+  makeMergeCase('alreadyImportedTombstoneNotExtendedOnResend', baseNow, {
+    templates: [],
+    tombstones: [
+      { id: tombId1, deletedAt: baseNow - 10 * dayMillis, baseHash: h1Init },
+    ],
+  }, {
+    templates: [],
+    tombstones: [
+      { id: tombId1, deletedAt: baseNow - 10 * dayMillis, baseHash: h1Init },
+    ],
+  }, { remoteSentAtMillis: baseNow - 181 * dayMillis, alsoCheckIdempotent: true }),
+];
+
+// --- Multi-Device Merge Test Cases (Item 7) ---
+function makeMultiMergeCase(name, nowMillis, pc, remotes, opts = {}) {
+  const expected = mergeTemplatesAll(pc, remotes, nowMillis);
+  if (opts.alsoCheckAllPermutations && remotes.length === 2) {
+    const swapped = mergeTemplatesAll(pc, [remotes[1], remotes[0]], nowMillis);
+    if (JSON.stringify(swapped.templates) !== JSON.stringify(expected.templates) ||
+        JSON.stringify(swapped.tombstones) !== JSON.stringify(expected.tombstones) ||
+        swapped.conflictCopyCount !== expected.conflictCopyCount ||
+        swapped.subsumedDuplicateCount !== expected.subsumedDuplicateCount ||
+        JSON.stringify(swapped.pcChanges) !== JSON.stringify(expected.pcChanges) ||
+        JSON.stringify(swapped.remoteChanges) !== JSON.stringify([expected.remoteChanges[1], expected.remoteChanges[0]])) {
+      throw Error(`multi-merge permutation failed for ${name}`);
+    }
+  }
+  return sortKeys({
+    name,
+    nowMillis,
+    pc: sortKeys(pc),
+    remotes: remotes.map(r => sortKeys({ state: sortKeys(r.state), sentAtMillis: r.sentAtMillis })),
+    alsoCheckAllPermutations: opts.alsoCheckAllPermutations || undefined,
+    expected,
+  });
+}
+
+const hOrig1 = contentHash({ kind: 'text', text: 'orig1' });
+const hTextA = contentHash({ kind: 'text', text: 'textA' });
+const templateMultiMergeCases = [
+  makeMultiMergeCase('multiDevicePreservesLoserTextWhenOtherDeviceOverwrites', baseNow, {
+    templates: [
+      { id: tplId1, kind: 'text', text: 'textPC', order: 0, updatedAt: baseNow - 20_000 },
+      { id: tplId2, kind: 'text', text: 'textA', order: 1, updatedAt: baseNow - 100_000 },
+    ],
+    tombstones: [],
+  }, [
+    {
+      state: {
+        templates: [
+          { id: tplId1, kind: 'text', text: 'textA', order: 0, updatedAt: baseNow - 30_000, baseHash: hOrig1 },
+        ],
+        tombstones: [],
+      },
+      sentAtMillis: baseNow,
+    },
+    {
+      state: {
+        templates: [
+          { id: tplId1, kind: 'text', text: 'orig1', order: 0, updatedAt: baseNow - 100_000, baseHash: hOrig1 },
+          { id: tplId2, kind: 'text', text: 'textB', order: 1, updatedAt: baseNow - 10_000, baseHash: hTextA },
+        ],
+        tombstones: [],
+      },
+      sentAtMillis: baseNow,
+    },
+  ], { alsoCheckAllPermutations: true }),
+
+  makeMultiMergeCase('multiDeviceUneditedAndDeletedWithConcurrentEdit', baseNow, {
+    templates: [
+      { id: tplId1, kind: 'text', text: 'orig1', order: 0, updatedAt: baseNow - 100_000 },
+    ],
+    tombstones: [],
+  }, [
+    {
+      state: {
+        templates: [
+          { id: tplId1, kind: 'text', text: 'editedByR1', order: 0, updatedAt: baseNow - 20_000, baseHash: hOrig1 },
+        ],
+        tombstones: [],
+      },
+      sentAtMillis: baseNow,
+    },
+    {
+      state: {
+        templates: [],
+        tombstones: [
+          { id: tplId1, deletedAt: baseNow - 15_000, baseHash: hOrig1 },
+        ],
+      },
+      sentAtMillis: baseNow,
+    },
+  ], { alsoCheckAllPermutations: true }),
+
+  makeMultiMergeCase('multiDeviceZeroRemotesNormalizesPc', baseNow, {
+    templates: [
+      { id: tplId2, kind: 'text', text: '同じ文', order: 5, updatedAt: baseNow - 20_000 },
+      { id: tplId1, kind: 'text', text: '同じ文', title: '見出し', order: 2, updatedAt: baseNow - 40_000 },
+    ],
+    tombstones: [],
+  }, []),
+];
+
+// --- Page Split Boundary Cases (Item 4) ---
+function makeSplitCase(name, sentAt, isState, specs) {
+  const items = specs.map((s, idx) => ({
+    id: `44444444-5555-4666-8777-8888888888${idx.toString(16).padStart(2, '0').toUpperCase()}`,
+    kind: 'text',
+    text: s.fillChar.repeat(s.textBytes),
+    order: idx,
+    updatedAt: baseNow,
+    baseHash: s.baseHash,
+  }));
+  const pages = splitTemplatePages(op1, { sentAt, templates: items, tombstones: [] }, isState);
+  for (const p of pages) {
+    if (p.bodyBytes > maxTemplatePageBodyBytes) throw Error(`split exceeded page limit in ${name}`);
+  }
+  return sortKeys({
+    name,
+    sentAt,
+    isState,
+    items: specs.map((s, idx) => sortKeys({
+      id: items[idx].id,
+      fillChar: s.fillChar,
+      textBytes: s.textBytes,
+      order: idx,
+      updatedAt: baseNow,
+      baseHash: s.baseHash,
+    })),
+    expectedPageItemCounts: pages.map(p => p.page.templates.length),
+    expectedPageBodyBytes: pages.map(p => p.bodyBytes),
+  });
+}
+
+const exactItem7Overhead = Buffer.byteLength(JSON.stringify(sortKeys({
+  id: '44444444-5555-4666-8777-888888888806',
+  kind: 'text',
+  order: 6,
+  text: '',
+  updatedAt: baseNow,
+})));
+const sample64KItemBytesNoBaseHash = Buffer.byteLength(JSON.stringify(sortKeys({
+  id: '44444444-5555-4666-8777-888888888803',
+  kind: 'text',
+  order: 3,
+  text: 'a'.repeat(maxTemplateTextBytes),
+  updatedAt: baseNow,
+})));
+const page1UsedForThree64K = emptyContinuationPageBytes + 3 * sample64KItemBytesNoBaseHash + 2;
+const exactRemainingForItem6 = maxTemplatePageBodyBytes - page1UsedForThree64K - 1 - exactItem7Overhead;
+
+const templatePageSplitCases = [
+  makeSplitCase('six64KiBPlusOne65130BytesContinuation32', baseNow, false, [
+    ...Array.from({ length: 6 }, () => ({ fillChar: 'a', textBytes: maxTemplateTextBytes })),
+    { fillChar: 'b', textBytes: 65130 },
+  ]),
+  makeSplitCase('exact256KiBContinuationPageBoundary', baseNow, true, [
+    ...Array.from({ length: 6 }, () => ({ fillChar: 'a', textBytes: maxTemplateTextBytes })),
+    { fillChar: 'b', textBytes: exactRemainingForItem6 },
+  ]),
+  makeSplitCase('oneByteOver256KiBContinuationPageMovesToNextPage', baseNow, true, [
+    ...Array.from({ length: 6 }, () => ({ fillChar: 'a', textBytes: maxTemplateTextBytes })),
+    { fillChar: 'b', textBytes: exactRemainingForItem6 + 1 },
+  ]),
+];
+if (templatePageSplitCases[1].expectedPageBodyBytes[1] !== maxTemplatePageBodyBytes) {
+  throw Error(`expected exact 256KiB page 1, got ${templatePageSplitCases[1].expectedPageBodyBytes[1]}`);
+}
+if (templatePageSplitCases[2].expectedPageItemCounts.length !== 3) {
+  throw Error(`expected 3 pages for overflow case`);
+}
+
+// --- Prepare Sync State Cases (Item 5) ---
+const prep300Items = Array.from({ length: 300 }, (_, i) => ({
+  id: `66666666-5555-4666-8777-${i.toString().padStart(12, '0')}`,
+  kind: 'text',
+  text: 'x'.repeat(maxTemplateTextBytes),
+  order: i,
+  updatedAt: baseNow,
+}));
+const prep300Res = prepareSyncState(prep300Items, [], baseNow, baseNow);
+const prep300Pages = splitTemplatePages(op1, { sentAt: baseNow, ...prep300Res.state }, false);
+if (prep300Res.state.templates.length !== 240 || prep300Res.excludedTemplateCount !== 60 || prep300Pages.length !== 80) {
+  throw Error(`unexpected 300x64KiB prepare result: kept=${prep300Res.state.templates.length}, excluded=${prep300Res.excludedTemplateCount}, pages=${prep300Pages.length}`);
+}
+
+const prepMixedRes = prepareSyncState([
+  { id: tplId1, kind: 'text', text: 'ok-1', order: 0, updatedAt: baseNow },
+  { id: tplId2, kind: 'text', text: 'a'.repeat(maxTemplateTextBytes + 1), order: 1, updatedAt: baseNow },
+  { id: tplId3, kind: 'text', text: '\u0001'.repeat(maxTemplateTextBytes), order: 2, updatedAt: baseNow },
+  { id: tplId4, kind: 'text', text: 'ok-2', order: 3, updatedAt: baseNow },
+], [], baseNow, baseNow);
+if (prepMixedRes.state.templates.length !== 2 || prepMixedRes.excludedTemplateCount !== 2) {
+  throw Error(`unexpected mixed prepare result`);
+}
+
+const prepOver300Items = Array.from({ length: 302 }, (_, i) => ({
+  id: `77777777-5555-4666-8777-${i.toString().padStart(12, '0')}`,
+  kind: 'text',
+  text: `item-${i}`,
+  order: i,
+  updatedAt: baseNow,
+}));
+const prepOver1000Tombs = Array.from({ length: 1005 }, (_, i) => ({
+  id: `88888888-5555-4666-8777-${i.toString().padStart(12, '0')}`,
+  deletedAt: baseNow - 10_000 + i,
+}));
+const prepCapRes = prepareSyncState(prepOver300Items, prepOver1000Tombs, baseNow, baseNow);
+if (prepCapRes.state.templates.length !== 300 || prepCapRes.excludedTemplateCount !== 2 || prepCapRes.state.tombstones.length !== 1000) {
+  throw Error(`unexpected cap prepare result`);
+}
+
+const templatePrepareCases = [
+  sortKeys({
+    name: 'threeHundred64KiBItemsCappedAt240',
+    nowMillis: baseNow,
+    sentAtMillis: baseNow,
+    itemCount: 300,
+    textBytes: maxTemplateTextBytes,
+    tombstoneCount: 0,
+    expectedKeptCount: prep300Res.state.templates.length,
+    expectedExcludedCount: prep300Res.excludedTemplateCount,
+    expectedTombstoneCount: prep300Res.state.tombstones.length,
+    expectedPageCount: prep300Pages.length,
+  }),
+  sortKeys({
+    name: 'oversizedTextAndControlEscapedExcluded',
+    nowMillis: baseNow,
+    sentAtMillis: baseNow,
+    expectedKeptIds: prepMixedRes.state.templates.map(t => t.id),
+    expectedExcludedCount: prepMixedRes.excludedTemplateCount,
+  }),
+  sortKeys({
+    name: 'over300TemplatesAndOver1000Tombstones',
+    nowMillis: baseNow,
+    sentAtMillis: baseNow,
+    itemCount: 302,
+    tombstoneCount: 1005,
+    expectedKeptCount: prepCapRes.state.templates.length,
+    expectedExcludedCount: prepCapRes.excludedTemplateCount,
+    expectedTombstoneCount: prepCapRes.state.tombstones.length,
+    expectedFirstTombstoneDeletedAt: prepCapRes.state.tombstones[0].deletedAt,
+    expectedLastTombstoneDeletedAt: prepCapRes.state.tombstones[999].deletedAt,
+  }),
 ];
 
 const vectors = {
@@ -828,6 +1392,7 @@ const vectors = {
     maxTemplateTextBytes, maxTemplateTitleChars, maxTemplateTitleUtf8Bytes: maxTemplateTitleBytes,
     maxTemplateTagChars, maxTemplateTagUtf8Bytes: maxTemplateTagBytes,
     maxTemplatePageBodyBytes, maxTemplatePages, maxTemplateTotalBytes,
+    maxTemplateOrder, emptyContinuationPageBytes,
   },
   pairing: { qr, parsed: parsePair(qr) },
   handshake: {
@@ -858,7 +1423,10 @@ const vectors = {
   templateFragmentation,
   templateFailures,
   templateMergeCases,
+  templateMultiMergeCases,
+  templatePageSplitCases,
+  templatePrepareCases,
 };
 
 writeFileSync(new URL('./test-vectors.json', import.meta.url), JSON.stringify(vectors, null, 2) + '\n');
-console.log(`Generated v${protocolVersion}: ${frames.length} frames, ${Object.keys(messages).length} messages, ${templateFrames.length} templateFrames, ${Object.keys(templateMessages).length} templateMessages, ${templateMergeCases.length} templateMergeCases; self-checks passed.`);
+console.log(`Generated v${protocolVersion}: ${frames.length} frames, ${Object.keys(messages).length} messages, ${templateFrames.length} templateFrames, ${Object.keys(templateMessages).length} templateMessages, ${templateMergeCases.length} templateMergeCases, ${templateMultiMergeCases.length} templateMultiMergeCases, ${templatePageSplitCases.length} templatePageSplitCases, ${templatePrepareCases.length} templatePrepareCases; self-checks passed.`);

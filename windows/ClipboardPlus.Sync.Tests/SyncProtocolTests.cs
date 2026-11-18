@@ -323,6 +323,8 @@ public sealed class SyncProtocolTests : IDisposable
         Assert.Equal(SyncProtocol.MaxTemplatePageBodyBytes, limits.GetProperty("maxTemplatePageBodyBytes").GetInt32());
         Assert.Equal(SyncProtocol.MaxTemplatePages, limits.GetProperty("maxTemplatePages").GetInt32());
         Assert.Equal(SyncProtocol.MaxTemplateTotalBytes, limits.GetProperty("maxTemplateTotalBytes").GetInt32());
+        Assert.Equal(TemplateSyncMessageCodec.MaxOrder, limits.GetProperty("maxTemplateOrder").GetInt32());
+        Assert.Equal(32, limits.GetProperty("emptyContinuationPageBytes").GetInt32());
 
         var tplMessages = V.GetProperty("templateMessages");
         var decoded = new Dictionary<string, TemplateSyncMessage>();
@@ -472,6 +474,7 @@ public sealed class SyncProtocolTests : IDisposable
             var expectedTombs = expected.GetProperty("tombstones").EnumerateArray().Select(ParseTomb).ToArray();
 
             Assert.Equal(expectedTemplates, actual.Templates);
+            Assert.Equal(expectedTemplates.Select(t => Encoding.UTF8.GetBytes(t.Text)).ToArray(), actual.Templates.Select(t => Encoding.UTF8.GetBytes(t.Text)).ToArray());
             Assert.Equal(expectedTombs, actual.Tombstones);
             Assert.Equal(expected.GetProperty("conflictCopyCount").GetInt32(), actual.ConflictCopyCount);
             Assert.Equal(expected.GetProperty("subsumedDuplicateCount").GetInt32(), actual.SubsumedDuplicateCount);
@@ -500,6 +503,212 @@ public sealed class SyncProtocolTests : IDisposable
                 Assert.Equal(0, resync.SubsumedDuplicateCount);
                 Assert.Equal(actual.Templates, resync.Templates);
                 Assert.Equal(actual.Tombstones, resync.Tombstones);
+            }
+
+            if (testCase.TryGetProperty("alsoCheckSlowClockResendNotExtended", out var slowResend) && slowResend.GetBoolean() && remoteSentAt is long sentAt)
+            {
+                const long tenDays = 10L * 24 * 60 * 60 * 1000;
+                var laterNow = nowMillis + tenDays;
+                var laterSentAt = sentAt + tenDays;
+                var pc2 = new TemplateSyncState(actual.Templates, actual.Tombstones);
+                var remoteSynced = new TemplateSyncState(
+                    actual.Templates.Select(t => t with { BaseHash = TemplateSyncMerge.ContentHash(t) }).ToArray(),
+                    actual.Tombstones);
+                var resyncSynced = TemplateSyncMerge.Merge(pc2, remoteSynced, laterNow, laterSentAt);
+                Assert.Equal(0, resyncSynced.PcChanges.Total);
+                Assert.Equal(actual.Tombstones, resyncSynced.Tombstones);
+
+                var resyncUnacked = TemplateSyncMerge.Merge(pc2, remote, laterNow, laterSentAt - 3000);
+                Assert.Equal(actual.Tombstones, resyncUnacked.Tombstones);
+            }
+        }
+    }
+
+    [Fact]
+    public void TemplateMultiMergeCasesMatchIndependentVectors()
+    {
+        static TemplateSyncItem ParseItem(JsonElement el) => new(
+            Guid.Parse(el.GetProperty("id").GetString()!),
+            el.GetProperty("kind").GetString()! == "url" ? TemplateSyncKind.Url : TemplateSyncKind.Text,
+            el.GetProperty("text").GetString()!,
+            el.TryGetProperty("title", out var t) ? t.GetString() : null,
+            el.TryGetProperty("tag", out var g) ? g.GetString() : null,
+            el.GetProperty("order").GetInt32(),
+            el.GetProperty("updatedAt").GetInt64(),
+            el.TryGetProperty("baseHash", out var bh) ? bh.GetString() : null);
+
+        static TemplateSyncTombstone ParseTomb(JsonElement el) => new(
+            Guid.Parse(el.GetProperty("id").GetString()!),
+            el.GetProperty("deletedAt").GetInt64(),
+            el.TryGetProperty("baseHash", out var bh) ? bh.GetString() : null);
+
+        static TemplateSyncState ParseSide(JsonElement el) => new(
+            el.GetProperty("templates").EnumerateArray().Select(ParseItem).ToArray(),
+            el.GetProperty("tombstones").EnumerateArray().Select(ParseTomb).ToArray());
+
+        static TemplateSyncSideChanges ParseChanges(JsonElement el) => new(
+            el.GetProperty("added").GetInt32(),
+            el.GetProperty("updated").GetInt32(),
+            el.GetProperty("deleted").GetInt32());
+
+        foreach (var testCase in V.GetProperty("templateMultiMergeCases").EnumerateArray())
+        {
+            var nowMillis = testCase.GetProperty("nowMillis").GetInt64();
+            var pc = ParseSide(testCase.GetProperty("pc"));
+            var remotes = testCase.GetProperty("remotes").EnumerateArray().Select(r =>
+            {
+                long? sentAt = r.TryGetProperty("sentAtMillis", out var sa) && sa.ValueKind != JsonValueKind.Null ? sa.GetInt64() : null;
+                return new TemplateSyncRemoteState(ParseSide(r.GetProperty("state")), sentAt);
+            }).ToArray();
+
+            var actual = TemplateSyncMerge.MergeAll(pc, remotes, nowMillis);
+            var expected = testCase.GetProperty("expected");
+            var expectedTemplates = expected.GetProperty("templates").EnumerateArray().Select(ParseItem).ToArray();
+            var expectedTombs = expected.GetProperty("tombstones").EnumerateArray().Select(ParseTomb).ToArray();
+
+            Assert.Equal(expectedTemplates, actual.Templates);
+            Assert.Equal(expectedTemplates.Select(t => Encoding.UTF8.GetBytes(t.Text)).ToArray(), actual.Templates.Select(t => Encoding.UTF8.GetBytes(t.Text)).ToArray());
+            Assert.Equal(expectedTombs, actual.Tombstones);
+            Assert.Equal(expected.GetProperty("conflictCopyCount").GetInt32(), actual.ConflictCopyCount);
+            Assert.Equal(expected.GetProperty("subsumedDuplicateCount").GetInt32(), actual.SubsumedDuplicateCount);
+            Assert.Equal(ParseChanges(expected.GetProperty("pcChanges")), actual.PcChanges);
+
+            var expectedRemoteChanges = expected.GetProperty("remoteChanges").EnumerateArray().Select(ParseChanges).ToArray();
+            Assert.Equal(expectedRemoteChanges, actual.RemoteChanges);
+
+            var expectedSkews = expected.GetProperty("remoteClockSkewSeconds").EnumerateArray()
+                .Select(el => el.ValueKind == JsonValueKind.Null ? (long?)null : el.GetInt64()).ToArray();
+            Assert.Equal(expectedSkews, actual.RemoteClockSkewSeconds);
+
+            if (testCase.TryGetProperty("alsoCheckAllPermutations", out var perm) && perm.GetBoolean() && remotes.Length == 2)
+            {
+                var swapped = TemplateSyncMerge.MergeAll(pc, [remotes[1], remotes[0]], nowMillis);
+                Assert.Equal(actual.Templates, swapped.Templates);
+                Assert.Equal(actual.Tombstones, swapped.Tombstones);
+                Assert.Equal(actual.ConflictCopyCount, swapped.ConflictCopyCount);
+                Assert.Equal(actual.SubsumedDuplicateCount, swapped.SubsumedDuplicateCount);
+                Assert.Equal(actual.PcChanges, swapped.PcChanges);
+                Assert.Equal([actual.RemoteChanges[1], actual.RemoteChanges[0]], swapped.RemoteChanges);
+            }
+        }
+    }
+
+    [Fact]
+    public void TemplatePageSplitCasesMatchIndependentVectors()
+    {
+        var op = Guid.NewGuid();
+        foreach (var testCase in V.GetProperty("templatePageSplitCases").EnumerateArray())
+        {
+            var sentAt = testCase.GetProperty("sentAt").GetInt64();
+            var isState = testCase.GetProperty("isState").GetBoolean();
+            var items = testCase.GetProperty("items").EnumerateArray().Select(el => new TemplateSyncItem(
+                Guid.Parse(el.GetProperty("id").GetString()!),
+                TemplateSyncKind.Text,
+                new string(el.GetProperty("fillChar").GetString()![0], el.GetProperty("textBytes").GetInt32()),
+                null,
+                null,
+                el.GetProperty("order").GetInt32(),
+                el.GetProperty("updatedAt").GetInt64(),
+                el.TryGetProperty("baseHash", out var bh) && bh.ValueKind != JsonValueKind.Null ? bh.GetString() : null)).ToArray();
+
+            var snapshot = new TemplateSyncSnapshot(sentAt, items, []);
+            var pages = TemplateSyncMessageCodec.SplitPages(op, snapshot, isState);
+            var expectedCounts = testCase.GetProperty("expectedPageItemCounts").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var expectedBodyBytes = testCase.GetProperty("expectedPageBodyBytes").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            Assert.Equal(expectedCounts.Length, pages.Count);
+
+            var assembler = new TemplateSyncPageAssembler(expectedOp: op, expectedIsState: isState);
+            TemplateSyncSnapshot? roundtrip = null;
+            for (var i = 0; i < pages.Count; i++)
+            {
+                var encoded = TemplateSyncMessageCodec.Encode(pages[i]);
+                var hdrLen = BinaryPrimitives.ReadUInt16BigEndian(encoded);
+                var bodyLen = encoded.Length - 2 - hdrLen;
+                Assert.Equal(expectedBodyBytes[i], bodyLen);
+
+                var decoded = TemplateSyncMessageCodec.Decode(encoded);
+                var pageTemplates = decoded switch
+                {
+                    TemplateSyncPush p => p.Page.Templates,
+                    TemplateSyncStateMessage s => s.Page.Templates,
+                    _ => throw new InvalidOperationException(),
+                };
+                Assert.Equal(expectedCounts[i], pageTemplates.Count);
+                roundtrip = assembler.Append(decoded);
+            }
+            Assert.NotNull(roundtrip);
+            Assert.Equal(items, roundtrip!.Templates);
+            assembler.Finish();
+        }
+    }
+
+    [Fact]
+    public void TemplatePrepareCasesMatchIndependentVectors()
+    {
+        var op = Guid.NewGuid();
+        foreach (var testCase in V.GetProperty("templatePrepareCases").EnumerateArray())
+        {
+            var name = testCase.GetProperty("name").GetString()!;
+            var nowMillis = testCase.GetProperty("nowMillis").GetInt64();
+            var sentAtMillis = testCase.GetProperty("sentAtMillis").GetInt64();
+            if (name == "threeHundred64KiBItemsCappedAt240")
+            {
+                var count = testCase.GetProperty("itemCount").GetInt32();
+                var textBytes = testCase.GetProperty("textBytes").GetInt32();
+                var items = Enumerable.Range(0, count).Select(i => new TemplateSyncItem(
+                    Guid.Parse($"66666666-5555-4666-8777-{i:D12}"),
+                    TemplateSyncKind.Text,
+                    new string('x', textBytes),
+                    null,
+                    null,
+                    i,
+                    nowMillis)).ToArray();
+                var prepared = TemplateSyncMerge.PrepareSyncState(items, [], nowMillis, sentAtMillis);
+                Assert.Equal(testCase.GetProperty("expectedKeptCount").GetInt32(), prepared.State.Templates.Count);
+                Assert.Equal(testCase.GetProperty("expectedExcludedCount").GetInt32(), prepared.ExcludedTemplateCount);
+                var pages = TemplateSyncMessageCodec.SplitPages(op, new TemplateSyncSnapshot(sentAtMillis, prepared.State.Templates, prepared.State.Tombstones), isState: false);
+                Assert.Equal(testCase.GetProperty("expectedPageCount").GetInt32(), pages.Count);
+                foreach (var p in pages) _ = TemplateSyncMessageCodec.Encode(p);
+            }
+            else if (name == "oversizedTextAndControlEscapedExcluded")
+            {
+                var items = new[]
+                {
+                    new TemplateSyncItem(Guid.Parse("44444444-5555-4666-8777-888888888881"), TemplateSyncKind.Text, "ok-1", null, null, 0, nowMillis),
+                    new TemplateSyncItem(Guid.Parse("44444444-5555-4666-8777-888888888882"), TemplateSyncKind.Text, new string('a', SyncProtocol.MaxTemplateTextBytes + 1), null, null, 1, nowMillis),
+                    new TemplateSyncItem(Guid.Parse("44444444-5555-4666-8777-888888888883"), TemplateSyncKind.Text, new string('\u0001', SyncProtocol.MaxTemplateTextBytes), null, null, 2, nowMillis),
+                    new TemplateSyncItem(Guid.Parse("44444444-5555-4666-8777-888888888884"), TemplateSyncKind.Text, "ok-2", null, null, 3, nowMillis),
+                };
+                var prepared = TemplateSyncMerge.PrepareSyncState(items, [], nowMillis, sentAtMillis);
+                var expectedIds = testCase.GetProperty("expectedKeptIds").EnumerateArray().Select(e => Guid.Parse(e.GetString()!)).ToArray();
+                Assert.Equal(expectedIds, prepared.State.Templates.Select(t => t.Id).ToArray());
+                Assert.Equal(testCase.GetProperty("expectedExcludedCount").GetInt32(), prepared.ExcludedTemplateCount);
+            }
+            else if (name == "over300TemplatesAndOver1000Tombstones")
+            {
+                var count = testCase.GetProperty("itemCount").GetInt32();
+                var tombCount = testCase.GetProperty("tombstoneCount").GetInt32();
+                var items = Enumerable.Range(0, count).Select(i => new TemplateSyncItem(
+                    Guid.Parse($"77777777-5555-4666-8777-{i:D12}"),
+                    TemplateSyncKind.Text,
+                    $"item-{i}",
+                    null,
+                    null,
+                    i,
+                    nowMillis)).ToArray();
+                var tombs = Enumerable.Range(0, tombCount).Select(i => new TemplateSyncTombstone(
+                    Guid.Parse($"88888888-5555-4666-8777-{i:D12}"),
+                    nowMillis - 10_000 + i)).ToArray();
+                var prepared = TemplateSyncMerge.PrepareSyncState(items, tombs, nowMillis, sentAtMillis);
+                Assert.Equal(testCase.GetProperty("expectedKeptCount").GetInt32(), prepared.State.Templates.Count);
+                Assert.Equal(testCase.GetProperty("expectedExcludedCount").GetInt32(), prepared.ExcludedTemplateCount);
+                Assert.Equal(testCase.GetProperty("expectedTombstoneCount").GetInt32(), prepared.State.Tombstones.Count);
+                Assert.Equal(testCase.GetProperty("expectedFirstTombstoneDeletedAt").GetInt64(), prepared.State.Tombstones[0].DeletedAt);
+                Assert.Equal(testCase.GetProperty("expectedLastTombstoneDeletedAt").GetInt64(), prepared.State.Tombstones[^1].DeletedAt);
+            }
+            else
+            {
+                throw new InvalidOperationException($"Unknown prepare case: {name}");
             }
         }
     }

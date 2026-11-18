@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Buffers.Text;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -46,138 +48,248 @@ public sealed record TemplateSyncStateMessage(Guid Op, int Part, int Total, Temp
 
 public sealed record TemplateSyncAck(Guid Op) : TemplateSyncMessage;
 
-internal static class TemplateCanonicalJson
+internal struct BoundedUtf8Sink
 {
-    internal static string SerializeString(string value)
+    private readonly MemoryStream? stream;
+    private readonly int maxBytes;
+    public int Count { get; private set; }
+
+    public BoundedUtf8Sink(int maxBytes, bool writeBytes)
     {
-        var sb = new StringBuilder(value.Length + 2);
-        sb.Append('"');
-        foreach (var rune in value.EnumerateRunes())
+        this.maxBytes = maxBytes;
+        stream = writeBytes ? new MemoryStream(Math.Min(maxBytes, 4096)) : null;
+    }
+
+    public void WriteByte(byte value)
+    {
+        EnsureCapacity(1);
+        stream?.WriteByte(value);
+        Count += 1;
+    }
+
+    public void WriteAscii(ReadOnlySpan<byte> ascii)
+    {
+        EnsureCapacity(ascii.Length);
+        stream?.Write(ascii);
+        Count += ascii.Length;
+    }
+
+    public void WriteInt64(long value)
+    {
+        Span<byte> buf = stackalloc byte[24];
+        Utf8Formatter.TryFormat(value, buf, out var written);
+        WriteAscii(buf[..written]);
+    }
+
+    public void WriteEscapedJsonString(string value)
+    {
+        WriteByte((byte)'"');
+        Span<byte> utf8Rune = stackalloc byte[4];
+        Span<byte> esc = stackalloc byte[6];
+        esc[0] = (byte)'\\';
+        esc[1] = (byte)'u';
+        esc[2] = (byte)'0';
+        esc[3] = (byte)'0';
+        var span = value.AsSpan();
+        while (!span.IsEmpty)
         {
+            var status = Rune.DecodeFromUtf16(span, out var rune, out var consumed);
+            if (status != OperationStatus.Done)
+                throw new SyncProtocolException(SyncError.Format);
+            span = span[consumed..];
             var cp = rune.Value;
             switch (cp)
             {
-                case '"': sb.Append("\\\""); break;
-                case '\\': sb.Append("\\\\"); break;
-                case '\b': sb.Append("\\b"); break;
-                case '\f': sb.Append("\\f"); break;
-                case '\n': sb.Append("\\n"); break;
-                case '\r': sb.Append("\\r"); break;
-                case '\t': sb.Append("\\t"); break;
+                case '"': WriteAscii("\\\""u8); break;
+                case '\\': WriteAscii("\\\\"u8); break;
+                case '\b': WriteAscii("\\b"u8); break;
+                case '\f': WriteAscii("\\f"u8); break;
+                case '\n': WriteAscii("\\n"u8); break;
+                case '\r': WriteAscii("\\r"u8); break;
+                case '\t': WriteAscii("\\t"u8); break;
                 default:
                     if (cp < 0x20)
-                        sb.Append($"\\u{cp:x4}");
+                    {
+                        esc[4] = HexDigit((cp >> 4) & 0xF);
+                        esc[5] = HexDigit(cp & 0xF);
+                        WriteAscii(esc);
+                    }
                     else
-                        sb.Append(rune.ToString());
+                    {
+                        var len = rune.EncodeToUtf8(utf8Rune);
+                        WriteAscii(utf8Rune[..len]);
+                    }
                     break;
             }
         }
-        sb.Append('"');
-        return sb.ToString();
+        WriteByte((byte)'"');
     }
 
-    internal static string SerializeItem(TemplateSyncItem item, bool includeBaseHash)
+    public readonly byte[] ToArray() => stream?.ToArray() ?? [];
+
+    private readonly void EnsureCapacity(int add)
     {
-        var sb = new StringBuilder();
-        sb.Append('{');
+        if (add > maxBytes - Count)
+            throw new SyncProtocolException(SyncError.Limit);
+    }
+
+    private static byte HexDigit(int nibble) =>
+        (byte)(nibble < 10 ? '0' + nibble : 'a' + (nibble - 10));
+}
+
+internal static class TemplateCanonicalJson
+{
+    internal static byte[] SerializeContentHashInput(TemplateSyncKind kind, string text, string? normTitle, string? normTag)
+    {
+        var sink = new BoundedUtf8Sink(int.MaxValue, writeBytes: true);
+        sink.WriteByte((byte)'[');
+        sink.WriteAscii(kind == TemplateSyncKind.Url ? "\"url\""u8 : "\"text\""u8);
+        sink.WriteByte((byte)',');
+        sink.WriteEscapedJsonString(text);
+        sink.WriteByte((byte)',');
+        if (normTitle is null) sink.WriteAscii("null"u8);
+        else sink.WriteEscapedJsonString(normTitle);
+        sink.WriteByte((byte)',');
+        if (normTag is null) sink.WriteAscii("null"u8);
+        else sink.WriteEscapedJsonString(normTag);
+        sink.WriteByte((byte)']');
+        return sink.ToArray();
+    }
+
+    internal static void WriteItem(TemplateSyncItem item, bool includeBaseHash, ref BoundedUtf8Sink sink)
+    {
+        sink.WriteByte((byte)'{');
         var first = true;
-        void Comma() { if (!first) sb.Append(','); first = false; }
+        static void Comma(ref BoundedUtf8Sink s, ref bool isFirst)
+        {
+            if (!isFirst) s.WriteByte((byte)',');
+            isFirst = false;
+        }
 
         if (includeBaseHash && item.BaseHash is not null)
         {
-            Comma();
-            sb.Append("\"baseHash\":");
-            sb.Append(SerializeString(item.BaseHash));
+            Comma(ref sink, ref first);
+            sink.WriteAscii("\"baseHash\":"u8);
+            sink.WriteEscapedJsonString(item.BaseHash);
         }
-        Comma();
-        sb.Append("\"id\":");
-        sb.Append(SerializeString(SyncProtocol.Id(item.Id)));
-        Comma();
-        sb.Append("\"kind\":");
-        sb.Append(item.Kind == TemplateSyncKind.Url ? "\"url\"" : "\"text\"");
-        Comma();
-        sb.Append("\"order\":");
-        sb.Append(item.Order.ToString(CultureInfo.InvariantCulture));
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"id\":"u8);
+        sink.WriteEscapedJsonString(SyncProtocol.Id(item.Id));
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"kind\":"u8);
+        sink.WriteAscii(item.Kind == TemplateSyncKind.Url ? "\"url\""u8 : "\"text\""u8);
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"order\":"u8);
+        sink.WriteInt64(item.Order);
         if (item.Tag is not null)
         {
-            Comma();
-            sb.Append("\"tag\":");
-            sb.Append(SerializeString(item.Tag));
+            Comma(ref sink, ref first);
+            sink.WriteAscii("\"tag\":"u8);
+            sink.WriteEscapedJsonString(item.Tag);
         }
-        Comma();
-        sb.Append("\"text\":");
-        sb.Append(SerializeString(item.Text));
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"text\":"u8);
+        sink.WriteEscapedJsonString(item.Text);
         if (item.Title is not null)
         {
-            Comma();
-            sb.Append("\"title\":");
-            sb.Append(SerializeString(item.Title));
+            Comma(ref sink, ref first);
+            sink.WriteAscii("\"title\":"u8);
+            sink.WriteEscapedJsonString(item.Title);
         }
-        Comma();
-        sb.Append("\"updatedAt\":");
-        sb.Append(item.UpdatedAt.ToString(CultureInfo.InvariantCulture));
-        sb.Append('}');
-        return sb.ToString();
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"updatedAt\":"u8);
+        sink.WriteInt64(item.UpdatedAt);
+        sink.WriteByte((byte)'}');
     }
 
-    internal static string SerializeTombstone(TemplateSyncTombstone tomb)
+    internal static void WriteTombstone(TemplateSyncTombstone tomb, ref BoundedUtf8Sink sink)
     {
-        var sb = new StringBuilder();
-        sb.Append('{');
+        sink.WriteByte((byte)'{');
         var first = true;
-        void Comma() { if (!first) sb.Append(','); first = false; }
+        static void Comma(ref BoundedUtf8Sink s, ref bool isFirst)
+        {
+            if (!isFirst) s.WriteByte((byte)',');
+            isFirst = false;
+        }
 
         if (tomb.BaseHash is not null)
         {
-            Comma();
-            sb.Append("\"baseHash\":");
-            sb.Append(SerializeString(tomb.BaseHash));
+            Comma(ref sink, ref first);
+            sink.WriteAscii("\"baseHash\":"u8);
+            sink.WriteEscapedJsonString(tomb.BaseHash);
         }
-        Comma();
-        sb.Append("\"deletedAt\":");
-        sb.Append(tomb.DeletedAt.ToString(CultureInfo.InvariantCulture));
-        Comma();
-        sb.Append("\"id\":");
-        sb.Append(SerializeString(SyncProtocol.Id(tomb.Id)));
-        sb.Append('}');
-        return sb.ToString();
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"deletedAt\":"u8);
+        sink.WriteInt64(tomb.DeletedAt);
+        Comma(ref sink, ref first);
+        sink.WriteAscii("\"id\":"u8);
+        sink.WriteEscapedJsonString(SyncProtocol.Id(tomb.Id));
+        sink.WriteByte((byte)'}');
     }
 
-    internal static string SerializePage(TemplateSyncPage page, bool isFirstPage, bool includeItemBaseHash)
+    internal static void WritePage(TemplateSyncPage page, bool isFirstPage, bool includeItemBaseHash, ref BoundedUtf8Sink sink)
     {
-        var sb = new StringBuilder();
-        sb.Append('{');
+        sink.WriteByte((byte)'{');
         if (isFirstPage)
         {
-            sb.Append("\"sentAt\":");
-            sb.Append(page.SentAt!.Value.ToString(CultureInfo.InvariantCulture));
-            sb.Append(',');
+            sink.WriteAscii("\"sentAt\":"u8);
+            sink.WriteInt64(page.SentAt!.Value);
+            sink.WriteByte((byte)',');
         }
-        sb.Append("\"templates\":[");
+        sink.WriteAscii("\"templates\":["u8);
         for (var i = 0; i < page.Templates.Count; i++)
         {
-            if (i > 0) sb.Append(',');
-            sb.Append(SerializeItem(page.Templates[i], includeItemBaseHash));
+            if (i > 0) sink.WriteByte((byte)',');
+            WriteItem(page.Templates[i], includeItemBaseHash, ref sink);
         }
-        sb.Append("],\"tombstones\":[");
+        sink.WriteAscii("],\"tombstones\":["u8);
         for (var i = 0; i < page.Tombstones.Count; i++)
         {
-            if (i > 0) sb.Append(',');
-            sb.Append(SerializeTombstone(page.Tombstones[i]));
+            if (i > 0) sink.WriteByte((byte)',');
+            WriteTombstone(page.Tombstones[i], ref sink);
         }
-        sb.Append(']');
+        sink.WriteByte((byte)']');
         if (isFirstPage)
         {
-            sb.Append(",\"v\":");
-            sb.Append(page.Version!.Value.ToString(CultureInfo.InvariantCulture));
+            sink.WriteAscii(",\"v\":"u8);
+            sink.WriteInt64(page.Version!.Value);
         }
-        sb.Append('}');
-        return sb.ToString();
+        sink.WriteByte((byte)'}');
+    }
+
+    internal static int MeasureItemUtf8Bytes(TemplateSyncItem item, bool includeBaseHash, int maxBytes)
+    {
+        var sink = new BoundedUtf8Sink(maxBytes, writeBytes: false);
+        WriteItem(item, includeBaseHash, ref sink);
+        return sink.Count;
+    }
+
+    internal static int MeasureTombstoneUtf8Bytes(TemplateSyncTombstone tomb, int maxBytes)
+    {
+        var sink = new BoundedUtf8Sink(maxBytes, writeBytes: false);
+        WriteTombstone(tomb, ref sink);
+        return sink.Count;
+    }
+
+    internal static int MeasurePageUtf8Bytes(TemplateSyncPage page, bool isFirstPage, bool includeItemBaseHash, int maxBytes)
+    {
+        var sink = new BoundedUtf8Sink(maxBytes, writeBytes: false);
+        WritePage(page, isFirstPage, includeItemBaseHash, ref sink);
+        return sink.Count;
+    }
+
+    internal static byte[] SerializePageToBytes(TemplateSyncPage page, bool isFirstPage, bool includeItemBaseHash, int maxBytes)
+    {
+        var sink = new BoundedUtf8Sink(maxBytes, writeBytes: true);
+        WritePage(page, isFirstPage, includeItemBaseHash, ref sink);
+        return sink.ToArray();
     }
 }
 
 public static class TemplateSyncMessageCodec
 {
+    public const int MaxOrder = int.MaxValue;
+
     public static int CountGraphemeClusters(string value) => new StringInfo(value).LengthInTextElements;
 
     internal static void ValidateTextString(string? text, int maxBytes)
@@ -210,7 +322,7 @@ public static class TemplateSyncMessageCodec
         ValidateTextString(item.Text, SyncProtocol.MaxTemplateTextBytes);
         if (item.Title is not null) ValidateLabelString(item.Title, SyncProtocol.MaxTemplateTitleCharacters, SyncProtocol.MaxTemplateTitleBytes);
         if (item.Tag is not null) ValidateLabelString(item.Tag, SyncProtocol.MaxTemplateTagCharacters, SyncProtocol.MaxTemplateTagBytes);
-        SyncProtocol.Require(item.Order >= 0);
+        SyncProtocol.Require(item.Order is >= 0 and <= MaxOrder);
         SyncProtocol.Require(item.UpdatedAt is >= -SyncProtocol.MaxTimestamp and <= SyncProtocol.MaxTimestamp);
         if (!allowBaseHash)
             SyncProtocol.Require(item.BaseHash is null);
@@ -276,14 +388,20 @@ public static class TemplateSyncMessageCodec
                 case TemplateSyncPush push:
                     ValidatePage(push.Page, push.Part, push.Total, isState: false);
                     header = $"{{\"op\":\"{SyncProtocol.Id(push.Op)}\",\"part\":{push.Part},\"t\":\"tpl_push\",\"total\":{push.Total}}}";
-                    body = SyncProtocol.Utf8.GetBytes(TemplateCanonicalJson.SerializePage(push.Page, push.Part == 0, includeItemBaseHash: true));
-                    SyncProtocol.Require(body.Length <= SyncProtocol.MaxTemplatePageBodyBytes, SyncError.Limit);
+                    body = TemplateCanonicalJson.SerializePageToBytes(
+                        push.Page,
+                        push.Part == 0,
+                        includeItemBaseHash: true,
+                        maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
                     break;
                 case TemplateSyncStateMessage state:
                     ValidatePage(state.Page, state.Part, state.Total, isState: true);
                     header = $"{{\"op\":\"{SyncProtocol.Id(state.Op)}\",\"part\":{state.Part},\"t\":\"tpl_state\",\"total\":{state.Total}}}";
-                    body = SyncProtocol.Utf8.GetBytes(TemplateCanonicalJson.SerializePage(state.Page, state.Part == 0, includeItemBaseHash: false));
-                    SyncProtocol.Require(body.Length <= SyncProtocol.MaxTemplatePageBodyBytes, SyncError.Limit);
+                    body = TemplateCanonicalJson.SerializePageToBytes(
+                        state.Page,
+                        state.Part == 0,
+                        includeItemBaseHash: false,
+                        maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
                     break;
                 default:
                     throw new SyncProtocolException(SyncError.Format);
@@ -433,7 +551,7 @@ public static class TemplateSyncMessageCodec
             ? (tagElem.ValueKind == JsonValueKind.String ? tagElem.GetString()! : throw new SyncProtocolException(SyncError.Format))
             : null;
         var orderLong = SyncMessageCodec.Integer(el, "order");
-        SyncProtocol.Require(orderLong is >= 0 and <= int.MaxValue);
+        SyncProtocol.Require(orderLong is >= 0 and <= MaxOrder);
         var updatedAt = SyncMessageCodec.Integer(el, "updatedAt");
         string? baseHash = allowBaseHash && el.TryGetProperty("baseHash", out var bhElem)
             ? (bhElem.ValueKind == JsonValueKind.String ? bhElem.GetString()! : throw new SyncProtocolException(SyncError.Format))
@@ -481,9 +599,16 @@ public static class TemplateSyncMessageCodec
             SyncProtocol.Require(seenIds.Add(tomb.Id));
         }
 
-        const int continuationOverhead = 28; // {"templates":[],"tombstones":[]}
-        var firstHeaderBytes = SyncProtocol.Utf8.GetByteCount(
-            $"{{\"sentAt\":{snapshot.SentAt.ToString(CultureInfo.InvariantCulture)},\"templates\":[],\"tombstones\":[],\"v\":1}}");
+        var continuationOverhead = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+            new TemplateSyncPage(null, null, [], []),
+            isFirstPage: false,
+            includeItemBaseHash: !isState,
+            maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
+        var firstHeaderBytes = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+            new TemplateSyncPage(1, snapshot.SentAt, [], []),
+            isFirstPage: true,
+            includeItemBaseHash: !isState,
+            maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
 
         var pages = new List<TemplateSyncPage>();
         var currentTemplates = new List<TemplateSyncItem>();
@@ -509,7 +634,10 @@ public static class TemplateSyncMessageCodec
 
         foreach (var item in snapshot.Templates)
         {
-            var itemBytes = SyncProtocol.Utf8.GetByteCount(TemplateCanonicalJson.SerializeItem(item, includeBaseHash: !isState));
+            var itemBytes = TemplateCanonicalJson.MeasureItemUtf8Bytes(
+                item,
+                includeBaseHash: !isState,
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes - continuationOverhead);
             var commaBytes = currentTemplates.Count > 0 ? 1 : 0;
             if (currentBytes + commaBytes + itemBytes > SyncProtocol.MaxTemplatePageBodyBytes)
             {
@@ -524,7 +652,9 @@ public static class TemplateSyncMessageCodec
 
         foreach (var tomb in snapshot.Tombstones)
         {
-            var tombBytes = SyncProtocol.Utf8.GetByteCount(TemplateCanonicalJson.SerializeTombstone(tomb));
+            var tombBytes = TemplateCanonicalJson.MeasureTombstoneUtf8Bytes(
+                tomb,
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes - continuationOverhead);
             var commaBytes = currentTombstones.Count > 0 ? 1 : 0;
             if (currentBytes + commaBytes + tombBytes > SyncProtocol.MaxTemplatePageBodyBytes)
             {
@@ -614,9 +744,11 @@ public sealed class TemplateSyncPageAssembler
                 SyncProtocol.Require(msgOp == op!.Value && msgIsState == isState!.Value && msgTotal == total!.Value && part == nextPart, SyncError.State);
             }
 
-            var pageBytes = SyncProtocol.Utf8.GetByteCount(
-                TemplateCanonicalJson.SerializePage(page, part == 0, includeItemBaseHash: !msgIsState));
-            SyncProtocol.Require(pageBytes <= SyncProtocol.MaxTemplatePageBodyBytes, SyncError.Limit);
+            var pageBytes = TemplateCanonicalJson.MeasurePageUtf8Bytes(
+                page,
+                isFirstPage: part == 0,
+                includeItemBaseHash: !msgIsState,
+                maxBytes: SyncProtocol.MaxTemplatePageBodyBytes);
             totalBodyBytes += pageBytes;
             SyncProtocol.Require(totalBodyBytes <= SyncProtocol.MaxTemplateTotalBytes, SyncError.Limit);
             SyncProtocol.Require(templates.Count + page.Templates.Count <= SyncProtocol.MaxTemplates, SyncError.Limit);

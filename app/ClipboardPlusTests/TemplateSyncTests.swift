@@ -233,5 +233,77 @@ final class TemplateSyncTests: XCTestCase {
         )
         XCTAssertEqual(conflictWithExistingText.conflictCopyCount, 0)
         XCTAssertEqual(conflictWithExistingText.templates.count, 2)
+
+        // Merged 150 + 150 = 300 x 64KiB distinct items (needs 100 pages > 80) throws limit
+        let pc150 = (0..<150).map { i in
+            TemplateSyncItem(id: UUID(), kind: .text, text: String(format: "pc-%03d-", Int32(i)) + String(repeating: "a", count: SyncProtocol.maxTemplateTextBytes - 7), order: i, updatedAt: now)
+        }
+        let remote150 = (0..<150).map { i in
+            TemplateSyncItem(id: UUID(), kind: .text, text: String(format: "rm-%03d-", Int32(i)) + String(repeating: "b", count: SyncProtocol.maxTemplateTextBytes - 7), order: i, updatedAt: now)
+        }
+        error(.limit) {
+            _ = try TemplateSyncMerge.merge(
+                pc: TemplateSyncState(templates: pc150, tombstones: []),
+                remote: TemplateSyncState(templates: remote150, tombstones: []),
+                nowMillis: now
+            )
+        }
+
+        // Order upper bound on wire (encode/validate) and bounded writer rejection on oversized pages
+        let op = UUID()
+        let maxOrderItem = TemplateSyncItem(id: UUID(), kind: .text, text: "max-order", order: TemplateSyncMessageCodec.maxOrder, updatedAt: 1)
+        let encodedMaxOrder = try TemplateSyncMessageCodec.encode(.push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: [maxOrderItem], tombstones: [])))
+        _ = try TemplateSyncMessageCodec.decode(encodedMaxOrder)
+        let overOrderItem = TemplateSyncItem(id: UUID(), kind: .text, text: "over-order", order: TemplateSyncMessageCodec.maxOrder + 1, updatedAt: 1)
+        error(.format) {
+            _ = try TemplateSyncMessageCodec.encode(.push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: [overOrderItem], tombstones: [])))
+        }
+
+        let oversizedPage = TemplateSyncPage(version: 1, sentAt: 0, templates: [
+            TemplateSyncItem(id: UUID(), kind: .text, text: String(repeating: "\u{0001}", count: SyncProtocol.maxTemplateTextBytes), order: 0, updatedAt: 1)
+        ], tombstones: [])
+        error(.limit) {
+            _ = try TemplateSyncMessageCodec.encode(.push(op: op, part: 0, total: 1, page: oversizedPage))
+        }
+        let manyLargeItems = (0..<10).map { i in
+            let ch = String(Unicode.Scalar(97 + i)!)
+            return TemplateSyncItem(id: UUID(), kind: .text, text: String(repeating: ch, count: SyncProtocol.maxTemplateTextBytes), order: i, updatedAt: 1)
+        }
+        error(.limit) {
+            _ = try TemplateSyncMessageCodec.encode(.push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: manyLargeItems, tombstones: [])))
+        }
+        let assembler = TemplateSyncPageAssembler()
+        error(.limit) { _ = try assembler.append(.push(op: op, part: 0, total: 1, page: oversizedPage)) }
+
+        // Direct UTF-8 byte comparison check for NFC vs NFD and PrepareSyncState dirty input filtering
+        let nfcId = UUID()
+        let nfdId = UUID()
+        let nfcVsNfd = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [TemplateSyncItem(id: nfcId, kind: .text, text: "\u{00E9}", tag: "\u{00E9}", order: 0, updatedAt: now)], tombstones: []),
+            remote: TemplateSyncState(templates: [TemplateSyncItem(id: nfdId, kind: .text, text: "e\u{0301}", tag: "e\u{0301}", order: 0, updatedAt: now)], tombstones: []),
+            nowMillis: now
+        )
+        XCTAssertEqual(nfcVsNfd.subsumedDuplicateCount, 0)
+        XCTAssertEqual(nfcVsNfd.templates.count, 2)
+        XCTAssertEqual(Array(nfcVsNfd.templates[0].text.utf8), Array("e\u{0301}".utf8))
+        XCTAssertEqual(Array(nfcVsNfd.templates[1].text.utf8), Array("\u{00E9}".utf8))
+
+        let keepId = UUID()
+        let ctrlId = UUID()
+        let preparedDirty = try TemplateSyncMerge.prepareSyncState(
+            templates: [
+                TemplateSyncItem(id: keepId, kind: .text, text: "valid", title: "ok", tag: "tag", order: 0, updatedAt: now),
+                TemplateSyncItem(id: keepId, kind: .text, text: "duplicate-id", order: 1, updatedAt: now),
+                TemplateSyncItem(id: ctrlId, kind: .text, text: "bad-title", title: "a\u{0007}b", order: 2, updatedAt: now)
+            ],
+            tombstones: [
+                TemplateSyncTombstone(id: keepId, deletedAt: now - 1000)
+            ],
+            nowMillis: now
+        )
+        XCTAssertEqual(preparedDirty.state.templates.count, 1)
+        XCTAssertEqual(preparedDirty.state.templates[0].id, keepId)
+        XCTAssertTrue(preparedDirty.state.tombstones.isEmpty)
+        XCTAssertEqual(preparedDirty.excludedTemplateCount, 2)
     }
 }
