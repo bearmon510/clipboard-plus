@@ -6,7 +6,7 @@ public readonly record struct ScreenBounds(int Left, int Top, int Right, int Bot
     public int Height => Math.Max(0, Bottom - Top);
 }
 
-public readonly record struct WindowPlacement(int Left, int Top, double Width, double Height);
+public readonly record struct WindowPlacement(int Left, int Top, double Width, double Height, double? Scale = null);
 
 public readonly record struct WindowPixelRect(int Left, int Top, int Width, int Height, double TargetScale);
 
@@ -39,7 +39,10 @@ public static class HistoryWindowPlacement
     public static double NormalizeScale(double scale) =>
         double.IsFinite(scale) && scale > 0 ? Math.Clamp(scale, 0.5, 6.0) : 1.0;
 
-    public static bool TryNormalize(int? left, int? top, double? width, double? height, out WindowPlacement placement)
+    public static bool TryNormalize(int? left, int? top, double? width, double? height, out WindowPlacement placement) =>
+        TryNormalize(left, top, width, height, null, out placement);
+
+    public static bool TryNormalize(int? left, int? top, double? width, double? height, double? scale, out WindowPlacement placement)
     {
         placement = default;
         if (left is not int x || top is not int y || width is not double w || height is not double h)
@@ -49,16 +52,33 @@ public static class HistoryWindowPlacement
         if (!double.IsFinite(w) || !double.IsFinite(h) || w <= 0 || h <= 0)
             return false;
 
+        double? normalizedScale = scale is double s && double.IsFinite(s) && s > 0
+            ? NormalizeScale(s)
+            : null;
+
         placement = new WindowPlacement(
             x,
             y,
             Math.Clamp(w, MinWidth, MaxLogicalWidth),
-            Math.Clamp(h, MinHeight, MaxLogicalHeight));
+            Math.Clamp(h, MinHeight, MaxLogicalHeight),
+            normalizedScale);
         return true;
     }
 
-    public static WindowPlacement? Normalize(int left, int top, double width, double height) =>
-        TryNormalize(left, top, width, height, out var placement) ? placement : null;
+    public static WindowPlacement? Normalize(int left, int top, double width, double height, double? scale = null) =>
+        TryNormalize(left, top, width, height, scale, out var placement) ? placement : null;
+
+    public static bool AreSame(WindowPlacement? current, WindowPlacement candidate)
+    {
+        if (current is not { } existing) return false;
+        if (existing.Left != candidate.Left || existing.Top != candidate.Top) return false;
+        if (Math.Abs(existing.Width - candidate.Width) > 1e-6 ||
+            Math.Abs(existing.Height - candidate.Height) > 1e-6)
+            return false;
+        if (existing.Scale is null || candidate.Scale is null)
+            return existing.Scale == candidate.Scale;
+        return Math.Abs(existing.Scale.Value - candidate.Scale.Value) <= 1e-6;
+    }
 
     /// <summary>
     /// Places a previously saved window inside the current screens.
@@ -164,14 +184,20 @@ public static class HistoryWindowPlacement
     {
         var best = screens[0];
         var bestFraction = -1.0;
+        var bestContainsCenter = false;
         var bestContainsOrigin = false;
         var bestDistSq = long.MaxValue;
+
+        var hasSavedScale = saved.Scale is double rawScale && double.IsFinite(rawScale) && rawScale > 0;
+        var savedScale = hasSavedScale ? NormalizeScale(saved.Scale!.Value) : 0;
 
         foreach (var screen in screens)
         {
             if (screen.Width <= 0 || screen.Height <= 0) continue;
 
-            var (w, h) = FitSizeToScreen(saved.Width, saved.Height, screen);
+            var (w, h) = hasSavedScale
+                ? ScaleSize(saved.Width, saved.Height, savedScale)
+                : FitSizeToScreen(saved.Width, saved.Height, screen);
             var right = (long)saved.Left + w;
             var bottom = (long)saved.Top + h;
 
@@ -185,25 +211,38 @@ public static class HistoryWindowPlacement
                 : 0L;
             var area = Math.Max(1L, (long)w * h);
             var fraction = (double)overlapArea / area;
+            var centerX = (int)Math.Clamp((long)saved.Left + w / 2, int.MinValue, int.MaxValue);
+            var centerY = (int)Math.Clamp((long)saved.Top + h / 2, int.MinValue, int.MaxValue);
+            var containsCenter = Contains(screen, centerX, centerY);
             var containsOrigin = Contains(screen, saved.Left, saved.Top);
             var distSq = RectDistanceSq(saved.Left, saved.Top, right, bottom, screen);
 
             var better = overlapArea > 0
                 ? fraction > bestFraction + 1e-9 ||
                   (Math.Abs(fraction - bestFraction) <= 1e-9 &&
-                   ((containsOrigin && !bestContainsOrigin) || (containsOrigin == bestContainsOrigin && distSq < bestDistSq)))
+                   ((containsCenter && !bestContainsCenter) ||
+                    (containsCenter == bestContainsCenter &&
+                     ((containsOrigin && !bestContainsOrigin) || (containsOrigin == bestContainsOrigin && distSq < bestDistSq)))))
                 : bestFraction <= 0 && distSq < bestDistSq;
 
             if (better)
             {
                 best = screen;
                 bestFraction = fraction;
+                bestContainsCenter = containsCenter;
                 bestContainsOrigin = containsOrigin;
                 bestDistSq = distSq;
             }
         }
 
         return best;
+    }
+
+    private static (int Width, int Height) ScaleSize(double logicalW, double logicalH, double scale)
+    {
+        var clampedDipW = double.IsFinite(logicalW) ? Math.Clamp(logicalW, MinWidth, MaxLogicalWidth) : DefaultWidth;
+        var clampedDipH = double.IsFinite(logicalH) ? Math.Clamp(logicalH, MinHeight, MaxLogicalHeight) : DefaultHeight;
+        return (Math.Max(1, (int)Math.Round(clampedDipW * scale)), Math.Max(1, (int)Math.Round(clampedDipH * scale)));
     }
 
     private static ScreenBounds PickScreenForPoint(int x, int y, IReadOnlyList<ScreenBounds> screens)

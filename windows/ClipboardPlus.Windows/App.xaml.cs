@@ -27,6 +27,7 @@ public partial class App : System.Windows.Application
     private bool exiting;
     private bool repairing;
     private Task? repairTask;
+    private Task pendingSettingsSave = Task.CompletedTask;
     private const string InstanceName = @"Local\clipboardplus.windows.instance.v1";
 
     internal AppSettings Settings { get; private set; } = null!;
@@ -70,6 +71,7 @@ public partial class App : System.Windows.Application
         {
             log = new AppLog(); log.Write("application starting");
             Settings = new AppSettings(log: log.Write);
+            HistoryWindow.ClearDragStaging(HistoryWindow.DragStagingRoot);
             var pairing = LocalStore.LoadOrCreate();
             window = new MainWindow(pairing, log.Write);
             MainWindow = window;
@@ -171,6 +173,7 @@ public partial class App : System.Windows.Application
             // A stopped coordinator copies nothing, so choosing an item would paste stale content.
             historyWindow?.Attach(null);
             historyWindow?.Hide();
+            HistoryWindow.ClearDragStaging(HistoryWindow.DragStagingRoot);
             try
             {
                 if (oldServer is not null) await oldServer.DisposeAsync();
@@ -221,10 +224,20 @@ public partial class App : System.Windows.Application
 
     private void SaveHistoryPlacement(WindowPlacement placement)
     {
-        if (Settings is null) return;
-        Settings.HistoryWindow = placement;
-        try { Settings.Save(); }
-        catch (Exception ex) { log?.Write($"settings save error={ex.GetType().Name}"); }
+        if (Settings is null || !Settings.TrySetHistoryWindow(placement))
+            return;
+        var previous = pendingSettingsSave;
+        pendingSettingsSave = SaveSettingsAfterAsync(previous);
+    }
+
+    private async Task SaveSettingsAfterAsync(Task previous)
+    {
+        try { await previous; } catch { }
+        await Task.Run(() =>
+        {
+            try { Settings?.Save(); }
+            catch (Exception ex) { log?.Write($"settings save error={ex.GetType().Name}"); }
+        });
     }
 
     internal void ApplyHotkeySettings()
@@ -266,6 +279,8 @@ public partial class App : System.Windows.Application
             historyWindow.AllowClose = true;
             historyWindow.Close();
         }
+        HistoryWindow.ClearDragStaging(HistoryWindow.DragStagingRoot);
+        await pendingSettingsSave;
         try
         {
             if (currentServer is not null) await currentServer.DisposeAsync();

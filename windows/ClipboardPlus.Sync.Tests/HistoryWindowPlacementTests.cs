@@ -177,4 +177,32 @@ public sealed class HistoryWindowPlacementTests
         Assert.Equal(HistoryWindowPlacement.HitNone, HistoryWindowPlacement.ComputeResizeHit(-800, -250, left, top, right, bottom, border, border));
         Assert.Equal(HistoryWindowPlacement.HitNone, HistoryWindowPlacement.ComputeResizeHit(-640, -250, left, top, right, bottom, border, border));
     }
+
+    [Fact]
+    public void ResolveSavedUsesSavedScaleAtDifferentDpiMonitorBoundary()
+    {
+        // Window is 360x460 DIP at 200% (720x920 px), placed at x=1660 (260px on Primary100, 460px + center on Right200).
+        var saved = new WindowPlacement(1660, 100, 360, 460, Scale: 2.0);
+        var resolved = HistoryWindowPlacement.ResolveSaved(saved, [Primary100, Right200]);
+
+        Assert.Equal(2.0, resolved.TargetScale);
+        Assert.Equal(1920, resolved.Left);
+        Assert.Equal(720, resolved.Width);
+        Assert.Equal(920, resolved.Height);
+    }
+
+    [Fact]
+    public void AreSameDetectsChangesAndToleratesFloatingPointNoise()
+    {
+        var baseline = new WindowPlacement(100, 200, 360.5, 460.25, 1.5);
+        Assert.False(HistoryWindowPlacement.AreSame(null, baseline));
+        Assert.True(HistoryWindowPlacement.AreSame(baseline, baseline));
+        Assert.True(HistoryWindowPlacement.AreSame(baseline, baseline with { Width = 360.5 + 1e-9 }));
+        Assert.False(HistoryWindowPlacement.AreSame(baseline, baseline with { Left = 101 }));
+        Assert.False(HistoryWindowPlacement.AreSame(baseline, baseline with { Top = 201 }));
+        Assert.False(HistoryWindowPlacement.AreSame(baseline, baseline with { Width = 361 }));
+        Assert.False(HistoryWindowPlacement.AreSame(baseline, baseline with { Height = 461 }));
+        Assert.False(HistoryWindowPlacement.AreSame(baseline, baseline with { Scale = 2.0 }));
+        Assert.False(HistoryWindowPlacement.AreSame(baseline with { Scale = null }, baseline));
+    }
 }

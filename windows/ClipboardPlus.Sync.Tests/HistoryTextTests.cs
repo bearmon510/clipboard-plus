@@ -106,4 +106,54 @@ public sealed class HistoryTextTests
         Assert.DoesNotContain(":", HistoryText.DragFileName(traversal));
         Assert.EndsWith(".pdf", HistoryText.DragFileName(traversal));
     }
+
+    [Fact]
+    public void DragFileNamePreservesExtensionOnLongNamesAndGuardsSuperscriptReservedNames()
+    {
+        var longPdf = Item("file", filename: new string('a', 150) + ".pdf");
+        var draggedPdf = HistoryText.DragFileName(longPdf);
+        Assert.Equal(HistoryText.MaxDragFileNameLength, draggedPdf.Length);
+        Assert.EndsWith(".pdf", draggedPdf);
+
+        var longEmojiPdf = Item("file", filename: new string('a', HistoryText.MaxDragFileNameLength - 5) + "😀😀.pdf");
+        var draggedEmojiPdf = HistoryText.DragFileName(longEmojiPdf);
+        Assert.Equal(new string('a', HistoryText.MaxDragFileNameLength - 5) + ".pdf", draggedEmojiPdf);
+
+        var longImageNoExt = new HistoryItem(Guid.NewGuid(), "image", null, new string('b', 150), null, 0, 0, "PC", new string('a', 64), "public.png");
+        var draggedImage = HistoryText.DragFileName(longImageNoExt);
+        Assert.Equal(HistoryText.MaxDragFileNameLength, draggedImage.Length);
+        Assert.EndsWith(".png", draggedImage);
+
+        foreach (var name in new[] { "COM¹.txt", "com².pdf", "COM³", "LPT¹.log", "lpt².dat", "LPT³", "CON  .txt" })
+        {
+            var dragged = HistoryText.DragFileName(Item("file", filename: name));
+            Assert.StartsWith("_", dragged);
+        }
+
+        var longReserved = HistoryText.DragFileName(Item("file", filename: "CON." + new string('x', 150) + ".pdf"));
+        Assert.StartsWith("_CON.", longReserved);
+        Assert.EndsWith(".pdf", longReserved);
+        Assert.Equal(HistoryText.MaxDragFileNameLength, longReserved.Length);
+    }
+
+    [Fact]
+    public void LinkRemainderIsCappedWithoutSplittingSurrogatePairs()
+    {
+        var longUrl = "https://example.com/" + new string('a', 300);
+        Assert.Equal(HistoryDisplayFlavor.Link, HistoryText.DetectFlavor(Item("text", longUrl), out var link, out _));
+        Assert.NotNull(link);
+        Assert.NotNull(link!.Value.Remainder);
+        Assert.Equal(HistoryText.MaxLinkRemainderLength + 1, link.Value.Remainder!.Length);
+        Assert.EndsWith("…", link.Value.Remainder);
+
+        var unicodeUrl = "https://example.com/" + new string('a', HistoryText.MaxLinkRemainderLength - 2) + "😀😀";
+        Assert.Equal(HistoryDisplayFlavor.Link, HistoryText.DetectFlavor(Item("text", unicodeUrl), out var unicodeLink, out _));
+        Assert.NotNull(unicodeLink!.Value.Remainder);
+        Assert.True(unicodeLink.Value.Remainder!.Length <= HistoryText.MaxLinkRemainderLength + 1);
+        Assert.EndsWith("…", unicodeLink.Value.Remainder);
+        Assert.DoesNotContain(unicodeLink.Value.Remainder, char.IsSurrogate);
+
+        var prefix = "/" + new string('a', HistoryText.MaxLinkRemainderLength - 2);
+        Assert.Equal(prefix + "…", HistoryText.TruncateWithEllipsis(prefix + "😀😀", HistoryText.MaxLinkRemainderLength));
+    }
 }

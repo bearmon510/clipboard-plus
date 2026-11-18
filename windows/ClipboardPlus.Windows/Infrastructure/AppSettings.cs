@@ -18,6 +18,8 @@ internal sealed class AppSettings
         public int? Top { get; set; }
         public double? Width { get; set; }
         public double? Height { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public double? Scale { get; set; }
     }
 
     private sealed class SettingsData
@@ -33,11 +35,16 @@ internal sealed class AppSettings
     private readonly string filePath;
     private readonly Action<string>? log;
     private readonly object gate = new();
+    private WindowPlacement? historyWindow;
 
     public bool HotkeyEnabled { get; set; } = true;
     public string Hotkey { get; set; } = HotkeyChord.Default.ToString();
     public bool PasteOnSelect { get; set; } = true;
-    public WindowPlacement? HistoryWindow { get; set; }
+    public WindowPlacement? HistoryWindow
+    {
+        get { lock (gate) return historyWindow; }
+        set { lock (gate) historyWindow = value; }
+    }
 
     public HotkeyChord ParsedHotkey => HotkeyChord.TryParse(Hotkey, out var chord) ? chord : HotkeyChord.Default;
 
@@ -88,11 +95,11 @@ internal sealed class AppSettings
 
                 if (data.HistoryWindow is { } bounds)
                 {
-                    if (HistoryWindowPlacement.TryNormalize(bounds.Left, bounds.Top, bounds.Width, bounds.Height, out var placement))
-                        HistoryWindow = placement;
+                    if (HistoryWindowPlacement.TryNormalize(bounds.Left, bounds.Top, bounds.Width, bounds.Height, bounds.Scale, out var placement))
+                        historyWindow = placement;
                     else
                     {
-                        HistoryWindow = null;
+                        historyWindow = null;
                         log?.Invoke("settings invalid history window");
                     }
                 }
@@ -105,6 +112,20 @@ internal sealed class AppSettings
         }
     }
 
+    public bool TrySetHistoryWindow(WindowPlacement placement)
+    {
+        if (!HistoryWindowPlacement.TryNormalize(placement.Left, placement.Top, placement.Width, placement.Height, placement.Scale, out var normalized))
+            return false;
+
+        lock (gate)
+        {
+            if (HistoryWindowPlacement.AreSame(historyWindow, normalized))
+                return false;
+            historyWindow = normalized;
+            return true;
+        }
+    }
+
     public void Save()
     {
         lock (gate)
@@ -113,21 +134,22 @@ internal sealed class AppSettings
             Hotkey = chord.ToString();
 
             WindowBoundsData? historyBounds = null;
-            if (HistoryWindow is { } current &&
-                HistoryWindowPlacement.TryNormalize(current.Left, current.Top, current.Width, current.Height, out var normalized))
+            if (historyWindow is { } current &&
+                HistoryWindowPlacement.TryNormalize(current.Left, current.Top, current.Width, current.Height, current.Scale, out var normalized))
             {
-                HistoryWindow = normalized;
+                historyWindow = normalized;
                 historyBounds = new WindowBoundsData
                 {
                     Left = normalized.Left,
                     Top = normalized.Top,
                     Width = normalized.Width,
                     Height = normalized.Height,
+                    Scale = normalized.Scale,
                 };
             }
             else
             {
-                HistoryWindow = null;
+                historyWindow = null;
             }
 
             var data = new SettingsData
@@ -163,6 +185,6 @@ internal sealed class AppSettings
         HotkeyEnabled = true;
         Hotkey = HotkeyChord.Default.ToString();
         PasteOnSelect = true;
-        HistoryWindow = null;
+        historyWindow = null;
     }
 }

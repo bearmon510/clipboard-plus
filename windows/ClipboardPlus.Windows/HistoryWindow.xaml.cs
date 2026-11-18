@@ -96,8 +96,6 @@ public sealed class HistoryRow
 public partial class HistoryWindow : Window, IHistoryPresenter
 {
     private const double ResizeBorderDip = 5;
-    private const int EscHotKeyId = 0x4350;
-    private static readonly TimeSpan DragStagingRetention = TimeSpan.FromHours(1);
 
     private readonly Action<string> log;
     private readonly Func<bool> pasteOnSelect;
@@ -106,11 +104,13 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private readonly Func<WindowPlacement?>? loadPlacement;
     private readonly Action<WindowPlacement>? savePlacement;
     private readonly ObservableCollection<HistoryRow> rows = [];
+    private readonly PasteTargetTracker pasteTarget = new();
 
     private SyncCoordinator? coordinator;
-    private HistoryInvocation? invocation;
     private CancellationTokenSource? pasteCancel;
     private HwndSource? hwndSource;
+    private WinEventDelegate? foregroundHookProc;
+    private nint foregroundHook;
     private int reloadVersion;
     private int? preferredIndex;
     private bool choosing;
@@ -118,7 +118,6 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private bool dragging;
     private bool pendingReloadAfterDrag;
     private bool placedForDisplay;
-    private bool escHotKeyRegistered;
     private Point? dragStartPoint;
     private HistoryRow? dragCandidate;
     private HistoryRow? pendingClickRow;
@@ -150,7 +149,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     /// <summary>Set when the app exits. Until then, closing (Alt+F4) only hides the reused window.</summary>
     public bool AllowClose { get; set; }
 
-    private static string DragStagingRoot => Path.Combine(LocalStore.Root, "drag");
+    internal static string DragStagingRoot => Path.Combine(LocalStore.Root, "drag");
 
     /// <summary>Follows the coordinator, which re-pairing replaces. Null while there is none.</summary>
     public void Attach(SyncCoordinator? next)
@@ -163,36 +162,42 @@ public partial class HistoryWindow : Window, IHistoryPresenter
 
     public void Present(HistoryInvocation value)
     {
+        if (dragging) return;
         // A paste still waiting for keys to be released belongs to the previous opening.
         pasteCancel?.Cancel();
         // The hotkey a second time closes the window, as Win+V does.
         if (IsVisible) { Hide(); return; }
 
-        invocation = value;
+        pasteTarget.Reset(value.PreviousWindow);
         ApplyTheme();
         SearchBox.Text = "";
-        CleanupOldDragStagingFiles(DragStagingRoot);
 
         var hwnd = new WindowInteropHelper(this).EnsureHandle();
         var target = ComputeTargetRect(hwnd, value);
-        ApplyPixelBounds(hwnd, target);
-        placedForDisplay = true;
 
-        Show();
-        ApplyPixelBounds(hwnd, target);
-        SetWindowPos(hwnd, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
-
-        var tookForeground = ForegroundContext.BringToFront(hwnd, () => _ = Activate());
-        if (tookForeground)
+        // Clear MinWidth/MinHeight across positioning and Show() so old-DPI limits never force cross-monitor overflow.
+        MinWidth = 0;
+        MinHeight = 0;
+        try
         {
-            UnregisterEscFallbackHotkey(hwnd);
+            ApplyPixelBounds(hwnd, target);
+            placedForDisplay = true;
+
+            Show();
+            ApplyPixelBounds(hwnd, target);
+            SetWindowPos(hwnd, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
         }
-        else
+        finally
         {
+            var actualScale = GetWindowScale(hwnd);
+            MinWidth = Math.Min(HistoryWindowPlacement.MinWidth, target.Width / actualScale);
+            MinHeight = Math.Min(HistoryWindowPlacement.MinHeight, target.Height / actualScale);
+        }
+
+        if (!ForegroundContext.BringToFront(hwnd, () => _ = Activate()))
             log("history window could not take the foreground");
-            RegisterEscFallbackHotkey(hwnd);
-        }
 
+        StartForegroundTracking();
         SearchBox.Focus();
         Keyboard.Focus(SearchBox);
         _ = ReloadAsync();
@@ -201,9 +206,18 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     // HistoryChanged fires while the coordinator holds its lock, so the reload is posted.
     private void OnHistoryChanged() => Dispatcher.BeginInvoke(() =>
     {
-        if (!IsVisible) return;
-        if (dragging) { pendingReloadAfterDrag = true; return; }
-        _ = ReloadAsync();
+        if (dragging)
+        {
+            pendingReloadAfterDrag = true;
+            return;
+        }
+        if (IsVisible)
+        {
+            _ = ReloadAsync();
+            return;
+        }
+        if (HasDragStagingEntries(DragStagingRoot))
+            _ = PruneDragStagingAsync();
     });
 
     private async Task ReloadAsync()
@@ -218,6 +232,17 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             catch (Exception ex) { log($"history load error={ex.GetType().Name}"); return; }
         }
         if (version != reloadVersion) return; // A newer search or change already reloaded.
+
+        if (!dragging && HasDragStagingEntries(DragStagingRoot))
+        {
+            if (search.Length == 0)
+                PruneDragStaging(DragStagingRoot, items);
+            else if (current is not null)
+                _ = PruneDragStagingAsync();
+        }
+
+        if (!IsVisible) return;
+
         var selected = Selected?.Item.Id;
         var now = DateTimeOffset.Now;
         rows.Clear();
@@ -229,6 +254,22 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         preferredIndex = null;
         HistoryList.SelectedIndex = index >= 0 ? index : (rows.Count > 0 ? 0 : -1);
         if (HistoryList.SelectedItem is not null) HistoryList.ScrollIntoView(HistoryList.SelectedItem);
+    }
+
+    private async Task PruneDragStagingAsync()
+    {
+        var current = coordinator;
+        if (current is null || dragging || !HasDragStagingEntries(DragStagingRoot)) return;
+        try
+        {
+            var allItems = await current.GetHistoryAsync(null);
+            if (!dragging)
+                PruneDragStaging(DragStagingRoot, allItems);
+        }
+        catch (Exception ex)
+        {
+            log($"history drag cleanup error={ex.GetType().Name}");
+        }
     }
 
     private void UpdateEmptyState(string search)
@@ -271,9 +312,9 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         try
         {
             await current.CopyHistoryAsync(row.Item.Id);
-            target = invocation?.PreviousWindow ?? 0;
-            // Opened from clipboard+'s own window or tray, there is nothing to paste into.
-            pasteAfter = pasteAfter && target != 0 && IsWindow(target) && !IsOwnWindow(target);
+            target = pasteTarget.CurrentTarget;
+            // Opened from clipboard+'s own window or tray with no other window visited, there is nothing to paste into.
+            pasteAfter = pasteAfter && target != 0 && ForegroundContext.IsWindowHandle(target) && !ForegroundContext.IsOwnProcessWindow(target);
             // While this window still holds the foreground, hand it back; once hidden, Windows may refuse.
             if (pasteAfter) SetForegroundWindow(target);
             Hide();
@@ -300,12 +341,6 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             if (pasteCancel == cancel) pasteCancel = null;
             cancel.Dispose();
         }
-    }
-
-    private static bool IsOwnWindow(nint window)
-    {
-        GetWindowThreadProcessId(window, out var processId);
-        return processId == (uint)Environment.ProcessId;
     }
 
     private async Task DeleteAsync(HistoryRow? row)
@@ -413,6 +448,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
 
     private void StartDrag(HistoryRow row)
     {
+        if (dragging) return;
         var data = BuildDragDataObject(row.Item, DragStagingRoot, log);
         if (data is null) return;
 
@@ -435,13 +471,15 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         {
             pendingReloadAfterDrag = false;
             if (IsVisible) _ = ReloadAsync();
+            else if (HasDragStagingEntries(DragStagingRoot)) _ = PruneDragStagingAsync();
         }
-
-        if (IsVisible && !IsActive && !choosing && HistoryList.ContextMenu?.IsOpen != true)
-            Hide();
     }
 
-    internal static DataObject? BuildDragDataObject(HistoryItem item, string stagingRoot, Action<string> log)
+    internal static DataObject? BuildDragDataObject(
+        HistoryItem item,
+        string stagingRoot,
+        Action<string> log,
+        Func<string, string, bool>? tryHardLink = null)
     {
         try
         {
@@ -455,22 +493,39 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             if (string.IsNullOrEmpty(item.Path) || !File.Exists(item.Path))
                 return null;
 
+            var folderKey = StagingFolderKey(item);
+            var fileName = HistoryText.DragFileName(item);
+
             if (item.Kind == "image")
             {
-                var staged = StageBodyFile(item.Path, stagingRoot, HistoryText.DragFileName(item));
+                BitmapFrame bitmap;
+                MemoryStream pngStream;
+                using (var stream = new FileStream(item.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    bitmap = ClipboardMonitor.LoadClipboardImage(stream, item.Type);
+                    if (item.Type == "public.png")
+                    {
+                        stream.Position = 0;
+                        pngStream = new MemoryStream(checked((int)stream.Length));
+                        stream.CopyTo(pngStream);
+                        pngStream.Position = 0;
+                    }
+                    else
+                    {
+                        pngStream = ClipboardMonitor.EncodeClipboardPng(bitmap);
+                    }
+                }
+
+                var staged = StageBodyFile(item.Path, stagingRoot, folderKey, fileName, tryHardLink);
                 if (staged is not null)
                     data.SetFileDropList(new StringCollection { staged });
 
-                using (var stream = new FileStream(item.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                {
-                    var bitmap = ClipboardMonitor.LoadClipboardImage(stream, item.Type);
-                    data.SetData(System.Windows.DataFormats.Bitmap, bitmap);
-                    data.SetData("PNG", ClipboardMonitor.EncodeClipboardPng(bitmap));
-                }
+                data.SetData(System.Windows.DataFormats.Bitmap, bitmap);
+                data.SetData("PNG", pngStream);
                 return data;
             }
 
-            var stagedFile = StageBodyFile(item.Path, stagingRoot, HistoryText.DragFileName(item));
+            var stagedFile = StageBodyFile(item.Path, stagingRoot, folderKey, fileName, tryHardLink);
             if (stagedFile is null) return null;
             data.SetFileDropList(new StringCollection { stagedFile });
             return data;
@@ -482,30 +537,96 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         }
     }
 
-    private static string? StageBodyFile(string sourcePath, string stagingRoot, string fileName)
+    internal static string StagingFolderKey(HistoryItem item)
     {
-        var folder = Path.Combine(stagingRoot, Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(folder);
-        var destination = Path.Combine(folder, fileName);
-        using var input = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-        input.CopyTo(output);
-        return destination;
+        if (!string.IsNullOrEmpty(item.Hash) && item.Hash.All(char.IsAsciiHexDigit))
+            return item.Hash.ToLowerInvariant();
+        return item.Id.ToString("N");
     }
 
-    private static void CleanupOldDragStagingFiles(string stagingRoot)
+    private static string? StageBodyFile(
+        string sourcePath,
+        string stagingRoot,
+        string folderKey,
+        string fileName,
+        Func<string, string, bool>? tryHardLink)
+    {
+        var sourceLength = new FileInfo(sourcePath).Length;
+        var folder = Path.Combine(stagingRoot, folderKey);
+        Directory.CreateDirectory(folder);
+        var destination = Path.Combine(folder, fileName);
+
+        if (File.Exists(destination))
+        {
+            try
+            {
+                if (new FileInfo(destination).Length == sourceLength)
+                    return destination;
+                File.Delete(destination);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+
+        tryHardLink ??= static (linkPath, existingPath) => CreateHardLink(linkPath, existingPath, 0);
+        if (tryHardLink(destination, sourcePath))
+            return destination;
+
+        var tempPath = Path.Combine(folder, Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            using (var input = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                input.CopyTo(output);
+            }
+            File.Move(tempPath, destination, overwrite: true);
+            return destination;
+        }
+        catch
+        {
+            try { File.Delete(tempPath); } catch { }
+            throw;
+        }
+    }
+
+    internal static bool HasDragStagingEntries(string stagingRoot)
+    {
+        try { return Directory.Exists(stagingRoot) && Directory.EnumerateFileSystemEntries(stagingRoot).Any(); }
+        catch (Exception) { return false; }
+    }
+
+    internal static void ClearDragStaging(string stagingRoot)
+    {
+        try
+        {
+            if (Directory.Exists(stagingRoot))
+                Directory.Delete(stagingRoot, recursive: true);
+        }
+        catch (Exception) { }
+    }
+
+    internal static void PruneDragStaging(string stagingRoot, IReadOnlyList<HistoryItem> items)
     {
         try
         {
             if (!Directory.Exists(stagingRoot)) return;
-            var cutoff = DateTime.UtcNow - DragStagingRetention;
+            var keep = items
+                .Where(i => i.Kind != "text")
+                .Select(StagingFolderKey)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             foreach (var dir in Directory.EnumerateDirectories(stagingRoot))
             {
-                try
-                {
-                    if (Directory.GetCreationTimeUtc(dir) < cutoff)
-                        Directory.Delete(dir, recursive: true);
-                }
+                var name = Path.GetFileName(dir);
+                if (keep.Contains(name)) continue;
+                try { Directory.Delete(dir, recursive: true); }
+                catch (Exception) { }
+            }
+            foreach (var file in Directory.EnumerateFiles(stagingRoot))
+            {
+                try { File.Delete(file); }
                 catch (Exception) { }
             }
         }
@@ -550,23 +671,29 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         e.Handled = true;
     }
 
-    private void OnContextMenuClosed(object sender, RoutedEventArgs e)
+    private HistoryRow? RowAt(object source)
     {
-        // Closing the menu by clicking another app leaves this window inactive without a new Deactivated.
-        if (IsVisible && !IsActive && !choosing && !dragging) Hide();
-    }
-
-    private HistoryRow? RowAt(object source) =>
-        source is DependencyObject element && ItemsControl.ContainerFromElement(HistoryList, element) is ListBoxItem item
+        var current = source as DependencyObject;
+        while (current is ContentElement content)
+            current = ContentOperations.GetParent(content) ?? LogicalTreeHelper.GetParent(content);
+        return current is not null && ItemsControl.ContainerFromElement(HistoryList, current) is ListBoxItem item
             ? item.DataContext as HistoryRow
             : null;
+    }
 
-    private static bool IsInsideButton(DependencyObject? source)
+    internal static bool IsInsideButton(DependencyObject? source)
     {
         while (source is not null)
         {
             if (source is ButtonBase) return true;
-            source = VisualTreeHelper.GetParent(source) ?? LogicalTreeHelper.GetParent(source);
+            source = source switch
+            {
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    VisualTreeHelper.GetParent(source) ?? LogicalTreeHelper.GetParent(source),
+                ContentElement content =>
+                    ContentOperations.GetParent(content) ?? LogicalTreeHelper.GetParent(content),
+                _ => LogicalTreeHelper.GetParent(source),
+            };
         }
         return false;
     }
@@ -581,26 +708,25 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         openSettings();
     }
 
-    private void OnActivated(object? sender, EventArgs e)
-    {
-        var hwnd = new WindowInteropHelper(this).Handle;
-        UnregisterEscFallbackHotkey(hwnd);
-        SearchBox.Focus();
-    }
+    private void OnActivated(object? sender, EventArgs e) => SearchBox.Focus();
 
     private void OnDeactivated(object? sender, EventArgs e)
     {
-        // The context menu is a separate popup and drag-and-drop runs a modal loop; neither should close the window.
-        if (HistoryList.ContextMenu?.IsOpen == true || choosing || dragging) return;
-        Hide();
+        if (!IsVisible) return;
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () =>
+        {
+            if (IsVisible)
+                pasteTarget.RecordForeground(ForegroundContext.CurrentForegroundWindow());
+        });
     }
 
     private void OnWindowVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
     {
         if (IsVisible) return;
+        reloadVersion++;
         SaveCurrentPlacement();
-        var hwnd = new WindowInteropHelper(this).Handle;
-        UnregisterEscFallbackHotkey(hwnd);
+        StopForegroundTracking();
+        pasteTarget.Reset();
         ResetDragState();
         // Hidden rows keep decoded thumbnails alive, so they go with the window.
         rows.Clear();
@@ -615,26 +741,26 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             return;
         }
         if (IsVisible) SaveCurrentPlacement();
-        UnregisterEscFallbackHotkey(new WindowInteropHelper(this).Handle);
+        StopForegroundTracking();
     }
 
     private void OnWindowClosed(object? sender, EventArgs e)
     {
+        StopForegroundTracking();
         if (hwndSource is not null)
         {
             hwndSource.RemoveHook(WindowProc);
             hwndSource = null;
         }
-        UnregisterEscFallbackHotkey(new WindowInteropHelper(this).Handle);
     }
 
     private void OnSourceInitialized(object? sender, EventArgs e)
     {
         var hwnd = new WindowInteropHelper(this).Handle;
-        RoundCorners(hwnd);
-        DisableMaximizeAndMinimizeButtons(hwnd);
         hwndSource = HwndSource.FromHwnd(hwnd);
         hwndSource?.AddHook(WindowProc);
+        RoundCorners(hwnd);
+        DisableMaximizeAndMinimizeButtons(hwnd);
     }
 
     private nint WindowProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
@@ -656,32 +782,52 @@ public partial class HistoryWindow : Window, IHistoryPresenter
                     return hit;
                 }
                 break;
-            case WmHotKey when (int)wParam == EscHotKeyId:
-                handled = true;
-                Hide();
-                return 0;
         }
         return 0;
     }
 
-    private void RegisterEscFallbackHotkey(nint hwnd)
+    private void StartForegroundTracking()
     {
-        if (hwnd == 0 || escHotKeyRegistered) return;
-        escHotKeyRegistered = RegisterHotKey(hwnd, EscHotKeyId, 0, VirtualKeyEscape);
+        if (foregroundHook != 0) return;
+        foregroundHookProc ??= OnForegroundWinEvent;
+        foregroundHook = SetWinEventHook(
+            EventSystemForeground,
+            EventSystemForeground,
+            0,
+            foregroundHookProc,
+            0,
+            0,
+            WinEventOutOfContext | WinEventSkipOwnProcess);
+        if (foregroundHook == 0)
+            log("foreground hook install failed");
     }
 
-    private void UnregisterEscFallbackHotkey(nint hwnd)
+    private void StopForegroundTracking()
     {
-        if (!escHotKeyRegistered || hwnd == 0) return;
-        UnregisterHotKey(hwnd, EscHotKeyId);
-        escHotKeyRegistered = false;
+        if (foregroundHook == 0) return;
+        UnhookWinEvent(foregroundHook);
+        foregroundHook = 0;
+    }
+
+    private void OnForegroundWinEvent(
+        nint hWinEventHook,
+        uint eventType,
+        nint hwnd,
+        int idObject,
+        int idChild,
+        uint idEventThread,
+        uint dwmsEventTime)
+    {
+        if (!IsVisible || eventType != EventSystemForeground || idObject != 0 || idChild != 0)
+            return;
+        pasteTarget.RecordForeground(hwnd);
     }
 
     private WindowPixelRect ComputeTargetRect(nint hwnd, HistoryInvocation value)
     {
         var screens = GetScreens(hwnd);
         if (loadPlacement?.Invoke() is { } saved &&
-            HistoryWindowPlacement.TryNormalize(saved.Left, saved.Top, saved.Width, saved.Height, out var validSaved))
+            HistoryWindowPlacement.TryNormalize(saved.Left, saved.Top, saved.Width, saved.Height, saved.Scale, out var validSaved))
         {
             return HistoryWindowPlacement.ResolveSaved(validSaved, screens);
         }
@@ -723,11 +869,11 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private WindowPlacement? ReadCurrentPlacement()
     {
         var hwnd = new WindowInteropHelper(this).Handle;
-        if (hwnd == 0 || !GetWindowRect(hwnd, out var rect)) return null;
+        if (hwnd == 0 || IsIconic(hwnd) || !GetWindowRect(hwnd, out var rect)) return null;
         var scale = GetWindowScale(hwnd);
         var widthDip = (rect.right - rect.left) / scale;
         var heightDip = (rect.bottom - rect.top) / scale;
-        return HistoryWindowPlacement.Normalize(rect.left, rect.top, widthDip, heightDip);
+        return HistoryWindowPlacement.Normalize(rect.left, rect.top, widthDip, heightDip, scale);
     }
 
     private IReadOnlyList<ScreenBounds> GetScreens(nint hwnd)
@@ -842,10 +988,8 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         var style = GetWindowStyle(hwnd);
         var updated = style & ~(nint)(WsMaximizeBox | WsMinimizeBox);
         if (updated != style)
-        {
             SetWindowStyle(hwnd, updated);
-            SetWindowPos(hwnd, 0, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
-        }
+        SetWindowPos(hwnd, 0, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
     }
 
     private static nint GetWindowStyle(nint hwnd) =>
@@ -855,7 +999,6 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         Environment.Is64BitProcess ? SetWindowLongPtr64(hwnd, GwlStyle, value) : SetWindowLong32(hwnd, GwlStyle, value);
 
     private const int VirtualKeyControl = 0x11;
-    private const uint VirtualKeyEscape = 0x1B;
     private const int DwmWindowCornerPreference = 33;
     private const int DwmRound = 2;
     private const int GwlStyle = -16;
@@ -863,7 +1006,6 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private const uint WsMinimizeBox = 0x00020000;
     private const int WmNcCalcSize = 0x0083;
     private const int WmNcHitTest = 0x0084;
-    private const int WmHotKey = 0x0312;
     private const uint SwpNoSize = 0x0001;
     private const uint SwpNoMove = 0x0002;
     private const uint SwpNoZOrder = 0x0004;
@@ -873,6 +1015,18 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private const uint MonitorDefaultToNearest = 2;
     private const int MdtEffectiveDpi = 0;
     private const int DpiAwarenessPerMonitorAware = 2;
+    private const uint EventSystemForeground = 0x0003;
+    private const uint WinEventOutOfContext = 0x0000;
+    private const uint WinEventSkipOwnProcess = 0x0002;
+
+    private delegate void WinEventDelegate(
+        nint hWinEventHook,
+        uint eventType,
+        nint hwnd,
+        int idObject,
+        int idChild,
+        uint idEventThread,
+        uint dwmsEventTime);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT
@@ -891,13 +1045,12 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     }
 
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetForegroundWindow(nint hwnd);
-    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindow(nint hwnd);
-    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out uint processId);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetWindowRect(nint hwnd, out RECT rect);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsIconic(nint hwnd);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetWindowPos(nint hwnd, nint hwndInsertAfter, int x, int y, int cx, int cy, uint flags);
-    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool RegisterHotKey(nint hwnd, int id, uint fsModifiers, uint vk);
-    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UnregisterHotKey(nint hwnd, int id);
+    [DllImport("user32.dll")] private static extern nint SetWinEventHook(uint eventMin, uint eventMax, nint hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UnhookWinEvent(nint hWinEventHook);
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(nint hwnd);
     [DllImport("user32.dll")] private static extern nint GetThreadDpiAwarenessContext();
     [DllImport("user32.dll")] private static extern int GetAwarenessFromDpiAwarenessContext(nint value);
@@ -908,4 +1061,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     [DllImport("user32.dll", EntryPoint = "SetWindowLong")] private static extern nint SetWindowLong32(nint hwnd, int index, nint value);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")] private static extern nint SetWindowLongPtr64(nint hwnd, int index, nint value);
     [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, nint lpSecurityAttributes);
 }

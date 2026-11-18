@@ -55,6 +55,17 @@ public static class ForegroundContext
         () => Environment.TickCount64,
         static (ms, ct) => Task.Delay(ms, ct));
 
+    internal static nint CurrentForegroundWindow() => GetForegroundWindow();
+
+    internal static bool IsWindowHandle(nint hwnd) => hwnd != 0 && IsWindow(hwnd);
+
+    internal static bool IsOwnProcessWindow(nint hwnd)
+    {
+        if (hwnd == 0) return false;
+        GetWindowThreadProcessId(hwnd, out var processId);
+        return processId == (uint)Environment.ProcessId;
+    }
+
     internal sealed record ActivateOperations(
         Func<nint, bool> IsWindow,
         Func<nint> GetForegroundWindow,
@@ -65,9 +76,7 @@ public static class ForegroundContext
         Func<nint, uint> GetWindowThreadProcessId,
         Func<uint> GetCurrentThreadId,
         Func<uint, uint, bool, bool> AttachThreadInput,
-        Func<bool> IsAltDown,
-        Func<bool> SendAltDown,
-        Func<bool, bool> SendAltUp,
+        Func<bool> SendUnassignedKeyTap,
         Action ActivateManaged);
 
     private static ActivateOperations CreateDefaultActivateOperations(Action activateManaged) => new(
@@ -80,9 +89,7 @@ public static class ForegroundContext
         hwnd => GetWindowThreadProcessId(hwnd, out _),
         GetCurrentThreadId,
         AttachThreadInput,
-        NativeInput.IsAltDown,
-        NativeInput.SendAltDown,
-        NativeInput.SendAltUp,
+        NativeInput.SendMenuMask,
         activateManaged);
 
     public static bool BringToFront(nint hwnd, Action activateManaged) =>
@@ -128,18 +135,12 @@ public static class ForegroundContext
             return true;
         }
 
-        if (!ops.IsAltDown() && ops.SendAltDown())
+        // Tap unassigned VK 0xE8 (no extended flag) so Windows treats us as the last-input process for SetForegroundWindow.
+        if (ops.SendUnassignedKeyTap())
         {
-            try
-            {
-                ops.SetForegroundWindow(hwnd);
-                ops.BringWindowToTop(hwnd);
-                ops.SetActiveWindow(hwnd);
-            }
-            finally
-            {
-                ops.SendAltUp(ops.GetForegroundWindow() != hwnd);
-            }
+            ops.SetForegroundWindow(hwnd);
+            ops.BringWindowToTop(hwnd);
+            ops.SetActiveWindow(hwnd);
         }
 
         ops.ActivateManaged();
@@ -248,15 +249,41 @@ public static class ForegroundContext
     private static extern uint GetCurrentThreadId();
 }
 
+/// <summary>Tracks the most recent foreground window outside this process while the history window is open.</summary>
+internal sealed class PasteTargetTracker(Func<nint, bool> isWindow, Func<nint, bool> isOwnWindow)
+{
+    private nint target;
+
+    public PasteTargetTracker()
+        : this(ForegroundContext.IsWindowHandle, ForegroundContext.IsOwnProcessWindow)
+    {
+    }
+
+    public nint CurrentTarget => IsValidTarget(target) ? target : 0;
+
+    public void Reset(nint initialWindow = 0)
+    {
+        target = IsValidTarget(initialWindow) ? initialWindow : 0;
+    }
+
+    public bool RecordForeground(nint hwnd)
+    {
+        if (!IsValidTarget(hwnd)) return false;
+        target = hwnd;
+        return true;
+    }
+
+    private bool IsValidTarget(nint hwnd) =>
+        hwnd != 0 && isWindow(hwnd) && !isOwnWindow(hwnd);
+}
+
 internal static class NativeInput
 {
     private const uint InputKeyboard = 1;
-    private const uint KeyEventExtendedKey = 0x0001;
     private const uint KeyEventKeyUp = 0x0002;
     private const ushort VkControl = 0x11;
-    private const ushort VkMenu = 0x12;
     private const ushort VkV = 0x56;
-    private const ushort VkMenuMask = 0xE8;
+    internal const ushort VkMenuMask = 0xE8;
 
     private static readonly int[] ModifierVirtualKeys =
     [
@@ -269,8 +296,6 @@ internal static class NativeInput
 
     public static bool IsKeyDown(int virtualKey) => (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
 
-    public static bool IsAltDown() => IsKeyDown(VkMenu) || IsKeyDown(0xA4) || IsKeyDown(0xA5);
-
     public static bool IsAnyModifierDown()
     {
         foreach (var vk in ModifierVirtualKeys)
@@ -280,33 +305,15 @@ internal static class NativeInput
         return false;
     }
 
+    internal static INPUT[] CreateMenuMaskInputs() =>
+    [
+        KeyboardInput(VkMenuMask, 0, keyUp: false),
+        KeyboardInput(VkMenuMask, 0, keyUp: true),
+    ];
+
     public static bool SendMenuMask()
     {
-        INPUT[] inputs =
-        [
-            KeyboardInput(VkMenuMask, 0, keyUp: false),
-            KeyboardInput(VkMenuMask, 0, keyUp: true),
-        ];
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
-    }
-
-    public static bool SendAltDown()
-    {
-        var scan = (ushort)MapVirtualKey(VkMenu, 0);
-        INPUT[] inputs = [KeyboardInputWithFlags(VkMenu, scan, KeyEventExtendedKey)];
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
-    }
-
-    public static bool SendAltUp(bool includeMenuMask)
-    {
-        var scan = (ushort)MapVirtualKey(VkMenu, 0);
-        INPUT[] inputs = includeMenuMask
-            ? [
-                KeyboardInputWithFlags(VkMenuMask, 0, 0),
-                KeyboardInputWithFlags(VkMenuMask, 0, KeyEventKeyUp),
-                KeyboardInputWithFlags(VkMenu, scan, KeyEventExtendedKey | KeyEventKeyUp),
-              ]
-            : [KeyboardInputWithFlags(VkMenu, scan, KeyEventExtendedKey | KeyEventKeyUp)];
+        var inputs = CreateMenuMaskInputs();
         return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
     }
 
@@ -324,10 +331,7 @@ internal static class NativeInput
         return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
     }
 
-    private static INPUT KeyboardInput(ushort vk, ushort scan, bool keyUp) =>
-        KeyboardInputWithFlags(vk, scan, keyUp ? KeyEventKeyUp : 0);
-
-    private static INPUT KeyboardInputWithFlags(ushort vk, ushort scan, uint flags) => new()
+    private static INPUT KeyboardInput(ushort vk, ushort scan, bool keyUp) => new()
     {
         type = InputKeyboard,
         U = new InputUnion
@@ -336,7 +340,7 @@ internal static class NativeInput
             {
                 wVk = vk,
                 wScan = scan,
-                dwFlags = flags,
+                dwFlags = keyUp ? KeyEventKeyUp : 0,
                 dwExtraInfo = SelfExtraInfo,
             },
         },

@@ -1,5 +1,7 @@
 using System.IO;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using ClipboardPlus.Windows.Core;
@@ -174,6 +176,125 @@ public sealed class HistoryWindowDragTests : IDisposable
             var brokenImageRow = new HistoryRow(new HistoryItem(Guid.NewGuid(), "image", null, null, Path.Combine(tempDir, "missing"), 10, now.ToUnixTimeMilliseconds(), "iPad", new string('3', 64), "public.png"), now);
             Assert.Equal(Visibility.Collapsed, brokenImageRow.ThumbnailVisibility);
             Assert.Equal(Visibility.Visible, brokenImageRow.ImageFallbackVisibility);
+        });
+    }
+
+    [Fact]
+    public void BuildDragDataObjectPassesRawPngBytesWithoutReencodingForPngItems()
+    {
+        Directory.CreateDirectory(tempDir);
+        var bodyPath = Path.Combine(tempDir, new string('f', 64));
+        var pngBytes = MakePng(4, 3);
+        File.WriteAllBytes(bodyPath, pngBytes);
+        var stagingRoot = Path.Combine(tempDir, "drag");
+
+        RunSta(() =>
+        {
+            var logs = new List<string>();
+            var item = new HistoryItem(Guid.NewGuid(), "image", null, "raw.png", bodyPath, pngBytes.Length, 100, "PC", new string('f', 64), "public.png");
+
+            var data = HistoryWindow.BuildDragDataObject(item, stagingRoot, logs.Add);
+
+            Assert.NotNull(data);
+            var pngData = Assert.IsAssignableFrom<Stream>(data!.GetData("PNG"));
+            using var copy = new MemoryStream();
+            pngData.CopyTo(copy);
+            Assert.Equal(pngBytes, copy.ToArray());
+            Assert.Empty(logs);
+        });
+    }
+
+    [Fact]
+    public void BuildDragDataObjectReusesStagedFileByHashAndFallsBackToCopyWhenHardLinkFails()
+    {
+        Directory.CreateDirectory(tempDir);
+        var hash = new string('1', 64);
+        var bodyPath = Path.Combine(tempDir, hash);
+        var payload = "hardlink and reuse payload"u8.ToArray();
+        File.WriteAllBytes(bodyPath, payload);
+        var stagingRoot = Path.Combine(tempDir, "drag");
+
+        RunSta(() =>
+        {
+            var logs = new List<string>();
+            var item = new HistoryItem(Guid.NewGuid(), "file", null, "memo.txt", bodyPath, payload.Length, 100, "PC", hash, "public.data");
+
+            // First call uses default CreateHardLink on the same volume.
+            var first = HistoryWindow.BuildDragDataObject(item, stagingRoot, logs.Add);
+            Assert.NotNull(first);
+            var firstPath = Assert.Single(first!.GetFileDropList().Cast<string>());
+            Assert.Contains(hash, firstPath);
+            Assert.Equal(payload, File.ReadAllBytes(firstPath));
+
+            // Second call for the same hash reuses the existing staged file without linking or copying again.
+            var linkAttempts = 0;
+            var second = HistoryWindow.BuildDragDataObject(item, stagingRoot, logs.Add, (_, _) => { linkAttempts++; return false; });
+            Assert.NotNull(second);
+            var secondPath = Assert.Single(second!.GetFileDropList().Cast<string>());
+            Assert.Equal(firstPath, secondPath);
+            Assert.Equal(0, linkAttempts);
+
+            // When staging a new hash and hard link fails (e.g., cross-volume), it falls back to copying.
+            var otherHash = new string('2', 64);
+            var otherBody = Path.Combine(tempDir, otherHash);
+            File.WriteAllBytes(otherBody, payload);
+            var otherItem = new HistoryItem(Guid.NewGuid(), "file", null, "other.txt", otherBody, payload.Length, 100, "PC", otherHash, "public.data");
+            var fallbackAttempts = 0;
+            var fallback = HistoryWindow.BuildDragDataObject(otherItem, stagingRoot, logs.Add, (_, _) => { fallbackAttempts++; return false; });
+            Assert.NotNull(fallback);
+            Assert.Equal(1, fallbackAttempts);
+            var fallbackPath = Assert.Single(fallback!.GetFileDropList().Cast<string>());
+            Assert.Equal(payload, File.ReadAllBytes(fallbackPath));
+            Assert.Empty(logs);
+        });
+    }
+
+    [Fact]
+    public void PruneAndClearDragStagingRemoveDeletedOrAllStagedEntries()
+    {
+        var stagingRoot = Path.Combine(tempDir, "drag");
+        var keepHash = new string('a', 64);
+        var dropHash = new string('b', 64);
+        Directory.CreateDirectory(Path.Combine(stagingRoot, keepHash));
+        File.WriteAllText(Path.Combine(stagingRoot, keepHash, "keep.txt"), "keep");
+        Directory.CreateDirectory(Path.Combine(stagingRoot, dropHash));
+        File.WriteAllText(Path.Combine(stagingRoot, dropHash, "drop.txt"), "drop");
+
+        var activeItem = new HistoryItem(Guid.NewGuid(), "file", null, "keep.txt", "ignored", 4, 100, "PC", keepHash, "public.data");
+        HistoryWindow.PruneDragStaging(stagingRoot, [activeItem]);
+
+        Assert.True(Directory.Exists(Path.Combine(stagingRoot, keepHash)));
+        Assert.False(Directory.Exists(Path.Combine(stagingRoot, dropHash)));
+        Assert.True(HistoryWindow.HasDragStagingEntries(stagingRoot));
+
+        // Clearing history leaves only text (or empty) -> prune removes remaining staged hash.
+        HistoryWindow.PruneDragStaging(stagingRoot, []);
+        Assert.False(Directory.Exists(Path.Combine(stagingRoot, keepHash)));
+        Assert.False(HistoryWindow.HasDragStagingEntries(stagingRoot));
+
+        // Recreate and verify ClearDragStaging deletes the entire root.
+        Directory.CreateDirectory(Path.Combine(stagingRoot, keepHash));
+        HistoryWindow.ClearDragStaging(stagingRoot);
+        Assert.False(Directory.Exists(stagingRoot));
+    }
+
+    [Fact]
+    public void IsInsideButtonHandlesContentElementsWithoutThrowing()
+    {
+        RunSta(() =>
+        {
+            var runInside = new Run("操作");
+            var insideText = new TextBlock(runInside);
+            var button = new Button { Content = insideText };
+
+            var runOutside = new Run("項目");
+            var outsideText = new TextBlock(runOutside);
+
+            Assert.True(HistoryWindow.IsInsideButton(runInside));
+            Assert.True(HistoryWindow.IsInsideButton(button));
+            Assert.False(HistoryWindow.IsInsideButton(runOutside));
+            Assert.False(HistoryWindow.IsInsideButton(outsideText));
+            Assert.False(HistoryWindow.IsInsideButton(null));
         });
     }
 }

@@ -194,4 +194,41 @@ public sealed class AppSettingsTests : IDisposable
             settings.HistoryWindow);
         Assert.Empty(logs);
     }
+
+    [Fact]
+    public void HistoryWindowScaleRoundTripsAndLegacyJsonWithoutScaleStillLoads()
+    {
+        var logs = new List<string>();
+        var settings = new AppSettings(tempDir, logs.Add)
+        {
+            HistoryWindow = new WindowPlacement(1660, 120, 360, 460, 2.0),
+        };
+        settings.Save();
+
+        var reloaded = new AppSettings(tempDir, logs.Add);
+        Assert.Equal(new WindowPlacement(1660, 120, 360, 460, 2.0), reloaded.HistoryWindow);
+
+        // Simulate older settings.json written before Scale existed.
+        File.WriteAllText(
+            Path.Combine(tempDir, "settings.json"),
+            """{"HistoryWindow": { "Left": 100, "Top": 200, "Width": 380, "Height": 480 }}""",
+            new UTF8Encoding(false));
+
+        var legacy = new AppSettings(tempDir, logs.Add);
+        Assert.Equal(new WindowPlacement(100, 200, 380, 480, null), legacy.HistoryWindow);
+        Assert.Empty(logs);
+    }
+
+    [Fact]
+    public void TrySetHistoryWindowReturnsFalseWhenPlacementIsUnchanged()
+    {
+        var settings = new AppSettings(tempDir);
+        var initial = new WindowPlacement(120, 140, 360, 460, 1.5);
+
+        Assert.True(settings.TrySetHistoryWindow(initial));
+        Assert.False(settings.TrySetHistoryWindow(initial));
+        Assert.False(settings.TrySetHistoryWindow(initial with { Width = 360 + 1e-9 }));
+        Assert.True(settings.TrySetHistoryWindow(initial with { Left = 121 }));
+        Assert.False(settings.TrySetHistoryWindow(new WindowPlacement(120, 140, -10, 460, 1.5)));
+    }
 }

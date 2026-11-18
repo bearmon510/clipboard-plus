@@ -22,12 +22,16 @@ public readonly record struct HistoryRgbColor(byte Red, byte Green, byte Blue);
 public static partial class HistoryText
 {
     public const int MaxTitleLength = 120;
+    public const int MaxLinkRemainderLength = 120;
+    public const int MaxDragFileNameLength = 120;
 
     private static readonly HashSet<string> ReservedWindowsNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "CON", "PRN", "AUX", "NUL",
         "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "COM\u00B9", "COM\u00B2", "COM\u00B3",
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "LPT\u00B9", "LPT\u00B2", "LPT\u00B3",
     };
 
     [GeneratedRegex(@"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")]
@@ -51,11 +55,7 @@ public static partial class HistoryText
                     .Where(line => line.Length > 0)
                     .Take(2);
                 var joined = string.Join("\n", lines);
-                if (joined.Length == 0) return "（空白だけの文章）";
-                if (joined.Length <= MaxTitleLength) return joined;
-                // Never split a surrogate pair (an emoji, say) at the cut.
-                var cut = char.IsHighSurrogate(joined[MaxTitleLength - 1]) ? MaxTitleLength - 1 : MaxTitleLength;
-                return joined[..cut] + "…";
+                return joined.Length == 0 ? "（空白だけの文章）" : TruncateWithEllipsis(joined, MaxTitleLength);
             case "image":
                 return string.IsNullOrWhiteSpace(item.Filename) ? "画像" : item.Filename!;
             default:
@@ -130,7 +130,10 @@ public static partial class HistoryText
             var validExt = item.Type == "public.jpeg"
                 ? ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
                 : ext.Equals(".png", StringComparison.OrdinalIgnoreCase);
-            return validExt ? safe : safe + expectedExt;
+            if (validExt) return safe;
+
+            var stem = SafeDragFileName(item.Filename, "image", MaxDragFileNameLength - expectedExt.Length);
+            return stem + expectedExt;
         }
 
         return SafeDragFileName(item.Filename, "file");
@@ -183,8 +186,11 @@ public static partial class HistoryText
             return false;
 
         var host = uri.IsDefaultPort ? uri.Host : FormattableString.Invariant($"{uri.Host}:{uri.Port}");
-        var remainder = uri.PathAndQuery + uri.Fragment;
-        link = new HistoryLinkParts(host, string.IsNullOrEmpty(remainder) || remainder == "/" ? null : remainder);
+        var remainderText = uri.PathAndQuery + uri.Fragment;
+        var remainder = string.IsNullOrEmpty(remainderText) || remainderText == "/"
+            ? null
+            : TruncateWithEllipsis(remainderText, MaxLinkRemainderLength);
+        link = new HistoryLinkParts(host, remainder);
         return true;
     }
 
@@ -215,11 +221,65 @@ public static partial class HistoryText
         return digits is >= 10 and <= 15;
     }
 
-    private static string SafeDragFileName(string? rawName, string fallback)
+    private static string SafeDragFileName(string? rawName, string fallback, int maxLength = MaxDragFileNameLength)
     {
-        var safe = string.IsNullOrWhiteSpace(rawName) ? fallback : SyncRepository.SafeFilename(rawName);
-        var dot = safe.IndexOf('.');
-        var stem = dot >= 0 ? safe[..dot] : safe;
-        return ReservedWindowsNames.Contains(stem) ? "_" + safe : safe;
+        if (string.IsNullOrWhiteSpace(rawName))
+            return fallback;
+
+        var sanitized = SanitizeFileNameChars(rawName).TrimEnd(' ', '.');
+        if (string.IsNullOrWhiteSpace(sanitized))
+            return fallback;
+
+        var firstDot = sanitized.IndexOf('.');
+        var baseStem = (firstDot >= 0 ? sanitized[..firstDot] : sanitized).TrimEnd(' ');
+        if (ReservedWindowsNames.Contains(baseStem))
+            sanitized = "_" + sanitized;
+
+        if (sanitized.Length <= maxLength)
+            return sanitized;
+
+        var lastDot = sanitized.LastIndexOf('.');
+        if (lastDot > 0)
+        {
+            var ext = sanitized[lastDot..];
+            if (ext.Length <= 20)
+            {
+                var maxStem = maxLength - ext.Length;
+                if (maxStem > 0)
+                {
+                    var stem = SliceWithoutSplittingSurrogate(sanitized[..lastDot], maxStem).TrimEnd(' ', '.');
+                    return string.IsNullOrWhiteSpace(stem) ? fallback + ext : stem + ext;
+                }
+            }
+        }
+
+        var truncated = SliceWithoutSplittingSurrogate(sanitized, maxLength).TrimEnd(' ', '.');
+        return string.IsNullOrWhiteSpace(truncated) ? fallback : truncated;
     }
+
+    internal static string TruncateWithEllipsis(string value, int maxLength)
+    {
+        if (value.Length <= maxLength) return value;
+        return SliceWithoutSplittingSurrogate(value, maxLength) + "…";
+    }
+
+    private static string SliceWithoutSplittingSurrogate(string value, int maxLength)
+    {
+        if (maxLength <= 0) return "";
+        if (value.Length <= maxLength) return value;
+        // Never split a surrogate pair (an emoji, say) at the cut.
+        var cut = char.IsHighSurrogate(value[maxLength - 1]) ? maxLength - 1 : maxLength;
+        return value[..cut];
+    }
+
+    private static string SanitizeFileNameChars(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        return new string(name.Select(c =>
+            invalid.Contains(c) || c is '/' or '\\' or ':' or '*' or '?' or '"' or '<' or '>' or '|' ||
+            char.IsControl(c) || IsBidiControl(c) ? '_' : c).ToArray());
+    }
+
+    private static bool IsBidiControl(char c) =>
+        c is '\u061C' or '\u200E' or '\u200F' or (>= '\u202A' and <= '\u202E') or (>= '\u2066' and <= '\u2069');
 }

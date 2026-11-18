@@ -168,7 +168,7 @@ public sealed class ForegroundContextTests
     {
         var foreground = OtherWindow;
         var attachedCalls = 0;
-        var altDownCalls = 0;
+        var maskTapCalls = 0;
         var managedActivated = false;
 
         var ops = new ForegroundContext.ActivateOperations(
@@ -181,15 +181,13 @@ public sealed class ForegroundContextTests
             GetWindowThreadProcessId: _ => 200,
             GetCurrentThreadId: () => 100,
             AttachThreadInput: (_, _, _) => { attachedCalls++; return true; },
-            IsAltDown: () => false,
-            SendAltDown: () => { altDownCalls++; return true; },
-            SendAltUp: _ => true,
+            SendUnassignedKeyTap: () => { maskTapCalls++; return true; },
             ActivateManaged: () => managedActivated = true);
 
         Assert.True(ForegroundContext.BringToFront(TargetWindow, ops));
         Assert.True(managedActivated);
         Assert.Equal(0, attachedCalls);
-        Assert.Equal(0, altDownCalls);
+        Assert.Equal(0, maskTapCalls);
     }
 
     [Fact]
@@ -200,7 +198,7 @@ public sealed class ForegroundContextTests
         var attachEvents = new List<bool>();
         var bringToTopCalled = false;
         var setActiveCalled = false;
-        var altDownCalls = 0;
+        var maskTapCalls = 0;
 
         var ops = new ForegroundContext.ActivateOperations(
             IsWindow: w => w == TargetWindow,
@@ -225,32 +223,29 @@ public sealed class ForegroundContextTests
                 attachEvents.Add(value);
                 return true;
             },
-            IsAltDown: () => false,
-            SendAltDown: () => { altDownCalls++; return true; },
-            SendAltUp: _ => true,
+            SendUnassignedKeyTap: () => { maskTapCalls++; return true; },
             ActivateManaged: () => { });
 
         Assert.True(ForegroundContext.BringToFront(TargetWindow, ops));
         Assert.Equal([true, false], attachEvents);
         Assert.True(bringToTopCalled);
         Assert.True(setActiveCalled);
-        Assert.Equal(0, altDownCalls);
+        Assert.Equal(0, maskTapCalls);
     }
 
     [Fact]
-    public void BringToFrontFallsBackToAltTapWhenForegroundWindowIsHungOrRefusesAttach()
+    public void BringToFrontFallsBackToUnassignedKeyTapWhenForegroundWindowIsHungOrRefusesAttach()
     {
         var foreground = OtherWindow;
-        var altDown = false;
+        var maskTapped = false;
         var attachAttempts = 0;
-        var maskFlags = new List<bool>();
 
         var ops = new ForegroundContext.ActivateOperations(
             IsWindow: w => w == TargetWindow,
             GetForegroundWindow: () => foreground,
             SetForegroundWindow: w =>
             {
-                if (altDown)
+                if (maskTapped)
                 {
                     foreground = w;
                     return true;
@@ -263,22 +258,18 @@ public sealed class ForegroundContextTests
             GetWindowThreadProcessId: _ => 200,
             GetCurrentThreadId: () => 100,
             AttachThreadInput: (_, _, _) => { attachAttempts++; return true; },
-            IsAltDown: () => false,
-            SendAltDown: () => { altDown = true; return true; },
-            SendAltUp: mask => { altDown = false; maskFlags.Add(mask); return true; },
+            SendUnassignedKeyTap: () => { maskTapped = true; return true; },
             ActivateManaged: () => { });
 
         Assert.True(ForegroundContext.BringToFront(TargetWindow, ops));
         Assert.Equal(0, attachAttempts);
-        Assert.False(altDown);
-        Assert.Equal([false], maskFlags);
+        Assert.True(maskTapped);
     }
 
     [Fact]
-    public void BringToFrontReleasesAltWithMenuMaskAndReturnsFalseWhenAllAttemptsFail()
+    public void BringToFrontReturnsFalseWhenAllAttemptsFail()
     {
-        var altDown = false;
-        var maskFlags = new List<bool>();
+        var maskTapCalls = 0;
         var managedActivated = false;
 
         var ops = new ForegroundContext.ActivateOperations(
@@ -291,38 +282,76 @@ public sealed class ForegroundContextTests
             GetWindowThreadProcessId: _ => 200,
             GetCurrentThreadId: () => 100,
             AttachThreadInput: (_, _, _) => false,
-            IsAltDown: () => false,
-            SendAltDown: () => { altDown = true; return true; },
-            SendAltUp: mask => { altDown = false; maskFlags.Add(mask); return true; },
+            SendUnassignedKeyTap: () => { maskTapCalls++; return true; },
             ActivateManaged: () => managedActivated = true);
 
         Assert.False(ForegroundContext.BringToFront(TargetWindow, ops));
         Assert.True(managedActivated);
-        Assert.False(altDown);
-        Assert.Equal([true], maskFlags);
+        Assert.Equal(1, maskTapCalls);
     }
 
     [Fact]
-    public void BringToFrontSkipsAltInjectionWhenAltIsAlreadyPhysicallyHeld()
+    public void NativeInputMenuMaskUsesUnassignedKeyWithoutExtendedFlagOrAlt()
     {
-        var altDownCalls = 0;
+        var inputs = NativeInput.CreateMenuMaskInputs();
+        Assert.Equal(2, inputs.Length);
+        Assert.All(inputs, input =>
+        {
+            Assert.Equal(1u, input.type);
+            Assert.Equal(NativeInput.VkMenuMask, input.U.ki.wVk);
+            Assert.Equal((ushort)0, input.U.ki.wScan);
+            Assert.Equal((uint)0, input.U.ki.dwFlags & 0x0001u); // No KeyEventExtendedKey.
+            Assert.Equal(NativeInput.SelfExtraInfo, input.U.ki.dwExtraInfo);
+        });
+        Assert.Equal(0u, inputs[0].U.ki.dwFlags);
+        Assert.Equal(0x0002u, inputs[1].U.ki.dwFlags);
+    }
 
-        var ops = new ForegroundContext.ActivateOperations(
-            IsWindow: w => w == TargetWindow,
-            GetForegroundWindow: () => OtherWindow,
-            SetForegroundWindow: _ => false,
-            BringWindowToTop: _ => false,
-            SetActiveWindow: _ => 0,
-            IsHungAppWindow: _ => false,
-            GetWindowThreadProcessId: _ => 200,
-            GetCurrentThreadId: () => 100,
-            AttachThreadInput: (_, _, _) => false,
-            IsAltDown: () => true,
-            SendAltDown: () => { altDownCalls++; return true; },
-            SendAltUp: _ => true,
-            ActivateManaged: () => { });
+    [Fact]
+    public void PasteTargetTrackerFollowsLatestExternalWindowAndIgnoresOwnWindows()
+    {
+        const nint ownHistoryWindow = 0x1001;
+        const nint ownSettingsWindow = 0x1002;
+        const nint appA = 0x2001;
+        const nint appB = 0x2002;
+        var alive = new HashSet<nint> { ownHistoryWindow, ownSettingsWindow, appA, appB };
 
-        Assert.False(ForegroundContext.BringToFront(TargetWindow, ops));
-        Assert.Equal(0, altDownCalls);
+        var tracker = new PasteTargetTracker(
+            isWindow: w => alive.Contains(w),
+            isOwnWindow: w => w is ownHistoryWindow or ownSettingsWindow);
+
+        // Initialized from hotkey invocation on appA.
+        tracker.Reset(appA);
+        Assert.Equal(appA, tracker.CurrentTarget);
+
+        // Switching to own windows keeps the previous external target.
+        Assert.False(tracker.RecordForeground(ownHistoryWindow));
+        Assert.False(tracker.RecordForeground(ownSettingsWindow));
+        Assert.Equal(appA, tracker.CurrentTarget);
+
+        // Moving to another external app updates the paste target to that latest app.
+        Assert.True(tracker.RecordForeground(appB));
+        Assert.Equal(appB, tracker.CurrentTarget);
+
+        // Returning to history window keeps appB as the paste target.
+        Assert.False(tracker.RecordForeground(ownHistoryWindow));
+        Assert.Equal(appB, tracker.CurrentTarget);
+
+        // Closing appB invalidates the handle so paste is not sent to a dead window.
+        alive.Remove(appB);
+        Assert.Equal((nint)0, tracker.CurrentTarget);
+
+        // Opened from tray/settings (0 or own window) yields no paste target until another app is visited.
+        tracker.Reset(ownSettingsWindow);
+        Assert.Equal((nint)0, tracker.CurrentTarget);
+        Assert.False(tracker.RecordForeground(ownHistoryWindow));
+        Assert.Equal((nint)0, tracker.CurrentTarget);
+        alive.Add(appB);
+        Assert.True(tracker.RecordForeground(appB));
+        Assert.Equal(appB, tracker.CurrentTarget);
+
+        // Hiding resets the tracker.
+        tracker.Reset();
+        Assert.Equal((nint)0, tracker.CurrentTarget);
     }
 }

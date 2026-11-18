@@ -258,7 +258,8 @@
       </Border>
 
       <!-- History List -->
-      <ListBox x:Name="HistoryList" Grid.Row="2" BorderThickness="0" Background="Transparent" Padding="12,2,6,4"
+      <ListBox x:Name="HistoryList" Grid.Row="2" BorderThickness="0" Background="Transparent"
+               Margin="0,0,5,0" Padding="12,2,2,4"
                Focusable="False"
                ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.ScrollUnit="Pixel"
@@ -403,7 +404,7 @@
         </ListBox.ItemTemplate>
 
         <ListBox.ContextMenu>
-          <ContextMenu Closed="OnContextMenuClosed">
+          <ContextMenu>
             <MenuItem Header="貼り付ける" Click="OnMenuPaste"/>
             <MenuItem Header="コピーだけする" Click="OnMenuCopy"/>
             <Separator/>
