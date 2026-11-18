@@ -7,6 +7,11 @@ name: Upload iPad app to TestFlight
 
 on:
   workflow_dispatch:
+    inputs:
+      upload:
+        description: Upload to App Store Connect and add to internal TestFlight groups (set false to verify signing and export only).
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -86,7 +91,7 @@ jobs:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
         run: node scripts/apple-signing-certificates.mjs snapshot --output "$RUNNER_TEMP/development-certificates-before.json"
 
-      - name: Archive iPad app
+      - name: Archive app
         working-directory: app
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -108,6 +113,7 @@ jobs:
               DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
               CODE_SIGN_STYLE=Automatic \
               APP_BUNDLE_ID="$CLIPBOARD_PLUS_BUNDLE_ID" \
+              APP_GROUP_ID="group.$CLIPBOARD_PLUS_BUNDLE_ID" \
               CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
               archive > "$log" 2>&1; then
             echo "Archive succeeded. Build number: $GITHUB_RUN_NUMBER"
@@ -117,8 +123,11 @@ jobs:
           fi
 
       - name: Create App Store export options
+        # Automatic signing covers the app and embedded extensions; no per-bundle
+        # provisioningProfiles mapping is needed for automatic export.
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPORT_DESTINATION: ${{ (inputs.upload == true || inputs.upload == 'true') && 'upload' || 'export' }}
         run: |
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -126,7 +135,7 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>destination</key>
-            <string>upload</string>
+            <string>${EXPORT_DESTINATION}</string>
             <key>manageAppVersionAndBuildNumber</key>
             <false/>
             <key>method</key>
@@ -141,23 +150,34 @@ jobs:
           </plist>
           PLIST
 
-      - name: Upload archive to TestFlight
+      - name: Export or upload archive
         env:
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          UPLOAD_TO_TESTFLIGHT: ${{ inputs.upload == true || inputs.upload == 'true' }}
         run: |
           log="$RUNNER_TEMP/export.log"
+          export_path="$RUNNER_TEMP/TestFlightExport"
           if xcodebuild \
               -exportArchive \
               -archivePath "$ARCHIVE_PATH" \
-              -exportPath "$RUNNER_TEMP/TestFlightExport" \
+              -exportPath "$export_path" \
               -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
               -allowProvisioningUpdates \
               -authenticationKeyPath "$APP_STORE_CONNECT_API_KEY_PATH" \
               -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
               -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID" \
               > "$log" 2>&1; then
-            echo "Uploaded build $GITHUB_RUN_NUMBER. App Store Connect processes it before TestFlight shows it."
+            if [ "$UPLOAD_TO_TESTFLIGHT" = "true" ]; then
+              echo "Uploaded build $GITHUB_RUN_NUMBER. App Store Connect processes it before TestFlight shows it."
+            else
+              ipa_path=$(find "$export_path" -maxdepth 1 -name '*.ipa' -print -quit)
+              if [ -z "$ipa_path" ]; then
+                echo "Export succeeded but no IPA file was produced."
+                exit 1
+              fi
+              echo "Exported signed IPA without uploading (build number: $GITHUB_RUN_NUMBER)."
+            fi
           else
             bash scripts/print-redacted-xcodebuild-errors.sh "$log"
             exit 1
@@ -186,6 +206,7 @@ jobs:
   distribute-internal:
     name: Add the build to internal TestFlight groups
     needs: upload-testflight
+    if: ${{ success() && (inputs.upload == true || inputs.upload == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     environment: ios-testflight

@@ -36,6 +36,18 @@ struct SettingsView: View {
                 if DeviceKind.current == .pad {
                     CaptureSettingsSection(screenshots: screenshots)
                 }
+                Section("キーボード") {
+                    Picker("開いたときのタブ", selection: Binding(
+                        get: { monitor.keyboardInitialTab },
+                        set: { monitor.setKeyboardInitialTab($0) }
+                    )) {
+                        ForEach(KeyboardTab.allCases) { tab in
+                            Text(tab.title).tag(tab)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(minHeight: 44)
+                }
                 Section("履歴の保存") {
                     Picker("自動削除", selection: Binding(
                         get: { monitor.historyRetention },

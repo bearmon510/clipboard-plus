@@ -49,6 +49,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     @Published private(set) var entries: [HistoryEntry] = []
     @Published private(set) var pollingInterval: TimeInterval = 0.5
     @Published private(set) var historyRetention: HistoryRetention = .defaultValue
+    @Published private(set) var keyboardInitialTab: KeyboardTab = .defaultValue
     @Published private(set) var storageError: String?
     @Published private(set) var pendingSaveCount = 0
     /// Successful saves since launch, including copies merged into an existing item.
@@ -75,8 +76,16 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     private let defaults: UserDefaults
     private let makeDatabase: (() throws -> HistoryPersistence)?
     private let imageDirectory: URL
+    private let keyboardContainerURL: () -> URL?
     private lazy var store: HistoryStore = {
-        let value = HistoryStore(retention: historyRetention, makeDatabase: makeDatabase, imageDirectory: imageDirectory) { [weak self] event in
+        let value = HistoryStore(
+            retention: historyRetention,
+            makeDatabase: makeDatabase,
+            imageDirectory: imageDirectory,
+            keyboardContainerURL: keyboardContainerURL,
+            inboxStateDefaults: defaults,
+            initialKeyboardTab: keyboardInitialTab
+        ) { [weak self] event in
         self?.handleStorageEvent(event)
         }
         value.syncEchoGuard = syncEcho
@@ -105,18 +114,21 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     init(defaults: UserDefaults = .standard, log: MeasurementLog? = nil,
          makeDatabase: (() throws -> HistoryPersistence)? = nil, schedulesMaintenance: Bool = true,
          imageDirectory: URL = HistoryImageFiles.defaultDirectory,
-         pasteboard: ClipboardPasteboard? = nil, resumesRecordingOnInit: Bool = true) {
+         pasteboard: ClipboardPasteboard? = nil, resumesRecordingOnInit: Bool = true,
+         keyboardContainerURL: @escaping () -> URL? = { SharedAppGroup.containerURL() }) {
         self.defaults = defaults
         self.syncEcho = SyncEchoGuard(defaults: defaults)
         self.log = log ?? MeasurementLog()
         self.makeDatabase = makeDatabase
         self.imageDirectory = imageDirectory
         self.pasteboard = pasteboard ?? UIPasteboard.general
+        self.keyboardContainerURL = keyboardContainerURL
         super.init()
         resumeRecordingOnActivation = !resumesRecordingOnInit
         let storedInterval = defaults.object(forKey: "pollingInterval") as? Double ?? 0.5
         pollingInterval = storedInterval.isFinite ? min(5, max(0.1, storedInterval)) : 0.5
         historyRetention = HistoryRetention.load(from: defaults)
+        keyboardInitialTab = KeyboardTab.load(from: defaults)
         maintenancePending = true
         store.load { [weak self] result in
             self?.maintenancePending = false
@@ -125,6 +137,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             case .failure: self?.reportStorageFailure()
             }
         }
+        importSharedInbox()
         if schedulesMaintenance {
             let cleanup = Timer(timeInterval: 1, target: self, selector: #selector(cleanupTimerFired(_:)), userInfo: nil, repeats: true)
             RunLoop.main.add(cleanup, forMode: .common)
@@ -175,6 +188,33 @@ final class ClipboardMonitor: NSObject, ObservableObject {
         }
     }
 
+    func setKeyboardInitialTab(_ value: KeyboardTab) {
+        guard value != keyboardInitialTab else { return }
+        keyboardInitialTab = value
+        value.save(to: defaults)
+        store.setKeyboardInitialTab(value)
+    }
+
+    func importSharedInbox(completion: ((Int) -> Void)? = nil) {
+        store.importSharedInbox { [weak self] result in
+            guard let self else { completion?(0); return }
+            switch result {
+            case .success(let summary):
+                if summary.importedCount > 0 {
+                    self.savedCount += summary.importedCount
+                    if self.pendingSaveCount == 0 { self.storageError = nil }
+                    let originSummary = Set(summary.origins.map(\.rawValue)).sorted().joined(separator: ",")
+                    self.record("受け取り箱から保存", details: "件数=\(summary.importedCount); 取得元=\(originSummary)")
+                }
+                completion?(summary.importedCount)
+            case .failure:
+                self.reportStorageFailure()
+                self.record("受け取り箱の取り込み失敗")
+                completion?(0)
+            }
+        }
+    }
+
     func updateScene(_ value: String) {
         if value == "active", resumeRecordingOnActivation {
             resumeRecordingOnActivation = false
@@ -203,6 +243,7 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             store.maintain(forceRetention: true) { result in
                 if case .failure = result { self.reportStorageFailure() }
             }
+            importSharedInbox()
         } else {
             cleanupExpired()
         }
@@ -921,6 +962,8 @@ final class ClipboardMonitor: NSObject, ObservableObject {
             imageNotice = "画像ファイルの後始末に失敗しました。自動で再試行します。"
             fileNotice = "ファイルの後始末に失敗しました。自動で再試行します。"
             record("履歴ファイルの後始末失敗")
+        case .keyboardWriteFailed:
+            record("キーボード用データの書き出し失敗", details: "次の変更時に再試行します")
         }
     }
 

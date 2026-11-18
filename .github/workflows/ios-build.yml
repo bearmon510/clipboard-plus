@@ -76,6 +76,26 @@ jobs:
             -derivedDataPath DerivedData \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Verify embedded extensions (Simulator)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          app_path="DerivedData/Build/Products/Debug-iphonesimulator/ClipboardPlus.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ClipboardPlusAppGroup' "$app_path/Info.plist")" = "group.example.clipboardplus"
+
+          keyboard_path="$app_path/PlugIns/ClipboardPlusKeyboard.appex"
+          test -d "$keyboard_path"
+          test -f "$keyboard_path/ClipboardPlusKeyboard"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$keyboard_path/Info.plist")" = "com.apple.keyboard-service"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionAttributes:RequestsOpenAccess' "$keyboard_path/Info.plist")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ClipboardPlusAppGroup' "$keyboard_path/Info.plist")" = "group.example.clipboardplus"
+
+          share_path="$app_path/PlugIns/ClipboardPlusShare.appex"
+          test -d "$share_path"
+          test -f "$share_path/ClipboardPlusShare"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$share_path/Info.plist")" = "com.apple.share-services"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ClipboardPlusAppGroup' "$share_path/Info.plist")" = "group.example.clipboardplus"
+
       # APIs can differ between the device SDK and the simulator SDK.
       # This catches that before a TestFlight upload does.
       - name: Build for a device without signing
@@ -88,11 +108,23 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath DerivedData-device \
-            CODE_SIGNING_ALLOWED=NO > device-build.log 2>&1 || {
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" > device-build.log 2>&1 || {
               grep -E "error:" device-build.log | sort -u | head -40
               exit 1
             }
           echo "Device build succeeded."
+
+      - name: Verify embedded extensions (Device)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          app_path="DerivedData-device/Build/Products/Release-iphoneos/ClipboardPlus.app"
+          test -d "$app_path/PlugIns/ClipboardPlusKeyboard.appex"
+          test -f "$app_path/PlugIns/ClipboardPlusKeyboard.appex/ClipboardPlusKeyboard"
+          test -d "$app_path/PlugIns/ClipboardPlusShare.appex"
+          test -f "$app_path/PlugIns/ClipboardPlusShare.appex/ClipboardPlusShare"
 
       - name: Run pure logic unit tests on iPad
         working-directory: app

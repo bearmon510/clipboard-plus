@@ -69,6 +69,12 @@ final class HistoryStore {
         case fileUsage(HistoryFileUsage)
         case cleanupFailed
         case automaticallyDeleted(count: Int, retention: HistoryRetention)
+        case keyboardWriteFailed
+    }
+
+    struct SharedInboxImportResult: Equatable {
+        let importedCount: Int
+        let origins: [SharedInboxItem.Origin]
     }
 
     private struct PendingCollection {
@@ -87,6 +93,19 @@ final class HistoryStore {
     private let makeDatabase: () throws -> HistoryPersistence
     private let onEvent: @MainActor (Event) -> Void
     private let now: () -> Date
+    private let keyboardContainerURL: () -> URL?
+    private let inboxStateDefaults: UserDefaults?
+    private let inboxSeenKey = "sharedInbox.seenIDs.v1"
+    private let maxSeenInboxIDs = 500
+    private var memorySeenInboxIDs: [UUID] = []
+    private var currentKeyboardTab: KeyboardTab
+    private var needsKeyboardExport = true
+    private var needsKeyboardSettingsWrite = true
+    private var lastKeyboardEntries: [KeyboardHistoryEntry]?
+    private var lastKeyboardURL: URL?
+    private var lastKeyboardSettingsTab: KeyboardTab?
+    private var lastKeyboardSettingsURL: URL?
+    private var didReportKeyboardWriteFailure = false
     private var database: HistoryPersistence?
     let imageFiles: HistoryImageFiles
     let fileFiles: HistoryFileFiles
@@ -109,6 +128,9 @@ final class HistoryStore {
          now: @escaping () -> Date = Date.init,
          backupQueue: DispatchQueue = DispatchQueue(label: "clipboardplus.backup", qos: .userInitiated),
          backupTemporaryFiles: BackupTemporaryFiles = .shared,
+         keyboardContainerURL: @escaping () -> URL? = { SharedAppGroup.containerURL() },
+         inboxStateDefaults: UserDefaults? = nil,
+         initialKeyboardTab: KeyboardTab = .defaultValue,
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.retention = retention
         self.makeDatabase = makeDatabase ?? { try HistoryStore.openDatabase(now: now) }
@@ -116,6 +138,9 @@ final class HistoryStore {
         self.now = now
         self.backupQueue = backupQueue
         self.backupTemporaryFiles = backupTemporaryFiles
+        self.keyboardContainerURL = keyboardContainerURL
+        self.inboxStateDefaults = inboxStateDefaults
+        self.currentKeyboardTab = initialKeyboardTab
         self.imageFiles = HistoryImageFiles(directory: imageDirectory)
         // One attachment directory/journal keeps deletion, undo, drag and backup protection atomic.
         self.fileFiles = HistoryFileFiles(directory: imageDirectory)
@@ -239,6 +264,7 @@ final class HistoryStore {
                        completion: @escaping @MainActor (Result<HistoryEntry, Error>) -> Void) {
         perform({ database in
             let entry = try database.collect(text, source: .pc, at: date)
+            self.needsKeyboardExport = true
             self.emit(.upsert(entry))
             return entry
         }, completion: completion)
@@ -328,16 +354,77 @@ final class HistoryStore {
                 }
                 catch { try? self.imageFiles.remove(file.filenames); throw error }
             }
+            self.needsKeyboardExport = true
             self.emit(.upsert(entry)); return entry
         }, completion: completion)
     }
 
     func load(completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
+            self.needsKeyboardExport = true
             try self.applyRetention(database, force: true)
             self.emit(.replace(try database.fetchAll()))
             return try database.latestDeletion()
         }, completion: completion)
+    }
+
+    func setKeyboardInitialTab(_ value: KeyboardTab) {
+        queue.async {
+            self.currentKeyboardTab = value
+            self.needsKeyboardSettingsWrite = true
+            guard let containerURL = self.keyboardContainerURL() else { return }
+            self.writeKeyboardSettingsIfNeeded(in: containerURL)
+        }
+    }
+
+    func importSharedInbox(completion: @escaping @MainActor (Result<SharedInboxImportResult, Error>) -> Void) {
+        queue.async {
+            guard let containerURL = self.keyboardContainerURL() else {
+                DispatchQueue.main.async {
+                    completion(.success(SharedInboxImportResult(importedCount: 0, origins: [])))
+                }
+                return
+            }
+            let inboxURL = SharedAppGroup.inboxDirectoryURL(in: containerURL)
+            let scan = SharedInbox.scan(directory: inboxURL)
+            for corrupt in scan.corruptFiles {
+                try? FileManager.default.removeItem(at: corrupt)
+            }
+            guard !scan.items.isEmpty else {
+                DispatchQueue.main.async {
+                    completion(.success(SharedInboxImportResult(importedCount: 0, origins: [])))
+                }
+                return
+            }
+            let result = Result { () throws -> SharedInboxImportResult in
+                try self.savePending()
+                let database = try self.requireDatabase()
+                var importedCount = 0
+                var origins: [SharedInboxItem.Origin] = []
+                defer {
+                    if importedCount > 0 {
+                        self.finishChanges(database)
+                    }
+                }
+                for pendingItem in scan.items {
+                    let item = pendingItem.item
+                    if self.hasSeenInboxID(item.id) || item.text.isEmpty {
+                        try? FileManager.default.removeItem(at: pendingItem.fileURL)
+                        continue
+                    }
+                    let entry = try database.collect(item.text, source: .manual, at: item.createdAt)
+                    self.rememberInboxID(item.id)
+                    try? FileManager.default.removeItem(at: pendingItem.fileURL)
+                    self.needsKeyboardExport = true
+                    self.emit(.upsert(entry))
+                    self.emit(.localEntry(entry, source: .manual, at: item.createdAt))
+                    importedCount += 1
+                    origins.append(item.origin)
+                }
+                return SharedInboxImportResult(importedCount: importedCount, origins: origins)
+            }
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 
     /// Explicit shortcut saves report the committed result. A failed request is not retained
@@ -364,13 +451,17 @@ final class HistoryStore {
             }
             self.emit(.saved(entry, retried: false))
             self.emit(.localEntry(entry, source: .manual, at: date))
+            self.needsKeyboardExport = true
             return entry
         }, completion: completion)
     }
 
     func maintain(forceRetention: Bool = false, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
-            if try database.purgeExpired() { self.emit(.replace(try database.fetchAll())) }
+            if try database.purgeExpired() {
+                self.needsKeyboardExport = true
+                self.emit(.replace(try database.fetchAll()))
+            }
             try self.applyRetention(database, force: forceRetention)
         }, completion: completion)
     }
@@ -401,12 +492,16 @@ final class HistoryStore {
     }
 
     private func recordAutomaticDeletion(_ count: Int) {
-        if count > 0 { emit(.automaticallyDeleted(count: count, retention: retention)) }
+        if count > 0 {
+            needsKeyboardExport = true
+            emit(.automaticallyDeleted(count: count, retention: retention))
+        }
     }
 
     func delete(id: Int, completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
             let deletion = try database.delete(id: id)
+            if deletion != nil { self.needsKeyboardExport = true }
             self.emit(.remove(id))
             return deletion
         }, completion: completion)
@@ -415,6 +510,7 @@ final class HistoryStore {
     func deleteAll(completion: @escaping @MainActor (Result<HistoryDeletion?, Error>) -> Void) {
         perform({ database in
             let deletion = try database.deleteAll()
+            if deletion != nil { self.needsKeyboardExport = true }
             self.emit(.replace(try database.fetchAll()))
             return deletion
         }, completion: completion)
@@ -423,6 +519,7 @@ final class HistoryStore {
     func undo(_ deletion: HistoryDeletion, completion: @escaping @MainActor (Result<Bool, Error>) -> Void) {
         perform({ database in
             let restored = try database.undo(deletion)
+            if restored { self.needsKeyboardExport = true }
             self.emit(.replace(try database.fetchAll()))
             return restored
         }, completion: completion)
@@ -435,6 +532,7 @@ final class HistoryStore {
     func moveToTemplates(id: Int, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
         perform({ database in
             let entry = try database.moveToTemplates(id: id)
+            self.needsKeyboardExport = true
             self.emit(.replace(try database.fetchAll()))
             return entry
         }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
@@ -443,6 +541,7 @@ final class HistoryStore {
     func createTemplate(text: String, title: String?, tag: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
         perform({ database in
             let entry = try database.createTemplate(text: text, title: title, tag: tag)
+            self.needsKeyboardExport = true
             self.emit(.replace(try database.fetchAll()))
             return entry
         }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
@@ -451,6 +550,7 @@ final class HistoryStore {
     func updateTemplate(id: Int, text: String?, title: String?, tag: String?, completion: @escaping @MainActor (Result<HistoryEntry, HistoryEditError>) -> Void) {
         perform({ database in
             let entry = try database.updateTemplate(id: id, text: text, title: title, tag: tag)
+            self.needsKeyboardExport = true
             self.emit(.replace(try database.fetchAll()))
             return entry
         }) { result in completion(result.mapError { $0 as? HistoryEditError ?? .failed }) }
@@ -459,6 +559,7 @@ final class HistoryStore {
     func reorderTemplates(_ orderedIDs: [Int], completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
             try database.reorderTemplates(orderedIDs)
+            self.needsKeyboardExport = true
             self.emit(.replace(try database.fetchAll()))
         }, completion: completion)
     }
@@ -466,6 +567,7 @@ final class HistoryStore {
     func renameTag(_ tag: String?, to newTag: String?, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         perform({ database in
             try database.renameTag(tag, to: newTag)
+            self.needsKeyboardExport = true
             self.emit(.replace(try database.fetchAll()))
         }, completion: completion)
     }
@@ -577,6 +679,7 @@ final class HistoryStore {
                 }
                 self.lastRetentionCheck = date
                 self.recordAutomaticDeletion(counts.removedByRetention)
+                self.needsKeyboardExport = true
                 self.finishChanges(database)
                 // A read failure after COMMIT must not report the successful merge as rolled back.
                 do { self.emit(.replace(try database.fetchAll())) }
@@ -636,6 +739,7 @@ final class HistoryStore {
             }
             emit(.saved(entry, retried: item.failed))
             if item.source != .pc { emit(.localEntry(entry, source: item.source, at: item.date)) }
+            needsKeyboardExport = true
             finishChanges(database)
         }
     }
@@ -663,7 +767,9 @@ final class HistoryStore {
     private func finishChanges(_ database: HistoryPersistence) {
         let date = now()
         dragProtectedUntil = dragProtectedUntil.filter { $0.value > date }
-        for entry in database.takeRemovals() {
+        let removals = database.takeRemovals()
+        if !removals.isEmpty { needsKeyboardExport = true }
+        for entry in removals {
             emit(.remove(entry.id))
             unusedFiles.formUnion(entry.attachmentFilenames)
         }
@@ -680,6 +786,67 @@ final class HistoryStore {
             emit(.imageUsage(try database.imageUsage()))
             emit(.fileUsage(try database.fileUsage()))
         } catch { emit(.cleanupFailed) }
+        syncKeyboardFiles(database)
+    }
+
+    private func syncKeyboardFiles(_ database: HistoryPersistence) {
+        guard let containerURL = keyboardContainerURL() else { return }
+        writeKeyboardSettingsIfNeeded(in: containerURL)
+        guard needsKeyboardExport else { return }
+        let historyURL = SharedAppGroup.keyboardHistoryURL(in: containerURL)
+        do {
+            let entries = try database.fetchAll()
+            let history = KeyboardHistoryBuilder.build(entries: entries, exportedAt: now())
+            needsKeyboardExport = false
+            guard history.entries != lastKeyboardEntries || historyURL != lastKeyboardURL else { return }
+            try KeyboardHistoryFile.write(history, to: historyURL)
+            lastKeyboardEntries = history.entries
+            lastKeyboardURL = historyURL
+            didReportKeyboardWriteFailure = false
+        } catch {
+            // Leave the database commit intact and retry on the next change or maintenance pass.
+            needsKeyboardExport = true
+            if !didReportKeyboardWriteFailure {
+                didReportKeyboardWriteFailure = true
+                emit(.keyboardWriteFailed)
+            }
+        }
+    }
+
+    private func writeKeyboardSettingsIfNeeded(in containerURL: URL) {
+        let settingsURL = SharedAppGroup.keyboardSettingsURL(in: containerURL)
+        guard needsKeyboardSettingsWrite || settingsURL != lastKeyboardSettingsURL || currentKeyboardTab != lastKeyboardSettingsTab else {
+            return
+        }
+        do {
+            let settings = KeyboardSettings(initialTab: currentKeyboardTab, updatedAt: now())
+            try KeyboardSettingsFile.write(settings, to: settingsURL)
+            lastKeyboardSettingsTab = currentKeyboardTab
+            lastKeyboardSettingsURL = settingsURL
+            needsKeyboardSettingsWrite = false
+        } catch {
+            needsKeyboardSettingsWrite = true
+        }
+    }
+
+    private func loadSeenInboxIDs() -> [UUID] {
+        guard let defaults = inboxStateDefaults else { return memorySeenInboxIDs }
+        return (defaults.stringArray(forKey: inboxSeenKey) ?? []).compactMap(UUID.init(uuidString:))
+    }
+
+    private func hasSeenInboxID(_ id: UUID) -> Bool {
+        loadSeenInboxIDs().contains(id)
+    }
+
+    private func rememberInboxID(_ id: UUID) {
+        var ids = loadSeenInboxIDs()
+        ids.removeAll { $0 == id }
+        ids.append(id)
+        if ids.count > maxSeenInboxIDs {
+            ids.removeFirst(ids.count - maxSeenInboxIDs)
+        }
+        memorySeenInboxIDs = ids
+        inboxStateDefaults?.set(ids.map(\.uuidString), forKey: inboxSeenKey)
     }
 
     private func emit(_ event: Event) {
