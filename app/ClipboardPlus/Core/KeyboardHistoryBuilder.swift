@@ -51,7 +51,8 @@ enum KeyboardHistoryBuilder {
                 isTemplate: $0.isTemplate,
                 title: $0.displayTitle,
                 tag: $0.tag,
-                templateOrder: $0.templateOrder
+                templateOrder: $0.templateOrder,
+                isFromPC: $0.source == .pc
             )
         }
         return KeyboardHistory(

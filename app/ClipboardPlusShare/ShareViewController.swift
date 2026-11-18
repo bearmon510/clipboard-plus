@@ -1,38 +1,77 @@
 import UIKit
-import UniformTypeIdentifiers
 
 final class ShareViewController: UIViewController {
     private var didStart = false
-    private var didFinish = false
+    private var didCompleteExtension = false
+    private var hasFinishedSaving = false
     private var saveTask: Task<Void, Never>?
+
+    private let cardView = UIView()
+    private let spinner = UIActivityIndicatorView(style: .medium)
+    private let statusImageView = UIImageView()
+    private let titleLabel = UILabel()
+    private let subtitleLabel = UILabel()
+    private let actionButton = UIButton(type: .system)
+
+    deinit {
+        saveTask?.cancel()
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        view.backgroundColor = .systemBackground
+        view.backgroundColor = .systemGroupedBackground
 
-        let spinner = UIActivityIndicatorView(style: .medium)
+        cardView.backgroundColor = .secondarySystemGroupedBackground
+        cardView.layer.cornerRadius = 16
+        cardView.layer.cornerCurve = .continuous
+        cardView.translatesAutoresizingMaskIntoConstraints = false
+
         spinner.startAnimating()
 
-        let statusLabel = UILabel()
-        statusLabel.text = "clipboard+に保存しています…"
-        statusLabel.font = .preferredFont(forTextStyle: .body)
-        statusLabel.textColor = .secondaryLabel
+        statusImageView.isHidden = true
+        statusImageView.contentMode = .scaleAspectFit
+        statusImageView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 32, weight: .semibold)
 
-        let cancelButton = UIButton(type: .system)
-        cancelButton.setTitle("キャンセル", for: .normal)
-        cancelButton.addTarget(self, action: #selector(cancelShare), for: .touchUpInside)
+        titleLabel.text = "clipboard+ に保存しています…"
+        titleLabel.font = .preferredFont(forTextStyle: .headline)
+        titleLabel.textColor = .label
+        titleLabel.textAlignment = .center
+        titleLabel.numberOfLines = 0
 
-        let stack = UIStackView(arrangedSubviews: [spinner, statusLabel, cancelButton])
+        subtitleLabel.isHidden = true
+        subtitleLabel.font = .preferredFont(forTextStyle: .footnote)
+        subtitleLabel.textColor = .secondaryLabel
+        subtitleLabel.textAlignment = .center
+        subtitleLabel.numberOfLines = 0
+
+        actionButton.setTitle("キャンセル", for: .normal)
+        actionButton.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
+        actionButton.addTarget(self, action: #selector(handleActionButton), for: .touchUpInside)
+
+        let stack = UIStackView(arrangedSubviews: [spinner, statusImageView, titleLabel, subtitleLabel, actionButton])
         stack.axis = .vertical
         stack.alignment = .center
         stack.spacing = 12
+        stack.setCustomSpacing(6, after: titleLabel)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        view.addSubview(stack)
+        cardView.addSubview(stack)
+        view.addSubview(cardView)
+
         NSLayoutConstraint.activate([
-            stack.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
+            cardView.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
+            cardView.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
+            cardView.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            cardView.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            cardView.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
+
+            stack.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -16),
+            stack.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -24),
+
+            actionButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
         ])
     }
 
@@ -41,94 +80,61 @@ final class ShareViewController: UIViewController {
         guard !didStart else { return }
         didStart = true
         saveTask = Task { [weak self] in
-            await self?.saveSharedItems()
+            await self?.runSaveFlow()
         }
     }
 
-    @objc private func cancelShare() {
-        guard !didFinish else { return }
-        didFinish = true
+    @objc private func handleActionButton() {
+        guard !didCompleteExtension else { return }
+        didCompleteExtension = true
         saveTask?.cancel()
-        extensionContext?.cancelRequest(withError: CocoaError(.userCancelled))
+        if hasFinishedSaving {
+            extensionContext?.completeRequest(returningItems: nil)
+        } else {
+            extensionContext?.cancelRequest(withError: CocoaError(.userCancelled))
+        }
     }
 
-    private func saveSharedItems() async {
+    private func runSaveFlow() async {
         let items = (extensionContext?.inputItems as? [NSExtensionItem]) ?? []
-        var collected: [String] = []
-        var seen: Set<String> = []
-        for item in items {
-            for provider in item.attachments ?? [] {
-                if Task.isCancelled { return }
-                if let text = await Self.loadText(from: provider),
-                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   seen.insert(text).inserted {
-                    collected.append(text)
-                }
-            }
-        }
-        guard !Task.isCancelled, !didFinish else { return }
-        if !collected.isEmpty, let directory = SharedAppGroup.inboxDirectoryURL() {
-            for text in collected {
-                _ = try? SharedInbox.write(text: text, origin: .shareExtension, to: directory)
-            }
-        }
-        didFinish = true
+        let collected = await SharedTextExtractor.extractTexts(from: items)
+        guard !Task.isCancelled, !didCompleteExtension else { return }
+
+        let outcome = ShareSaveOutcome.save(
+            texts: collected,
+            inboxDirectory: SharedAppGroup.inboxDirectoryURL()
+        )
+        presentOutcome(outcome)
+
+        try? await Task.sleep(nanoseconds: outcome.autoDismissDelayNanoseconds)
+        guard !Task.isCancelled, !didCompleteExtension else { return }
+        didCompleteExtension = true
         extensionContext?.completeRequest(returningItems: nil)
     }
 
-    private static func loadText(from provider: NSItemProvider) async -> String? {
-        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
-           !provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
-            return nil
-        }
-        if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier),
-           !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
-           let urlText = await loadURLString(from: provider) {
-            return urlText
-        }
-        if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
-            || provider.canLoadObject(ofClass: NSString.self) {
-            return await loadPlainText(from: provider)
-        }
-        return nil
-    }
+    private func presentOutcome(_ outcome: ShareSaveOutcome) {
+        hasFinishedSaving = true
+        spinner.stopAnimating()
+        spinner.isHidden = true
 
-    private static func loadURLString(from provider: NSItemProvider) async -> String? {
-        await withCheckedContinuation { continuation in
-            provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { item, _ in
-                if let url = item as? URL {
-                    continuation.resume(returning: url.isFileURL ? nil : url.absoluteString)
-                } else if let data = item as? Data,
-                          let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    continuation.resume(returning: url.isFileURL ? nil : url.absoluteString)
-                } else if let text = item as? String, !text.isEmpty {
-                    continuation.resume(returning: text)
-                } else {
-                    continuation.resume(returning: nil)
-                }
+        statusImageView.image = UIImage(systemName: outcome.symbolName)
+        switch outcome {
+        case .saved:
+            statusImageView.tintColor = UIColor { traits in
+                traits.userInterfaceStyle == .dark
+                    ? UIColor(red: 0.45, green: 0.64, blue: 1.0, alpha: 1)
+                    : UIColor(red: 0.15, green: 0.39, blue: 0.92, alpha: 1)
             }
+        case .noSupportedContent:
+            statusImageView.tintColor = .secondaryLabel
+        case .storageUnavailable, .saveFailed:
+            statusImageView.tintColor = .systemOrange
         }
-    }
+        statusImageView.isHidden = false
 
-    private static func loadPlainText(from provider: NSItemProvider) async -> String? {
-        let objectText: String? = await withCheckedContinuation { continuation in
-            provider.loadObject(ofClass: NSString.self) { object, _ in
-                continuation.resume(returning: object as? String)
-            }
-        }
-        if let objectText { return objectText }
-        return await withCheckedContinuation { continuation in
-            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                if let text = item as? String {
-                    continuation.resume(returning: text)
-                } else if let attributed = item as? NSAttributedString {
-                    continuation.resume(returning: attributed.string)
-                } else if let data = item as? Data {
-                    continuation.resume(returning: String(data: data, encoding: .utf8))
-                } else {
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
+        titleLabel.text = outcome.title
+        subtitleLabel.text = outcome.subtitle
+        subtitleLabel.isHidden = outcome.subtitle == nil
+        actionButton.setTitle("閉じる", for: .normal)
     }
 }

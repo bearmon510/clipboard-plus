@@ -22,6 +22,8 @@ final class ScreenSnapshotTests: XCTestCase {
     private static let narrow = CGSize(width: 360, height: 780)
     private static let wide = CGSize(width: 1_024, height: 768)
     private static let phone = CGSize(width: 393, height: 852)
+    private static let keyboardPhone = CGSize(width: 393, height: 284)
+    private static let keyboardPad = CGSize(width: 1_024, height: 340)
 
     /// The first-run guide would otherwise open over every main screen.
     override func setUp() {
@@ -167,6 +169,113 @@ final class ScreenSnapshotTests: XCTestCase {
                                  onText: { _ in }, onImage: { _ in }, onClose: {})
         try save(render(noText, size: Self.narrow, style: .light), "capture-narrow-notext")
         try save(render(CaptureGuideView(), size: Self.narrow, style: .light), "capture-guide-narrow-light")
+    }
+
+    @MainActor
+    func testRenderKeyboardScreens() throws {
+        let now = Date()
+        let entries = sampleKeyboardEntries(now: now)
+
+        let historyPhone = KeyboardViewModel(
+            entries: entries,
+            initialTab: .history,
+            loadState: .loaded,
+            hasFullAccess: false,
+            needsInputModeSwitchKey: true,
+            referenceDateOverride: now
+        )
+        try save(renderKeyboard(historyPhone, size: Self.keyboardPhone, style: .light), "keyboard-history-phone-light")
+
+        let templatesPad = KeyboardViewModel(
+            entries: entries,
+            initialTab: .templates,
+            loadState: .loaded,
+            hasFullAccess: false,
+            needsInputModeSwitchKey: true,
+            referenceDateOverride: now
+        )
+        try save(renderKeyboard(templatesPad, size: Self.keyboardPad, style: .dark), "keyboard-templates-pad-dark")
+
+        let alphanumericPhone = KeyboardViewModel(
+            entries: entries,
+            initialTab: .history,
+            loadState: .loaded,
+            mode: .alphanumeric,
+            alphanumericPage: .letters,
+            shiftState: .once,
+            hasFullAccess: false,
+            needsInputModeSwitchKey: true,
+            referenceDateOverride: now
+        )
+        try save(renderKeyboard(alphanumericPhone, size: Self.keyboardPhone, style: .dark), "keyboard-alphanumeric-phone-dark")
+
+        let emptyPhone = KeyboardViewModel(
+            entries: [],
+            initialTab: .history,
+            loadState: .loaded,
+            hasFullAccess: false,
+            needsInputModeSwitchKey: true,
+            referenceDateOverride: now
+        )
+        try save(renderKeyboard(emptyPhone, size: Self.keyboardPhone, style: .light), "keyboard-empty-phone-light")
+
+        let fullAccessPhone = KeyboardViewModel(
+            entries: entries,
+            initialTab: .history,
+            loadState: .loaded,
+            hasFullAccess: true,
+            needsInputModeSwitchKey: true,
+            referenceDateOverride: now
+        )
+        try save(renderKeyboard(fullAccessPhone, size: Self.keyboardPhone, style: .light), "keyboard-fullaccess-phone-light")
+    }
+
+    @MainActor
+    private func renderKeyboard(_ model: KeyboardViewModel, size: CGSize, style: UIUserInterfaceStyle) -> UIImage {
+        let view = KeyboardView(model: model)
+            .frame(width: size.width, height: size.height)
+            .background(KeyboardTheme.page)
+        return render(view, size: size, style: style)
+    }
+
+    private func sampleKeyboardEntries(now: Date) -> [KeyboardHistoryEntry] {
+        [
+            KeyboardHistoryEntry(
+                id: 1, kind: .text,
+                text: "打ち合わせの議事録を共有します。\n明日の10時からレビューを行います。",
+                lastCollectedAt: now.addingTimeInterval(-4), isTemplate: false, isFromPC: true
+            ),
+            KeyboardHistoryEntry(
+                id: 2, kind: .url,
+                text: "https://developer.apple.com/documentation/uikit/uipastecontrol",
+                lastCollectedAt: now.addingTimeInterval(-240), isTemplate: false, isFromPC: false
+            ),
+            KeyboardHistoryEntry(
+                id: 3, kind: .text,
+                text: "〒100-0001 東京都千代田区千代田1-1 試験ビル 3階",
+                lastCollectedAt: now.addingTimeInterval(-1_800), isTemplate: false, isFromPC: false
+            ),
+            KeyboardHistoryEntry(
+                id: 4, kind: .text,
+                text: "いつもお世話になっております。試験 太郎です。",
+                lastCollectedAt: now, isTemplate: true, title: "あいさつ", tag: "メール", templateOrder: 0
+            ),
+            KeyboardHistoryEntry(
+                id: 5, kind: .text,
+                text: "引き続きよろしくお願いいたします。",
+                lastCollectedAt: now, isTemplate: true, title: "結び", tag: "メール", templateOrder: 1
+            ),
+            KeyboardHistoryEntry(
+                id: 6, kind: .text,
+                text: "電話：03-0000-0000\nメール：hello@example.com",
+                lastCollectedAt: now, isTemplate: true, title: "連絡先", tag: "住所セット", templateOrder: 0
+            ),
+            KeyboardHistoryEntry(
+                id: 7, kind: .url,
+                text: "https://example.com/forms/contact",
+                lastCollectedAt: now, isTemplate: true, title: "問い合わせフォーム", tag: nil, templateOrder: 0
+            ),
+        ]
     }
 
     /// A made-up page standing in for a screenshot of another app.

@@ -1,7 +1,9 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
     @ObservedObject var monitor: ClipboardMonitor
     @ObservedObject var log: MeasurementLog
     let screenshots: ScreenshotWatcher
@@ -46,6 +48,22 @@ struct SettingsView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .frame(minHeight: 44)
+                    Text("この\(DeviceKind.current.name)でほかのアプリに履歴やテンプレートを入れるには、設定アプリ →「一般」→「キーボード」→「キーボード」→「新しいキーボードを追加…」で「clipboard+」を選び、入力中に地球儀キーで切り替えます。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("必要に応じて「フルアクセスを許可」をオンにすると、キーボード上の「今のコピーを保存」からコピーした文章やリンクを保存できます。オフのままでも履歴とテンプレートの挿入は使えます。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            openURL(url)
+                        }
+                    } label: {
+                        Label("設定を開く", systemImage: "gear")
+                    }
                     .frame(minHeight: 44)
                 }
                 Section("履歴の保存") {

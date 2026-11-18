@@ -1,7 +1,7 @@
 import Foundation
 
 /// Initial tab shown when switching to the clipboard+ keyboard extension.
-enum KeyboardTab: String, Codable, CaseIterable, Identifiable {
+enum KeyboardTab: String, Codable, CaseIterable, Identifiable, Sendable {
     case history
     case templates
 
@@ -22,7 +22,7 @@ enum KeyboardTab: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-struct KeyboardSettings: Codable, Equatable {
+struct KeyboardSettings: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
     let formatVersion: Int
