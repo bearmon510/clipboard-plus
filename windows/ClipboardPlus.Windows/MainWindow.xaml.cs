@@ -20,6 +20,8 @@ public partial class MainWindow : Window
     private Func<CancellationToken, Task<HotkeyChord?>>? recordHotkey;
     private Action? applyHotkey;
     private CancellationTokenSource? recording;
+    private readonly WifiTransferProbe? wifiProbe;
+    private string? renderedProbeQrText;
     public event Action? RepairRequested;
     public event Action? HistoryRequested;
 
@@ -34,21 +36,33 @@ public partial class MainWindow : Window
         {
             Title = "clipboard+ for Windows — プレビュー";
             RepairButton.IsEnabled = LogsButton.IsEnabled = StartupCheck.IsEnabled = false;
+            WifiProbeModeDirect.IsEnabled = WifiProbeModeHotspot.IsEnabled = WifiProbeStartButton.IsEnabled = false;
             UpdateBluetooth("プレビュー表示");
         }
-        else StartupCheck.IsChecked = LocalStore.StartupEnabled;
+        else
+        {
+            StartupCheck.IsChecked = LocalStore.StartupEnabled;
+            wifiProbe = new WifiTransferProbe(log, Dispatcher);
+            wifiProbe.SnapshotChanged += UpdateWifiProbe;
+            UpdateWifiProbe(wifiProbe.CurrentSnapshot);
+        }
     }
 
     public void UpdatePairing(SyncPairing pairing)
     {
-        using var data = QRCodeGenerator.GenerateQrCode(pairing.ToQrString(), QRCodeGenerator.ECCLevel.Q);
+        QrImage.Source = RenderQrBitmap(pairing.ToQrString());
+        // A new pairing forgets the devices, so the window starts over too.
+        UpdateSync(new SyncStatus(0, 0, null, null, Devices: []));
+    }
+
+    private static BitmapImage RenderQrBitmap(string content)
+    {
+        using var data = QRCodeGenerator.GenerateQrCode(content, QRCodeGenerator.ECCLevel.Q);
         using var code = new PngByteQRCode(data);
         using var stream = new MemoryStream(code.GetGraphic(8));
         var bitmap = new BitmapImage();
         bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.StreamSource = stream; bitmap.EndInit(); bitmap.Freeze();
-        QrImage.Source = bitmap;
-        // A new pairing forgets the devices, so the window starts over too.
-        UpdateSync(new SyncStatus(0, 0, null, null, Devices: []));
+        return bitmap;
     }
 
     public void UpdateBluetooth(string state) { bluetoothState = state; UpdateStatus(); }
@@ -163,5 +177,71 @@ public partial class MainWindow : Window
             StartupCheck.IsChecked = LocalStore.StartupEnabled;
             System.Windows.MessageBox.Show(this, "起動時の設定を保存できませんでした。", "clipboard+");
         }
+    }
+
+    internal async Task StopWifiProbeAsync()
+    {
+        if (wifiProbe is not null)
+            await wifiProbe.DisposeAsync();
+    }
+
+    internal void StopWifiProbeSync() => wifiProbe?.StopSync();
+
+    private async void OnStartWifiProbe(object sender, RoutedEventArgs e)
+    {
+        if (wifiProbe is null || preview) return;
+        var mode = WifiProbeModeHotspot.IsChecked == true
+            ? WifiProbeMode.MobileHotspot
+            : WifiProbeMode.WifiDirectLegacy;
+        WifiProbeStartButton.IsEnabled = false;
+        WifiProbeModeDirect.IsEnabled = WifiProbeModeHotspot.IsEnabled = false;
+        WifiProbeStopButton.IsEnabled = true;
+        await wifiProbe.StartAsync(mode);
+    }
+
+    private async void OnStopWifiProbe(object sender, RoutedEventArgs e)
+    {
+        if (wifiProbe is null) return;
+        WifiProbeStopButton.IsEnabled = false;
+        await wifiProbe.StopAsync();
+    }
+
+    private void UpdateWifiProbe(WifiProbeSnapshot state)
+    {
+        WifiProbeStartButton.IsEnabled = !preview && !state.IsRunning;
+        WifiProbeModeDirect.IsEnabled = !preview && !state.IsRunning;
+        WifiProbeModeHotspot.IsEnabled = !preview && !state.IsRunning;
+        WifiProbeStopButton.IsEnabled = !preview && state.IsRunning;
+        WifiProbeStatusText.Text = state.StatusMessage;
+
+        if (string.IsNullOrEmpty(state.ErrorMessage))
+        {
+            WifiProbeErrorText.Text = "";
+            WifiProbeErrorText.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            WifiProbeErrorText.Text = state.ErrorMessage;
+            WifiProbeErrorText.Visibility = Visibility.Visible;
+        }
+
+        if (state.QrPayload is { } qr)
+        {
+            var text = qr.ToQrString();
+            if (renderedProbeQrText != text)
+            {
+                WifiProbeQrImage.Source = RenderQrBitmap(text);
+                renderedProbeQrText = text;
+            }
+            WifiProbeQrPanel.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            renderedProbeQrText = null;
+            WifiProbeQrImage.Source = null;
+            WifiProbeQrPanel.Visibility = Visibility.Collapsed;
+        }
+
+        WifiProbeTimelineText.Text = WifiProbeText.FormatTimeline(state);
     }
 }

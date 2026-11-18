@@ -281,6 +281,8 @@ public partial class App : System.Windows.Application
         }
         HistoryWindow.ClearDragStaging(HistoryWindow.DragStagingRoot);
         await pendingSettingsSave;
+        if (window is not null)
+            await window.StopWifiProbeAsync();
         try
         {
             if (currentServer is not null) await currentServer.DisposeAsync();
@@ -295,6 +297,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        window?.StopWifiProbeSync();
         keyboardHook?.Dispose();
         tray?.Dispose();
         activationWait?.Unregister(null); activation?.Dispose();

@@ -137,6 +137,16 @@ struct SettingsView: View {
                             .font(.footnote)
                     }
                 }
+                Section {
+                    NavigationLink {
+                        WifiProbeView()
+                    } label: {
+                        Label("Wi-Fi 転送の試験", systemImage: "wifi")
+                    }
+                    .frame(minHeight: 44)
+                } footer: {
+                    Text("開発者向けの小さな試験項目です。PC側の一時Wi-Fiへつなぎ、\(DeviceKind.current.name)との転送速度や確認枠の出方を確かめます。")
+                }
             }
             .navigationTitle("設定")
             .navigationBarTitleDisplayMode(.inline)

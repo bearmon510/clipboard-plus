@@ -44,6 +44,7 @@ targets:
         UIBackgroundModes: [bluetooth-central]
         NSBluetoothAlwaysUsageDescription: 近くのWindowsのPCと、コピーした文章を受け渡すために使います。
         NSCameraUsageDescription: PCに表示されたQRコードを読んで、PCと組にするために使います。
+        NSLocalNetworkUsageDescription: 近くのWindowsのPCが作る一時的なWi-Fiへつなぎ、大きな画像やファイルを直接受け渡すために使います。外部のサーバーへ送信することはありません。
         NSPhotoLibraryUsageDescription: 撮ったスクリーンショットを見つけて、範囲を選んで切り取るために使います。写真を外へ送ることはありません。
         # Shows the Documents folder (measurement log only) in the Files app.
         # History, images and backups stay outside it.

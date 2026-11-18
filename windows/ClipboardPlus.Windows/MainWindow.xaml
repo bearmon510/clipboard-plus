@@ -65,6 +65,30 @@
       </WrapPanel>
       <CheckBox x:Name="StartupCheck" Content="Windowsの起動時に開く" Click="OnStartupChanged"/>
       <TextBlock Text="ウインドウを閉じても同期を続けます。終了するには、タスクトレイのアイコンから「終了」を選んでください。" FontSize="12" Foreground="#64748B" Margin="0,14,0,0"/>
+      <Expander Header="Wi-Fi 転送の試験（段階A・開発用）" Foreground="#64748B" Margin="0,18,0,0">
+        <Border Background="White" CornerRadius="12" Padding="18" Margin="0,10,0,0" BorderBrush="#E2E8F0" BorderThickness="1" TextElement.Foreground="#1F2937">
+          <StackPanel>
+            <TextBlock Text="実機で一時Wi-FiとTCPの速度・許可ダイアログを確かめる試験用機能です（Bluetooth同期とはつながりません）。" FontSize="12" Foreground="#64748B" TextWrapping="Wrap"/>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+              <RadioButton x:Name="WifiProbeModeDirect" Content="Wi-Fi Direct（レガシー）" IsChecked="True" Margin="0,0,16,0"/>
+              <RadioButton x:Name="WifiProbeModeHotspot" Content="モバイルホットスポット"/>
+            </StackPanel>
+            <WrapPanel Margin="0,12,0,0">
+              <Button x:Name="WifiProbeStartButton" Content="試験を始める" Padding="12,5" Margin="0,0,8,0" Click="OnStartWifiProbe"/>
+              <Button x:Name="WifiProbeStopButton" Content="試験を終える" Padding="12,5" IsEnabled="False" Click="OnStopWifiProbe"/>
+            </WrapPanel>
+            <TextBlock x:Name="WifiProbeStatusText" Text="まだ始めていません。" Margin="0,12,0,0" TextWrapping="Wrap"/>
+            <TextBlock x:Name="WifiProbeErrorText" Foreground="#B45309" Margin="0,6,0,0" TextWrapping="Wrap" Visibility="Collapsed"/>
+            <StackPanel x:Name="WifiProbeQrPanel" Margin="0,12,0,0" Visibility="Collapsed">
+              <Border Background="White" Padding="6" HorizontalAlignment="Center" BorderBrush="#E2E8F0" BorderThickness="1">
+                <Image x:Name="WifiProbeQrImage" Width="210" Height="210" RenderOptions.BitmapScalingMode="NearestNeighbor"/>
+              </Border>
+              <TextBlock Text="iPhone・iPadの「設定」→「Wi-Fi 転送の試験」からこのQRコードを読んでください。終わったら「試験を終える」で一時Wi-Fiを止めます。" FontSize="12" Foreground="#64748B" Margin="0,8,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+            <TextBlock x:Name="WifiProbeTimelineText" FontFamily="Consolas, Yu Gothic UI" FontSize="12" Foreground="#334155" Margin="0,12,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+      </Expander>
     </StackPanel>
   </ScrollViewer>
 </Window>
