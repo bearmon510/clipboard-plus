@@ -309,6 +309,9 @@ internal sealed class BleWritePipeline
     private readonly Func<Task> refreshSubscriptionsAsync;
     private readonly Func<BleSubscribedClient[], long, Task>? applySubscriptionsAsync;
     private readonly Func<object, BleSubscriptionSlot, Task<object?>>? rehandshakePeerAsync;
+    // WinRT may hand out a different GattSession object for the same link (the write event and
+    // SubscribedClients do), so the server compares sessions by device; generations catch reconnects.
+    private readonly Func<object, object, bool> sameSession;
     private readonly Func<object, uint, byte[], Task<bool>> deliverPacketAsync;
     private readonly Func<object, Task> disconnectPeerAsync;
     private readonly Action<object>? rejectPeerSync;
@@ -350,13 +353,15 @@ internal sealed class BleWritePipeline
         Func<Task>? onIngestStart = null,
         Func<BleSubscribedClient[], long, Task>? applySubscriptionsAsync = null,
         TimeSpan? shutdownTimeout = null,
-        Func<object, BleSubscriptionSlot, Task<object?>>? rehandshakePeerAsync = null)
+        Func<object, BleSubscriptionSlot, Task<object?>>? rehandshakePeerAsync = null,
+        Func<object, object, bool>? sameSession = null)
     {
         this.admission = admission;
         this.log = log;
         this.refreshSubscriptionsAsync = refreshSubscriptionsAsync;
         this.applySubscriptionsAsync = applySubscriptionsAsync;
         this.rehandshakePeerAsync = rehandshakePeerAsync;
+        this.sameSession = sameSession ?? (static (a, b) => Equals(a, b));
         this.deliverPacketAsync = deliverPacketAsync;
         this.disconnectPeerAsync = disconnectPeerAsync;
         this.rejectPeerSync = rejectPeerSync;
@@ -491,7 +496,7 @@ internal sealed class BleWritePipeline
                 foreach (var peerId in knownSubscribedSessions.Keys.ToArray())
                 {
                     var known = knownSubscribedSessions[peerId];
-                    if (!currentByPeer.TryGetValue(peerId, out var currentSession) || !Equals(currentSession, known.Session))
+                    if (!currentByPeer.TryGetValue(peerId, out var currentSession) || !sameSession(currentSession, known.Session))
                     {
                         knownSubscribedSessions.Remove(peerId);
                         AdvancePeerGenerationLocked(peerId, known.SubscriptionGeneration + 1);
@@ -502,7 +507,7 @@ internal sealed class BleWritePipeline
                 {
                     var slot = slotsByPeer[key];
                     var stillSubscribed = currentByPeer.TryGetValue(slot.PeerId, out var currentSession)
-                        && Equals(currentSession, slot.Session);
+                        && sameSession(currentSession, slot.Session);
                     if (!stillSubscribed || !Equals(slot.Characteristic, activeCharacteristic))
                     {
                         InvalidateSlotOnlyLocked(slot);
@@ -515,7 +520,7 @@ internal sealed class BleWritePipeline
                 {
                     var client = clients[i];
                     long peerSubGen;
-                    if (knownSubscribedSessions.TryGetValue(client.PeerId, out var active) && Equals(active.Session, client.Session))
+                    if (knownSubscribedSessions.TryGetValue(client.PeerId, out var active) && sameSession(active.Session, client.Session))
                     {
                         peerSubGen = active.SubscriptionGeneration;
                     }
@@ -576,7 +581,7 @@ internal sealed class BleWritePipeline
         {
             return !stopping
                 && knownSubscribedSessions.TryGetValue(peerId, out var known)
-                && Equals(known.Session, session)
+                && sameSession(known.Session, session)
                 && known.SubscriptionGeneration == subscriptionGeneration;
         }
     }
@@ -609,21 +614,21 @@ internal sealed class BleWritePipeline
             if (subscriptionGeneration is { } explicitSubGen)
             {
                 if (!knownSubscribedSessions.TryGetValue(peerId, out var known)
-                    || !Equals(known.Session, session)
+                    || !sameSession(known.Session, session)
                     || known.SubscriptionGeneration != explicitSubGen)
                 {
                     return null;
                 }
             }
             var targetSubGen = subscriptionGeneration
-                ?? (knownSubscribedSessions.TryGetValue(peerId, out var activeKnown) && Equals(activeKnown.Session, session)
+                ?? (knownSubscribedSessions.TryGetValue(peerId, out var activeKnown) && sameSession(activeKnown.Session, session)
                     ? activeKnown.SubscriptionGeneration
                     : nextSubscriptionGenerationByPeer.GetValueOrDefault(peerId, 1));
             if (slotsByPeer.TryGetValue(peerId, out var existing))
             {
                 if (!existing.Invalidated
                     && Equals(existing.Characteristic, characteristic)
-                    && Equals(existing.Session, session)
+                    && sameSession(existing.Session, session)
                     && existing.SubscriptionGeneration == targetSubGen
                     && existing.Peer is null)
                 {
@@ -684,7 +689,7 @@ internal sealed class BleWritePipeline
         {
             InvalidateSlotOnlyLocked(slot);
             if (knownSubscribedSessions.TryGetValue(slot.PeerId, out var known)
-                && Equals(known.Session, slot.Session)
+                && sameSession(known.Session, slot.Session)
                 && known.SubscriptionGeneration == slot.SubscriptionGeneration)
             {
                 knownSubscribedSessions.Remove(slot.PeerId);
@@ -825,18 +830,18 @@ internal sealed class BleWritePipeline
             if (stopping || !Equals(activeCharacteristic, characteristic)) return null;
             if (slotsByPeer.TryGetValue(peerId, out var existing) && !existing.Invalidated)
             {
-                if (Equals(existing.Characteristic, characteristic) && Equals(existing.Session, session))
+                if (Equals(existing.Characteristic, characteristic) && sameSession(existing.Session, session))
                 {
                     if (existing.Rejected) return null;
                     return existing;
                 }
                 if (existing.Peer is not null) return null;
-                if (knownSubscribedSessions.TryGetValue(peerId, out var known) && Equals(known.Session, existing.Session))
+                if (knownSubscribedSessions.TryGetValue(peerId, out var known) && sameSession(known.Session, existing.Session))
                     return null;
                 InvalidateSlotOnlyLocked(existing);
                 AdvancePeerGenerationLocked(peerId, existing.SubscriptionGeneration + 1);
             }
-            else if (knownSubscribedSessions.TryGetValue(peerId, out var activeKnown) && !Equals(activeKnown.Session, session))
+            else if (knownSubscribedSessions.TryGetValue(peerId, out var activeKnown) && !sameSession(activeKnown.Session, session))
             {
                 return null;
             }

@@ -45,7 +45,8 @@ internal sealed class BleServer : IAsyncDisposable
             peer => ((Peer)peer).Reject(),
             applySubscriptionsAsync: ApplySubscriptionSnapshotAsync,
             shutdownTimeout: shutdownTimeout,
-            rehandshakePeerAsync: RehandshakePeerAsync);
+            rehandshakePeerAsync: RehandshakePeerAsync,
+            sameSession: SameSession);
     }
 
     public void Start() => polling = Task.Run(async () =>
@@ -241,7 +242,7 @@ internal sealed class BleServer : IAsyncDisposable
             var oldSubGen = old.Slot?.SubscriptionGeneration ?? 0;
             var stillSubscribed = old.Session.SessionStatus != GattSessionStatus.Closed
                 && !(old.Slot?.Invalidated ?? false)
-                && clients.Any(c => c.PeerId == old.Id && Equals(c.Session, old.Session) && c.SubscriptionGeneration == oldSubGen);
+                && clients.Any(c => c.PeerId == old.Id && SameSession(c.Session, old.Session) && c.SubscriptionGeneration == oldSubGen);
             if (!stillSubscribed)
                 await RemovePeerAsync(old);
         }
@@ -257,7 +258,7 @@ internal sealed class BleServer : IAsyncDisposable
             var existing = peerRegistry.GetValueOrDefault(id);
             if (existing is not null)
             {
-                if (Equals(existing.Session, client.Session)
+                if (SameSession(existing.Session, client.Session)
                     && existing.Slot?.SubscriptionGeneration == item.SubscriptionGeneration
                     && !(existing.Slot?.Invalidated ?? false))
                 {
@@ -293,7 +294,7 @@ internal sealed class BleServer : IAsyncDisposable
             return null;
         }
         var client = ReadSubscribedClients(currentOutbound)
-            .Where(c => c.PeerId == oldPeer.Id && Equals(c.Session, oldPeer.Session))
+            .Where(c => c.PeerId == oldPeer.Id && SameSession(c.Session, oldPeer.Session))
             .Select(c => (GattSubscribedClient)c.Client)
             .FirstOrDefault() ?? oldPeer.Client;
         await RemovePeerAsync(oldPeer);
@@ -379,6 +380,17 @@ internal sealed class BleServer : IAsyncDisposable
             return await coordinator.ReceiveAsync(peer, bytes);
         await coordinator.DisconnectAsync(peer);
         return false;
+    }
+
+    // The write event and SubscribedClients can return different GattSession objects for the same
+    // link, so reference equality silently dropped every write (build 34 never got past HELLO).
+    // A session is identified by its device; subscription generations tell reconnects apart.
+    private static bool SameSession(object a, object b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is not GattSession x || b is not GattSession y) return Equals(a, b);
+        try { return string.Equals(x.DeviceId.Id, y.DeviceId.Id, StringComparison.Ordinal); }
+        catch (Exception) { return false; }
     }
 
     private static void RejectWrite(GattWriteRequestedEventArgs args)
