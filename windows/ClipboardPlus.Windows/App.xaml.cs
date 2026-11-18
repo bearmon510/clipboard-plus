@@ -127,7 +127,7 @@ public partial class App : System.Windows.Application
             if (task.IsCompletedSuccessfully)
                 Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(task.Result); });
         }, TaskScheduler.Default);
-        server = new(coordinator, log.Write);
+        server = new(coordinator, log.Write, Dispatcher);
         var currentServer = server;
         server.StatusChanged += state => Dispatcher.BeginInvoke(() => { if (server == currentServer) window!.UpdateBluetooth(state); });
         server.Start();

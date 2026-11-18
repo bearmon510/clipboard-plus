@@ -48,7 +48,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public Guid? InFlight;
         public Guid DeviceId;
         public AttachmentTransfer? ActiveAttachment;
-        public readonly HashSet<Guid> ActiveIncomingAttachments = [];
+        public readonly Dictionary<Guid, DateTimeOffset> ActiveIncomingAttachments = [];
         public readonly Dictionary<Guid, AttachmentReceive> AttachmentReceives = [];
         public bool HighThroughputRequested;
         public DateTimeOffset LastAttachmentActivity = now;
@@ -70,12 +70,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public SyncFrameReceiver? Receiver;
     }
 
-    private sealed record PendingChunk(int EndOffset, DateTimeOffset? CompletedAt);
+    private sealed record PendingChunk(int EndOffset, bool HandedOffLastPacket, PendingReply? Reply);
     private sealed class AttachmentTransfer(Guid id, int size, DateTimeOffset startedAt)
     {
         public readonly Guid Id = id;
         public readonly int Size = size;
         public readonly DateTimeOffset StartedAt = startedAt;
+        public DateTimeOffset LastActivity = startedAt;
         public bool AwaitingInitialResume = true;
         public int NextSendOffset;
         public int AckedOffset;
@@ -141,7 +142,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             if (c.InFlight is Guid current && !ids.Contains(current)) { Drop(c, "pending item removed"); continue; }
             foreach (var id in c.Sent.Keys.Where(id => !ids.Contains(id)).ToArray()) c.Sent.Remove(id);
             if (c.ActiveAttachment is { } att && !ids.Contains(att.Id)) c.ActiveAttachment = null;
-            c.ActiveIncomingAttachments.RemoveWhere(id => store.Incoming(c.DeviceId, id) is null);
+            foreach (var id in c.ActiveIncomingAttachments.Keys.Where(id => store.Incoming(c.DeviceId, id) is null).ToArray()) c.ActiveIncomingAttachments.Remove(id);
             foreach (var id in c.AttachmentReceives.Keys.Where(id => store.Incoming(c.DeviceId, id) is null).ToArray()) c.AttachmentReceives.Remove(id);
             c.Attempted.RemoveWhere(id => !ids.Contains(id));
             c.ResumedAttachments.RemoveWhere(id => !ids.Contains(id));
@@ -348,7 +349,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             if (offset == offer.Size) await FinishIncomingAsync(c, offer);
                             else
                             {
-                                c.ActiveIncomingAttachments.Add(offer.Id);
+                                c.ActiveIncomingAttachments[offer.Id] = offerNow;
                                 EnableHighThroughput(c, offerNow);
                                 QueueReply(c, new SyncResume(offer.Id, offset));
                             }
@@ -360,7 +361,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             c.LastAttachmentActivity = c.LastPacket;
                             c.Progress = new(c.DeviceId, "receive", chunk.Id, 1, 1, saved, incoming.Size);
                             if (saved == incoming.Size) await FinishIncomingAsync(c, incoming);
-                            else QueueReply(c, new SyncResume(chunk.Id, saved));
+                            else
+                            {
+                                c.ActiveIncomingAttachments[chunk.Id] = c.LastPacket;
+                                EnableHighThroughput(c, c.LastPacket);
+                                QueueReply(c, new SyncResume(chunk.Id, saved));
+                            }
                             break;
                         case SyncResume resume:
                             var queued = store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == resume.Id);
@@ -368,6 +374,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             if (queued.Kind == "text" || resume.Offset >= queued.Size || c.ActiveAttachment?.Id != resume.Id)
                                 throw new SyncProtocolException(SyncError.State);
                             var att = c.ActiveAttachment;
+                            var resumeNow = Now();
                             if (att.AwaitingInitialResume)
                             {
                                 att.AwaitingInitialResume = false;
@@ -380,22 +387,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             else
                             {
                                 var idx = att.Chunks.FindIndex(ch => ch.EndOffset == resume.Offset);
-                                if (idx < 0) throw new SyncProtocolException(SyncError.State);
+                                if (idx < 0 || !att.Chunks[idx].HandedOffLastPacket) throw new SyncProtocolException(SyncError.State);
                                 att.Chunks.RemoveRange(0, idx + 1);
                                 att.AckedOffset = resume.Offset;
-                                if (att.Chunks.Count > 0 && att.Chunks[0].CompletedAt is DateTimeOffset frontAt)
-                                {
-                                    var baseDeadline = frontAt + ReplyTimeout;
-                                    var maxDeadline = frontAt + ReplyTimeout + MaxReplyExtension;
-                                    var deadline = c.Sent.TryGetValue(resume.Id, out var prev) && prev.ActiveFrameToken is not null && prev.Deadline > baseDeadline
-                                        ? (prev.Deadline > maxDeadline ? maxDeadline : prev.Deadline)
-                                        : baseDeadline;
-                                    c.Sent[resume.Id] = new(frontAt, deadline, baseDeadline, prev?.ActiveFrameToken);
-                                }
-                                else c.Sent.Remove(resume.Id);
                             }
+                            att.LastActivity = resumeNow;
                             c.ResumedAttachments.Add(resume.Id);
-                            c.LastAttachmentActivity = Now();
+                            EnableHighThroughput(c, resumeNow);
                             StartSending(c); break;
                         case SyncAck ack:
                             foreach (var id in ack.Ids)
@@ -503,14 +501,19 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     // An attachment whose 60-second reply deadline expires drops the connection so the
                     // next session restarts cleanly from offer; text items may resend on the same link.
                     var expired = c.Sent.Where(p => p.Key != c.InFlight && now > p.Value.Deadline).Select(p => p.Key).ToArray();
-                    if (expired.Any(id => c.ActiveAttachment?.Id == id ||
+                    var attachmentExpired = c.ActiveAttachment?.Chunks.Any(ch => ch.Reply is { } reply && now > reply.Deadline) ?? false;
+                    if (attachmentExpired || expired.Any(id => c.ActiveAttachment?.Id == id ||
                         store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == id)?.Kind is "image" or "file"))
                     {
                         Drop(c, "attachment timeout");
                         continue;
                     }
                     foreach (var id in expired) c.Sent.Remove(id);
-                    if (c.HighThroughputRequested && c.ActiveAttachment is null && c.ActiveIncomingAttachments.Count == 0 &&
+                    foreach (var staleId in c.ActiveIncomingAttachments.Where(p => now - p.Value >= HighThroughputIdleGrace).Select(p => p.Key).ToArray())
+                        c.ActiveIncomingAttachments.Remove(staleId);
+                    var outgoingAttachmentActive = c.ActiveAttachment is { } activeAtt &&
+                        (c.InFlight == activeAtt.Id || now - activeAtt.LastActivity < HighThroughputIdleGrace);
+                    if (c.HighThroughputRequested && !outgoingAttachmentActive && c.ActiveIncomingAttachments.Count == 0 &&
                         now - c.LastAttachmentActivity >= HighThroughputIdleGrace)
                     {
                         c.HighThroughputRequested = false;
@@ -658,16 +661,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                                 message = new SyncChunk(item.Id, offset, data);
                                 var end = offset + data.Length;
                                 att.NextSendOffset = end;
-                                att.Chunks.Add(new(end, null));
+                                att.Chunks.Add(new(end, false, null));
                                 chunkEndOffset = end;
                                 finishesItem = end == item.Size;
                                 c.Progress = new(c.DeviceId, "send", item.Id, itemIndex, itemCount, end, item.Size);
-                                c.LastAttachmentActivity = sentNow;
-                                if (!c.Sent.ContainsKey(item.Id))
-                                {
-                                    var initialDeadline = sentNow + ReplyTimeout;
-                                    c.Sent[item.Id] = new(sentNow, initialDeadline, initialDeadline, null);
-                                }
+                                att.LastActivity = sentNow;
+                                EnableHighThroughput(c, sentNow);
                             }
                             else
                             {
@@ -681,7 +680,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             }
                             c.Attempted.Add(item.Id);
                             frame = c.Sender!.Seal(SyncMessageCodec.Encode(message));
-                            retransmission = !attempted.Add(item.Id);
+                            retransmission = !isChunk && !attempted.Add(item.Id);
                             c.InFlight = item.Id;
                         }
                         else { c.Sending = false; return; }
@@ -694,13 +693,19 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 for (var packetIndex = 0; packetIndex < packets.Count; packetIndex++)
                 {
                     c.Stop.Token.ThrowIfCancellationRequested();
-                    if (packetIndex == packets.Count - 1 && item is not null && finishesItem && item.Kind != "text")
+                    if (packetIndex == packets.Count - 1 && item is not null && item.Kind != "text")
                     {
                         await gate.WaitAsync();
                         try
                         {
                             if (c.Retired) return;
-                            if (c.ResumedAttachments.Contains(item.Id)) c.FinalChunkSentAttachments.Add(item.Id);
+                            if (isChunk && chunkEndOffset is int end && c.ActiveAttachment is { } active && active.Id == item.Id)
+                            {
+                                var idx = active.Chunks.FindIndex(ch => ch.EndOffset == end);
+                                if (idx >= 0) active.Chunks[idx] = active.Chunks[idx] with { HandedOffLastPacket = true };
+                            }
+                            if (finishesItem && c.ResumedAttachments.Contains(item.Id))
+                                c.FinalChunkSentAttachments.Add(item.Id);
                         }
                         finally { gate.Release(); }
                     }
@@ -738,12 +743,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                                 if (idx >= 0)
                                 {
                                     var completedNow = Now();
-                                    att.Chunks[idx] = att.Chunks[idx] with { CompletedAt = completedNow };
-                                    if (idx == 0)
+                                    var completedDeadline = completedNow + ReplyTimeout;
+                                    att.Chunks[idx] = att.Chunks[idx] with
                                     {
-                                        var completedDeadline = completedNow + ReplyTimeout;
-                                        c.Sent[item.Id] = new(completedNow, completedDeadline, completedDeadline, null);
-                                    }
+                                        Reply = new(completedNow, completedDeadline, completedDeadline, null)
+                                    };
+                                    att.LastActivity = completedNow;
+                                    c.LastAttachmentActivity = completedNow;
                                 }
                             }
                             c.InFlight = null;
@@ -756,6 +762,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                                 var completedNow = Now();
                                 var completedDeadline = completedNow + ReplyTimeout;
                                 c.Sent[item.Id] = new(completedNow, completedDeadline, completedDeadline, null);
+                                att.LastActivity = completedNow;
+                                if (item.Size > 0) c.LastAttachmentActivity = completedNow;
                             }
                             c.InFlight = null;
                             if (finishesItem) lastSent = Now();
@@ -803,41 +811,50 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         Publish();
     }
 
+    private static PendingReply ExtendReply(PendingReply entry, ulong frameToken, DateTimeOffset candidate)
+    {
+        if (entry.ActiveFrameToken != frameToken)
+            entry = entry with { BaselineDeadline = entry.Deadline, ActiveFrameToken = frameToken };
+        var maxDeadline = entry.InitialSentAt + ReplyTimeout + MaxReplyExtension;
+        var updated = candidate > maxDeadline ? maxDeadline : candidate;
+        return updated > entry.Deadline ? entry with { Deadline = updated } : entry;
+    }
+
+    private static PendingReply RevertReply(PendingReply entry, ulong frameToken) =>
+        entry.ActiveFrameToken == frameToken
+            ? entry with { Deadline = entry.BaselineDeadline, ActiveFrameToken = null }
+            : entry;
+
+    private static PendingReply ConfirmReply(PendingReply entry, ulong frameToken) =>
+        entry.ActiveFrameToken == frameToken
+            ? entry with { BaselineDeadline = entry.Deadline, ActiveFrameToken = null }
+            : entry;
+
+    private static void TransformReplies(Connection c, Func<PendingReply, PendingReply> transform)
+    {
+        foreach (var id in c.Sent.Keys.ToArray())
+            c.Sent[id] = transform(c.Sent[id]);
+        if (c.ActiveAttachment is { } att)
+        {
+            for (var i = 0; i < att.Chunks.Count; i++)
+            {
+                if (att.Chunks[i].Reply is { } reply)
+                    att.Chunks[i] = att.Chunks[i] with { Reply = transform(reply) };
+            }
+        }
+    }
+
     private static void ExtendReplyDeadlines(Connection c, ulong frameToken, DateTimeOffset now)
     {
         var candidate = now + ReplyTimeout;
-        foreach (var id in c.Sent.Keys.ToArray())
-        {
-            var entry = c.Sent[id];
-            if (entry.ActiveFrameToken != frameToken)
-                entry = entry with { BaselineDeadline = entry.Deadline, ActiveFrameToken = frameToken };
-            var maxDeadline = entry.InitialSentAt + ReplyTimeout + MaxReplyExtension;
-            var updated = candidate > maxDeadline ? maxDeadline : candidate;
-            if (updated > entry.Deadline)
-                entry = entry with { Deadline = updated };
-            c.Sent[id] = entry;
-        }
+        TransformReplies(c, entry => ExtendReply(entry, frameToken, candidate));
     }
 
-    private static void RevertReplyExtension(Connection c, ulong frameToken)
-    {
-        foreach (var id in c.Sent.Keys.ToArray())
-        {
-            var entry = c.Sent[id];
-            if (entry.ActiveFrameToken == frameToken)
-                c.Sent[id] = entry with { Deadline = entry.BaselineDeadline, ActiveFrameToken = null };
-        }
-    }
+    private static void RevertReplyExtension(Connection c, ulong frameToken) =>
+        TransformReplies(c, entry => RevertReply(entry, frameToken));
 
-    private static void ConfirmReplyExtension(Connection c, ulong frameToken)
-    {
-        foreach (var id in c.Sent.Keys.ToArray())
-        {
-            var entry = c.Sent[id];
-            if (entry.ActiveFrameToken == frameToken)
-                c.Sent[id] = entry with { BaselineDeadline = entry.Deadline, ActiveFrameToken = null };
-        }
-    }
+    private static void ConfirmReplyExtension(Connection c, ulong frameToken) =>
+        TransformReplies(c, entry => ConfirmReply(entry, frameToken));
 
     // Exception messages can contain paths or external input. Log only a fixed code/type.
     private static string Failure(Exception e) => e is SyncProtocolException p ? p.Code.ToString() : e.GetType().Name;

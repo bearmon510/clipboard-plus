@@ -931,7 +931,7 @@ public sealed class SyncCoordinatorTests
         pad.Peer.OnSend = _ => { chunkEntered.TrySetResult(); return chunkRelease.Task; };
         try
         {
-            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer1.Id, SyncProtocol.ChunkBytes)), pad.Peer.PacketLimit))
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer1.Id, SyncProtocol.ChunkBytes * 4)), pad.Peer.PacketLimit))
                 Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
             await chunkEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
@@ -1768,5 +1768,254 @@ public sealed class SyncCoordinatorTests
         Assert.Equal(txData, received.ToArray());
         await pad.SendAsync(new SyncAck([txOffer.Id]));
         Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task PipelinedResumePreservesConfirmedExtensionAndEnforcesPerChunkCap()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var data = new byte[SyncProtocol.ChunkBytes * 4 + 100];
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "ext-win.bin", Data: data)]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        // Send all 4 initial chunks around t=1s.
+        r.Now = r.Now.AddSeconds(1);
+        var windowSentAt = r.Now;
+        await pad.SendAsync(new SyncResume(offer.Id, 0));
+        Assert.Equal(4, pad.Drain().Cast<SyncChunk>().Count());
+
+        // Receive large incoming frame slowly until t=90s -> confirmed deadline extends to 150s.
+        var largePackets = SyncPacketizer.Split(pad.Seal(new SyncItem(Guid.NewGuid(), 100, "pad", new string('e', 2000))), 200);
+        Assert.True(largePackets.Count >= 6);
+        for (var i = 0; i < largePackets.Count; i++)
+        {
+            r.Now = windowSentAt.AddSeconds((i + 1) * 89.0 / largePackets.Count);
+            Assert.True(await r.Pc.ReceiveAsync(pad.Peer, largePackets[i]));
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad.Peer.Rejected);
+        }
+        r.Now = windowSentAt.AddSeconds(89); // t=90s relative to offer.
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        pad.Drain();
+
+        // At t=91s relative to windowSentAt, resume chunk 0 -> chunk 1 becomes front and keeps extended deadline.
+        r.Now = windowSentAt.AddSeconds(90);
+        await pad.SendAsync(new SyncResume(offer.Id, SyncProtocol.ChunkBytes));
+        Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+
+        r.Now = windowSentAt.AddSeconds(91);
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad.Peer.Rejected);
+
+        r.Now = windowSentAt.AddSeconds(148);
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad.Peer.Rejected);
+
+        r.Now = windowSentAt.AddSeconds(151);
+        await r.Pc.TickAsync(r.Now);
+        Assert.True(pad.Peer.Rejected);
+
+        // Part 2: New chunk sent after resume gets its own 4-minute cap from its own completion time.
+        var pad2 = await r.ConnectAsync(512);
+        var reoffer = Assert.IsType<SyncOffer>(Assert.Single(pad2.Drain()));
+        r.Now = r.Now.AddSeconds(1);
+        var win2Start = r.Now;
+        await pad2.SendAsync(new SyncResume(reoffer.Id, 0));
+        Assert.Equal(4, pad2.Drain().Cast<SyncChunk>().Count());
+
+        var msgSeq = 200;
+        byte[][] NextFramePackets() => SyncPacketizer.Split(
+            pad2.Seal(new SyncItem(Guid.NewGuid(), msgSeq++, "pad", new string((char)('a' + (msgSeq % 26)), 1000))), 200).ToArray();
+        var curPackets = Array.Empty<byte[]>();
+        var pktIdx = 0;
+        while ((r.Now - win2Start).TotalSeconds < 160 || pktIdx > 0)
+        {
+            if (pktIdx == 0) curPackets = NextFramePackets();
+            Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, curPackets[pktIdx++]));
+            if (pktIdx == curPackets.Length) { await r.Pc.WaitForOutgoingAsync(pad2.Peer); pad2.Drain(); pktIdx = 0; }
+            r.Now = r.Now.AddSeconds(10);
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad2.Peer.Rejected);
+        }
+        Assert.True((r.Now - win2Start).TotalSeconds < 240);
+
+        // Resume all 4 chunks around ~180s; chunk 4 is sent now with its own 240s cap (survives past win2Start + 240s).
+        await pad2.SendAsync(new SyncResume(reoffer.Id, SyncProtocol.ChunkBytes * 4));
+        Assert.IsType<SyncChunk>(Assert.Single(pad2.Drain()));
+        var chunk4SentAt = r.Now;
+
+        pktIdx = 0;
+        while ((r.Now - win2Start).TotalSeconds < 250 || pktIdx > 0)
+        {
+            if (pktIdx == 0) curPackets = NextFramePackets();
+            Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, curPackets[pktIdx++]));
+            if (pktIdx == curPackets.Length) { await r.Pc.WaitForOutgoingAsync(pad2.Peer); pad2.Drain(); pktIdx = 0; }
+            r.Now = r.Now.AddSeconds(10);
+            await r.Pc.TickAsync(r.Now);
+            Assert.False(pad2.Peer.Rejected);
+        }
+        Assert.True((r.Now - win2Start).TotalSeconds > 240);
+        Assert.True((r.Now - chunk4SentAt).TotalSeconds < 240);
+
+        await pad2.SendAsync(new SyncAck([reoffer.Id]));
+        Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task TickExpiresFrontChunkEvenWhileLaterChunkIsInFlight()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var data = new byte[SyncProtocol.ChunkBytes * 4 + 100];
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "front-expire.bin", Data: data)]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        var t0 = r.Now;
+        await pad.SendAsync(new SyncResume(offer.Id, 0));
+        Assert.Equal(4, pad.Drain().Cast<SyncChunk>().Count());
+
+        // Block chunk 4 mid-send while chunk 1 is already sent and waiting for resume.
+        var chunk4Entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var chunk4Release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad.Peer.OnSend = _ => { chunk4Entered.TrySetResult(); return chunk4Release.Task; };
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer.Id, SyncProtocol.ChunkBytes)), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+            await chunk4Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            r.Now = t0.AddSeconds(61);
+            await r.Pc.TickAsync(r.Now);
+            Assert.True(pad.Peer.Rejected);
+            Assert.Equal(1, r.State.Pending);
+        }
+        finally { chunk4Release.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+    }
+
+    [Fact]
+    public async Task ResumeRequiresLastPacketHandoffAndAllowsPendingNotifyCompletionOnResumeAndAck()
+    {
+        var r = new Rig();
+        var data = new byte[SyncProtocol.ChunkBytes * 5 + 17];
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "handoff.bin", Data: data)]));
+
+        // 1. Reject resume sent while chunk 0 stopped after its first packet (last packet not handed off).
+        var pad1 = await r.ConnectAsync(20);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad1.Drain()));
+        var firstPkt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad1.Peer.OnSend = _ => { firstPkt.TrySetResult(); return releaseFirst.Task; };
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad1.Seal(new SyncResume(offer.Id, 0)), pad1.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad1.Peer, packet));
+            await firstPkt.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var ok = true;
+            foreach (var packet in SyncPacketizer.Split(pad1.Seal(new SyncResume(offer.Id, SyncProtocol.ChunkBytes)), pad1.Peer.PacketLimit))
+                ok = await r.Pc.ReceiveAsync(pad1.Peer, packet);
+            Assert.False(ok);
+            Assert.True(pad1.Peer.Rejected);
+            Assert.Equal(1, r.State.Pending);
+        }
+        finally { releaseFirst.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad1.Peer);
+
+        // 2. Accept resume when last packet of chunk 0 IS handed off while NotifyValueAsync is still pending.
+        var pad2 = await r.ConnectAsync(512);
+        var offer2 = Assert.IsType<SyncOffer>(Assert.Single(pad2.Drain()));
+        var chunk0LastEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var chunk0LastRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad2.Peer.OnSend = packet =>
+        {
+            if ((packet[0] & 2) != 0 && !chunk0LastEntered.Task.IsCompleted)
+            {
+                chunk0LastEntered.TrySetResult();
+                return chunk0LastRelease.Task;
+            }
+            return Task.CompletedTask;
+        };
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad2.Seal(new SyncResume(offer2.Id, 0)), pad2.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, packet));
+            await chunk0LastEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            foreach (var packet in SyncPacketizer.Split(pad2.Seal(new SyncResume(offer2.Id, SyncProtocol.ChunkBytes)), pad2.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, packet));
+            Assert.False(pad2.Peer.Rejected);
+        }
+        finally { chunk0LastRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad2.Peer);
+        var sentChunks = pad2.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(5, sentChunks.Length);
+
+        // 3. Accept ack when final chunk's last packet IS handed off while NotifyValueAsync is still pending.
+        var finalLastEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finalLastRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad2.Peer.OnSend = packet =>
+        {
+            if ((packet[0] & 2) != 0 && !finalLastEntered.Task.IsCompleted)
+            {
+                finalLastEntered.TrySetResult();
+                return finalLastRelease.Task;
+            }
+            return Task.CompletedTask;
+        };
+        try
+        {
+            foreach (var packet in SyncPacketizer.Split(pad2.Seal(new SyncResume(offer2.Id, SyncProtocol.ChunkBytes * 2)), pad2.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, packet));
+            await finalLastEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            foreach (var packet in SyncPacketizer.Split(pad2.Seal(new SyncAck([offer2.Id])), pad2.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, packet));
+            Assert.False(pad2.Peer.Rejected);
+            Assert.Equal(0, r.State.Pending);
+        }
+        finally { finalLastRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad2.Peer);
+    }
+
+    [Fact]
+    public async Task AbandonedIncomingAttachmentReleasesHighThroughputAfterIdleGraceWhileKeepingPartial()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var data = Enumerable.Range(0, SyncProtocol.ChunkBytes * 5 + 25).Select(i => (byte)(i * 5 + 1)).ToArray();
+        var offer = new SyncOffer(Guid.NewGuid(), r.Now.ToUnixTimeMilliseconds(), "pad", "file", data.Length,
+            Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(data)),
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("abandoned.bin")), "public.data");
+
+        await pad.SendAsync(offer);
+        Assert.Equal(new SyncResume(offer.Id, 0), Assert.Single(pad.Drain()));
+        for (var i = 0; i < 4; i++)
+            await pad.SendAsync(new SyncChunk(offer.Id, i * SyncProtocol.ChunkBytes, data[(i * SyncProtocol.ChunkBytes)..((i + 1) * SyncProtocol.ChunkBytes)]));
+        pad.Drain();
+        Assert.Equal([true], pad.Peer.HighThroughputHistory);
+
+        // Sender drops the item locally and sends nothing more; after 6s idle, high-throughput is released
+        // while the partial remains on disk for potential resume.
+        r.Now = r.Now.AddSeconds(6);
+        await r.Pc.TickAsync(r.Now);
+        Assert.False(pad.Peer.Rejected);
+        Assert.Equal([true, false], pad.Peer.HighThroughputHistory);
+        Assert.NotNull(r.Store.Incoming(r.DeviceId, offer.Id));
+
+        // If sender later resumes sending remaining chunks, high-throughput turns back on and completes cleanly.
+        r.Now = r.Now.AddSeconds(1);
+        await pad.SendAsync(new SyncChunk(offer.Id, SyncProtocol.ChunkBytes * 4, data[(SyncProtocol.ChunkBytes * 4)..(SyncProtocol.ChunkBytes * 5)]));
+        Assert.Equal([true, false, true], pad.Peer.HighThroughputHistory);
+        await pad.SendAsync(new SyncChunk(offer.Id, SyncProtocol.ChunkBytes * 5, data[(SyncProtocol.ChunkBytes * 5)..]));
+        var replies = pad.Drain();
+        Assert.Equal(offer.Id, Assert.Single(Assert.IsType<SyncAck>(replies[^1]).Ids));
+
+        r.Now = r.Now.AddSeconds(6);
+        await r.Pc.TickAsync(r.Now);
+        Assert.Equal([true, false, true, false], pad.Peer.HighThroughputHistory);
     }
 }

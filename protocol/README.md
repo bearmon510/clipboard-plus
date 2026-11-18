@@ -45,9 +45,9 @@ C#のメッセージはSyncItem / SyncAck / SyncPing / SyncPong / SyncDevice / S
 | Windows Core/SyncRepository.cs | 端末別キュー、既知端末、履歴、受信途中、重複記録。原子的JSONと別ファイルの本体 |
 | Windows Core/SyncCoordinator.cs | 認証ID別の配送、まとめackキュー、進捗、履歴一覧／検索／通知／削除／コピー、状態API。Windows非依存Coreをテストにもリンク |
 
-offer→初回resume→最大4チャンク（128KiB）までのスライディングウィンドウでchunkを先送りし、受信者はディスクへ順番どおり書き込んだ位置をresumeで返す（1チャンクずつの旧stop-and-wait相手とも互換動作）。最後に全体SHA-256を確認し、履歴保存後に項目単位のack（両側とも1通に最大1,024件までまとめる）。添付の60秒応答期限切れは接続を切って再接続でofferからやり直し、同一接続内で未完了の重複offerを受けた場合やresume後に最終chunk送信完了前のackを受けた場合は状態誤り（state）として切断する（offer直後のackは維持）。受信中の複数パケットフレームが進んでいる間は返信の60秒期限で切断せず、受信が止まった場合は組み立て期限で切断する。1台のackで他端末のキューは消さない。端末間の中継はしない。
+offer→初回resume→最大4チャンク（128KiB）までのスライディングウィンドウでchunkを先送りし、受信者はディスクへ順番どおり書き込んだ位置をresumeで返す（1チャンクずつの旧stop-and-wait相手とも互換動作）。応答期限（基本60秒、大きなフレーム受信中は各チャンク送信完了から最大4分）と最終パケット引き渡し段階はチャンク単位で管理し、最後のパケットを下へ渡していないchunk境界のresumeは無効（state）とする（PC側は `NotifyValueAsync` 完了を待たない）。最後に全体SHA-256を確認し、履歴保存後に項目単位のack（両側とも1通に最大1,024件までまとめる）。添付の応答期限切れや送信中フレームの24時間期限切れ時は接続を切って再接続でやり直し、同一接続内で未完了の重複offerを受けた場合やresume後に最終chunk送信完了前のackを受けた場合は状態誤り（state）として切断する（offer直後のackは維持）。受信中の複数パケットフレームが進んでいる間は返信の60秒期限で切断せず、受信が止まった場合は組み立て期限で切断する。1台のackで他端末のキューは消さない。端末間の中継はしない。
 
-端末は最後のパケット送受信から30秒でping、キュー投入から10秒以内にpongがなければ再接続。PCだけがpingへpongを返し、pongには返信しない。ack/pong/resumeは次の項目より優先する。GATT値上限はWindowsでmax(20,min(512,MaxPduSize-3))、iOSでmin(512,maximumWriteValueLength)。WindowsのGATTサーバー（`BleServer`）は入口上限を全体512件・相手256件（`WriteAdmission`既定値64/16は維持）とし、`WriteWithoutResponse` のdeferral即時完了、添付転送中の高スループット接続パラメータ要求（対応OSのみ）、接続ごとの送信、認証前の制限を維持する。
+端末は最後のパケット送受信から30秒でping、キュー投入から10秒以内にpongがなければ再接続。PCだけがpingへpongを返し、pongには返信しない。ack/pong/resumeは次の項目より優先する。GATT値上限はWindowsでmax(20,min(512,MaxPduSize-3))、iOSでmin(512,maximumWriteValueLength)。WindowsのGATTサーバー（`BleServer`）は `WriteAdmission` の受付上限をバイト数（既定値 全体4MiB・相手ごと1MiB）で数え、上限超過で捨てた場合は即座にその接続を失効させる（件数のみ記録）。受け取った書き込みにはcharacteristicと購読の世代をひも付けて切断時の古い書き込みが新しいセッションへ入らないようにし、deferralの完了は1度だけ試みて例外をその項目内に閉じ込め、リースを必ず解放し、ワーカー失敗時も広告停止・購読解除まで終了を進める。`WriteWithoutResponse` のdeferral即時完了、添付転送中の高スループット接続パラメータ要求（`net10.0-windows10.0.22621.0` のWinRT投影で `ApiInformation` を確認し、WPF Dispatcherから `FromIdAsync` を開始、終了時は要求オブジェクトの `Dispose` まで待機。対応OSのみ）、接続ごとの送信、認証前の制限を維持する。
 
 ## 実行
 

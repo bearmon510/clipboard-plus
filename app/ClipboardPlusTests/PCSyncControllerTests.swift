@@ -2143,4 +2143,203 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.send(.ack(ids: [txOffer.id]))
         XCTAssertEqual(f.controller.pendingCount, 0)
     }
+
+    @MainActor
+    func testPipelinedResumePreservesConfirmedExtensionAndEnforcesPerChunkCap() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        try f.link.connect(pairing, limit: 512)
+
+        let data = Data(repeating: 4, count: SyncProtocol.chunkBytes * 4 + 100)
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data, name: "ext-ios.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+        await drain(f)
+        let offer = try XCTUnwrap(f.link.offers.first)
+
+        f.clock.date = f.clock.date.addingTimeInterval(1)
+        let windowSentAt = f.clock.date
+        try f.link.send(.resume(id: offer.id, offset: 0))
+        XCTAssertEqual(f.link.chunks.count, 4)
+
+        let largeIncoming = try f.link.seal(.item(id: UUID(), at: Int64(windowSentAt.timeIntervalSince1970 * 1000),
+                                                  from: "pc", text: String(repeating: "延", count: 600)))
+        let largePackets = try SyncPacketizer.split(largeIncoming, packetLimit: 182)
+        XCTAssertGreaterThanOrEqual(largePackets.count, 6)
+        for (index, packet) in largePackets.enumerated() {
+            f.clock.date = windowSentAt.addingTimeInterval(Double(index + 1) * 89.0 / Double(largePackets.count))
+            f.link.onEvent?(.packet(packet))
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        await drain(f)
+
+        // At +90s since windowSentAt, resume chunk 0; chunk 1 becomes front and preserves extended deadline.
+        f.clock.date = windowSentAt.addingTimeInterval(90)
+        try f.link.send(.resume(id: offer.id, offset: SyncProtocol.chunkBytes))
+        XCTAssertEqual(f.link.chunks.count, 5)
+
+        f.clock.date = windowSentAt.addingTimeInterval(91)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+
+        f.clock.date = windowSentAt.addingTimeInterval(148)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+
+        f.clock.date = windowSentAt.addingTimeInterval(151)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.rejected, [false])
+
+        // Part 2: New chunk sent after resume gets its own 4-minute cap from its own completion time.
+        try f.link.connect(pairing, limit: 512)
+        let reoffer = try XCTUnwrap(f.link.offers.last)
+        f.clock.date = f.clock.date.addingTimeInterval(1)
+        let win2Start = f.clock.date
+        try f.link.send(.resume(id: reoffer.id, offset: 0))
+        let baseChunkCount = f.link.chunks.count
+
+        var msgIndex = 0
+        func nextFramePackets() throws -> [Data] {
+            msgIndex += 1
+            let ch = ["a", "b", "c", "d", "e", "f"][msgIndex % 6]
+            let frame = try f.link.seal(.item(id: UUID(), at: Int64(win2Start.timeIntervalSince1970 * 1000) + Int64(msgIndex),
+                                              from: "pc", text: String(repeating: ch, count: 1000)))
+            return try SyncPacketizer.split(frame, packetLimit: 182)
+        }
+        var curPackets: [Data] = []
+        var pktIdx = 0
+        while f.clock.date.timeIntervalSince(win2Start) < 160 || pktIdx > 0 {
+            if pktIdx == 0 {
+                curPackets = try nextFramePackets()
+            }
+            f.link.onEvent?(.packet(curPackets[pktIdx]))
+            pktIdx += 1
+            if pktIdx == curPackets.count {
+                await drain(f)
+                pktIdx = 0
+            }
+            f.clock.date = f.clock.date.addingTimeInterval(10)
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        XCTAssertLessThan(f.clock.date.timeIntervalSince(win2Start), 240)
+
+        try f.link.send(.resume(id: reoffer.id, offset: SyncProtocol.chunkBytes * 4))
+        XCTAssertEqual(f.link.chunks.count, baseChunkCount + 1)
+        let chunk4SentAt = f.clock.date
+
+        pktIdx = 0
+        while f.clock.date.timeIntervalSince(win2Start) < 250 || pktIdx > 0 {
+            if pktIdx == 0 {
+                curPackets = try nextFramePackets()
+            }
+            f.link.onEvent?(.packet(curPackets[pktIdx]))
+            pktIdx += 1
+            if pktIdx == curPackets.count {
+                await drain(f)
+                pktIdx = 0
+            }
+            f.clock.date = f.clock.date.addingTimeInterval(10)
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+        }
+        XCTAssertGreaterThan(f.clock.date.timeIntervalSince(win2Start), 240)
+        XCTAssertLessThan(f.clock.date.timeIntervalSince(chunk4SentAt), 240)
+
+        try f.link.send(.ack(ids: [reoffer.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+    }
+
+    @MainActor
+    func testResumeBeforeChunkLastPacketHandedOffDisconnectsAndPreservesPending() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        let data = Data(repeating: 6, count: SyncProtocol.chunkBytes * 5 + 17)
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data, name: "handoff.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+
+        // 1. Reject resume sent while chunk 0 stopped after its first packet.
+        try f.link.connect(pairing, limit: 20)
+        let offer1 = try XCTUnwrap(f.link.offers.first)
+        f.link.stopAfterPackets = 1
+        try f.link.send(.resume(id: offer1.id, offset: 0))
+        XCTAssertFalse(f.link.canSend)
+        try f.link.send(.resume(id: offer1.id, offset: SyncProtocol.chunkBytes))
+        XCTAssertEqual(f.link.rejected, [false])
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        // 2. Accept resume for handed-off chunk 1 even while chunk 4 is paused mid-packet,
+        // and reject resume for chunk 4 before its last packet is handed off.
+        try f.link.connect(pairing, limit: 20)
+        let offer2 = try XCTUnwrap(f.link.offers.last)
+        try f.link.send(.resume(id: offer2.id, offset: 0))
+        XCTAssertEqual(f.link.chunks.count, 4)
+
+        f.link.stopAfterPackets = 1
+        try f.link.send(.resume(id: offer2.id, offset: SyncProtocol.chunkBytes))
+        XCTAssertFalse(f.link.canSend)
+
+        try f.link.send(.resume(id: offer2.id, offset: SyncProtocol.chunkBytes * 2))
+        XCTAssertEqual(f.link.rejected.count, 1)
+        try f.link.send(.resume(id: offer2.id, offset: SyncProtocol.chunkBytes * 5))
+        XCTAssertEqual(f.link.rejected, [false, false])
+        XCTAssertEqual(f.controller.pendingCount, 1)
+    }
+
+    @MainActor
+    func testPeriodicPruneDisconnectsWhenInFlightItemExceedsPendingLifetime() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        try f.link.connect(pairing, limit: 20)
+        let itemCountBefore = f.link.items.count
+        f.link.stopAfterPackets = 1
+
+        f.monitor.saveManually([String(repeating: "切", count: 500)], receivedAt: f.clock.date)
+        await drain(f)
+        XCTAssertFalse(f.link.canSend)
+        XCTAssertEqual(f.controller.pendingCount, 1)
+
+        f.clock.date.addTimeInterval(SyncProtocol.pendingLifetime + 10)
+        f.controller.checkTimeouts()
+        await drain(f)
+
+        XCTAssertEqual(f.controller.pendingCount, 0)
+        XCTAssertEqual(f.link.rejected, [false])
+        XCTAssertEqual(f.controller.status, .searching)
+        let log = try String(contentsOf: f.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        XCTAssertTrue(log.contains("送信中の期限切れ"))
+
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.items.count, itemCountBefore)
+    }
+
+    @MainActor
+    func testAttachmentChunkSendDoesNotEmitPerChunkResendLog() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        let data = Data(repeating: 8, count: SyncProtocol.chunkBytes * 4 + 17)
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data, name: "log-once.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+
+        try f.link.connect(pairing, limit: 512)
+        let offer = try XCTUnwrap(f.link.offers.first)
+        try f.link.send(.resume(id: offer.id, offset: 0))
+        try f.link.send(.resume(id: offer.id, offset: SyncProtocol.chunkBytes))
+        XCTAssertEqual(f.link.chunks.count, 5)
+        await drain(f)
+
+        let logBeforeReconnect = try String(contentsOf: f.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        XCTAssertFalse(logBeforeReconnect.contains("再送または継続"))
+
+        // Disconnect before ack and reconnect: only the re-offered attachment logs resend once (not each chunk).
+        f.link.disconnect()
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.offers.count, 2)
+        try f.link.send(.resume(id: offer.id, offset: 0))
+        try f.link.send(.resume(id: offer.id, offset: SyncProtocol.chunkBytes))
+        try f.link.send(.ack(ids: [offer.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+        await drain(f)
+
+        let logAfterReconnect = try String(contentsOf: f.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        let resendLines = logAfterReconnect.split(separator: "\n").filter { $0.contains("再送または継続") }
+        XCTAssertEqual(resendLines.count, 1)
+    }
 }

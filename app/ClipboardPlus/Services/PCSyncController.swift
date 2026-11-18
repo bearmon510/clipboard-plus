@@ -58,7 +58,8 @@ final class PCSyncController: ObservableObject {
     private var seen: [UUID] { disk.state.seen }
     private struct PendingChunk {
         let endOffset: Int
-        var completedAt: Date?
+        var handedOffLastPacket = false
+        var reply: PendingReply?
     }
     private struct AttachmentTransfer {
         let id: UUID
@@ -273,7 +274,7 @@ final class PCSyncController: ObservableObject {
         resetSession()
         pairingGeneration = UUID()
         pairing = nil; pcName = nil; status = .unpaired; historyReady = false
-        try? disk.clear(); monitor.clearPCFingerprints(); refreshPending(); receiving.removeAll()
+        try? disk.clear(); monitor.clearPCFingerprints(); attempted.removeAll(); refreshPending(); receiving.removeAll()
         requiresPeerUpdate = false; settings.requiresPeerUpdate = false
         requiresRepair = false; settings.requiresRepair = false
         compatibilityMessage = nil; authenticationFailures = 0; nextReconnectAt = nil
@@ -336,6 +337,7 @@ final class PCSyncController: ObservableObject {
         pendingCount = pending.count
         let ids = Set(pending.map(\.id))
         sentThisConnection.formIntersection(ids)
+        attempted.formIntersection(ids)
         sentAt = sentAt.filter { ids.contains($0.key) }
         if let active = activeAttachment, !ids.contains(active.id) {
             closeReadHandle(for: active.id)
@@ -469,7 +471,7 @@ final class PCSyncController: ObservableObject {
                                     if end == offer.size { closeReadHandle(for: item.id) }
                                     message = .chunk(id: item.id, offset: offset, data: data)
                                     active.nextSendOffset = end
-                                    active.chunks.append(PendingChunk(endOffset: end, completedAt: nil))
+                                    active.chunks.append(PendingChunk(endOffset: end))
                                     activeAttachment = active
                                     chunkEndOffset = end
                                     finishesAttachment = end == offer.size
@@ -486,7 +488,7 @@ final class PCSyncController: ObservableObject {
                                 sentThisConnection.insert(item.id)
                             }
                             frame = try sender.seal(SyncMessageCodec.encode(message))
-                            if !attempted.insert(item.id).inserted { record("再送または継続; 件数=1") }
+                            if chunkEndOffset == nil, !attempted.insert(item.id).inserted { record("再送または継続; 件数=1") }
                         } else { return }
                     } else { return }
                     let packets = try SyncPacketizer.split(frame, packetLimit: writeLimit)
@@ -506,27 +508,21 @@ final class PCSyncController: ObservableObject {
                     let completedNow = now()
                     if pending.contains(where: { $0.id == id }) {
                         let initialDeadline = completedNow.addingTimeInterval(Self.replyTimeout)
+                        let reply = PendingReply(
+                            initialSentAt: completedNow,
+                            deadline: initialDeadline,
+                            baselineDeadline: initialDeadline,
+                            activeFrameToken: nil
+                        )
                         if let endOffset = current.chunkEndOffset {
                             if var active = activeAttachment, active.id == id,
                                let idx = active.chunks.firstIndex(where: { $0.endOffset == endOffset }) {
-                                active.chunks[idx].completedAt = completedNow
+                                active.chunks[idx].handedOffLastPacket = true
+                                active.chunks[idx].reply = reply
                                 activeAttachment = active
-                                if idx == 0 || sentAt[id] == nil {
-                                    sentAt[id] = PendingReply(
-                                        initialSentAt: completedNow,
-                                        deadline: initialDeadline,
-                                        baselineDeadline: initialDeadline,
-                                        activeFrameToken: nil
-                                    )
-                                }
                             }
                         } else if activeAttachment == nil || activeAttachment?.id != id || activeAttachment?.awaitingInitialResume == true || activeAttachment?.size == 0 {
-                            sentAt[id] = PendingReply(
-                                initialSentAt: completedNow,
-                                deadline: initialDeadline,
-                                baselineDeadline: initialDeadline,
-                                activeFrameToken: nil
-                            )
+                            sentAt[id] = reply
                         }
                     }
                     if current.finishesAttachment { finalChunkSentAttachments.insert(id) }
@@ -669,30 +665,12 @@ final class PCSyncController: ObservableObject {
                     sentAt.removeValue(forKey: id)
                     finalChunkSentAttachments.remove(id)
                 } else {
-                    guard let idx = active.chunks.firstIndex(where: { $0.endOffset == offset }) else {
+                    guard let idx = active.chunks.firstIndex(where: { $0.endOffset == offset }),
+                          active.chunks[idx].handedOffLastPacket else {
                         throw SyncProtocolError.state
                     }
                     active.chunks.removeFirst(idx + 1)
                     active.ackedOffset = offset
-                    if let frontCompleted = active.chunks.first?.completedAt {
-                        let baseDeadline = frontCompleted.addingTimeInterval(Self.replyTimeout)
-                        let maxDeadline = frontCompleted.addingTimeInterval(Self.replyTimeout + Self.maxReplyExtension)
-                        let existing = sentAt[id]
-                        let deadline: Date
-                        if let existing, existing.activeFrameToken != nil, existing.deadline > baseDeadline {
-                            deadline = min(existing.deadline, maxDeadline)
-                        } else {
-                            deadline = baseDeadline
-                        }
-                        sentAt[id] = PendingReply(
-                            initialSentAt: frontCompleted,
-                            deadline: deadline,
-                            baselineDeadline: baseDeadline,
-                            activeFrameToken: existing?.activeFrameToken
-                        )
-                    } else {
-                        sentAt.removeValue(forKey: id)
-                    }
                 }
                 activeAttachment = active
                 resumedAttachments.insert(id)
@@ -703,7 +681,7 @@ final class PCSyncController: ObservableObject {
                         throw SyncProtocolError.state
                     }
                 }
-                let accepted = Set(ids.filter { sentAt[$0] != nil })
+                let accepted = Set(ids.filter { sentAt[$0] != nil || (activeAttachment?.id == $0 && finalChunkSentAttachments.contains($0)) })
                 if let active = activeAttachment, accepted.contains(active.id) {
                     closeReadHandle(for: active.id)
                     let ms = milliseconds(since: active.startedAt)
@@ -793,10 +771,24 @@ final class PCSyncController: ObservableObject {
         if ackQueue.count > SyncProtocol.maxAckIds * 4 { fail(reject: false, reason: "ack待ち上限"); return }
         pump()
     }
-    private func extendReplyDeadlines(for frameToken: UInt64, at now: Date) {
-        let candidate = now.addingTimeInterval(Self.replyTimeout)
+    private func transformReplies(_ transform: (inout PendingReply) -> Void) {
         for id in Array(sentAt.keys) {
             guard var entry = sentAt[id] else { continue }
+            transform(&entry)
+            sentAt[id] = entry
+        }
+        if var active = activeAttachment {
+            for idx in active.chunks.indices {
+                guard var reply = active.chunks[idx].reply else { continue }
+                transform(&reply)
+                active.chunks[idx].reply = reply
+            }
+            activeAttachment = active
+        }
+    }
+    private func extendReplyDeadlines(for frameToken: UInt64, at now: Date) {
+        let candidate = now.addingTimeInterval(Self.replyTimeout)
+        transformReplies { entry in
             if entry.activeFrameToken != frameToken {
                 entry.baselineDeadline = entry.deadline
                 entry.activeFrameToken = frameToken
@@ -806,23 +798,20 @@ final class PCSyncController: ObservableObject {
             if updated > entry.deadline {
                 entry.deadline = updated
             }
-            sentAt[id] = entry
         }
     }
     private func revertReplyExtension(for frameToken: UInt64) {
-        for id in Array(sentAt.keys) {
-            guard var entry = sentAt[id], entry.activeFrameToken == frameToken else { continue }
+        transformReplies { entry in
+            guard entry.activeFrameToken == frameToken else { return }
             entry.deadline = entry.baselineDeadline
             entry.activeFrameToken = nil
-            sentAt[id] = entry
         }
     }
     private func confirmReplyExtension(for frameToken: UInt64) {
-        for id in Array(sentAt.keys) {
-            guard var entry = sentAt[id], entry.activeFrameToken == frameToken else { continue }
+        transformReplies { entry in
+            guard entry.activeFrameToken == frameToken else { return }
             entry.baselineDeadline = entry.deadline
             entry.activeFrameToken = nil
-            sentAt[id] = entry
         }
     }
     private func fail(reject: Bool, countBackoff: Bool = false, reason: String) {
@@ -840,6 +829,10 @@ final class PCSyncController: ObservableObject {
             } else {
                 let hadActive = activeAttachment != nil
                 do { try disk.prune(now: date); refreshPending() } catch { record("送信待ち保存失敗") }
+                if let id = output?.id, !pending.contains(where: { $0.id == id }) {
+                    fail(reject: false, reason: "送信中の期限切れ")
+                    return
+                }
                 if hadActive && activeAttachment == nil && status == .connected { pump() }
             }
         }
@@ -851,7 +844,8 @@ final class PCSyncController: ObservableObject {
             fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信停止期限")
         } else if let start = writeBlockedSince, date.timeIntervalSince(start) > 60 {
             fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信準備待ち期限")
-        } else if sentAt.values.contains(where: { date > $0.deadline }) {
+        } else if sentAt.values.contains(where: { date > $0.deadline }) ||
+                  (activeAttachment?.chunks.contains(where: { chunk in chunk.reply.map { date > $0.deadline } ?? false }) ?? false) {
             fail(reject: false, reason: "ack期限")
         } else if let start = pingRequestedAt, date.timeIntervalSince(start) >= 10 {
             fail(reject: false, reason: "pong期限")
