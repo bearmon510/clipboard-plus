@@ -138,6 +138,7 @@ struct KeyboardView: View {
                             }
                         }
                     }
+                    .hideKeyboardScrollEdgeEffects()
                     .id(model.selectedTab)
                 }
             }
@@ -238,6 +239,7 @@ struct KeyboardView: View {
                 )
                 .frame(maxWidth: .infinity, minHeight: listProxy.size.height)
             }
+            .hideKeyboardScrollEdgeEffects()
         }
     }
 
@@ -647,5 +649,18 @@ private struct KeyboardRowPressStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.68 : 1)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private extension View {
+    /// Disables iOS 26+ automatic scroll-edge blur so the top row or tag header
+    /// stays sharp when unscrolled without reserving extra vertical space.
+    @ViewBuilder
+    func hideKeyboardScrollEdgeEffects() -> some View {
+        if #available(iOS 26.0, *) {
+            self.scrollEdgeEffectHidden(true, for: .all)
+        } else {
+            self
+        }
     }
 }
