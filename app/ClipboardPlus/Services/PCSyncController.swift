@@ -663,6 +663,7 @@ final class PCSyncController: ObservableObject {
                 guard let offer = item.offer, offset < offer.size,
                       var active = activeAttachment, active.id == id else { throw SyncProtocolError.state }
                 if active.awaitingInitialResume {
+                    guard active.handedOffOfferLastPacket else { return }
                     active.awaitingInitialResume = false
                     active.ackedOffset = offset
                     active.nextSendOffset = offset

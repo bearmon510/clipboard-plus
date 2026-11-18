@@ -43,9 +43,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly List<Guid> AckQueue = [];
         public readonly Queue<SyncMessage> Replies = new();
         public readonly CancellationTokenSource Stop = new();
+        public readonly SemaphoreSlim HandoffGate = new(1, 1);
+        public readonly object HandoffStateGate = new();
         public Task Outgoing = Task.CompletedTask;
         public bool Sending;
-        public bool Retired;
+        public volatile bool Retired;
         public Guid? InFlight;
         public Guid DeviceId;
         public AttachmentTransfer? ActiveAttachment;
@@ -143,12 +145,15 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             var ids = store.Pending(c.DeviceId).Select(i => i.Id).ToHashSet();
             if (c.InFlight is Guid current && !ids.Contains(current)) { Drop(c, "pending item removed"); continue; }
             foreach (var id in c.Sent.Keys.Where(id => !ids.Contains(id)).ToArray()) c.Sent.Remove(id);
-            if (c.ActiveAttachment is { } att && !ids.Contains(att.Id)) c.ActiveAttachment = null;
+            lock (c.HandoffStateGate)
+            {
+                if (c.ActiveAttachment is { } att && !ids.Contains(att.Id)) c.ActiveAttachment = null;
+                c.Attempted.RemoveWhere(id => !ids.Contains(id));
+                c.ResumedAttachments.RemoveWhere(id => !ids.Contains(id));
+                c.FinalChunkSentAttachments.RemoveWhere(id => !ids.Contains(id));
+            }
             foreach (var id in c.ActiveIncomingAttachments.Keys.Where(id => store.Incoming(c.DeviceId, id) is null).ToArray()) c.ActiveIncomingAttachments.Remove(id);
             foreach (var id in c.AttachmentReceives.Keys.Where(id => store.Incoming(c.DeviceId, id) is null).ToArray()) c.AttachmentReceives.Remove(id);
-            c.Attempted.RemoveWhere(id => !ids.Contains(id));
-            c.ResumedAttachments.RemoveWhere(id => !ids.Contains(id));
-            c.FinalChunkSentAttachments.RemoveWhere(id => !ids.Contains(id));
             if (c.Progress is { Direction: "send" } s && !ids.Contains(s.ItemId)) c.Progress = null;
             if (c.Progress is { Direction: "receive" } r && store.Incoming(c.DeviceId, r.ItemId) is null) c.Progress = null;
         }
@@ -239,16 +244,33 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
     public async Task<bool> ReceiveAsync(ISyncPeer peer, byte[] packet)
     {
+        Connection? c;
         await gate.WaitAsync();
         try
         {
-            if (stopped || !connections.TryGetValue(peer, out var c) || c.Retired) return false;
+            if (stopped || !connections.TryGetValue(peer, out c) || c.Retired) return false;
             if (peer.IsRejected)
             {
                 Drop(c, "peer retired");
                 return false;
             }
-            if (c.VersionRejected) return true;
+        }
+        finally { gate.Release(); }
+
+        await c.HandoffGate.WaitAsync();
+        try
+        {
+            await gate.WaitAsync();
+            try
+            {
+                if (stopped || !connections.TryGetValue(peer, out var tracked) || !ReferenceEquals(tracked, c) || c.Retired)
+                    return false;
+                if (peer.IsRejected)
+                {
+                    Drop(c, "peer retired");
+                    return false;
+                }
+                if (c.VersionRejected) return true;
             try
             {
                 var wasPartial = c.Assembler.HasPartialFrame;
@@ -384,6 +406,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             var resumeNow = Now();
                             if (att.AwaitingInitialResume)
                             {
+                                if (!att.HandedOffOfferLastPacket) break;
                                 att.AwaitingInitialResume = false;
                                 att.AckedOffset = resume.Offset;
                                 att.NextSendOffset = resume.Offset;
@@ -447,8 +470,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 Drop(c, Failure(e));
                 return false;
             }
+            }
+            finally { gate.Release(); }
         }
-        finally { gate.Release(); }
+        finally { c.HandoffGate.Release(); }
     }
 
     public async Task ClipboardChangedAsync(ClipboardSnapshot snapshot)
@@ -520,8 +545,17 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     // An attachment whose 60-second reply deadline expires drops the connection so the
                     // next session restarts cleanly from offer; text items may resend on the same link.
                     var expired = c.Sent.Where(p => p.Key != c.InFlight && now > p.Value.Deadline).Select(p => p.Key).ToArray();
-                    var attachmentExpired = c.ActiveAttachment?.Chunks.Any(ch => ch.Reply is { } reply && now > reply.Deadline) ?? false;
-                    if (attachmentExpired || expired.Any(id => c.ActiveAttachment?.Id == id ||
+                    bool attachmentExpired;
+                    Guid? activeAttachmentId;
+                    bool outgoingAttachmentActive;
+                    lock (c.HandoffStateGate)
+                    {
+                        attachmentExpired = c.ActiveAttachment?.Chunks.Any(ch => ch.Reply is { } reply && now > reply.Deadline) ?? false;
+                        activeAttachmentId = c.ActiveAttachment?.Id;
+                        outgoingAttachmentActive = c.ActiveAttachment is { } activeAtt &&
+                            (c.InFlight == activeAtt.Id || now - activeAtt.LastActivity < HighThroughputIdleGrace);
+                    }
+                    if (attachmentExpired || expired.Any(id => activeAttachmentId == id ||
                         store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == id)?.Kind is "image" or "file"))
                     {
                         Drop(c, "attachment timeout");
@@ -537,8 +571,6 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             c.ActiveIncomingAttachments.Remove(staleId);
                     }
                     var incomingAttachmentActive = incomingPacketActive || c.ActiveIncomingAttachments.Count > 0;
-                    var outgoingAttachmentActive = c.ActiveAttachment is { } activeAtt &&
-                        (c.InFlight == activeAtt.Id || now - activeAtt.LastActivity < HighThroughputIdleGrace);
                     if (c.HighThroughputRequested && !outgoingAttachmentActive && !incomingAttachmentActive &&
                         now - c.LastAttachmentActivity >= HighThroughputIdleGrace)
                     {
@@ -582,7 +614,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         }
     }
 
-    // Only selection/sealing uses gate; notification I/O never holds it.
+    // Selection/sealing uses gate; last-packet notification start uses per-connection HandoffGate.
     private void StartSending(Connection c)
     {
         if (c.Sending || c.Retired || stopped) return;
@@ -719,34 +751,56 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 var packets = SyncPacketizer.Split(frame, Math.Min(512, c.Peer.PacketLimit));
                 for (var packetIndex = 0; packetIndex < packets.Count; packetIndex++)
                 {
-                    Task sendTask;
+                    Task sendTask = Task.CompletedTask;
                     if (packetIndex == packets.Count - 1 && item is not null && item.Kind != "text")
                     {
-                        await gate.WaitAsync();
+                        string? dropReason = null;
+                        await c.HandoffGate.WaitAsync();
                         try
                         {
                             if (c.Retired || c.Stop.IsCancellationRequested) return;
-                            if (c.Peer.IsRejected) { Drop(c, "peer retired"); return; }
-                            sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
-                            if (sendTask.IsCompleted) sendTask.GetAwaiter().GetResult();
-                            if (isChunk && chunkEndOffset is int end && c.ActiveAttachment is { } active && active.Id == item.Id)
+                            if (c.Peer.IsRejected)
                             {
-                                var idx = active.Chunks.FindIndex(ch => ch.EndOffset == end);
-                                if (idx >= 0) active.Chunks[idx] = active.Chunks[idx] with { HandedOffLastPacket = true };
+                                dropReason = "peer retired";
                             }
-                            else if (!isChunk && c.ActiveAttachment is { } activeOffer && activeOffer.Id == item.Id)
+                            else
                             {
-                                activeOffer.HandedOffOfferLastPacket = true;
+                                try
+                                {
+                                    sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
+                                    if (sendTask.IsCompleted) sendTask.GetAwaiter().GetResult();
+                                    lock (c.HandoffStateGate)
+                                    {
+                                        if (!c.Retired && !c.Stop.IsCancellationRequested)
+                                        {
+                                            if (isChunk && chunkEndOffset is int end && c.ActiveAttachment is { } active && active.Id == item.Id)
+                                            {
+                                                var idx = active.Chunks.FindIndex(ch => ch.EndOffset == end);
+                                                if (idx >= 0) active.Chunks[idx] = active.Chunks[idx] with { HandedOffLastPacket = true };
+                                            }
+                                            else if (!isChunk && c.ActiveAttachment is { } activeOffer && activeOffer.Id == item.Id)
+                                            {
+                                                activeOffer.HandedOffOfferLastPacket = true;
+                                            }
+                                            if (finishesItem && c.ResumedAttachments.Contains(item.Id))
+                                                c.FinalChunkSentAttachments.Add(item.Id);
+                                        }
+                                    }
+                                }
+                                catch (Exception e)
+                                {
+                                    dropReason = Failure(e);
+                                }
                             }
-                            if (finishesItem && c.ResumedAttachments.Contains(item.Id))
-                                c.FinalChunkSentAttachments.Add(item.Id);
                         }
-                        catch (Exception e)
+                        finally { c.HandoffGate.Release(); }
+                        if (dropReason is not null)
                         {
-                            if (!c.Retired) Drop(c, Failure(e));
+                            await gate.WaitAsync();
+                            try { if (!c.Retired) Drop(c, dropReason); }
+                            finally { gate.Release(); }
                             return;
                         }
-                        finally { gate.Release(); }
                     }
                     else
                     {
@@ -840,11 +894,17 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
     private void Drop(Connection c, string reason)
     {
-        c.Retired = true;
-        c.Stop.Cancel();
+        lock (c.HandoffStateGate)
+        {
+            c.Retired = true;
+            c.Stop.Cancel();
+            c.ActiveAttachment = null;
+            c.ResumedAttachments.Clear();
+            c.FinalChunkSentAttachments.Clear();
+        }
         c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.Sent.Clear();
-        c.ActiveAttachment = null; c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
-        c.OfferedThisConnection.Clear(); c.ResumedAttachments.Clear(); c.FinalChunkSentAttachments.Clear(); c.Progress = null;
+        c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
+        c.OfferedThisConnection.Clear(); c.Progress = null;
         if (c.HighThroughputRequested) { c.HighThroughputRequested = false; c.Peer.SetHighThroughput(false); }
         connections.Remove(c.Peer);
         attempted.RemoveWhere(id => !store.Devices.Any(d => store.Pending(d.Id).Any(i => i.Id == id)));

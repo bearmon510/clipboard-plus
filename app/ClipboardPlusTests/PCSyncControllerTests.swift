@@ -2391,4 +2391,38 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.send(.ack(ids: [emptyOfferID]))
         XCTAssertEqual(f.controller.pendingCount, 0)
     }
+
+    @MainActor
+    func testAttachmentOfferResumeIgnoredMidPacketAndAcceptedAfterOfferLastPacketHandedOff() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        try f.link.connect(pairing, limit: 20)
+        f.link.stopAfterPackets = 1
+
+        let data = Data([10, 20, 30, 40, 50])
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data, name: "mid-offer-resume.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+        XCTAssertFalse(f.link.canSend)
+        XCTAssertTrue(f.link.offers.isEmpty)
+
+        let syncDir = f.root.appendingPathComponent("images").appendingPathComponent("PCSync-v2", isDirectory: true)
+        let stateData = try Data(contentsOf: syncDir.appendingPathComponent("state.json"))
+        let savedState = try JSONDecoder().decode(SyncDiskStore.State.self, from: stateData)
+        let offerID = try XCTUnwrap(savedState.pending.first?.id)
+
+        // Premature initial resume before offer's last packet is handed off is ignored without disconnecting.
+        try f.link.send(.resume(id: offerID, offset: 0))
+        XCTAssertEqual(f.controller.pendingCount, 1)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+        XCTAssertTrue(f.link.chunks.isEmpty)
+
+        // Hand off the remaining packets of offer, then initial resume sends chunk and final ACK succeeds.
+        f.link.resume()
+        XCTAssertEqual(f.link.offers.count, 1)
+        try f.link.send(.resume(id: offerID, offset: 0))
+        XCTAssertEqual(f.link.chunks.count, 1)
+        XCTAssertEqual(f.link.chunks.first?.data, data)
+        try f.link.send(.ack(ids: [offerID]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+    }
 }

@@ -10,7 +10,8 @@ public sealed class SyncCoordinatorTests
     {
         public int PacketLimit { get; set; } = 20;
         public bool Rejected { get; private set; }
-        bool ISyncPeer.IsRejected => Rejected;
+        public BleSubscriptionSlot? Slot { get; set; }
+        bool ISyncPeer.IsRejected => Rejected || (Slot is { } s && (s.Rejected || s.Invalidated));
         public bool FailSend { get; set; }
         public Func<byte[], Task>? OnSend;
         public readonly List<byte[]> Packets = [];
@@ -2271,5 +2272,177 @@ public sealed class SyncCoordinatorTests
             Assert.True(await r.Pc.ReceiveAsync(pad.Peer, finalChunkPackets[i]));
         await r.Pc.WaitForOutgoingAsync(pad.Peer);
         Assert.Equal(offer.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+    }
+
+    [Fact]
+    public async Task ReceiveAsyncWaitingOnGateDropsWhenSlotRetiredBeforePeerReject()
+    {
+        var r = new Rig();
+        var otherId = Guid.NewGuid();
+        var pad1 = await r.ConnectAsync(512);
+        var pad2 = await r.ConnectAsync(512, deviceId: otherId);
+        var slot1 = new BleSubscriptionSlot(new object(), "pad1", new object(), 1, 1) { Peer = pad1.Peer };
+        pad1.Peer.Slot = slot1;
+
+        var writeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        r.Clipboard.BeforeWrite = () =>
+        {
+            if (r.Clipboard.Writes.Count == 0)
+            {
+                writeEntered.TrySetResult();
+                return releaseWrite.Task;
+            }
+            return Task.CompletedTask;
+        };
+
+        var holderPacket = Assert.Single(SyncPacketizer.Split(pad2.Seal(new SyncItem(Guid.NewGuid(), 100, "pad", "holds-gate")), pad2.Peer.PacketLimit));
+        var holderTask = r.Pc.ReceiveAsync(pad2.Peer, holderPacket);
+        await writeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var blockedPacket = Assert.Single(SyncPacketizer.Split(pad1.Seal(new SyncItem(Guid.NewGuid(), 101, "pad", "slot-retired")), pad1.Peer.PacketLimit));
+        var blockedTask = r.Pc.ReceiveAsync(pad1.Peer, blockedPacket);
+        await Task.Delay(30);
+
+        // Retire ONLY the slot flag (simulating RetireSlotAndScheduleDisconnect during log() before Peer.Reject() runs).
+        slot1.Rejected = true;
+        Assert.False(pad1.Peer.Rejected);
+        releaseWrite.SetResult();
+
+        Assert.True(await holderTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(await blockedTask.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Equal(["holds-gate"], r.Clipboard.Writes);
+        Assert.True(pad1.Peer.Rejected);
+        Assert.Empty(pad1.Drain());
+        Assert.Equal(1, r.State.Connected);
+    }
+
+    [Fact]
+    public async Task OfferInitialResumeIgnoredBeforeLastPacketHandedOffAndAcceptedAfterHandoff()
+    {
+        var r = new Rig();
+        var data = new byte[] { 10, 20, 30, 40, 50 };
+        var pad = await r.ConnectAsync(20);
+
+        var firstPacketPaused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowRemainingPackets = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var packetIndex = 0;
+        pad.Peer.OnSend = _ =>
+        {
+            if (Interlocked.Increment(ref packetIndex) == 1)
+            {
+                firstPacketPaused.TrySetResult();
+                return allowRemainingPackets.Task;
+            }
+            return Task.CompletedTask;
+        };
+
+        try
+        {
+            await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "mid-offer-resume.bin", Data: data)]));
+            await firstPacketPaused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var offerId = Assert.Single(r.Store.Pending(r.DeviceId)).Id;
+
+            // Initial resume arriving before offer's last packet is handed off is ignored without disconnecting.
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offerId, 0)), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+            Assert.False(pad.Peer.Rejected);
+            Assert.Equal(1, r.State.Pending);
+        }
+        finally { allowRemainingPackets.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+
+        // After offer's last packet is handed off, initial resume succeeds, chunk is sent, and final ACK succeeds.
+        await pad.SendAsync(new SyncResume(offer.Id, 0));
+        var chunk = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(data, chunk.Data);
+        await pad.SendAsync(new SyncAck([offer.Id]));
+        Assert.Equal(0, r.State.Pending);
+        Assert.False(pad.Peer.Rejected);
+
+        // Initial resume arriving AFTER offer's last packet is handed off while NotifyValueAsync is still pending also succeeds.
+        var pad512 = await r.ConnectAsync(512);
+        var offerLastEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var offerLastRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pad512.Peer.OnSend = packet =>
+        {
+            if ((packet[0] & 2) != 0 && !offerLastEntered.Task.IsCompleted)
+            {
+                offerLastEntered.TrySetResult();
+                return offerLastRelease.Task;
+            }
+            return Task.CompletedTask;
+        };
+        try
+        {
+            await r.Pc.ClipboardChangedAsync(new(2, null, false, [new("file", Filename: "pending-offer-resume.bin", Data: data)]));
+            await offerLastEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var offer2Id = Assert.Single(r.Store.Pending(r.DeviceId)).Id;
+
+            foreach (var packet in SyncPacketizer.Split(pad512.Seal(new SyncResume(offer2Id, 0)), pad512.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad512.Peer, packet));
+            Assert.False(pad512.Peer.Rejected);
+        }
+        finally { offerLastRelease.TrySetResult(); }
+        await r.Pc.WaitForOutgoingAsync(pad512.Peer);
+        var drained = pad512.Drain();
+        Assert.Equal(2, drained.Length);
+        var offer2 = Assert.IsType<SyncOffer>(drained[0]);
+        var chunk2 = Assert.IsType<SyncChunk>(drained[1]);
+        Assert.Equal(data, chunk2.Data);
+        await pad512.SendAsync(new SyncAck([offer2.Id]));
+        Assert.Equal(0, r.State.Pending);
+    }
+
+    [Fact]
+    public async Task BlockedLastPacketNotifyStartDoesNotBlockOtherPeersOrDisconnect()
+    {
+        var r = new Rig();
+        var pad2Id = Guid.NewGuid();
+        var pad1 = await r.ConnectAsync(512);
+        var pad2 = await r.ConnectAsync(512, deviceId: pad2Id);
+
+        var enteredSyncNotify = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseSyncNotify = new ManualResetEventSlim(false);
+        pad1.Peer.OnSend = _ =>
+        {
+            enteredSyncNotify.TrySetResult();
+            releaseSyncNotify.Wait(TimeSpan.FromSeconds(5));
+            return Task.CompletedTask;
+        };
+
+        try
+        {
+            // Trigger an attachment offer (last packet uses per-connection HandoffGate).
+            await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "block.bin", Data: [1, 2, 3])]));
+            await enteredSyncNotify.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // While pad1 is blocked synchronously inside SendPacketAsync (NotifyValueAsync start),
+            // pad2's receive, tick, and disconnect still complete without waiting on pad1.
+            var pad2Item = new SyncItem(Guid.NewGuid(), 200, "pad", "from-pad2");
+            var pad2Packet = Assert.Single(SyncPacketizer.Split(pad2.Seal(pad2Item), pad2.Peer.PacketLimit));
+            Assert.True(await r.Pc.ReceiveAsync(pad2.Peer, pad2Packet).WaitAsync(TimeSpan.FromSeconds(2)));
+            await r.Pc.WaitForOutgoingAsync(pad2.Peer).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(["from-pad2"], r.Clipboard.Writes);
+            var pad2Messages = pad2.Drain();
+            Assert.Contains(pad2Messages, m => m is SyncOffer);
+            Assert.Contains(pad2Messages, m => m is SyncAck ack && ack.Ids.Contains(pad2Item.Id));
+
+            await r.Pc.TickAsync(r.Now.AddSeconds(1)).WaitAsync(TimeSpan.FromSeconds(2));
+            await r.Pc.DisconnectAsync(pad2.Peer).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(pad2.Peer.Rejected);
+
+            // Disconnecting pad1 itself (e.g. BleServer shutdown) also completes without blocking on c1.HandoffGate.
+            await r.Pc.DisconnectAsync(pad1.Peer).WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(pad1.Peer.Rejected);
+        }
+        finally
+        {
+            releaseSyncNotify.Set();
+        }
+        await r.Pc.WaitForOutgoingAsync(pad1.Peer);
+        await r.Pc.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
     }
 }

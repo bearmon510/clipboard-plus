@@ -139,6 +139,7 @@ public sealed class BleLimitsTests
             var session = new object();
             pipeline.SetActiveCharacteristic(characteristic);
             var slot = pipeline.BindPeer(characteristic, "pad-1", session, peerObj);
+            Assert.NotNull(slot);
 
             // Build 4 pipelined chunks (32 KiB each + header/GCM overhead), split at packetLimit.
             var packets = new List<byte[]>();
@@ -226,6 +227,7 @@ public sealed class BleLimitsTests
             var session = new object();
             pipeline.SetActiveCharacteristic(characteristic);
             var slot = pipeline.BindPeer(characteristic, "secret-device-id", session, peerObj);
+            Assert.NotNull(slot);
             var payload = new byte[512];
 
             // First 2 writes fill the 1024-byte peer limit while work is paused.
@@ -287,6 +289,7 @@ public sealed class BleLimitsTests
             var newSession = new object();
             pipeline.SetActiveCharacteristic(characteristic);
             var oldSlot = pipeline.BindPeer(characteristic, "same-device-id", oldSession, oldPeer);
+            Assert.NotNull(oldSlot);
 
             // First write stalls inside GetRequestAsync in ingest, keeping the 2nd write queued behind it.
             var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -303,6 +306,7 @@ public sealed class BleLimitsTests
             // Disconnect old session and re-subscribe with the SAME device ID before ingest drains.
             pipeline.InvalidateSlot(oldSlot);
             var newSlot = pipeline.BindPeer(characteristic, "same-device-id", newSession, newPeer);
+            Assert.NotNull(newSlot);
             Assert.NotEqual(oldSlot.Generation, newSlot.Generation);
 
             gateRequest.SetResult();
@@ -354,6 +358,7 @@ public sealed class BleLimitsTests
         var session2 = new object();
         pipeline.SetActiveCharacteristic(characteristic);
         var slot1 = pipeline.BindPeer(characteristic, "peer-err", session1, peerObj);
+        Assert.NotNull(slot1);
 
         // 1. GetRequestAsync throws AND Deferral.Complete throws -> tried once, lease returned, ingest stays alive.
         var failCompleteAttempts = 0;
@@ -450,6 +455,7 @@ public sealed class BleLimitsTests
 
             // New session subscribes for the same device ID -> must NOT inherit old provisional slot.
             var newSlot = pipeline.BindPeer(inbound, "same-pad", newSession, newPeer);
+            Assert.NotNull(newSlot);
             Assert.Same(newSession, newSlot.Session);
 
             // Valid write from new session succeeds; old session write is discarded with lease & completion returned.
@@ -475,6 +481,7 @@ public sealed class BleLimitsTests
                 _ => Task.FromResult<BleWriteRequestData?>(new(0, [7, 8], false, () => { }, _ => { })),
                 () => { }, () => { });
             var bound = pipeline.BindPeer(inbound, "other-pad", sameEarlySession, sameSessionPeer);
+            Assert.NotNull(bound);
             Assert.Same(sameSessionPeer, bound.Peer);
 
             deadline = DateTime.UtcNow.AddSeconds(5);
@@ -528,7 +535,7 @@ public sealed class BleLimitsTests
                     snapshotEvents.Add($"add:{gen}");
                     var c = clients[0];
                     activePeer = peer2;
-                    pipeline!.BindPeer(inbound, c.PeerId, c.Session, peer2, gen);
+                    pipeline!.BindPeer(inbound, c.PeerId, c.Session, peer2, c.SubscriptionGeneration);
                 }
                 return Task.CompletedTask;
             });
@@ -538,6 +545,7 @@ public sealed class BleLimitsTests
             pipeline.SetActiveCharacteristic(inbound, outbound);
             activePeer = peer1;
             var slot1 = pipeline.BindPeer(inbound, "same-pad", session, peer1);
+            Assert.NotNull(slot1);
 
             // Pause the work channel so both unsubscribe ([]) and resubscribe ([same-pad]) occur before work drains.
             var blockerTask = pipeline.QueueWork(async () =>
@@ -624,6 +632,7 @@ public sealed class BleLimitsTests
         {
             pipeline.SetActiveCharacteristic(characteristic);
             var slot = pipeline.BindPeer(characteristic, "tight-peer", session, peerObj);
+            Assert.NotNull(slot);
 
             // Estimated 20 bytes fits under 100-byte peer limit, but actual payload length is 150 bytes.
             pipeline.EnqueueWrite(
@@ -889,5 +898,515 @@ public sealed class BleLimitsTests
             () => shutdownOrder.Add("stop-advertising-immediate")).WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(["stop-advertising-immediate", "stop-provider"], shutdownOrder);
+    }
+
+    private sealed class TestSubscriptionPeer(string id, object session, BleSubscriptionSlot slot)
+    {
+        public string Id { get; } = id;
+        public object Session { get; } = session;
+        public BleSubscriptionSlot Slot { get; } = slot;
+        public bool Rejected { get; private set; }
+        public bool Disposed { get; private set; }
+        public void Reject() => Rejected = true;
+        public void Dispose() => Disposed = true;
+    }
+
+    private sealed class FakeCoordinatorPeer(string id, BleSubscriptionSlot slot, List<byte[]> sentPackets) : ISyncPeer
+    {
+        private volatile bool rejected;
+        public string Id { get; } = id;
+        public BleSubscriptionSlot Slot { get; } = slot;
+        public int PacketLimit => 20;
+        public bool Rejected => rejected || Slot.Rejected || Slot.Invalidated;
+        public bool IsRejected => Rejected;
+        public Task SendPacketAsync(byte[] packet)
+        {
+            if (Rejected) throw new InvalidOperationException("Retired");
+            sentPackets.Add(packet.ToArray());
+            return Task.CompletedTask;
+        }
+        public void Reject()
+        {
+            rejected = true;
+            Slot.Rejected = true;
+        }
+    }
+
+    [Fact]
+    public async Task SubscribeUnsubscribeResubscribeSameSessionWhileWorkerPausedPreservesHelloInProvisionalSlot()
+    {
+        var admission = new WriteAdmission();
+        var logs = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var delivered = new List<(object peer, byte[] bytes)>();
+        var registry = new BlePeerRegistry<TestSubscriptionPeer>();
+        var inbound = new object();
+        var outbound = new object();
+        var sessionA = new object();
+        var sessionB = new object();
+        var bindHistory = new List<string>();
+        BleWritePipeline? pipeline = null;
+
+        var blockWork = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        pipeline = new BleWritePipeline(
+            admission,
+            logs.Enqueue,
+            () => Task.CompletedTask,
+            (peer, _, bytes) => { delivered.Add((peer, bytes)); return Task.FromResult(true); },
+            _ => Task.CompletedTask,
+            applySubscriptionsAsync: (clients, snapshotGen) =>
+            {
+                foreach (var old in registry.Snapshot())
+                {
+                    if (pipeline!.ShouldKeepPeerForSnapshot(old.Id, old.Slot, snapshotGen))
+                        continue;
+                    var stillSubscribed = clients.Any(c =>
+                        c.PeerId == old.Id
+                        && Equals(c.Session, old.Session)
+                        && c.SubscriptionGeneration == old.Slot.SubscriptionGeneration);
+                    if (!stillSubscribed)
+                    {
+                        registry.Remove(old.Id, old);
+                        pipeline.InvalidateSlot(old.Slot);
+                    }
+                }
+                foreach (var c in clients)
+                {
+                    if (!pipeline!.IsCurrentSubscription(c.PeerId, c.Session, c.SubscriptionGeneration))
+                    {
+                        bindHistory.Add($"skip:{c.PeerId}:{c.SubscriptionGeneration}");
+                        continue;
+                    }
+                    var tempPeer = new object();
+                    var boundSlot = pipeline.BindPeer(inbound, c.PeerId, c.Session, tempPeer, c.SubscriptionGeneration);
+                    if (boundSlot is null)
+                    {
+                        bindHistory.Add($"null:{c.PeerId}:{c.SubscriptionGeneration}");
+                        continue;
+                    }
+                    var wrapped = new TestSubscriptionPeer(c.PeerId, c.Session, boundSlot);
+                    boundSlot.Peer = wrapped;
+                    registry.TryAdd(c.PeerId, wrapped);
+                    bindHistory.Add($"bound:{c.PeerId}:{c.SubscriptionGeneration}");
+                }
+                return Task.CompletedTask;
+            });
+
+        try
+        {
+            pipeline.SetActiveCharacteristic(inbound, outbound);
+
+            // Pause work so subscribe -> unsubscribe -> resubscribe (same session!) all happen before drain.
+            var blockerTask = pipeline.QueueWork(async () =>
+            {
+                workBlocked.SetResult();
+                await blockWork.Task;
+            });
+            await workBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // 1. pad-b subscribes (ensuring pad-a's per-peer generation stays independent of pad-b).
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("pad-b", sessionB, new object())]);
+            // 2. pad-a subscribes (gen 1), unsubscribes, then resubscribes on the SAME session (gen 2).
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("pad-b", sessionB, new object()), new("pad-a", sessionA, new object())]);
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("pad-b", sessionB, new object())]);
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("pad-b", sessionB, new object()), new("pad-a", sessionA, new object())]);
+
+            // 3. New HELLO for pad-a arrives into a provisional slot BEFORE work unblocks.
+            var hello = new SyncPadHandshake(SyncPairing.Create("pc"), Guid.NewGuid()).CreateHello();
+            var helloPacket = Assert.Single(SyncPacketizer.Split(hello, 512));
+            var helloCompleted = 0;
+            var helloRejected = 0;
+            pipeline.EnqueueWrite(
+                inbound,
+                "pad-a",
+                sessionA,
+                helloPacket.Length,
+                sessionClosed: false,
+                _ => Task.FromResult<BleWriteRequestData?>(new(0, helloPacket, false, () => { }, _ => { })),
+                () => Interlocked.Increment(ref helloCompleted),
+                () => Interlocked.Increment(ref helloRejected));
+
+            Assert.Equal(0, helloRejected);
+
+            blockWork.SetResult();
+            await blockerTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while ((delivered.Count == 0 || admission.TotalBytes > 0) && DateTime.UtcNow < deadline)
+                await Task.Delay(10);
+
+            var activePadA = registry.GetValueOrDefault("pad-a");
+            Assert.NotNull(activePadA);
+            Assert.Equal(2, activePadA.Slot.SubscriptionGeneration);
+            Assert.False(activePadA.Slot.Invalidated);
+            Assert.Contains("skip:pad-a:1", bindHistory);
+            Assert.Contains("bound:pad-a:2", bindHistory);
+
+            var deliveredHello = Assert.Single(delivered);
+            Assert.Same(activePadA, deliveredHello.peer);
+            Assert.Equal(helloPacket, deliveredHello.bytes);
+            Assert.Equal(1, helloCompleted);
+            Assert.Equal(0, admission.TotalBytes);
+        }
+        finally
+        {
+            blockWork.TrySetResult();
+            await pipeline.ShutdownAsync(() => Task.CompletedTask);
+        }
+    }
+
+    [Fact]
+    public async Task RehandshakeHelloOnSameSessionReplacesOldSlotAndInvalidatesEarlierGenerations()
+    {
+        var admission = new WriteAdmission();
+        var logs = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var pairing = SyncPairing.Create("pc");
+        var padId = Guid.NewGuid();
+        var root = Path.Combine(Path.GetTempPath(), "clipboardplus-tests", Guid.NewGuid().ToString("N"));
+        var store = new SyncRepository(root, pairing.PcId);
+        var clipboardWrites = new List<string>();
+        var coordinator = new SyncCoordinator(pairing, new InlineClipboard(clipboardWrites), logs.Enqueue, store);
+        var registry = new BlePeerRegistry<FakeCoordinatorPeer>();
+        var inbound = new object();
+        var outbound = new object();
+        var session = new object();
+        var sentPacketsByPeer = new List<byte[]>();
+        BleWritePipeline? pipeline = null;
+
+        pipeline = new BleWritePipeline(
+            admission,
+            logs.Enqueue,
+            () => Task.CompletedTask,
+            (peerObj, offset, bytes) => offset == 0 && bytes.Length <= 512
+                ? coordinator.ReceiveAsync((ISyncPeer)peerObj, bytes)
+                : Task.FromResult(false),
+            async peerObj =>
+            {
+                var p = (FakeCoordinatorPeer)peerObj;
+                p.Reject();
+                await coordinator.DisconnectAsync(p);
+            },
+            peerObj => ((FakeCoordinatorPeer)peerObj).Reject(),
+            applySubscriptionsAsync: async (clients, snapshotGen) =>
+            {
+                foreach (var old in registry.Snapshot())
+                {
+                    if (pipeline!.ShouldKeepPeerForSnapshot(old.Id, old.Slot, snapshotGen))
+                        continue;
+                    if (!clients.Any(c => c.PeerId == old.Id && Equals(c.Session, session) && c.SubscriptionGeneration == old.Slot.SubscriptionGeneration))
+                    {
+                        registry.Remove(old.Id, old);
+                        pipeline.InvalidateSlot(old.Slot);
+                        old.Reject();
+                        await coordinator.DisconnectAsync(old);
+                    }
+                }
+                foreach (var c in clients)
+                {
+                    if (!pipeline!.IsCurrentSubscription(c.PeerId, c.Session, c.SubscriptionGeneration)) continue;
+                    var existing = registry.GetValueOrDefault(c.PeerId);
+                    if (existing is not null && Equals(c.Session, session) && existing.Slot.SubscriptionGeneration == c.SubscriptionGeneration && !existing.Slot.Invalidated)
+                        continue;
+                    var tempPeer = new object();
+                    var slot = pipeline.BindPeer(inbound, c.PeerId, c.Session, tempPeer, c.SubscriptionGeneration);
+                    if (slot is null) continue;
+                    var coordPeer = new FakeCoordinatorPeer(c.PeerId, slot, sentPacketsByPeer);
+                    slot.Peer = coordPeer;
+                    registry.TryAdd(c.PeerId, coordPeer);
+                    await coordinator.ConnectAsync(coordPeer);
+                }
+            },
+            rehandshakePeerAsync: async (oldPeerObj, newSlot) =>
+            {
+                var oldPeer = (FakeCoordinatorPeer)oldPeerObj;
+                registry.Remove(newSlot.PeerId, oldPeer);
+                oldPeer.Reject();
+                await coordinator.DisconnectAsync(oldPeer);
+                var newPeer = new FakeCoordinatorPeer(newSlot.PeerId, newSlot, sentPacketsByPeer);
+                Assert.True(pipeline!.TryAttachPeerToSlot(newSlot, newPeer));
+                registry.TryAdd(newSlot.PeerId, newPeer);
+                await coordinator.ConnectAsync(newPeer);
+                return newPeer;
+            });
+
+        try
+        {
+            pipeline.SetActiveCharacteristic(inbound, outbound);
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("pad-1", session, new object())]);
+            await pipeline.DrainPendingSubscriptionsAsync();
+
+            var firstPeer = registry.GetValueOrDefault("pad-1");
+            Assert.NotNull(firstPeer);
+            Assert.Equal(1, firstPeer.Slot.SubscriptionGeneration);
+
+            // 1. Complete first handshake + AUTH on session.
+            var hs1 = new SyncPadHandshake(pairing, padId);
+            await SendFrameToPipelineAsync(pipeline, inbound, "pad-1", session, hs1.CreateHello(), 20);
+            await coordinator.WaitForOutgoingAsync(firstPeer);
+            var welcome1 = DrainSingleFrame(sentPacketsByPeer);
+            var auth1 = hs1.AcceptWelcome(welcome1);
+            await SendFrameToPipelineAsync(pipeline, inbound, "pad-1", session, auth1.Auth, 20);
+            await coordinator.WaitForOutgoingAsync(firstPeer);
+            Assert.Equal(1, (await coordinator.GetStatusAsync()).Connected);
+
+            // 2. WinRT misses intermediate unsubscribe on same session and sees same client list again.
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("pad-1", session, new object())]);
+            await pipeline.DrainPendingSubscriptionsAsync();
+
+            // 3. Resubscribed client sends a fresh 3-packet HELLO on the SAME session -> re-handshake replaces old slot & peer.
+            var hs2 = new SyncPadHandshake(pairing, padId);
+            await SendFrameToPipelineAsync(pipeline, inbound, "pad-1", session, hs2.CreateHello(), 20);
+            var secondPeer = registry.GetValueOrDefault("pad-1");
+            Assert.NotNull(secondPeer);
+            Assert.NotSame(firstPeer, secondPeer);
+            Assert.True(firstPeer.Slot.Invalidated);
+            Assert.Equal(2, secondPeer.Slot.SubscriptionGeneration);
+            Assert.True(firstPeer.Rejected);
+            await coordinator.WaitForOutgoingAsync(secondPeer);
+            var welcome2 = DrainSingleFrame(sentPacketsByPeer);
+            var auth2 = hs2.AcceptWelcome(welcome2);
+            await SendFrameToPipelineAsync(pipeline, inbound, "pad-1", session, auth2.Auth, 20);
+            await coordinator.WaitForOutgoingAsync(secondPeer);
+
+            var sender2 = new SyncFrameSender(auth2.Keys.PadToPc);
+            var item = new SyncItem(Guid.NewGuid(), 100, "pad", "rehandshake-ok");
+            await SendFrameToPipelineAsync(pipeline, inbound, "pad-1", session, sender2.Seal(SyncMessageCodec.Encode(item)), 20);
+            await coordinator.WaitForOutgoingAsync(secondPeer);
+            Assert.Equal(["rehandshake-ok"], clipboardWrites);
+
+            // 4. A previously Rejected subscription cannot recover by re-sending HELLO without unsubscribing.
+            secondPeer.Reject();
+            var rejectedSync = 0;
+            var hs3 = new SyncPadHandshake(pairing, padId);
+            var pkt3 = SyncPacketizer.Split(hs3.CreateHello(), 512)[0];
+            pipeline.EnqueueWrite(inbound, "pad-1", session, pkt3.Length, false,
+                _ => Task.FromResult<BleWriteRequestData?>(new(0, pkt3, false, () => { }, _ => { })),
+                () => { }, () => Interlocked.Increment(ref rejectedSync));
+            Assert.Equal(1, rejectedSync);
+        }
+        finally
+        {
+            await pipeline.ShutdownAsync(() => Task.CompletedTask);
+            await coordinator.DisposeAsync();
+        }
+    }
+
+    private sealed class InlineClipboard(List<string> writes) : IClipboardAccess
+    {
+        private uint seq;
+        public Task<uint> WriteTextAsync(string text) { writes.Add(text); return Task.FromResult(++seq); }
+    }
+
+    private static async Task SendFrameToPipelineAsync(BleWritePipeline pipeline, object characteristic, string peerId, object session, byte[] frame, int packetLimit)
+    {
+        var packets = SyncPacketizer.Split(frame, packetLimit);
+        var done = 0;
+        foreach (var pkt in packets)
+        {
+            pipeline.EnqueueWrite(characteristic, peerId, session, pkt.Length, false,
+                _ => Task.FromResult<BleWriteRequestData?>(new(0, pkt, false, () => { }, _ => { })),
+                () => Interlocked.Increment(ref done),
+                () => throw new InvalidOperationException("Unexpected sync rejection"));
+        }
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (Volatile.Read(ref done) < packets.Count && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+        Assert.Equal(packets.Count, done);
+        // Ensure queued work items on work channel have also drained.
+        await pipeline.QueueWork(() => Task.CompletedTask);
+    }
+
+    private static byte[] DrainSingleFrame(List<byte[]> packets)
+    {
+        var assembler = new SyncPacketAssembler(512);
+        byte[]? result = null;
+        foreach (var pkt in packets)
+            result = assembler.Append(pkt) ?? result;
+        assembler.Finish();
+        packets.Clear();
+        return Assert.IsType<byte[]>(result);
+    }
+
+    [Fact]
+    public async Task OverLimitRetiresSlotAndPeerBeforeLoggingAndMarksProvisionalSlotOnBind()
+    {
+        // 1. Bound peer: both slot and peer are marked rejected BEFORE log() runs.
+        {
+            var admission = new WriteAdmission(globalByteLimit: 100, peerByteLimit: 100);
+            var characteristic = new object();
+            var session = new object();
+            var peer = new TestSubscriptionPeer("p1", session, null!);
+            var peerRejectedAtLog = false;
+            var slotRejectedAtLog = false;
+            BleSubscriptionSlot? slot = null;
+            var pipeline = new BleWritePipeline(
+                admission,
+                msg =>
+                {
+                    if (msg.Contains("write limit exceeded"))
+                    {
+                        slotRejectedAtLog = slot?.Rejected ?? false;
+                        peerRejectedAtLog = peer.Rejected;
+                    }
+                },
+                () => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(true),
+                _ => Task.CompletedTask,
+                peerObj => ((TestSubscriptionPeer)peerObj).Reject());
+
+            try
+            {
+                pipeline.SetActiveCharacteristic(characteristic);
+                slot = pipeline.BindPeer(characteristic, "p1", session, peer);
+                Assert.NotNull(slot);
+
+                var rejectedSync = 0;
+                pipeline.EnqueueWrite(characteristic, "p1", session, 101, false,
+                    _ => Task.FromResult<BleWriteRequestData?>(new(0, new byte[101], false, () => { }, _ => { })),
+                    () => { }, () => Interlocked.Increment(ref rejectedSync));
+
+                Assert.Equal(1, rejectedSync);
+                Assert.True(slotRejectedAtLog);
+                Assert.True(peerRejectedAtLog);
+            }
+            finally
+            {
+                await pipeline.ShutdownAsync(() => Task.CompletedTask);
+            }
+        }
+
+        // 2. Provisional slot exceeding actual length marks slot rejected before logging, and BindPeer rejects peer immediately.
+        {
+            var admission = new WriteAdmission(globalByteLimit: 100, peerByteLimit: 100);
+            var characteristic = new object();
+            var session = new object();
+            var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var logCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var peerRejectedSync = 0;
+            var pipeline = new BleWritePipeline(
+                admission,
+                msg => { if (msg.Contains("write limit exceeded")) logCalled.TrySetResult(); },
+                () => Task.CompletedTask,
+                (_, _, _) => Task.FromResult(true),
+                _ => { disconnected.TrySetResult(); return Task.CompletedTask; },
+                _ => Interlocked.Increment(ref peerRejectedSync));
+
+            try
+            {
+                pipeline.SetActiveCharacteristic(characteristic);
+                pipeline.EnqueueWrite(characteristic, "prov", session, 20, false,
+                    _ => Task.FromResult<BleWriteRequestData?>(new(0, 150, () => new byte[150], false, () => { }, _ => { })),
+                    () => { }, () => { });
+
+                await logCalled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                var slot = pipeline.BindPeer(characteristic, "prov", session, new object());
+                Assert.NotNull(slot);
+                Assert.True(slot.Rejected);
+                Assert.True(Volatile.Read(ref peerRejectedSync) >= 1);
+                await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            finally
+            {
+                await pipeline.ShutdownAsync(() => Task.CompletedTask);
+            }
+        }
+    }
+
+    private sealed class FakeEventSession
+    {
+        public int AttachedHandlers;
+    }
+
+    private sealed class FakeRegisteredPeer(FakeEventSession session, BleSubscriptionSlot slot)
+    {
+        public FakeEventSession Session { get; } = session;
+        public BleSubscriptionSlot Slot { get; } = slot;
+        public bool Rejected { get; private set; }
+        public bool Disposed { get; private set; }
+        public void AttachHandler() => Interlocked.Increment(ref Session.AttachedHandlers);
+        public void DetachHandler() => Interlocked.Decrement(ref Session.AttachedHandlers);
+        public void Reject() => Rejected = true;
+        public void Dispose() => Disposed = true;
+    }
+
+    [Fact]
+    public async Task BlockedEventRegistrationAfterShutdownDrainDisposesPeerWithoutLeaking()
+    {
+        var admission = new WriteAdmission();
+        var logs = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var registry = new BlePeerRegistry<FakeRegisteredPeer>();
+        var inbound = new object();
+        var outbound = new object();
+        var session = new FakeEventSession();
+        var enteredRegistration = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowRegistrationFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        FakeRegisteredPeer? createdPeer = null;
+        BleWritePipeline? pipeline = null;
+
+        pipeline = new BleWritePipeline(
+            admission,
+            logs.Enqueue,
+            () => Task.CompletedTask,
+            (_, _, _) => Task.FromResult(true),
+            _ => Task.CompletedTask,
+            applySubscriptionsAsync: async (clients, _) =>
+            {
+                foreach (var c in clients)
+                {
+                    if (registry.IsClosed) return;
+                    var placeholder = new object();
+                    var slot = pipeline!.BindPeer(inbound, c.PeerId, c.Session, placeholder, c.SubscriptionGeneration);
+                    if (slot is null) continue;
+                    var peer = new FakeRegisteredPeer((FakeEventSession)c.Session, slot);
+                    createdPeer = peer;
+                    peer.AttachHandler();
+                    enteredRegistration.TrySetResult();
+                    await allowRegistrationFinish.Task;
+                    if (!registry.TryAdd(c.PeerId, peer))
+                    {
+                        pipeline.InvalidateSlot(slot);
+                        peer.DetachHandler();
+                        peer.Reject();
+                        peer.Dispose();
+                        cleanupDone.TrySetResult();
+                        return;
+                    }
+                }
+            },
+            shutdownTimeout: TimeSpan.FromMilliseconds(50));
+
+        try
+        {
+            pipeline.SetActiveCharacteristic(inbound, outbound);
+            pipeline.CaptureSubscriptionsChanged(outbound, () => [new("late-peer", session, new object())]);
+            await enteredRegistration.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Shutdown times out waiting for the blocked registration and drains/closes the registry.
+            await pipeline.ShutdownAsync(() =>
+            {
+                registry.Drain(close: true);
+                return Task.CompletedTask;
+            });
+            Assert.True(registry.IsClosed);
+            Assert.Equal(0, registry.Count);
+
+            // Unblock registration: TryAdd fails under the lock and disposes/unsubscribes immediately.
+            allowRegistrationFinish.SetResult();
+            await cleanupDone.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(0, registry.Count);
+            Assert.Empty(registry.Snapshot());
+            Assert.NotNull(createdPeer);
+            Assert.True(createdPeer.Disposed);
+            Assert.True(createdPeer.Rejected);
+            Assert.True(createdPeer.Slot.Invalidated);
+            Assert.Equal(0, session.AttachedHandlers);
+        }
+        finally
+        {
+            allowRegistrationFinish.TrySetResult();
+        }
     }
 }

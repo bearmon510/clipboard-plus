@@ -21,10 +21,8 @@ internal sealed class BleServer : IAsyncDisposable
     private readonly BleWritePipeline pipeline;
     private readonly CancellationTokenSource stop = new();
     private readonly object endpointGate = new();
-    private readonly object peersGate = new();
-    private readonly Dictionary<string, Peer> peers = [];
+    private readonly BlePeerRegistry<Peer> peerRegistry = new();
     private readonly TimeSpan shutdownTimeout = TimeSpan.FromSeconds(5);
-    private int peerCount;
     private volatile bool adapterReady;
     private Task? polling;
     private GattServiceProvider? provider;
@@ -46,7 +44,8 @@ internal sealed class BleServer : IAsyncDisposable
             peer => coordinator.DisconnectAsync((Peer)peer),
             peer => ((Peer)peer).Reject(),
             applySubscriptionsAsync: ApplySubscriptionSnapshotAsync,
-            shutdownTimeout: shutdownTimeout);
+            shutdownTimeout: shutdownTimeout,
+            rehandshakePeerAsync: RehandshakePeerAsync);
     }
 
     public void Start() => polling = Task.Run(async () =>
@@ -64,7 +63,7 @@ internal sealed class BleServer : IAsyncDisposable
                         Status(offStatus);
                     });
                 }
-                else if (!adapterReady || Volatile.Read(ref peerCount) > 0)
+                else if (!adapterReady || peerRegistry.Count > 0)
                 {
                     await Queue(async () =>
                     {
@@ -233,71 +232,112 @@ internal sealed class BleServer : IAsyncDisposable
             currentOutbound = outbound;
             currentInbound = inbound;
         }
-        if (stopping || currentOutbound is null || currentInbound is null) return;
+        if (stopping || peerRegistry.IsClosed || currentOutbound is null || currentInbound is null) return;
 
-        Peer[] snapshot;
-        lock (peersGate) snapshot = peers.Values.ToArray();
-        foreach (var old in snapshot)
+        foreach (var old in peerRegistry.Snapshot())
         {
+            if (pipeline.ShouldKeepPeerForSnapshot(old.Id, old.Slot, subscriptionGeneration))
+                continue;
+            var oldSubGen = old.Slot?.SubscriptionGeneration ?? 0;
             var stillSubscribed = old.Session.SessionStatus != GattSessionStatus.Closed
                 && !(old.Slot?.Invalidated ?? false)
-                && clients.Any(c => c.PeerId == old.Id && Equals(c.Session, old.Session));
+                && clients.Any(c => c.PeerId == old.Id && Equals(c.Session, old.Session) && c.SubscriptionGeneration == oldSubGen);
             if (!stillSubscribed)
                 await RemovePeerAsync(old);
         }
 
         foreach (var item in clients)
         {
-            if (stopping) return;
+            if (stopping || peerRegistry.IsClosed) return;
             var client = (GattSubscribedClient)item.Client;
             if (client.Session.SessionStatus == GattSessionStatus.Closed) continue;
             var id = item.PeerId;
-            Peer? existing;
-            int currentCount;
-            lock (peersGate)
-            {
-                peers.TryGetValue(id, out existing);
-                currentCount = peers.Count;
-            }
+            if (!pipeline.IsCurrentSubscription(id, client.Session, item.SubscriptionGeneration))
+                continue;
+            var existing = peerRegistry.GetValueOrDefault(id);
             if (existing is not null)
             {
-                if (Equals(existing.Session, client.Session))
+                if (Equals(existing.Session, client.Session)
+                    && existing.Slot?.SubscriptionGeneration == item.SubscriptionGeneration
+                    && !(existing.Slot?.Invalidated ?? false))
                 {
                     existing.Client = client;
                     continue;
                 }
                 await RemovePeerAsync(existing);
-                lock (peersGate) currentCount = peers.Count;
             }
-            if (currentCount >= 8) continue;
+            if (peerRegistry.Count >= 8) continue;
+            if (stopping || peerRegistry.IsClosed) return;
+            if (!pipeline.IsCurrentSubscription(id, client.Session, item.SubscriptionGeneration))
+                continue;
 
             var peer = new Peer(client, currentOutbound, log, () => stopping, stop.Token, dispatcher, pipeline.RetireSlot);
-            var slot = pipeline.BindPeer(currentInbound, id, client.Session, peer, subscriptionGeneration);
-            peer.Slot = slot;
-            peer.StatusHandler = (session, args) =>
+            var slot = pipeline.BindPeer(currentInbound, id, client.Session, peer, item.SubscriptionGeneration);
+            if (slot is null)
             {
-                if (args.Status == GattSessionStatus.Closed && peer.Slot is { } closedSlot)
-                    pipeline.InvalidateSlot(closedSlot);
-                _ = Queue(async () =>
-                {
-                    Peer? tracked;
-                    lock (peersGate) tracked = peers.GetValueOrDefault(peer.Id);
-                    if (args.Status == GattSessionStatus.Closed && ReferenceEquals(tracked, peer))
-                        await RemovePeerAsync(peer);
-                });
-            };
-            peer.MtuHandler = (session, args) => log($"mtu pdu={session.MaxPduSize}");
-            peer.Session.SessionStatusChanged += peer.StatusHandler;
-            peer.Session.MaxPduSizeChanged += peer.MtuHandler;
-            lock (peersGate)
-            {
-                peers[id] = peer;
-                Volatile.Write(ref peerCount, peers.Count);
+                await peer.DisposeAsync();
+                continue;
             }
-            log($"subscribed mtu={client.Session.MaxPduSize}");
-            if (slot.Rejected) peer.Reject();
-            else await coordinator.ConnectAsync(peer);
+            await RegisterAndConnectPeerAsync(peer, client, slot);
         }
+    }
+
+    private async Task<object?> RehandshakePeerAsync(object oldPeerObj, BleSubscriptionSlot newSlot)
+    {
+        var oldPeer = (Peer)oldPeerObj;
+        GattLocalCharacteristic? currentOutbound;
+        lock (endpointGate) currentOutbound = outbound;
+        if (stopping || peerRegistry.IsClosed || currentOutbound is null)
+        {
+            pipeline.InvalidateSlot(newSlot);
+            return null;
+        }
+        var client = ReadSubscribedClients(currentOutbound)
+            .Where(c => c.PeerId == oldPeer.Id && Equals(c.Session, oldPeer.Session))
+            .Select(c => (GattSubscribedClient)c.Client)
+            .FirstOrDefault() ?? oldPeer.Client;
+        await RemovePeerAsync(oldPeer);
+        if (stopping || peerRegistry.IsClosed)
+        {
+            pipeline.InvalidateSlot(newSlot);
+            return null;
+        }
+        var newPeer = new Peer(client, currentOutbound, log, () => stopping, stop.Token, dispatcher, pipeline.RetireSlot);
+        if (!pipeline.TryAttachPeerToSlot(newSlot, newPeer))
+        {
+            await newPeer.DisposeAsync();
+            return null;
+        }
+        return await RegisterAndConnectPeerAsync(newPeer, client, newSlot) ? newPeer : null;
+    }
+
+    private async Task<bool> RegisterAndConnectPeerAsync(Peer peer, GattSubscribedClient client, BleSubscriptionSlot slot)
+    {
+        peer.Slot = slot;
+        peer.StatusHandler = (session, args) =>
+        {
+            if (args.Status == GattSessionStatus.Closed && peer.Slot is { } closedSlot)
+                pipeline.InvalidateSlot(closedSlot);
+            _ = Queue(async () =>
+            {
+                var tracked = peerRegistry.GetValueOrDefault(peer.Id);
+                if (args.Status == GattSessionStatus.Closed && ReferenceEquals(tracked, peer))
+                    await RemovePeerAsync(peer);
+            });
+        };
+        peer.MtuHandler = (session, args) => log($"mtu pdu={session.MaxPduSize}");
+        peer.Session.SessionStatusChanged += peer.StatusHandler;
+        peer.Session.MaxPduSizeChanged += peer.MtuHandler;
+        if (!peerRegistry.TryAdd(peer.Id, peer))
+        {
+            await DisposeRemovedPeerAsync(peer);
+            return false;
+        }
+        if (slot.Rejected || slot.Invalidated) peer.Reject();
+        log($"subscribed mtu={client.Session.MaxPduSize}");
+        if (!peer.Rejected)
+            await coordinator.ConnectAsync(peer);
+        return !peer.Rejected;
     }
 
     private void WriteRequested(GattLocalCharacteristic sender, GattWriteRequestedEventArgs args)
@@ -362,20 +402,17 @@ internal sealed class BleServer : IAsyncDisposable
 
     private async Task RemovePeerAsync(Peer peer)
     {
-        lock (peersGate)
-        {
-            if (peers.TryGetValue(peer.Id, out var current) && ReferenceEquals(current, peer))
-                peers.Remove(peer.Id);
-            Volatile.Write(ref peerCount, peers.Count);
-        }
+        peerRegistry.Remove(peer.Id, peer);
         await DisposeRemovedPeerAsync(peer);
     }
 
     private async Task DisposeRemovedPeerAsync(Peer peer)
     {
         if (peer.Slot is { } slot) pipeline.InvalidateSlot(slot);
-        try { peer.Session.SessionStatusChanged -= peer.StatusHandler; } catch (Exception) { }
-        try { peer.Session.MaxPduSizeChanged -= peer.MtuHandler; } catch (Exception) { }
+        if (peer.StatusHandler is { } statusHandler)
+            try { peer.Session.SessionStatusChanged -= statusHandler; } catch (Exception) { }
+        if (peer.MtuHandler is { } mtuHandler)
+            try { peer.Session.MaxPduSizeChanged -= mtuHandler; } catch (Exception) { }
         peer.Reject();
         await peer.DisposeAsync();
         await coordinator.DisconnectAsync(peer);
@@ -418,13 +455,7 @@ internal sealed class BleServer : IAsyncDisposable
 
     private async Task StopProviderAsync()
     {
-        Peer[] snapshot;
-        lock (peersGate)
-        {
-            snapshot = peers.Values.ToArray();
-            peers.Clear();
-            Volatile.Write(ref peerCount, 0);
-        }
+        var snapshot = peerRegistry.Drain(close: stopping);
         var disposePeers = snapshot
             .Select(peer => (Func<Task>)(() => DisposeRemovedPeerAsync(peer)))
             .ToArray();
@@ -437,7 +468,9 @@ internal sealed class BleServer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        stopping = true; stop.Cancel();
+        stopping = true;
+        peerRegistry.Close();
+        stop.Cancel();
         StopEndpoint();
         if (polling is not null)
         {
@@ -446,7 +479,7 @@ internal sealed class BleServer : IAsyncDisposable
             catch (Exception e) { log($"polling error={e.GetType().Name}"); }
         }
         await pipeline.ShutdownAsync(StopProviderAsync, StopEndpoint);
-        if (polling is null || polling.IsCompleted) stop.Dispose();
+        if ((polling is null || polling.IsCompleted) && pipeline.IsStopped) stop.Dispose();
     }
 
     private sealed class Peer(
@@ -458,14 +491,16 @@ internal sealed class BleServer : IAsyncDisposable
         Dispatcher? dispatcher,
         Action<BleSubscriptionSlot> retireSlot) : ISyncPeer, IAsyncDisposable
     {
-        public GattSubscribedClient Client = client;
+        private volatile GattSubscribedClient currentClient = client;
+        private volatile BleSubscriptionSlot? currentSlot;
+        public GattSubscribedClient Client { get => currentClient; set => currentClient = value; }
         public readonly GattSession Session = client.Session;
         public string Id => Session.DeviceId.Id;
-        public BleSubscriptionSlot? Slot;
+        public BleSubscriptionSlot? Slot { get => currentSlot; set => currentSlot = value; }
         private volatile bool rejected;
         private int rejectedFlag;
-        public bool Rejected => rejected;
-        public bool IsRejected => rejected;
+        public bool Rejected => rejected || (currentSlot is { } s && (s.Rejected || s.Invalidated));
+        public bool IsRejected => Rejected;
         public TypedEventHandler<GattSession, GattSessionStatusChangedEventArgs>? StatusHandler;
         public TypedEventHandler<GattSession, object>? MtuHandler;
         private readonly object connGate = new();
