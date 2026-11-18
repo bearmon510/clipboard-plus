@@ -20,7 +20,10 @@ internal sealed class BleServer : IAsyncDisposable
     private readonly WriteAdmission writes = new();
     private readonly BleWritePipeline pipeline;
     private readonly CancellationTokenSource stop = new();
+    private readonly object endpointGate = new();
+    private readonly object peersGate = new();
     private readonly Dictionary<string, Peer> peers = [];
+    private readonly TimeSpan shutdownTimeout = TimeSpan.FromSeconds(5);
     private int peerCount;
     private volatile bool adapterReady;
     private Task? polling;
@@ -41,7 +44,9 @@ internal sealed class BleServer : IAsyncDisposable
             UpdateSubscriptionsAsync,
             DeliverPacketAsync,
             peer => coordinator.DisconnectAsync((Peer)peer),
-            peer => ((Peer)peer).Reject());
+            peer => ((Peer)peer).Reject(),
+            applySubscriptionsAsync: ApplySubscriptionSnapshotAsync,
+            shutdownTimeout: shutdownTimeout);
     }
 
     public void Start() => polling = Task.Run(async () =>
@@ -119,25 +124,30 @@ internal sealed class BleServer : IAsyncDisposable
     private async Task EnsureProviderAsync()
     {
         if (stopping) return;
-        if (provider?.AdvertisementStatus is GattServiceProviderAdvertisementStatus.Started or GattServiceProviderAdvertisementStatus.StartedWithoutAllAdvertisementData)
+        GattServiceProvider? currentProvider;
+        lock (endpointGate) currentProvider = provider;
+        if (currentProvider?.AdvertisementStatus is GattServiceProviderAdvertisementStatus.Started or GattServiceProviderAdvertisementStatus.StartedWithoutAllAdvertisementData)
         {
             adapterReady = true;
             return;
         }
         await StopProviderAsync();
+        if (stopping) return;
         var result = await GattServiceProvider.CreateAsync(ServiceId);
         if (result.Error != BluetoothError.Success)
         {
             log($"service create error={result.Error}");
             Status("Bluetoothの待ち受けを開始できません。再試行しています"); return;
         }
-        provider = result.ServiceProvider;
-        var writeResult = await provider.Service.CreateCharacteristicAsync(ToPcId, new()
+        if (stopping) return;
+        var createdProvider = result.ServiceProvider;
+        var writeResult = await createdProvider.Service.CreateCharacteristicAsync(ToPcId, new()
         {
             CharacteristicProperties = GattCharacteristicProperties.Write | GattCharacteristicProperties.WriteWithoutResponse,
             WriteProtectionLevel = GattProtectionLevel.Plain
         });
-        var notifyResult = await provider.Service.CreateCharacteristicAsync(ToPadId, new()
+        if (stopping) return;
+        var notifyResult = await createdProvider.Service.CreateCharacteristicAsync(ToPadId, new()
         {
             CharacteristicProperties = GattCharacteristicProperties.Notify,
             ReadProtectionLevel = GattProtectionLevel.Plain,
@@ -145,19 +155,42 @@ internal sealed class BleServer : IAsyncDisposable
         });
         if (writeResult.Error != BluetoothError.Success || notifyResult.Error != BluetoothError.Success)
             throw new InvalidOperationException("Cannot create GATT characteristics");
-        inbound = writeResult.Characteristic; outbound = notifyResult.Characteristic;
-        pipeline.SetActiveCharacteristic(inbound);
-        inbound.WriteRequested += WriteRequested;
-        outbound.SubscribedClientsChanged += SubscriptionsChanged;
-        provider.AdvertisementStatusChanged += AdvertisementChanged;
-        provider.StartAdvertising(new() { IsDiscoverable = true, IsConnectable = true });
+        var createdInbound = writeResult.Characteristic;
+        var createdOutbound = notifyResult.Characteristic;
+        lock (endpointGate)
+        {
+            if (stopping) return;
+            provider = createdProvider;
+            inbound = createdInbound;
+            outbound = createdOutbound;
+        }
+        pipeline.SetActiveCharacteristic(createdInbound, createdOutbound);
+        createdInbound.WriteRequested += WriteRequested;
+        createdOutbound.SubscribedClientsChanged += SubscriptionsChanged;
+        createdProvider.AdvertisementStatusChanged += AdvertisementChanged;
+        createdProvider.StartAdvertising(new() { IsDiscoverable = true, IsConnectable = true });
+        if (stopping)
+        {
+            try { createdInbound.WriteRequested -= WriteRequested; }
+            catch (Exception) { }
+            try { createdOutbound.SubscribedClientsChanged -= SubscriptionsChanged; }
+            catch (Exception) { }
+            try { createdProvider.AdvertisementStatusChanged -= AdvertisementChanged; }
+            catch (Exception) { }
+            try { createdProvider.StopAdvertising(); }
+            catch (Exception) { }
+            StopEndpoint();
+            return;
+        }
         Status("Bluetoothの待ち受けを開始しています");
     }
 
     private void AdvertisementChanged(GattServiceProvider sender, GattServiceProviderAdvertisementStatusChangedEventArgs args) =>
         _ = Queue(() =>
         {
-            if (sender == provider)
+            GattServiceProvider? currentProvider;
+            lock (endpointGate) currentProvider = provider;
+            if (!stopping && Equals(sender, currentProvider))
             {
                 var started = args.Status is GattServiceProviderAdvertisementStatus.Started or GattServiceProviderAdvertisementStatus.StartedWithoutAllAdvertisementData;
                 adapterReady = started;
@@ -168,33 +201,99 @@ internal sealed class BleServer : IAsyncDisposable
         });
 
     private void SubscriptionsChanged(GattLocalCharacteristic sender, object args) =>
-        _ = Queue(async () => { if (sender == outbound) await UpdateSubscriptionsAsync(); });
+        pipeline.CaptureSubscriptionsChanged(sender, () => ReadSubscribedClients(sender));
+
+    private static BleSubscribedClient[] ReadSubscribedClients(GattLocalCharacteristic characteristic) =>
+        characteristic.SubscribedClients
+            .Where(c => c.Session.SessionStatus != GattSessionStatus.Closed)
+            .Select(c => new BleSubscribedClient(c.Session.DeviceId.Id, c.Session, c))
+            .ToArray();
 
     private async Task UpdateSubscriptionsAsync()
     {
-        if (outbound is null || inbound is null) return;
-        var clients = outbound.SubscribedClients.ToArray();
-        foreach (var old in peers.Values.ToArray())
-            if (old.Session.SessionStatus == GattSessionStatus.Closed ||
-                !clients.Any(c => c.Session.DeviceId.Id == old.Id)) await RemovePeerAsync(old);
-        foreach (var client in clients)
+        await pipeline.DrainPendingSubscriptionsAsync();
+        GattLocalCharacteristic? currentOutbound;
+        GattLocalCharacteristic? currentInbound;
+        lock (endpointGate)
         {
-            var id = client.Session.DeviceId.Id;
-            if (peers.TryGetValue(id, out var existing)) { existing.Client = client; continue; }
-            if (peers.Count >= 8) continue;
-            var peer = new Peer(client, outbound, log, () => stopping, stop.Token, dispatcher, pipeline.RetireSlot);
-            var slot = pipeline.BindPeer(inbound, id, peer);
-            peer.Slot = slot;
-            peer.StatusHandler = (session, args) => _ = Queue(async () =>
+            currentOutbound = outbound;
+            currentInbound = inbound;
+        }
+        if (stopping || currentOutbound is null || currentInbound is null) return;
+        pipeline.CaptureSubscriptionsChanged(currentOutbound, () => ReadSubscribedClients(currentOutbound), enqueueDrain: false);
+        await pipeline.DrainPendingSubscriptionsAsync();
+    }
+
+    private async Task ApplySubscriptionSnapshotAsync(BleSubscribedClient[] clients, long subscriptionGeneration)
+    {
+        GattLocalCharacteristic? currentOutbound;
+        GattLocalCharacteristic? currentInbound;
+        lock (endpointGate)
+        {
+            currentOutbound = outbound;
+            currentInbound = inbound;
+        }
+        if (stopping || currentOutbound is null || currentInbound is null) return;
+
+        Peer[] snapshot;
+        lock (peersGate) snapshot = peers.Values.ToArray();
+        foreach (var old in snapshot)
+        {
+            var stillSubscribed = old.Session.SessionStatus != GattSessionStatus.Closed
+                && !(old.Slot?.Invalidated ?? false)
+                && clients.Any(c => c.PeerId == old.Id && Equals(c.Session, old.Session));
+            if (!stillSubscribed)
+                await RemovePeerAsync(old);
+        }
+
+        foreach (var item in clients)
+        {
+            if (stopping) return;
+            var client = (GattSubscribedClient)item.Client;
+            if (client.Session.SessionStatus == GattSessionStatus.Closed) continue;
+            var id = item.PeerId;
+            Peer? existing;
+            int currentCount;
+            lock (peersGate)
             {
-                if (args.Status == GattSessionStatus.Closed && peers.GetValueOrDefault(peer.Id) == peer)
-                    await RemovePeerAsync(peer);
-            });
+                peers.TryGetValue(id, out existing);
+                currentCount = peers.Count;
+            }
+            if (existing is not null)
+            {
+                if (Equals(existing.Session, client.Session))
+                {
+                    existing.Client = client;
+                    continue;
+                }
+                await RemovePeerAsync(existing);
+                lock (peersGate) currentCount = peers.Count;
+            }
+            if (currentCount >= 8) continue;
+
+            var peer = new Peer(client, currentOutbound, log, () => stopping, stop.Token, dispatcher, pipeline.RetireSlot);
+            var slot = pipeline.BindPeer(currentInbound, id, client.Session, peer, subscriptionGeneration);
+            peer.Slot = slot;
+            peer.StatusHandler = (session, args) =>
+            {
+                if (args.Status == GattSessionStatus.Closed && peer.Slot is { } closedSlot)
+                    pipeline.InvalidateSlot(closedSlot);
+                _ = Queue(async () =>
+                {
+                    Peer? tracked;
+                    lock (peersGate) tracked = peers.GetValueOrDefault(peer.Id);
+                    if (args.Status == GattSessionStatus.Closed && ReferenceEquals(tracked, peer))
+                        await RemovePeerAsync(peer);
+                });
+            };
             peer.MtuHandler = (session, args) => log($"mtu pdu={session.MaxPduSize}");
             peer.Session.SessionStatusChanged += peer.StatusHandler;
             peer.Session.MaxPduSizeChanged += peer.MtuHandler;
-            peers.Add(id, peer);
-            Volatile.Write(ref peerCount, peers.Count);
+            lock (peersGate)
+            {
+                peers[id] = peer;
+                Volatile.Write(ref peerCount, peers.Count);
+            }
             log($"subscribed mtu={client.Session.MaxPduSize}");
             if (slot.Rejected) peer.Reject();
             else await coordinator.ConnectAsync(peer);
@@ -208,19 +307,22 @@ internal sealed class BleServer : IAsyncDisposable
         var estimatedBytes = BleLimits.NotificationBytes(session.MaxPduSize);
         var sessionClosed = session.SessionStatus == GattSessionStatus.Closed;
         var deferral = args.GetDeferral();
-        // Acquire deferral, subscription slot, and byte admission synchronously before awaiting GetRequestAsync.
+        // Acquire deferral, subscription slot, session, and byte admission synchronously before awaiting GetRequestAsync.
         pipeline.EnqueueWrite(
             sender,
             id,
+            session,
             estimatedBytes,
             sessionClosed,
             async ct =>
             {
                 var request = await args.GetRequestAsync().AsTask(ct);
                 if (request is null) return null;
+                var length = (long)(request.Value?.Length ?? 0);
                 return new BleWriteRequestData(
                     request.Offset,
-                    request.Value.ToArray(),
+                    length,
+                    () => request.Value is null ? [] : request.Value.ToArray(),
                     request.Option == GattWriteOption.WriteWithResponse,
                     () => request.Respond(),
                     error => request.RespondWithProtocolError(error));
@@ -260,54 +362,91 @@ internal sealed class BleServer : IAsyncDisposable
 
     private async Task RemovePeerAsync(Peer peer)
     {
-        peers.Remove(peer.Id);
-        Volatile.Write(ref peerCount, peers.Count);
+        lock (peersGate)
+        {
+            if (peers.TryGetValue(peer.Id, out var current) && ReferenceEquals(current, peer))
+                peers.Remove(peer.Id);
+            Volatile.Write(ref peerCount, peers.Count);
+        }
+        await DisposeRemovedPeerAsync(peer);
+    }
+
+    private async Task DisposeRemovedPeerAsync(Peer peer)
+    {
         if (peer.Slot is { } slot) pipeline.InvalidateSlot(slot);
         try { peer.Session.SessionStatusChanged -= peer.StatusHandler; } catch (Exception) { }
         try { peer.Session.MaxPduSizeChanged -= peer.MtuHandler; } catch (Exception) { }
+        peer.Reject();
         await peer.DisposeAsync();
         await coordinator.DisconnectAsync(peer);
     }
 
-    private async Task StopProviderAsync()
+    private void StopEndpoint()
     {
-        adapterReady = false;
-        pipeline.SetActiveCharacteristic(null);
-        foreach (var peer in peers.Values.ToArray())
+        GattLocalCharacteristic? oldInbound;
+        GattLocalCharacteristic? oldOutbound;
+        GattServiceProvider? oldProvider;
+        lock (endpointGate)
         {
-            try { await RemovePeerAsync(peer); }
-            catch (Exception e) { log($"peer remove error={e.GetType().Name}"); }
+            adapterReady = false;
+            oldInbound = inbound;
+            oldOutbound = outbound;
+            oldProvider = provider;
+            inbound = null;
+            outbound = null;
+            provider = null;
         }
-        if (inbound is not null)
+        pipeline.SetActiveCharacteristic(null);
+        if (oldInbound is not null)
         {
-            try { inbound.WriteRequested -= WriteRequested; }
+            try { oldInbound.WriteRequested -= WriteRequested; }
             catch (Exception e) { log($"write unsubscribe error={e.GetType().Name}"); }
         }
-        if (outbound is not null)
+        if (oldOutbound is not null)
         {
-            try { outbound.SubscribedClientsChanged -= SubscriptionsChanged; }
+            try { oldOutbound.SubscribedClientsChanged -= SubscriptionsChanged; }
             catch (Exception e) { log($"subscription unsubscribe error={e.GetType().Name}"); }
         }
-        if (provider is not null)
+        if (oldProvider is not null)
         {
-            try { provider.AdvertisementStatusChanged -= AdvertisementChanged; }
+            try { oldProvider.AdvertisementStatusChanged -= AdvertisementChanged; }
             catch (Exception) { }
-            try { provider.StopAdvertising(); }
+            try { oldProvider.StopAdvertising(); }
             catch (Exception e) { log($"advertising stop error={e.GetType().Name}"); }
         }
-        provider = null; inbound = null; outbound = null;
+    }
+
+    private async Task StopProviderAsync()
+    {
+        Peer[] snapshot;
+        lock (peersGate)
+        {
+            snapshot = peers.Values.ToArray();
+            peers.Clear();
+            Volatile.Write(ref peerCount, 0);
+        }
+        var disposePeers = snapshot
+            .Select(peer => (Func<Task>)(() => DisposeRemovedPeerAsync(peer)))
+            .ToArray();
+        await BleEndpointCleanup.StopEndpointBeforePeersAsync(
+            StopEndpoint,
+            disposePeers,
+            stopping ? shutdownTimeout : Timeout.InfiniteTimeSpan,
+            log);
     }
 
     public async ValueTask DisposeAsync()
     {
         stopping = true; stop.Cancel();
+        StopEndpoint();
         if (polling is not null)
         {
-            try { await polling; }
+            try { await polling.WaitAsync(shutdownTimeout); }
+            catch (TimeoutException) { log("polling shutdown timeout"); }
             catch (Exception e) { log($"polling error={e.GetType().Name}"); }
         }
-        await pipeline.ShutdownAsync(StopProviderAsync);
-        stop.Dispose();
+        await pipeline.ShutdownAsync(StopProviderAsync, StopEndpoint);
+        if (polling is null || polling.IsCompleted) stop.Dispose();
     }
 
     private sealed class Peer(
@@ -324,7 +463,9 @@ internal sealed class BleServer : IAsyncDisposable
         public string Id => Session.DeviceId.Id;
         public BleSubscriptionSlot? Slot;
         private volatile bool rejected;
+        private int rejectedFlag;
         public bool Rejected => rejected;
+        public bool IsRejected => rejected;
         public TypedEventHandler<GattSession, GattSessionStatusChangedEventArgs>? StatusHandler;
         public TypedEventHandler<GattSession, object>? MtuHandler;
         private readonly object connGate = new();
@@ -350,6 +491,7 @@ internal sealed class BleServer : IAsyncDisposable
         {
             // Windows' local GATT API does not expose a force-disconnect operation.
             // Reject all subsequent writes on this subscription until it disappears.
+            if (Interlocked.Exchange(ref rejectedFlag, 1) != 0) return;
             rejected = true;
             if (Slot is { } slot) retireSlot(slot);
             SetHighThroughput(false);
@@ -487,32 +629,24 @@ internal sealed class BleServer : IAsyncDisposable
                                 }
                                 if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
                                 {
-                                    var request = bleDevice.RequestPreferredConnectionParameters(
-                                        BluetoothLEPreferredConnectionParameters.ThroughputOptimized);
-                                    if (request is not null && request.Status == BluetoothLEPreferredConnectionParametersRequestStatus.Success)
-                                    {
-                                        bool keep;
-                                        lock (connGate)
-                                            keep = !disposed && !Rejected && !isStopping() && desiredHighThroughput;
-                                        if (keep)
+                                    _ = ConnectionTuningRequest.Acquire(
+                                        () => bleDevice.RequestPreferredConnectionParameters(
+                                            BluetoothLEPreferredConnectionParameters.ThroughputOptimized),
+                                        request => request.Status == BluetoothLEPreferredConnectionParametersRequestStatus.Success,
+                                        request => request.Status.ToString(),
+                                        request =>
                                         {
-                                            throughputRequest = request;
-                                            log("conn params throughput status=Success");
-                                        }
-                                        else
-                                        {
-                                            try { request.Dispose(); }
-                                            catch (Exception) { }
-                                        }
-                                    }
-                                    else
-                                    {
-                                        var statusLabel = request?.Status.ToString() ?? "Unsupported";
-                                        try { request?.Dispose(); }
-                                        catch (Exception) { }
-                                        connParamsUnavailable = true;
-                                        log($"conn params throughput status={statusLabel}");
-                                    }
+                                            lock (connGate)
+                                            {
+                                                if (disposed || Rejected || isStopping() || !desiredHighThroughput)
+                                                    return false;
+                                                throughputRequest = request;
+                                                return true;
+                                            }
+                                        },
+                                        log,
+                                        out var unavailable);
+                                    if (unavailable) connParamsUnavailable = true;
                                 }
                             }
                         }

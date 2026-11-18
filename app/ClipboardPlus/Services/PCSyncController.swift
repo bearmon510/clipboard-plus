@@ -65,6 +65,7 @@ final class PCSyncController: ObservableObject {
         let id: UUID
         let size: Int
         var awaitingInitialResume = true
+        var handedOffOfferLastPacket = false
         var nextSendOffset = 0
         var ackedOffset = 0
         let startedAt: Date
@@ -523,6 +524,10 @@ final class PCSyncController: ObservableObject {
                             }
                         } else if activeAttachment == nil || activeAttachment?.id != id || activeAttachment?.awaitingInitialResume == true || activeAttachment?.size == 0 {
                             sentAt[id] = reply
+                            if var active = activeAttachment, active.id == id, active.awaitingInitialResume {
+                                active.handedOffOfferLastPacket = true
+                                activeAttachment = active
+                            }
                         }
                     }
                     if current.finishesAttachment { finalChunkSentAttachments.insert(id) }
@@ -681,7 +686,13 @@ final class PCSyncController: ObservableObject {
                         throw SyncProtocolError.state
                     }
                 }
-                let accepted = Set(ids.filter { sentAt[$0] != nil || (activeAttachment?.id == $0 && finalChunkSentAttachments.contains($0)) })
+                let accepted = Set(ids.filter { id in
+                    if let active = activeAttachment, active.id == id {
+                        return active.handedOffOfferLastPacket &&
+                            (sentAt[id] != nil || finalChunkSentAttachments.contains(id))
+                    }
+                    return sentAt[id] != nil
+                })
                 if let active = activeAttachment, accepted.contains(active.id) {
                     closeReadHandle(for: active.id)
                     let ms = milliseconds(since: active.startedAt)

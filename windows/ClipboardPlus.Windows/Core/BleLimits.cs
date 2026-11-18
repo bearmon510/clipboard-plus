@@ -15,6 +15,8 @@ internal sealed class WriteAdmission(
     public const int DefaultGlobalBytes = 4 * 1024 * 1024;
     public const int DefaultPeerBytes = 1024 * 1024;
 
+    private readonly int globalByteLimit = globalByteLimit;
+    private readonly int peerByteLimit = peerByteLimit;
     private readonly object gate = new();
     private readonly Dictionary<string, long> bytesByPeer = [];
     private long totalBytes;
@@ -62,17 +64,26 @@ internal sealed class WriteAdmission(
             this.charged = charged;
         }
 
-        public void Adjust(int actualBytes)
+        public bool TryAdjust(long actualBytes)
         {
-            var next = Math.Max(1, actualBytes);
+            var next = Math.Max(1L, actualBytes);
             lock (owner.gate)
             {
-                if (disposed) return;
-                var delta = next - charged;
-                if (delta == 0) return;
-                charged = next;
+                if (disposed) return false;
+                if (next > owner.globalByteLimit || next > owner.peerByteLimit) return false;
+                var nextInt = (int)next;
+                var delta = nextInt - charged;
+                if (delta == 0) return true;
+                if (delta > 0)
+                {
+                    var current = owner.bytesByPeer.GetValueOrDefault(peer);
+                    if (owner.totalBytes + delta > owner.globalByteLimit || current + delta > owner.peerByteLimit)
+                        return false;
+                }
+                charged = nextInt;
                 owner.bytesByPeer[peer] = owner.bytesByPeer.GetValueOrDefault(peer) + delta;
                 owner.totalBytes += delta;
+                return true;
             }
         }
 
@@ -93,19 +104,108 @@ internal sealed class WriteAdmission(
 
 internal sealed record BleWriteRequestData(
     uint Offset,
-    byte[] Bytes,
+    long PayloadLength,
+    Func<byte[]> CopyBytes,
     bool IsWithResponse,
     Action RespondSuccess,
-    Action<byte> RespondError);
+    Action<byte> RespondError)
+{
+    public BleWriteRequestData(
+        uint offset,
+        byte[] bytes,
+        bool isWithResponse,
+        Action respondSuccess,
+        Action<byte> respondError)
+        : this(offset, bytes.Length, () => bytes, isWithResponse, respondSuccess, respondError)
+    {
+    }
+}
 
-internal sealed class BleSubscriptionSlot(object characteristic, string peerId, long generation)
+internal sealed record BleSubscribedClient(string PeerId, object Session, object Client);
+
+internal sealed class BleSubscriptionSlot(
+    object characteristic,
+    string peerId,
+    object session,
+    long generation,
+    long subscriptionGeneration)
 {
     public object Characteristic { get; } = characteristic;
     public string PeerId { get; } = peerId;
+    public object Session { get; } = session;
     public long Generation { get; } = generation;
+    public long SubscriptionGeneration { get; } = subscriptionGeneration;
     public object? Peer { get; set; }
     public bool Rejected { get; set; }
     public bool Invalidated { get; set; }
+}
+
+internal static class ConnectionTuningRequest
+{
+    public static TRequest? Acquire<TRequest>(
+        Func<TRequest?> requestFactory,
+        Func<TRequest, bool> isSuccess,
+        Func<TRequest, string> getStatusLabel,
+        Func<TRequest, bool> tryTakeOwnership,
+        Action<string> log,
+        out bool unavailable)
+        where TRequest : class, IDisposable
+    {
+        unavailable = false;
+        TRequest? request = null;
+        var owned = false;
+        try
+        {
+            request = requestFactory();
+            if (request is not null && isSuccess(request))
+            {
+                if (tryTakeOwnership(request))
+                {
+                    owned = true;
+                    log("conn params throughput status=Success");
+                    return request;
+                }
+                return null;
+            }
+            var statusLabel = request is null ? "Unsupported" : getStatusLabel(request);
+            unavailable = true;
+            log($"conn params throughput status={statusLabel}");
+            return null;
+        }
+        finally
+        {
+            if (!owned && request is not null)
+            {
+                try { request.Dispose(); }
+                catch (Exception) { }
+            }
+        }
+    }
+}
+
+internal static class BleEndpointCleanup
+{
+    public static async Task StopEndpointBeforePeersAsync(
+        Action stopEndpoint,
+        IReadOnlyList<Func<Task>> disposePeers,
+        TimeSpan peerDisposeTimeout,
+        Action<string> log)
+    {
+        stopEndpoint();
+        if (disposePeers.Count == 0) return;
+        var peerTask = Task.WhenAll(disposePeers.Select(async dispose =>
+        {
+            try { await dispose(); }
+            catch (Exception e) { log($"peer remove error={e.GetType().Name}"); }
+        }));
+        if (peerDisposeTimeout == Timeout.InfiniteTimeSpan)
+        {
+            await peerTask;
+            return;
+        }
+        try { await peerTask.WaitAsync(peerDisposeTimeout); }
+        catch (TimeoutException) { log("peer dispose shutdown timeout"); }
+    }
 }
 
 internal sealed class BleWritePipeline
@@ -121,29 +221,41 @@ internal sealed class BleWritePipeline
         }
     }
 
+    private readonly record struct WorkItem(Func<Task> Run, Action? Discard = null);
+
+    private sealed record SubscriptionSnapshot(long Generation, BleSubscribedClient[] Clients);
+
     private sealed record PendingWrite(
         object Characteristic,
         BleSubscriptionSlot Slot,
         long Generation,
         Func<CancellationToken, Task<BleWriteRequestData?>> GetRequestAsync,
         CompletionOnce Completion,
-        WriteAdmission.WriteLease Lease);
+        WriteAdmission.WriteLease Lease,
+        Action RejectSync);
 
     private readonly WriteAdmission admission;
     private readonly Action<string> log;
     private readonly Func<Task> refreshSubscriptionsAsync;
+    private readonly Func<BleSubscribedClient[], long, Task>? applySubscriptionsAsync;
     private readonly Func<object, uint, byte[], Task<bool>> deliverPacketAsync;
     private readonly Func<object, Task> disconnectPeerAsync;
     private readonly Action<object>? rejectPeerSync;
     private readonly TimeSpan requestTimeout;
+    private readonly TimeSpan shutdownTimeout;
     private readonly int minPacketCharge;
-    private readonly Channel<Func<Task>> work = Channel.CreateUnbounded<Func<Task>>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<WorkItem> work = Channel.CreateUnbounded<WorkItem>(new UnboundedChannelOptions { SingleReader = true });
     private readonly Channel<PendingWrite> ingest = Channel.CreateUnbounded<PendingWrite>(new UnboundedChannelOptions { SingleReader = true });
     private readonly CancellationTokenSource stop = new();
+    private readonly object subscriptionReadGate = new();
     private readonly object slotGate = new();
     private readonly Dictionary<string, BleSubscriptionSlot> slotsByPeer = [];
+    private readonly Dictionary<string, object> knownSubscribedSessions = [];
+    private readonly Queue<SubscriptionSnapshot> pendingSubscriptionSnapshots = new();
     private object? activeCharacteristic;
+    private object? activeOutbound;
     private long nextGeneration;
+    private long nextSubscriptionGeneration;
     private volatile bool stopping;
     private readonly Task worker;
     private readonly Task ingestWorker;
@@ -159,15 +271,19 @@ internal sealed class BleWritePipeline
         TimeSpan? requestTimeout = null,
         int minPacketCharge = 20,
         Func<Task>? onWorkerStart = null,
-        Func<Task>? onIngestStart = null)
+        Func<Task>? onIngestStart = null,
+        Func<BleSubscribedClient[], long, Task>? applySubscriptionsAsync = null,
+        TimeSpan? shutdownTimeout = null)
     {
         this.admission = admission;
         this.log = log;
         this.refreshSubscriptionsAsync = refreshSubscriptionsAsync;
+        this.applySubscriptionsAsync = applySubscriptionsAsync;
         this.deliverPacketAsync = deliverPacketAsync;
         this.disconnectPeerAsync = disconnectPeerAsync;
         this.rejectPeerSync = rejectPeerSync;
         this.requestTimeout = requestTimeout ?? TimeSpan.FromSeconds(10);
+        this.shutdownTimeout = shutdownTimeout ?? TimeSpan.FromSeconds(5);
         this.minPacketCharge = Math.Max(1, minPacketCharge);
         worker = Task.Run(async () =>
         {
@@ -176,28 +292,61 @@ internal sealed class BleWritePipeline
                 if (onWorkerStart is not null) await onWorkerStart();
                 await foreach (var action in work.Reader.ReadAllAsync())
                 {
-                    try { await action(); }
+                    try { await action.Run(); }
                     catch (Exception e) { log($"bluetooth operation error={e.GetType().Name}"); }
                 }
             }
-            finally { workerStopped.TrySetResult(); }
+            catch (Exception e)
+            {
+                log($"worker error={e.GetType().Name}");
+            }
+            finally
+            {
+                work.Writer.TryComplete();
+                while (work.Reader.TryRead(out var remaining))
+                {
+                    try { remaining.Discard?.Invoke(); }
+                    catch (Exception e) { log($"worker cleanup error={e.GetType().Name}"); }
+                }
+                workerStopped.TrySetResult();
+            }
         });
         ingestWorker = Task.Run(async () =>
         {
-            if (onIngestStart is not null) await onIngestStart();
-            await IngestLoopAsync();
+            try
+            {
+                if (onIngestStart is not null) await onIngestStart();
+                await IngestLoopAsync();
+            }
+            catch (Exception e)
+            {
+                log($"ingest worker error={e.GetType().Name}");
+            }
+            finally
+            {
+                ingest.Writer.TryComplete();
+                while (ingest.Reader.TryRead(out var remaining))
+                {
+                    try { remaining.RejectSync(); }
+                    catch (Exception) { }
+                    try { remaining.Completion.Complete(); }
+                    finally { remaining.Lease.Dispose(); }
+                }
+            }
         });
     }
 
     public Task QueueWork(Func<Task> action)
     {
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (worker.IsCompleted || !work.Writer.TryWrite(async () =>
-        {
-            try { await action(); }
-            catch (Exception e) { log($"bluetooth operation error={e.GetType().Name}"); }
-            finally { done.TrySetResult(); }
-        }))
+        if (worker.IsCompleted || !work.Writer.TryWrite(new WorkItem(
+            async () =>
+            {
+                try { await action(); }
+                catch (Exception e) { log($"bluetooth operation error={e.GetType().Name}"); }
+                finally { done.TrySetResult(); }
+            },
+            () => done.TrySetResult())))
         {
             done.TrySetResult();
             return done.Task;
@@ -205,21 +354,24 @@ internal sealed class BleWritePipeline
         return done.Task.IsCompleted ? done.Task : Task.WhenAny(done.Task, workerStopped.Task);
     }
 
-    public void SetActiveCharacteristic(object? characteristic)
+    public void SetActiveCharacteristic(object? characteristic, object? outbound = null)
     {
         lock (slotGate)
         {
             activeCharacteristic = characteristic;
+            activeOutbound = characteristic is null ? null : outbound ?? characteristic;
             if (characteristic is null)
             {
                 foreach (var slot in slotsByPeer.Values) slot.Invalidated = true;
                 slotsByPeer.Clear();
+                knownSubscribedSessions.Clear();
+                pendingSubscriptionSnapshots.Clear();
                 return;
             }
             foreach (var key in slotsByPeer.Keys.ToArray())
             {
                 var slot = slotsByPeer[key];
-                if (!ReferenceEquals(slot.Characteristic, characteristic))
+                if (!Equals(slot.Characteristic, characteristic))
                 {
                     slot.Invalidated = true;
                     slotsByPeer.Remove(key);
@@ -228,20 +380,88 @@ internal sealed class BleWritePipeline
         }
     }
 
-    public BleSubscriptionSlot BindPeer(object characteristic, string peerId, object peer)
+    public void CaptureSubscriptionsChanged(object outboundCharacteristic, Func<BleSubscribedClient[]> readClients, bool enqueueDrain = true)
+    {
+        if (stopping) return;
+        lock (subscriptionReadGate)
+        {
+            if (stopping) return;
+            lock (slotGate)
+            {
+                if (stopping || !Equals(activeOutbound, outboundCharacteristic) || activeCharacteristic is null)
+                    return;
+            }
+            var clients = readClients();
+            lock (slotGate)
+            {
+                if (stopping || !Equals(activeOutbound, outboundCharacteristic) || activeCharacteristic is null)
+                    return;
+                var subGen = ++nextSubscriptionGeneration;
+                knownSubscribedSessions.Clear();
+                foreach (var client in clients)
+                    knownSubscribedSessions.TryAdd(client.PeerId, client.Session);
+                foreach (var key in slotsByPeer.Keys.ToArray())
+                {
+                    var slot = slotsByPeer[key];
+                    var stillSubscribed = clients.Any(c => c.PeerId == slot.PeerId && Equals(c.Session, slot.Session));
+                    if (!stillSubscribed || !Equals(slot.Characteristic, activeCharacteristic))
+                    {
+                        slot.Invalidated = true;
+                        slotsByPeer.Remove(key);
+                    }
+                }
+                pendingSubscriptionSnapshots.Enqueue(new(subGen, clients));
+            }
+            if (enqueueDrain && !worker.IsCompleted)
+                _ = work.Writer.TryWrite(new WorkItem(DrainPendingSubscriptionsAsync));
+        }
+    }
+
+    public async Task DrainPendingSubscriptionsAsync()
+    {
+        while (!stopping)
+        {
+            SubscriptionSnapshot? next;
+            lock (slotGate)
+            {
+                if (stopping || !pendingSubscriptionSnapshots.TryDequeue(out next))
+                    return;
+            }
+            if (applySubscriptionsAsync is not null)
+                await applySubscriptionsAsync(next.Clients, next.Generation);
+        }
+    }
+
+    public BleSubscriptionSlot BindPeer(
+        object characteristic,
+        string peerId,
+        object session,
+        object peer,
+        long? subscriptionGeneration = null)
     {
         lock (slotGate)
         {
             if (slotsByPeer.TryGetValue(peerId, out var existing))
             {
-                if (!existing.Invalidated && ReferenceEquals(existing.Characteristic, characteristic) && existing.Peer is null)
+                if (!existing.Invalidated
+                    && Equals(existing.Characteristic, characteristic)
+                    && Equals(existing.Session, session)
+                    && existing.Peer is null)
                 {
                     existing.Peer = peer;
                     return existing;
                 }
                 existing.Invalidated = true;
             }
-            var created = new BleSubscriptionSlot(characteristic, peerId, ++nextGeneration) { Peer = peer };
+            var created = new BleSubscriptionSlot(
+                characteristic,
+                peerId,
+                session,
+                ++nextGeneration,
+                subscriptionGeneration ?? nextSubscriptionGeneration)
+            {
+                Peer = peer
+            };
             slotsByPeer[peerId] = created;
             return created;
         }
@@ -254,6 +474,8 @@ internal sealed class BleWritePipeline
             slot.Invalidated = true;
             if (slotsByPeer.TryGetValue(slot.PeerId, out var current) && ReferenceEquals(current, slot))
                 slotsByPeer.Remove(slot.PeerId);
+            if (knownSubscribedSessions.TryGetValue(slot.PeerId, out var known) && Equals(known, slot.Session))
+                knownSubscribedSessions.Remove(slot.PeerId);
         }
     }
 
@@ -265,6 +487,7 @@ internal sealed class BleWritePipeline
     public void EnqueueWrite(
         object characteristic,
         string peerId,
+        object session,
         int estimatedBytes,
         bool sessionClosed,
         Func<CancellationToken, Task<BleWriteRequestData?>> getRequestAsync,
@@ -272,7 +495,7 @@ internal sealed class BleWritePipeline
         Action rejectSync)
     {
         var completion = new CompletionOnce(completeDeferral, e => log($"write deferral error={e.GetType().Name}"));
-        var slot = !stopping && !sessionClosed ? CaptureWriteSlot(characteristic, peerId) : null;
+        var slot = !stopping && !sessionClosed ? CaptureWriteSlot(characteristic, peerId, session) : null;
         if (slot is null)
         {
             try { rejectSync(); }
@@ -287,58 +510,79 @@ internal sealed class BleWritePipeline
             finally { completion.Complete(); }
             return;
         }
-        if (!ingest.Writer.TryWrite(new(characteristic, slot, slot.Generation, getRequestAsync, completion, lease)))
+        if (ingestWorker.IsCompleted || !ingest.Writer.TryWrite(new(characteristic, slot, slot.Generation, getRequestAsync, completion, lease, rejectSync)))
         {
             try { rejectSync(); }
             finally { try { completion.Complete(); } finally { lease.Dispose(); } }
         }
     }
 
-    public async Task ShutdownAsync(Func<Task> stopProviderAsync)
+    public async Task ShutdownAsync(Func<Task> stopProviderAsync, Action? stopImmediate = null)
     {
         stopping = true;
         stop.Cancel();
+        SetActiveCharacteristic(null);
+        try { stopImmediate?.Invoke(); }
+        catch (Exception e) { log($"stop provider error={e.GetType().Name}"); }
+
         ingest.Writer.TryComplete();
-        try { await ingestWorker; }
+        try { await ingestWorker.WaitAsync(shutdownTimeout); }
+        catch (TimeoutException) { log("ingest worker shutdown timeout"); }
         catch (Exception e) { log($"ingest worker error={e.GetType().Name}"); }
 
         var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var ranStop = 0;
-        if (!worker.IsCompleted && work.Writer.TryWrite(async () =>
-        {
-            if (Interlocked.Exchange(ref ranStop, 1) == 0)
+        if (!worker.IsCompleted && work.Writer.TryWrite(new WorkItem(
+            async () =>
             {
-                try { await stopProviderAsync(); }
-                catch (Exception e) { log($"stop provider error={e.GetType().Name}"); }
-            }
-            stopped.TrySetResult();
-        }))
+                if (Interlocked.Exchange(ref ranStop, 1) == 0)
+                {
+                    try { await stopProviderAsync(); }
+                    catch (Exception e) { log($"stop provider error={e.GetType().Name}"); }
+                }
+                stopped.TrySetResult();
+            },
+            () => stopped.TrySetResult())))
         {
-            await Task.WhenAny(stopped.Task, workerStopped.Task);
+            try { await Task.WhenAny(stopped.Task, workerStopped.Task).WaitAsync(shutdownTimeout); }
+            catch (TimeoutException) { log("worker stop provider timeout"); }
         }
         if (Interlocked.Exchange(ref ranStop, 1) == 0)
         {
-            try { await stopProviderAsync(); }
+            try { await stopProviderAsync().WaitAsync(shutdownTimeout); }
+            catch (TimeoutException) { log("stop provider timeout"); }
             catch (Exception e) { log($"stop provider error={e.GetType().Name}"); }
         }
 
         work.Writer.TryComplete();
-        try { await worker; }
+        try { await worker.WaitAsync(shutdownTimeout); }
+        catch (TimeoutException) { log("worker shutdown timeout"); }
         catch (Exception e) { log($"worker error={e.GetType().Name}"); }
-        stop.Dispose();
+        if (ingestWorker.IsCompleted && worker.IsCompleted) stop.Dispose();
     }
 
-    private BleSubscriptionSlot? CaptureWriteSlot(object characteristic, string peerId)
+    private BleSubscriptionSlot? CaptureWriteSlot(object characteristic, string peerId, object session)
     {
         lock (slotGate)
         {
-            if (stopping || !ReferenceEquals(activeCharacteristic, characteristic)) return null;
+            if (stopping || !Equals(activeCharacteristic, characteristic)) return null;
             if (slotsByPeer.TryGetValue(peerId, out var existing) && !existing.Invalidated)
             {
-                if (existing.Rejected || !ReferenceEquals(existing.Characteristic, characteristic)) return null;
-                return existing;
+                if (Equals(existing.Characteristic, characteristic) && Equals(existing.Session, session))
+                {
+                    if (existing.Rejected) return null;
+                    return existing;
+                }
+                if (existing.Peer is not null) return null;
+                if (knownSubscribedSessions.TryGetValue(peerId, out var known) && Equals(known, existing.Session))
+                    return null;
+                existing.Invalidated = true;
             }
-            var created = new BleSubscriptionSlot(characteristic, peerId, ++nextGeneration);
+            else if (knownSubscribedSessions.TryGetValue(peerId, out var activeKnown) && !Equals(activeKnown, session))
+            {
+                return null;
+            }
+            var created = new BleSubscriptionSlot(characteristic, peerId, session, ++nextGeneration, nextSubscriptionGeneration);
             slotsByPeer[peerId] = created;
             return created;
         }
@@ -350,8 +594,8 @@ internal sealed class BleWritePipeline
         lock (slotGate)
         {
             return !stopping
-                && ReferenceEquals(activeCharacteristic, characteristic)
-                && ReferenceEquals(slot.Characteristic, characteristic)
+                && Equals(activeCharacteristic, characteristic)
+                && Equals(slot.Characteristic, characteristic)
                 && slot.Generation == generation
                 && !slot.Invalidated
                 && !slot.Rejected
@@ -366,10 +610,12 @@ internal sealed class BleWritePipeline
         lock (slotGate)
         {
             return !stopping
-                && ReferenceEquals(activeCharacteristic, characteristic)
-                && ReferenceEquals(slot.Characteristic, characteristic)
+                && Equals(activeCharacteristic, characteristic)
+                && Equals(slot.Characteristic, characteristic)
                 && slot.Generation == generation
-                && !slot.Invalidated;
+                && !slot.Invalidated
+                && slotsByPeer.TryGetValue(slot.PeerId, out var current)
+                && ReferenceEquals(current, slot);
         }
     }
 
@@ -389,29 +635,32 @@ internal sealed class BleWritePipeline
         if (!newlyRetired) return;
         log(logMessage);
         if (peer is not null) rejectPeerSync?.Invoke(peer);
-        _ = work.Writer.TryWrite(async () =>
+        if (!worker.IsCompleted)
         {
-            if (stopping) return;
-            object? currentPeer;
-            lock (slotGate) currentPeer = slot.Peer;
-            if (currentPeer is null)
+            _ = work.Writer.TryWrite(new WorkItem(async () =>
             {
-                await refreshSubscriptionsAsync();
+                if (stopping) return;
+                object? currentPeer;
                 lock (slotGate) currentPeer = slot.Peer;
                 if (currentPeer is null)
                 {
-                    InvalidateSlot(slot);
-                    return;
+                    await refreshSubscriptionsAsync();
+                    lock (slotGate) currentPeer = slot.Peer;
+                    if (currentPeer is null)
+                    {
+                        InvalidateSlot(slot);
+                        return;
+                    }
                 }
-            }
-            bool invalidated;
-            lock (slotGate) invalidated = slot.Invalidated;
-            if (!invalidated)
-            {
-                rejectPeerSync?.Invoke(currentPeer);
-                await disconnectPeerAsync(currentPeer);
-            }
-        });
+                bool invalidated;
+                lock (slotGate) invalidated = slot.Invalidated;
+                if (!invalidated)
+                {
+                    rejectPeerSync?.Invoke(currentPeer);
+                    await disconnectPeerAsync(currentPeer);
+                }
+            }));
+        }
     }
 
     private async Task IngestLoopAsync()
@@ -434,19 +683,40 @@ internal sealed class BleWritePipeline
                         RetireSlotAndScheduleDisconnect(item.Slot, "write request missing; retiring connection count=1");
                     continue;
                 }
-                item.Lease.Adjust(Math.Max(minPacketCharge, request.Bytes.Length));
+                if (!item.Lease.TryAdjust(Math.Max((long)minPacketCharge, request.PayloadLength)))
+                {
+                    if (request.IsWithResponse) TryRespondError(request, 0x11);
+                    if (IsValidForProcessing(item.Slot, item.Characteristic, item.Generation))
+                        RetireSlotAndScheduleDisconnect(item.Slot, "write limit exceeded; retiring connection count=1");
+                    continue;
+                }
+                var bytes = request.CopyBytes();
+                if (bytes.Length != request.PayloadLength && !item.Lease.TryAdjust(Math.Max((long)minPacketCharge, bytes.Length)))
+                {
+                    if (request.IsWithResponse) TryRespondError(request, 0x11);
+                    if (IsValidForProcessing(item.Slot, item.Characteristic, item.Generation))
+                        RetireSlotAndScheduleDisconnect(item.Slot, "write limit exceeded; retiring connection count=1");
+                    continue;
+                }
                 if (!request.IsWithResponse)
                 {
                     // Release the WinRT deferral immediately after copying the payload so
                     // downstream disk I/O or gate contention never stalls BLE packet reception.
                     item.Completion.Complete();
-                    handedOff = work.Writer.TryWrite(() =>
-                        ProcessItemAsync(item.Slot, item.Characteristic, item.Generation, request.Offset, request.Bytes, null, null, item.Lease));
+                    handedOff = !worker.IsCompleted && work.Writer.TryWrite(new WorkItem(
+                        () => ProcessItemAsync(item.Slot, item.Characteristic, item.Generation, request.Offset, bytes, null, null, item.Lease),
+                        () => item.Lease.Dispose()));
                 }
                 else
                 {
-                    handedOff = work.Writer.TryWrite(() =>
-                        ProcessItemAsync(item.Slot, item.Characteristic, item.Generation, request.Offset, request.Bytes, request, item.Completion, item.Lease));
+                    handedOff = !worker.IsCompleted && work.Writer.TryWrite(new WorkItem(
+                        () => ProcessItemAsync(item.Slot, item.Characteristic, item.Generation, request.Offset, bytes, request, item.Completion, item.Lease),
+                        () =>
+                        {
+                            TryRespondError(request, 0x0E);
+                            try { item.Completion.Complete(); }
+                            finally { item.Lease.Dispose(); }
+                        }));
                 }
                 if (!handedOff)
                 {

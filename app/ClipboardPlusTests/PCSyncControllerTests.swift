@@ -2342,4 +2342,53 @@ final class PCSyncControllerTests: XCTestCase {
         let resendLines = logAfterReconnect.split(separator: "\n").filter { $0.contains("再送または継続") }
         XCTAssertEqual(resendLines.count, 1)
     }
+
+    @MainActor
+    func testAttachmentOfferAckIgnoredMidPacketAndAcceptedAfterOfferLastPacketHandedOff() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        try f.link.connect(pairing, limit: 20)
+        f.link.stopAfterPackets = 1
+
+        let data = Data([10, 20, 30, 40])
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data, name: "mid-offer.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+        XCTAssertFalse(f.link.canSend)
+        XCTAssertTrue(f.link.offers.isEmpty)
+
+        let syncDir = f.root.appendingPathComponent("images").appendingPathComponent("PCSync-v2", isDirectory: true)
+        let stateData = try Data(contentsOf: syncDir.appendingPathComponent("state.json"))
+        let savedState = try JSONDecoder().decode(SyncDiskStore.State.self, from: stateData)
+        let offerID = try XCTUnwrap(savedState.pending.first?.id)
+
+        // Mid-offer ACK before offer's last packet is handed off is ignored without disconnecting or deleting pending.
+        try f.link.send(.ack(ids: [offerID]))
+        XCTAssertEqual(f.controller.pendingCount, 1)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+
+        // Hand off the remaining packets of offer, then ACK succeeds.
+        f.link.resume()
+        XCTAssertEqual(f.link.offers.count, 1)
+        try f.link.send(.ack(ids: [offerID]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+
+        // Same behavior for a 0-byte attachment offer.
+        f.link.stopAfterPackets = 1
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(), name: "empty-offer.bin")], receivedAt: f.clock.date.addingTimeInterval(1))
+        await awaitSave(f, savedCount: 2)
+        XCTAssertFalse(f.link.canSend)
+        XCTAssertEqual(f.link.offers.count, 1)
+
+        let emptyStateData = try Data(contentsOf: syncDir.appendingPathComponent("state.json"))
+        let emptyState = try JSONDecoder().decode(SyncDiskStore.State.self, from: emptyStateData)
+        let emptyOfferID = try XCTUnwrap(emptyState.pending.first?.id)
+
+        try f.link.send(.ack(ids: [emptyOfferID]))
+        XCTAssertEqual(f.controller.pendingCount, 1)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+
+        f.link.resume()
+        XCTAssertEqual(f.link.offers.count, 2)
+        try f.link.send(.ack(ids: [emptyOfferID]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+    }
 }

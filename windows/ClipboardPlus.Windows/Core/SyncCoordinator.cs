@@ -6,6 +6,7 @@ namespace ClipboardPlus.Windows.Core;
 public interface ISyncPeer
 {
     int PacketLimit { get; }
+    bool IsRejected => false;
     Task SendPacketAsync(byte[] packet);
     // Retire this connection, including after a protocol/notification failure.
     void Reject();
@@ -78,6 +79,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly DateTimeOffset StartedAt = startedAt;
         public DateTimeOffset LastActivity = startedAt;
         public bool AwaitingInitialResume = true;
+        public bool HandedOffOfferLastPacket;
         public int NextSendOffset;
         public int AckedOffset;
         public int StartOffset;
@@ -225,7 +227,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         await gate.WaitAsync();
         try
         {
-            if (stopped) { peer.Reject(); return; }
+            if (stopped || peer.IsRejected) { peer.Reject(); return; }
             if (connections.ContainsKey(peer)) return;
             if (connections.Count >= 8) { peer.Reject(); return; }
             connections.Add(peer, new(pairing, peer, Now()));
@@ -240,7 +242,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         await gate.WaitAsync();
         try
         {
-            if (stopped || !connections.TryGetValue(peer, out var c)) return false;
+            if (stopped || !connections.TryGetValue(peer, out var c) || c.Retired) return false;
+            if (peer.IsRejected)
+            {
+                Drop(c, "peer retired");
+                return false;
+            }
             if (c.VersionRejected) return true;
             try
             {
@@ -399,7 +406,14 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             foreach (var id in ack.Ids)
                                 if (c.ResumedAttachments.Contains(id) && !c.FinalChunkSentAttachments.Contains(id))
                                     throw new SyncProtocolException(SyncError.State);
-                            var ids = ack.Ids.Where(id => c.Sent.ContainsKey(id) || c.InFlight == id || c.ActiveAttachment?.Id == id || c.Attempted.Contains(id)).ToHashSet();
+                            var ids = ack.Ids.Where(id =>
+                            {
+                                if (c.ActiveAttachment is { } att && att.Id == id)
+                                    return c.ResumedAttachments.Contains(id)
+                                        ? c.FinalChunkSentAttachments.Contains(id)
+                                        : att.HandedOffOfferLastPacket;
+                                return c.Sent.ContainsKey(id) || c.InFlight == id || c.Attempted.Contains(id);
+                            }).ToHashSet();
                             store.Ack(c.DeviceId, ids);
                             if (c.ActiveAttachment is { } activeAtt && ids.Contains(activeAtt.Id))
                             {
@@ -493,6 +507,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             }
             foreach (var c in connections.Values.ToArray())
             {
+                if (c.Peer.IsRejected)
+                {
+                    Drop(c, "peer retired");
+                    continue;
+                }
                 if ((c.Stage < 2 && now - c.Started > TimeSpan.FromSeconds(20)) ||
                     (c.Assembler.HasPartialFrame && now - c.LastPacket > TimeSpan.FromSeconds(20)))
                     Drop(c, "receive timeout");
@@ -509,11 +528,18 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         continue;
                     }
                     foreach (var id in expired) c.Sent.Remove(id);
-                    foreach (var staleId in c.ActiveIncomingAttachments.Where(p => now - p.Value >= HighThroughputIdleGrace).Select(p => p.Key).ToArray())
-                        c.ActiveIncomingAttachments.Remove(staleId);
+                    var incomingPacketActive = c.ActiveIncomingAttachments.Count > 0 &&
+                        c.Assembler.HasPartialFrame &&
+                        now - c.LastPacket < HighThroughputIdleGrace;
+                    if (!incomingPacketActive)
+                    {
+                        foreach (var staleId in c.ActiveIncomingAttachments.Where(p => now - p.Value >= HighThroughputIdleGrace).Select(p => p.Key).ToArray())
+                            c.ActiveIncomingAttachments.Remove(staleId);
+                    }
+                    var incomingAttachmentActive = incomingPacketActive || c.ActiveIncomingAttachments.Count > 0;
                     var outgoingAttachmentActive = c.ActiveAttachment is { } activeAtt &&
                         (c.InFlight == activeAtt.Id || now - activeAtt.LastActivity < HighThroughputIdleGrace);
-                    if (c.HighThroughputRequested && !outgoingAttachmentActive && c.ActiveIncomingAttachments.Count == 0 &&
+                    if (c.HighThroughputRequested && !outgoingAttachmentActive && !incomingAttachmentActive &&
                         now - c.LastAttachmentActivity >= HighThroughputIdleGrace)
                     {
                         c.HighThroughputRequested = false;
@@ -615,6 +641,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 try
                 {
                     if (c.Retired) return;
+                    if (c.Peer.IsRejected) { Drop(c, "peer retired"); return; }
                     if (c.ControlFrames.TryDequeue(out var control)) frame = control;
                     else if (c.Stage == 2 && c.AckQueue.Count > 0)
                     {
@@ -692,24 +719,40 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 var packets = SyncPacketizer.Split(frame, Math.Min(512, c.Peer.PacketLimit));
                 for (var packetIndex = 0; packetIndex < packets.Count; packetIndex++)
                 {
-                    c.Stop.Token.ThrowIfCancellationRequested();
+                    Task sendTask;
                     if (packetIndex == packets.Count - 1 && item is not null && item.Kind != "text")
                     {
                         await gate.WaitAsync();
                         try
                         {
-                            if (c.Retired) return;
+                            if (c.Retired || c.Stop.IsCancellationRequested) return;
+                            if (c.Peer.IsRejected) { Drop(c, "peer retired"); return; }
+                            sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
+                            if (sendTask.IsCompleted) sendTask.GetAwaiter().GetResult();
                             if (isChunk && chunkEndOffset is int end && c.ActiveAttachment is { } active && active.Id == item.Id)
                             {
                                 var idx = active.Chunks.FindIndex(ch => ch.EndOffset == end);
                                 if (idx >= 0) active.Chunks[idx] = active.Chunks[idx] with { HandedOffLastPacket = true };
                             }
+                            else if (!isChunk && c.ActiveAttachment is { } activeOffer && activeOffer.Id == item.Id)
+                            {
+                                activeOffer.HandedOffOfferLastPacket = true;
+                            }
                             if (finishesItem && c.ResumedAttachments.Contains(item.Id))
                                 c.FinalChunkSentAttachments.Add(item.Id);
                         }
+                        catch (Exception e)
+                        {
+                            if (!c.Retired) Drop(c, Failure(e));
+                            return;
+                        }
                         finally { gate.Release(); }
                     }
-                    var sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
+                    else
+                    {
+                        c.Stop.Token.ThrowIfCancellationRequested();
+                        sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
+                    }
                     if (!sendTask.IsCompleted)
                         await sendTask.WaitAsync(TimeSpan.FromSeconds(10), c.Stop.Token);
                     else
@@ -719,6 +762,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 try
                 {
                     if (c.Retired) return;
+                    if (c.Peer.IsRejected) { Drop(c, "peer retired"); return; }
                     // An ACK may arrive before NotifyValueAsync completes.
                     if (item is not null)
                     {
