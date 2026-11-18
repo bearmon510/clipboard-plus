@@ -9,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using ClipboardPlus.Sync;
 using ClipboardPlus.Windows.Core;
 using ClipboardPlus.Windows.Infrastructure;
 using Microsoft.Win32;
@@ -18,9 +19,14 @@ using Button = System.Windows.Controls.Button;
 using ButtonBase = System.Windows.Controls.Primitives.ButtonBase;
 using Color = System.Windows.Media.Color;
 using ColorConverter = System.Windows.Media.ColorConverter;
+using DataFormats = System.Windows.DataFormats;
 using DataObject = System.Windows.DataObject;
+using DispatcherPriority = System.Windows.Threading.DispatcherPriority;
+using DispatcherTimer = System.Windows.Threading.DispatcherTimer;
 using DragDrop = System.Windows.DragDrop;
 using DragDropEffects = System.Windows.DragDropEffects;
+using DragEventArgs = System.Windows.DragEventArgs;
+using IDataObject = System.Windows.IDataObject;
 using KeyEventArgs = System.Windows.Input.KeyEventArgs;
 using MouseEventArgs = System.Windows.Input.MouseEventArgs;
 using Point = System.Windows.Point;
@@ -30,6 +36,9 @@ namespace ClipboardPlus.Windows;
 /// <summary>One history item as the window shows it. The thumbnail loads only when a row is drawn.</summary>
 public sealed class HistoryRow
 {
+    internal const int ThumbnailDecodeHeight = 280; // Twice the 140-DIP card slot, so a full-size image is never decoded.
+    internal const int ThumbnailMaxDecodeWidth = 720;
+
     private readonly Lazy<ImageSource?> thumbnail;
 
     public HistoryRow(HistoryItem item, DateTimeOffset now)
@@ -62,7 +71,7 @@ public sealed class HistoryRow
 
     public Visibility LinkVisibility => Flavor == HistoryDisplayFlavor.Link ? Visibility.Visible : Visibility.Collapsed;
     public Visibility LinkRemainderVisibility => !string.IsNullOrEmpty(LinkRemainder) ? Visibility.Visible : Visibility.Collapsed;
-    public Visibility PlainTitleVisibility => Flavor != HistoryDisplayFlavor.Link ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility PlainTitleVisibility => Flavor != HistoryDisplayFlavor.Link && ThumbnailVisibility != Visibility.Visible ? Visibility.Visible : Visibility.Collapsed;
     public Visibility ThumbnailVisibility => Flavor == HistoryDisplayFlavor.Image && Thumbnail is not null ? Visibility.Visible : Visibility.Collapsed;
     public Visibility ImageFallbackVisibility => Flavor == HistoryDisplayFlavor.Image && Thumbnail is null ? Visibility.Visible : Visibility.Collapsed;
     public Visibility FileIconVisibility => Flavor == HistoryDisplayFlavor.File ? Visibility.Visible : Visibility.Collapsed;
@@ -75,11 +84,25 @@ public sealed class HistoryRow
         {
             // The stream is closed here, and shared for deletion, so cleaning up bodies never waits on it.
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var probe = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnDemand);
+            if (probe.Frames.Count == 0) return null;
+            var probeFrame = probe.Frames[0];
+            var pixelWidth = probeFrame.PixelWidth;
+            var pixelHeight = probeFrame.PixelHeight;
+            if (pixelWidth <= 0 || pixelHeight <= 0) return null;
+
+            stream.Position = 0;
             var bitmap = new BitmapImage();
             bitmap.BeginInit();
             bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
-            bitmap.DecodePixelHeight = 88; // Twice the 44-pixel slot, so a full-size image is never decoded.
+            if (pixelHeight > ThumbnailDecodeHeight || pixelWidth > ThumbnailMaxDecodeWidth)
+            {
+                // Set only one axis so BitmapImage preserves the image's aspect ratio.
+                if ((long)pixelWidth * ThumbnailDecodeHeight > (long)ThumbnailMaxDecodeWidth * pixelHeight)
+                    bitmap.DecodePixelWidth = ThumbnailMaxDecodeWidth;
+                else
+                    bitmap.DecodePixelHeight = ThumbnailDecodeHeight;
+            }
             bitmap.StreamSource = stream;
             bitmap.EndInit();
             bitmap.Freeze();
@@ -96,6 +119,7 @@ public sealed class HistoryRow
 public partial class HistoryWindow : Window, IHistoryPresenter
 {
     private const double ResizeBorderDip = 5;
+    internal const string SelfDragFormat = "ClipboardPlus.HistoryDrag";
 
     private readonly Action<string> log;
     private readonly Func<bool> pasteOnSelect;
@@ -111,11 +135,13 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private HwndSource? hwndSource;
     private WinEventDelegate? foregroundHookProc;
     private nint foregroundHook;
+    private DispatcherTimer? noticeTimer;
     private int reloadVersion;
     private int? preferredIndex;
     private bool choosing;
     private bool deleting;
     private bool dragging;
+    private bool dropOverlayActive;
     private bool pendingReloadAfterDrag;
     private bool placedForDisplay;
     private Point? dragStartPoint;
@@ -166,7 +192,11 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         // A paste still waiting for keys to be released belongs to the previous opening.
         pasteCancel?.Cancel();
         // The hotkey a second time closes the window, as Win+V does.
-        if (IsVisible) { Hide(); return; }
+        if (IsVisible && HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.HotkeyWhileVisible))
+        {
+            Hide();
+            return;
+        }
 
         pasteTarget.Reset(value.PreviousWindow);
         ApplyTheme();
@@ -303,21 +333,23 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         HistoryList.ScrollIntoView(rows[index]);
     }
 
-    private async Task ChooseAsync(HistoryRow? row, bool pasteAfter)
+    private async Task ChooseAsync(HistoryRow? row, bool? explicitPaste, bool ctrlPressed = false)
     {
         var current = coordinator;
         if (row is null || current is null || choosing) return;
         choosing = true;
         nint target;
+        HistorySelectionDecision decision;
         try
         {
             await current.CopyHistoryAsync(row.Item.Id);
             target = pasteTarget.CurrentTarget;
             // Opened from clipboard+'s own window or tray with no other window visited, there is nothing to paste into.
-            pasteAfter = pasteAfter && target != 0 && ForegroundContext.IsWindowHandle(target) && !ForegroundContext.IsOwnProcessWindow(target);
-            // While this window still holds the foreground, hand it back; once hidden, Windows may refuse.
-            if (pasteAfter) SetForegroundWindow(target);
-            Hide();
+            var validTarget = target != 0 && ForegroundContext.IsWindowHandle(target) && !ForegroundContext.IsOwnProcessWindow(target);
+            decision = HistoryWindowPlacement.DecideSelection(pasteOnSelect(), ctrlPressed, explicitPaste, validTarget);
+            // Hand foreground to the target app while leaving this Topmost window open for further selections.
+            if (decision.ShouldPaste) SetForegroundWindow(target);
+            if (decision.ShouldClose) Hide();
         }
         catch (Exception ex)
         {
@@ -327,7 +359,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         }
         finally { choosing = false; }
 
-        if (!pasteAfter) return;
+        if (!decision.ShouldPaste) return;
         pasteCancel?.Cancel();
         var cancel = pasteCancel = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         try
@@ -361,12 +393,15 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0 || (GetAsyncKeyState(VirtualKeyControl) & 0x8000) != 0;
         switch (e.Key)
         {
-            case Key.Escape: Hide(); break;
+            case Key.Escape:
+                if (HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.EscapeKey, IsActive))
+                    Hide();
+                break;
             case Key.Down: Move(1); break;
             case Key.Up: Move(-1); break;
             case Key.PageDown: Move(5); break;
             case Key.PageUp: Move(-5); break;
-            case Key.Enter: _ = ChooseAsync(Selected, pasteAfter: !ctrl && pasteOnSelect()); break;
+            case Key.Enter: _ = ChooseAsync(Selected, explicitPaste: null, ctrlPressed: ctrl); break;
             // While a search is typed, Delete edits the search; with an empty box it removes the item.
             case Key.Delete when SearchBox.Text.Length == 0: _ = DeleteAsync(Selected); break;
             default: return;
@@ -382,7 +417,11 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         catch (InvalidOperationException) { }
     }
 
-    private void OnCloseClicked(object sender, RoutedEventArgs e) => Hide();
+    private void OnCloseClicked(object sender, RoutedEventArgs e)
+    {
+        if (HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.CloseButton))
+            Hide();
+    }
 
     private void OnClearSearch(object sender, RoutedEventArgs e)
     {
@@ -443,7 +482,20 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         if (clickRow is null || dragging || IsInsideButton(e.OriginalSource as DependencyObject))
             return;
         if (RowAt(e.OriginalSource) == clickRow)
-            _ = ChooseAsync(clickRow, pasteAfter: pasteOnSelect());
+            _ = ChooseAsync(clickRow, explicitPaste: null, ctrlPressed: false);
+    }
+
+    private void OnThumbnailImageSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (sender is not FrameworkElement element) return;
+        if (e.NewSize.Width <= 0 || e.NewSize.Height <= 0)
+        {
+            element.Clip = null;
+            return;
+        }
+        var clip = new RectangleGeometry(new Rect(0, 0, e.NewSize.Width, e.NewSize.Height), 8, 8);
+        clip.Freeze();
+        element.Clip = clip;
     }
 
     private void StartDrag(HistoryRow row)
@@ -484,6 +536,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         try
         {
             var data = new DataObject();
+            data.SetData(SelfDragFormat, true);
             if (item.Kind == "text")
             {
                 data.SetText(item.Text ?? "");
@@ -698,9 +751,459 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         return false;
     }
 
-    private void OnMenuPaste(object sender, RoutedEventArgs e) => _ = ChooseAsync(Selected, pasteAfter: true);
-    private void OnMenuCopy(object sender, RoutedEventArgs e) => _ = ChooseAsync(Selected, pasteAfter: false);
+    private void OnMenuPaste(object sender, RoutedEventArgs e) => _ = ChooseAsync(Selected, explicitPaste: true);
+    private void OnMenuCopy(object sender, RoutedEventArgs e) => _ = ChooseAsync(Selected, explicitPaste: false);
     private void OnMenuDelete(object sender, RoutedEventArgs e) => _ = DeleteAsync(Selected);
+
+    private void OnDismissNotice(object sender, RoutedEventArgs e) => HideDropNotice();
+
+    private void OnPreviewDragEnter(object sender, DragEventArgs e) => HandleDragOver(e);
+    private void OnPreviewDragOver(object sender, DragEventArgs e) => HandleDragOver(e);
+
+    private void HandleDragOver(DragEventArgs e)
+    {
+        var sourceKind = DetectDropSource(e.Data, dragging);
+        var acceptable = sourceKind != DropSourceKind.None && (e.AllowedEffects & DragDropEffects.Copy) != 0;
+        if (acceptable)
+        {
+            e.Effects = DragDropEffects.Copy;
+            SetDropOverlayActive(true);
+        }
+        else
+        {
+            e.Effects = DragDropEffects.None;
+            SetDropOverlayActive(false);
+        }
+        e.Handled = true;
+    }
+
+    private void OnPreviewDragLeave(object sender, DragEventArgs e)
+    {
+        dropOverlayActive = false;
+        e.Handled = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            if (!dropOverlayActive)
+                DropOverlay.Visibility = Visibility.Collapsed;
+        });
+    }
+
+    private async void OnPreviewDrop(object sender, DragEventArgs e)
+    {
+        e.Handled = true;
+        SetDropOverlayActive(false);
+
+        var sourceKind = DetectDropSource(e.Data, dragging);
+        if (sourceKind == DropSourceKind.None || (e.AllowedEffects & DragDropEffects.Copy) == 0)
+            return;
+
+        DropExtractionResult extracted;
+        try
+        {
+            if (sourceKind == DropSourceKind.FileDrop)
+            {
+                var paths = e.Data.GetData(DataFormats.FileDrop) as string[] ?? [];
+                extracted = await Task.Run(() => ReadDroppedFiles(paths));
+            }
+            else
+            {
+                extracted = ExtractNonFileDrop(e.Data, sourceKind);
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"history drop error={ex.GetType().Name}");
+            if (IsVisible) ShowDropNotice("追加できない項目がありました", isWarning: true);
+            return;
+        }
+
+        var added = 0;
+        var protocolSkipped = 0;
+        if (extracted.Contents.Count > 0)
+        {
+            var current = coordinator;
+            if (current is null)
+            {
+                if (IsVisible) ShowDropNotice("いまは履歴に追加できません", isWarning: true);
+                return;
+            }
+            try
+            {
+                var result = await current.AddLocalContentsAsync(extracted.Contents);
+                added = result.Added;
+                protocolSkipped = result.Skipped;
+            }
+            catch (Exception ex)
+            {
+                log($"history drop add error={ex.GetType().Name}");
+                if (IsVisible) ShowDropNotice("履歴に追加できませんでした", isWarning: true);
+                return;
+            }
+        }
+
+        var summary = new DropNoticeSummary(
+            Added: added,
+            TooLargeCount: extracted.TooLargeCount,
+            TooManyFilesCount: extracted.TooManyFilesCount,
+            DirectoryOrLinkCount: extracted.DirectoryOrLinkCount,
+            InvalidOrEmptyCount: extracted.InvalidOrEmptyCount,
+            UnavailableCount: extracted.UnavailableCount,
+            ProtocolSkippedCount: protocolSkipped,
+            TextTooLarge: extracted.TextTooLarge || (sourceKind == DropSourceKind.Text && protocolSkipped > 0));
+
+        if (IsVisible && HistoryDrop.FormatDropNotice(summary) is { } notice)
+            ShowDropNotice(notice.Message, notice.IsWarning);
+    }
+
+    private void SetDropOverlayActive(bool active)
+    {
+        dropOverlayActive = active;
+        DropOverlay.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void ShowDropNotice(string message, bool isWarning)
+    {
+        NoticeBanner.SetResourceReference(Border.BackgroundProperty, isWarning ? "NoticeWarningBg" : "NoticeBg");
+        NoticeBanner.SetResourceReference(Border.BorderBrushProperty, isWarning ? "NoticeWarningBorder" : "NoticeBorder");
+        NoticeIcon.SetResourceReference(TextBlock.ForegroundProperty, isWarning ? "NoticeWarningFg" : "NoticeFg");
+        NoticeText.SetResourceReference(TextBlock.ForegroundProperty, isWarning ? "NoticeWarningFg" : "NoticeFg");
+        NoticeIcon.Text = isWarning ? "\uE7BA" : "\uE73E";
+        NoticeText.Text = message;
+        NoticeBanner.Visibility = Visibility.Visible;
+
+        if (noticeTimer is null)
+        {
+            noticeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(3500) };
+            noticeTimer.Tick += (_, _) => HideDropNotice();
+        }
+        noticeTimer.Stop();
+        noticeTimer.Start();
+    }
+
+    private void HideDropNotice()
+    {
+        noticeTimer?.Stop();
+        NoticeBanner.Visibility = Visibility.Collapsed;
+        NoticeText.Text = "";
+    }
+
+    internal sealed record DropExtractionResult(
+        IReadOnlyList<ClipboardContent> Contents,
+        int TooLargeCount,
+        int TooManyFilesCount,
+        int DirectoryOrLinkCount,
+        int InvalidOrEmptyCount,
+        int UnavailableCount,
+        bool TextTooLarge = false);
+
+    internal static DropSourceKind DetectDropSource(IDataObject? data, bool isDraggingFromSelf)
+    {
+        if (data is null) return DropSourceKind.None;
+        return HistoryDrop.SelectDropSource(
+            isDraggingFromSelf: isDraggingFromSelf,
+            hasSelfDragMarker: data.GetDataPresent(SelfDragFormat),
+            hasFileDrop: data.GetDataPresent(DataFormats.FileDrop),
+            hasImage: data.GetDataPresent("PNG") || data.GetDataPresent(DataFormats.Dib) || data.GetDataPresent(DataFormats.Bitmap),
+            hasText: data.GetDataPresent(DataFormats.UnicodeText) || data.GetDataPresent(DataFormats.Text) || data.GetDataPresent(typeof(string)));
+    }
+
+    internal static DropExtractionResult ExtractNonFileDrop(IDataObject data, DropSourceKind kind)
+    {
+        if (kind == DropSourceKind.Text)
+        {
+            var text = data.GetData(DataFormats.UnicodeText) as string
+                ?? data.GetData(DataFormats.Text) as string
+                ?? data.GetData(typeof(string)) as string;
+            var evaluation = HistoryDrop.EvaluateTextDrop(text);
+            if (!evaluation.Accepted)
+            {
+                return evaluation.Reason == DropSkipReason.TooLarge
+                    ? new([], 1, 0, 0, 0, 0, TextTooLarge: true)
+                    : new([], 0, 0, 0, 1, 0);
+            }
+            return new([new ClipboardContent("text", Text: text)], 0, 0, 0, 0, 0);
+        }
+
+        if (kind == DropSourceKind.Image)
+        {
+            if (TryExtractImageDrop(data, out var pngBytes, out var failureReason) && pngBytes is not null)
+                return new([new ClipboardContent("image", Data: pngBytes, Type: "public.png")], 0, 0, 0, 0, 0);
+
+            return failureReason == DropSkipReason.TooLarge
+                ? new([], 1, 0, 0, 0, 0)
+                : new([], 0, 0, 0, 1, 0);
+        }
+
+        return new([], 0, 0, 0, 0, 0);
+    }
+
+    internal static DropExtractionResult ReadDroppedFiles(IReadOnlyList<string> paths)
+    {
+        if (paths.Count == 0)
+            return new([], 0, 0, 0, 0, 0);
+
+        var entries = new List<DroppedFileEntry>(paths.Count);
+        foreach (var rawPath in paths)
+        {
+            if (string.IsNullOrWhiteSpace(rawPath))
+            {
+                entries.Add(new("", "", Exists: false, IsDirectoryOrReparsePoint: false, Length: -1));
+                continue;
+            }
+            try
+            {
+                var attrs = File.GetAttributes(rawPath);
+                var isDirOrLink = (attrs & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0;
+                var info = new FileInfo(rawPath);
+                var length = isDirOrLink ? 0L : info.Length;
+                entries.Add(new(info.FullName, info.Name, Exists: true, IsDirectoryOrReparsePoint: isDirOrLink, Length: length));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or System.Security.SecurityException)
+            {
+                entries.Add(new(rawPath, "", Exists: false, IsDirectoryOrReparsePoint: false, Length: -1));
+            }
+        }
+
+        var plan = HistoryDrop.PlanFileDrops(entries);
+        var contents = new List<ClipboardContent>(plan.Accepted.Count);
+        var tooLarge = plan.TooLargeCount;
+        var unavailable = plan.UnavailableCount;
+
+        foreach (var entry in plan.Accepted)
+        {
+            try
+            {
+                using var stream = new FileStream(entry.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                if (stream.Length > HistoryDrop.MaxAttachmentBytes)
+                {
+                    tooLarge++;
+                    continue;
+                }
+                var data = ReadStreamUpToLimit(stream, HistoryDrop.MaxAttachmentBytes, out var exceeded);
+                if (exceeded)
+                {
+                    tooLarge++;
+                    continue;
+                }
+                contents.Add(new("file", Filename: entry.FileName, Data: data));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                unavailable++;
+            }
+        }
+
+        return new DropExtractionResult(
+            contents,
+            tooLarge,
+            plan.TooManyFilesCount,
+            plan.DirectoryOrLinkCount,
+            plan.InvalidOrEmptyCount,
+            unavailable);
+    }
+
+    private static bool TryExtractImageDrop(IDataObject data, out byte[]? pngBytes, out DropSkipReason failureReason)
+    {
+        pngBytes = null;
+        failureReason = DropSkipReason.InvalidFormatOrEmpty;
+
+        if (data.GetDataPresent("PNG"))
+        {
+            var rawPng = ReadBytesFromDataObject(data, "PNG", HistoryDrop.MaxAttachmentBytes, out var exceeded);
+            if (exceeded)
+            {
+                failureReason = DropSkipReason.TooLarge;
+                return false;
+            }
+            if (rawPng is not null)
+            {
+                if (TryNormalizeImageBytesToPng(rawPng, out pngBytes, out failureReason))
+                    return true;
+                if (failureReason == DropSkipReason.TooLarge)
+                    return false;
+            }
+        }
+
+        if (data.GetDataPresent(DataFormats.Dib))
+        {
+            var maxDibBytes = HistoryDrop.MaxImagePixels * 4 + 4096;
+            var dib = ReadBytesFromDataObject(data, DataFormats.Dib, maxDibBytes, out var exceeded);
+            if (exceeded)
+            {
+                failureReason = DropSkipReason.TooLarge;
+                return false;
+            }
+            if (dib is not null && TryConvertDibToBmpBytes(dib) is { } bmpBytes)
+            {
+                if (TryNormalizeImageBytesToPng(bmpBytes, out pngBytes, out failureReason))
+                    return true;
+                if (failureReason == DropSkipReason.TooLarge)
+                    return false;
+            }
+        }
+
+        if (data.GetDataPresent(DataFormats.Bitmap))
+        {
+            var bitmapObj = data.GetData(DataFormats.Bitmap);
+            if (bitmapObj is BitmapSource bitmapSource)
+            {
+                if (TryEncodeBitmapSourceToPng(bitmapSource, out pngBytes, out failureReason))
+                    return true;
+                if (failureReason == DropSkipReason.TooLarge)
+                    return false;
+            }
+            else if (bitmapObj is System.Drawing.Bitmap drawingBitmap)
+            {
+                if (!HistoryDrop.IsImageWithinPixelLimit(drawingBitmap.Width, drawingBitmap.Height))
+                {
+                    failureReason = DropSkipReason.TooLarge;
+                    return false;
+                }
+                try
+                {
+                    using var encoded = new MemoryStream();
+                    drawingBitmap.Save(encoded, System.Drawing.Imaging.ImageFormat.Png);
+                    if (!HistoryDrop.IsImageWithinByteLimit(encoded.Length))
+                    {
+                        failureReason = DropSkipReason.TooLarge;
+                        return false;
+                    }
+                    pngBytes = encoded.ToArray();
+                    return true;
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException) { }
+            }
+        }
+
+        return false;
+    }
+
+    private static byte[]? ReadBytesFromDataObject(IDataObject data, string format, long maxBytes, out bool exceeded)
+    {
+        exceeded = false;
+        object? raw;
+        try { raw = data.GetData(format); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
+
+        if (raw is byte[] bytes)
+        {
+            if (bytes.LongLength > maxBytes)
+            {
+                exceeded = true;
+                return null;
+            }
+            return bytes;
+        }
+        if (raw is Stream stream)
+        {
+            if (stream.CanSeek) stream.Position = 0;
+            var result = ReadStreamUpToLimit(stream, maxBytes, out exceeded);
+            return exceeded ? null : result;
+        }
+        return null;
+    }
+
+    private static byte[] ReadStreamUpToLimit(Stream stream, long maxBytes, out bool exceeded)
+    {
+        exceeded = false;
+        if (stream.CanSeek && stream.Length - stream.Position > maxBytes)
+        {
+            exceeded = true;
+            return [];
+        }
+        using var output = new MemoryStream();
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var remaining = maxBytes - output.Length + 1;
+            var toRead = (int)Math.Min(buffer.Length, remaining);
+            var read = stream.Read(buffer, 0, toRead);
+            if (read <= 0) break;
+            if (output.Length + read > maxBytes)
+            {
+                exceeded = true;
+                return [];
+            }
+            output.Write(buffer, 0, read);
+        }
+        return output.ToArray();
+    }
+
+    private static byte[]? TryConvertDibToBmpBytes(byte[] dib)
+    {
+        if (dib.Length < 40) return null;
+        var header = BitConverter.ToInt32(dib, 0);
+        if (header < 40 || header > dib.Length) return null;
+        var bits = BitConverter.ToUInt16(dib, 14);
+        var compression = BitConverter.ToInt32(dib, 16);
+        var colors = BitConverter.ToUInt32(dib, 32);
+        if (colors == 0 && bits <= 8) colors = 1u << bits;
+        var paletteBytes = (long)colors * 4 + (header == 40 && compression == 3 ? 12 : 0);
+        if (paletteBytes < 0 || paletteBytes > dib.Length - header) return null;
+        var offsetLong = 14L + header + paletteBytes;
+        if (offsetLong > int.MaxValue || offsetLong > 14L + dib.Length) return null;
+
+        var input = new byte[14 + dib.Length];
+        input[0] = (byte)'B';
+        input[1] = (byte)'M';
+        BitConverter.GetBytes(input.Length).CopyTo(input, 2);
+        BitConverter.GetBytes((int)offsetLong).CopyTo(input, 10);
+        dib.CopyTo(input, 14);
+        return input;
+    }
+
+    private static bool TryNormalizeImageBytesToPng(byte[] imageBytes, out byte[]? pngBytes, out DropSkipReason failureReason)
+    {
+        pngBytes = null;
+        failureReason = DropSkipReason.InvalidFormatOrEmpty;
+        try
+        {
+            using var stream = new MemoryStream(imageBytes);
+            var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnDemand);
+            if (decoder.Frames.Count == 0)
+                return false;
+            var frame = decoder.Frames[0];
+            if (!HistoryDrop.IsImageWithinPixelLimit(frame.PixelWidth, frame.PixelHeight))
+            {
+                failureReason = DropSkipReason.TooLarge;
+                return false;
+            }
+            return TryEncodeBitmapSourceToPng(frame, out pngBytes, out failureReason);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryEncodeBitmapSourceToPng(BitmapSource source, out byte[]? pngBytes, out DropSkipReason failureReason)
+    {
+        pngBytes = null;
+        failureReason = DropSkipReason.InvalidFormatOrEmpty;
+        try
+        {
+            if (!HistoryDrop.IsImageWithinPixelLimit(source.PixelWidth, source.PixelHeight))
+            {
+                failureReason = DropSkipReason.TooLarge;
+                return false;
+            }
+            var encoder = new PngBitmapEncoder();
+            encoder.Frames.Add(source is BitmapFrame frame ? frame : BitmapFrame.Create(source));
+            using var result = new MemoryStream();
+            encoder.Save(result);
+            if (!HistoryDrop.IsImageWithinByteLimit(result.Length))
+            {
+                failureReason = DropSkipReason.TooLarge;
+                return false;
+            }
+            pngBytes = result.ToArray();
+            return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return false;
+        }
+    }
 
     private void OnSettings(object sender, RoutedEventArgs e)
     {
@@ -728,6 +1231,8 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         StopForegroundTracking();
         pasteTarget.Reset();
         ResetDragState();
+        SetDropOverlayActive(false);
+        HideDropNotice();
         // Hidden rows keep decoded thumbnails alive, so they go with the window.
         rows.Clear();
     }
@@ -746,6 +1251,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
 
     private void OnWindowClosed(object? sender, EventArgs e)
     {
+        noticeTimer?.Stop();
         StopForegroundTracking();
         if (hwndSource is not null)
         {
@@ -972,6 +1478,13 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         Set("FileBadgeBg", "#1A0D9488", "#262DD4BF");
         Set("EmailPhoneTint", "#16A34A", "#4ADE80");
         Set("ColorTint", "#DB2777", "#F472B6");
+        Set("DropOverlayBg", "#1A2663EB", "#2473A3FF");
+        Set("NoticeBg", "#EFF6FF", "#1E293B");
+        Set("NoticeBorder", "#BFDBFE", "#3B82F6");
+        Set("NoticeFg", "#1D4ED8", "#93C5FD");
+        Set("NoticeWarningBg", "#FEF3C7", "#3B2811");
+        Set("NoticeWarningBorder", "#F59E0B", "#D97706");
+        Set("NoticeWarningFg", "#92400E", "#FCD34D");
     }
 
     /// <summary>Rounded corners on Windows 11. Earlier versions ignore the attribute.</summary>

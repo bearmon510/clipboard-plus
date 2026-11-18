@@ -2445,4 +2445,148 @@ public sealed class SyncCoordinatorTests
         await r.Pc.WaitForOutgoingAsync(pad1.Peer);
         await r.Pc.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
     }
+
+    [Fact]
+    public async Task AddLocalContentsAsyncAddsToHistorySendsToPeersAndLeavesClipboardSequencesUntouched()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var historyChangedCount = 0;
+        r.Pc.HistoryChanged += () => historyChangedCount++;
+
+        // Establish both ownSequence (via received item written to clipboard) and lastClipboardSequence.
+        await pad.SendAsync(new SyncItem(Guid.NewGuid(), r.Now.ToUnixTimeMilliseconds(), "pad", "from-pad"));
+        pad.Drain();
+        await r.Pc.ClipboardChangedAsync(new(200, "copied-on-pc", false));
+        await r.Pc.WaitForOutgoingAsync();
+        await pad.SendAsync(new SyncAck([Assert.IsType<SyncItem>(Assert.Single(pad.Drain())).Id]));
+        historyChangedCount = 0;
+
+        var fileBytes = new byte[] { 10, 20, 30, 40 };
+        var imageBytes = new byte[] { 137, 80, 78, 71, 1, 2, 3, 4 };
+        var result = await r.Pc.AddLocalContentsAsync([
+            new("text", Text: "dropped-text"),
+            new("file", Filename: "dropped.bin", Data: fileBytes),
+            new("image", Data: imageBytes, Type: "public.png"),
+        ]);
+        await r.Pc.WaitForOutgoingAsync();
+
+        Assert.Equal(new LocalAddResult(3, 0), result);
+        Assert.Equal(3, historyChangedCount);
+
+        var history = await r.Pc.GetHistoryAsync();
+        Assert.Equal(5, history.Count);
+        Assert.Contains(history, i => i.Kind == "text" && i.Text == "dropped-text" && i.Source == "PC");
+        Assert.Contains(history, i => i.Kind == "file" && i.Filename == "dropped.bin" && i.Source == "PC");
+        Assert.Contains(history, i => i.Kind == "image" && i.Type == "public.png" && i.Source == "PC");
+
+        // Connected peer receives the dropped text item and the first attachment offer (then second after ACK).
+        var batch1 = pad.Drain();
+        Assert.Equal(2, batch1.Length);
+        var textSent = Assert.IsType<SyncItem>(batch1[0]);
+        Assert.Equal("dropped-text", textSent.Text);
+        Assert.Equal("pc", textSent.From);
+        var fileOffer = Assert.IsType<SyncOffer>(batch1[1]);
+        Assert.Equal("dropped.bin", fileOffer.Filename);
+
+        await pad.SendAsync(new SyncResume(fileOffer.Id, 0));
+        var fileChunk = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(fileBytes, fileChunk.Data);
+        await pad.SendAsync(new SyncAck([textSent.Id, fileOffer.Id]));
+
+        var imageOffer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal("image", imageOffer.Kind);
+        await pad.SendAsync(new SyncResume(imageOffer.Id, 0));
+        Assert.Equal(imageBytes, Assert.IsType<SyncChunk>(Assert.Single(pad.Drain())).Data);
+        await pad.SendAsync(new SyncAck([imageOffer.Id]));
+        Assert.Equal(0, r.State.Pending);
+
+        // ownSequence and lastClipboardSequence must remain untouched.
+        await r.Pc.ClipboardChangedAsync(new(200, "copied-on-pc", false));
+        await r.Pc.ClipboardChangedAsync(new(r.Clipboard.Sequence, "from-pad", false));
+        await r.Pc.WaitForOutgoingAsync();
+        Assert.Empty(pad.Drain());
+
+        await r.Pc.ClipboardChangedAsync(new(201, "after-drop-copy", false));
+        await r.Pc.WaitForOutgoingAsync();
+        Assert.Equal("after-drop-copy", Assert.IsType<SyncItem>(Assert.Single(pad.Drain())).Text);
+    }
+
+    [Fact]
+    public async Task AddLocalContentsAsyncDeduplicatesHistoryAndEnqueuesUpdateForPeers()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var fileBytes = new byte[] { 1, 2, 3, 4, 5 };
+
+        await r.Pc.AddLocalContentsAsync([
+            new("text", Text: "dup-text"),
+            new("file", Filename: "dup.bin", Data: fileBytes),
+        ]);
+        await r.Pc.WaitForOutgoingAsync();
+        var firstBatch = pad.Drain();
+        var firstText = Assert.IsType<SyncItem>(firstBatch[0]);
+        var firstOffer = Assert.IsType<SyncOffer>(firstBatch[1]);
+        await pad.SendAsync(new SyncAck([firstOffer.Id, firstText.Id]));
+
+        var initialHistory = await r.Pc.GetHistoryAsync();
+        Assert.Equal(2, initialHistory.Count);
+        var originalTextId = initialHistory.Single(i => i.Kind == "text").Id;
+        var originalFileId = initialHistory.Single(i => i.Kind == "file").Id;
+
+        r.Now = r.Now.AddMinutes(1);
+        var secondResult = await r.Pc.AddLocalContentsAsync([
+            new("text", Text: "dup-text"),
+            new("file", Filename: "dup.bin", Data: fileBytes),
+        ]);
+        await r.Pc.WaitForOutgoingAsync();
+
+        Assert.Equal(new LocalAddResult(2, 0), secondResult);
+        var updatedHistory = await r.Pc.GetHistoryAsync();
+        Assert.Equal(2, updatedHistory.Count);
+        Assert.Equal(originalTextId, updatedHistory.Single(i => i.Kind == "text").Id);
+        Assert.Equal(originalFileId, updatedHistory.Single(i => i.Kind == "file").Id);
+        Assert.All(updatedHistory, i => Assert.Equal(r.Now.ToUnixTimeMilliseconds(), i.At));
+
+        var secondBatch = pad.Drain();
+        Assert.Equal(2, secondBatch.Length);
+        Assert.Equal("dup-text", Assert.IsType<SyncItem>(secondBatch[0]).Text);
+        Assert.Equal("dup.bin", Assert.IsType<SyncOffer>(secondBatch[1]).Filename);
+    }
+
+    [Fact]
+    public async Task AddLocalContentsAsyncRejectsOversizedItemsWithoutSendingOrLoggingSecrets()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+
+        var tooLongText = "secret-text-" + new string('x', SyncProtocol.MaxPlaintextBytes);
+        var tooBigFile = new byte[SyncProtocol.MaxItemBytes + 1];
+
+        var rejectedResult = await r.Pc.AddLocalContentsAsync([
+            new("text", Text: tooLongText),
+            new("file", Filename: "secret-oversized.bin", Data: tooBigFile),
+            new("file", Filename: "", Data: [1, 2, 3]),
+        ]);
+        await r.Pc.WaitForOutgoingAsync();
+
+        Assert.Equal(new LocalAddResult(0, 3), rejectedResult);
+        Assert.Empty(await r.Pc.GetHistoryAsync());
+        Assert.Empty(pad.Drain());
+
+        var mixedResult = await r.Pc.AddLocalContentsAsync([
+            new("file", Filename: "secret-too-big-2.bin", Data: tooBigFile),
+            new("text", Text: "secret-accepted-text"),
+        ]);
+        await r.Pc.WaitForOutgoingAsync();
+
+        Assert.Equal(new LocalAddResult(1, 1), mixedResult);
+        var stored = Assert.Single(await r.Pc.GetHistoryAsync());
+        Assert.Equal("secret-accepted-text", stored.Text);
+        Assert.Equal("secret-accepted-text", Assert.IsType<SyncItem>(Assert.Single(pad.Drain())).Text);
+
+        Assert.DoesNotContain(r.Logs, entry =>
+            entry.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
+            entry.Contains("oversized", StringComparison.OrdinalIgnoreCase));
+    }
 }

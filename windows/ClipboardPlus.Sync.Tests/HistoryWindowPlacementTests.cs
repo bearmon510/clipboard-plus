@@ -205,4 +205,58 @@ public sealed class HistoryWindowPlacementTests
         Assert.False(HistoryWindowPlacement.AreSame(baseline, baseline with { Scale = 2.0 }));
         Assert.False(HistoryWindowPlacement.AreSame(baseline with { Scale = null }, baseline));
     }
+
+    [Fact]
+    public void ShouldCloseWindowOnlyClosesForCloseButtonActiveEscapeAndHotkeyToggle()
+    {
+        Assert.True(HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.CloseButton));
+        Assert.True(HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.HotkeyWhileVisible));
+        Assert.True(HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.EscapeKey, isWindowActive: true));
+        Assert.False(HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.EscapeKey, isWindowActive: false));
+
+        foreach (var keepOpenTrigger in new[]
+        {
+            HistoryWindowTrigger.SelectForPaste,
+            HistoryWindowTrigger.SelectCopyOnly,
+            HistoryWindowTrigger.CtrlEnter,
+            HistoryWindowTrigger.MenuPaste,
+            HistoryWindowTrigger.MenuCopyOnly,
+            HistoryWindowTrigger.DragOut,
+            HistoryWindowTrigger.Deactivate,
+            HistoryWindowTrigger.DeleteItem,
+            HistoryWindowTrigger.DropIn,
+        })
+        {
+            Assert.False(HistoryWindowPlacement.ShouldCloseWindow(keepOpenTrigger, isWindowActive: true));
+            Assert.False(HistoryWindowPlacement.ShouldCloseWindow(keepOpenTrigger, isWindowActive: false));
+        }
+    }
+
+    [Fact]
+    public void DecideSelectionNeverClosesAndHonorsPasteSettingCtrlAndMenuOverrides()
+    {
+        var clickPaste = HistoryWindowPlacement.DecideSelection(
+            pasteOnSelect: true, ctrlPressed: false, explicitPaste: null, hasValidExternalTarget: true);
+        Assert.Equal(new HistorySelectionDecision(ShouldCopy: true, ShouldPaste: true, ShouldClose: false), clickPaste);
+
+        var ctrlEnter = HistoryWindowPlacement.DecideSelection(
+            pasteOnSelect: true, ctrlPressed: true, explicitPaste: null, hasValidExternalTarget: true);
+        Assert.Equal(new HistorySelectionDecision(ShouldCopy: true, ShouldPaste: false, ShouldClose: false), ctrlEnter);
+
+        var pasteOff = HistoryWindowPlacement.DecideSelection(
+            pasteOnSelect: false, ctrlPressed: false, explicitPaste: null, hasValidExternalTarget: true);
+        Assert.Equal(new HistorySelectionDecision(ShouldCopy: true, ShouldPaste: false, ShouldClose: false), pasteOff);
+
+        var menuPasteWithSettingOff = HistoryWindowPlacement.DecideSelection(
+            pasteOnSelect: false, ctrlPressed: false, explicitPaste: true, hasValidExternalTarget: true);
+        Assert.Equal(new HistorySelectionDecision(ShouldCopy: true, ShouldPaste: true, ShouldClose: false), menuPasteWithSettingOff);
+
+        var menuCopyWithSettingOn = HistoryWindowPlacement.DecideSelection(
+            pasteOnSelect: true, ctrlPressed: false, explicitPaste: false, hasValidExternalTarget: true);
+        Assert.Equal(new HistorySelectionDecision(ShouldCopy: true, ShouldPaste: false, ShouldClose: false), menuCopyWithSettingOn);
+
+        var noExternalTarget = HistoryWindowPlacement.DecideSelection(
+            pasteOnSelect: true, ctrlPressed: false, explicitPaste: true, hasValidExternalTarget: false);
+        Assert.Equal(new HistorySelectionDecision(ShouldCopy: true, ShouldPaste: false, ShouldClose: false), noExternalTarget);
+    }
 }

@@ -10,6 +10,24 @@ public readonly record struct WindowPlacement(int Left, int Top, double Width, d
 
 public readonly record struct WindowPixelRect(int Left, int Top, int Width, int Height, double TargetScale);
 
+public enum HistoryWindowTrigger
+{
+    CloseButton,
+    EscapeKey,
+    HotkeyWhileVisible,
+    SelectForPaste,
+    SelectCopyOnly,
+    CtrlEnter,
+    MenuPaste,
+    MenuCopyOnly,
+    DragOut,
+    Deactivate,
+    DeleteItem,
+    DropIn,
+}
+
+public readonly record struct HistorySelectionDecision(bool ShouldCopy, bool ShouldPaste, bool ShouldClose);
+
 /// <summary>
 /// Pure placement, screen clamping, DPI scaling, resize hit-testing, and drag threshold logic
 /// for the history window, kept apart from WPF so it can be unit tested.
@@ -178,6 +196,34 @@ public static class HistoryWindowPlacement
         if (top) return HitTop;
         if (bottom) return HitBottom;
         return HitNone;
+    }
+
+    /// <summary>
+    /// Only the close button, Esc while this window is in front, or pressing the hotkey again closes the window.
+    /// Pasting, copying, dragging, deleting, dropping, or clicking outside all leave it open.
+    /// </summary>
+    public static bool ShouldCloseWindow(HistoryWindowTrigger trigger, bool isWindowActive = true) => trigger switch
+    {
+        HistoryWindowTrigger.CloseButton => true,
+        HistoryWindowTrigger.HotkeyWhileVisible => true,
+        HistoryWindowTrigger.EscapeKey => isWindowActive,
+        _ => false,
+    };
+
+    /// <summary>
+    /// Decides whether selecting an item copies only or also restores foreground to paste, without closing the window.
+    /// </summary>
+    public static HistorySelectionDecision DecideSelection(
+        bool pasteOnSelect,
+        bool ctrlPressed,
+        bool? explicitPaste,
+        bool hasValidExternalTarget)
+    {
+        var wantsPaste = explicitPaste ?? (!ctrlPressed && pasteOnSelect);
+        return new HistorySelectionDecision(
+            ShouldCopy: true,
+            ShouldPaste: wantsPaste && hasValidExternalTarget,
+            ShouldClose: false);
     }
 
     private static ScreenBounds PickScreenForSaved(WindowPlacement saved, IReadOnlyList<ScreenBounds> screens)

@@ -15,6 +15,8 @@ public interface ISyncPeer
 
 public sealed record ClipboardSnapshot(uint Sequence, string? Text, bool Excluded, IReadOnlyList<ClipboardContent>? Contents = null);
 
+public readonly record struct LocalAddResult(int Added, int Skipped);
+
 public interface IClipboardAccess
 {
     Task<uint> WriteTextAsync(string text);
@@ -485,28 +487,52 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             lastClipboardSequence = snapshot.Sequence;
             if (snapshot.Sequence == ownSequence || snapshot.Excluded) return;
             var contents = snapshot.Contents ?? (snapshot.Text is null ? [] : new ClipboardContent[] { new("text", Text: snapshot.Text) });
-            var skipped = 0;
-            var now = Now();
-            foreach (var content in contents) {
-                try {
-                    var item = store.Create(content, now.ToUnixTimeMilliseconds(), "PC");
-                    if (item.Kind == "text") SyncMessageCodec.Encode(new SyncItem(item.Id, item.At, "pc", item.Text!));
-                    else SyncMessageCodec.ValidateOffer(item.Offer);
-                    store.AddAndEnqueue(item, now); HistoryChanged?.Invoke();
-                } catch (SyncProtocolException) { skipped++; }
-            }
-            if (skipped > 0) log($"clipboard skipped items={skipped} reason=size-or-format");
-            TrimConnectionQueues();
-            log($"queued pending={store.PendingCount}");
-            foreach (var c in connections.Values.ToArray())
-            {
-                if (c.Stage != 2) continue;
-                try { StartSending(c); }
-                catch (Exception e) { Drop(c, Failure(e)); }
-            }
-            Publish();
+            AddLocalContentsLocked(contents);
         }
         finally { gate.Release(); }
+    }
+
+    public async Task<LocalAddResult> AddLocalContentsAsync(IReadOnlyList<ClipboardContent> contents)
+    {
+        ArgumentNullException.ThrowIfNull(contents);
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped || contents.Count == 0) return new(0, 0);
+            return AddLocalContentsLocked(contents);
+        }
+        finally { gate.Release(); }
+    }
+
+    private LocalAddResult AddLocalContentsLocked(IReadOnlyList<ClipboardContent> contents)
+    {
+        var added = 0;
+        var skipped = 0;
+        var now = Now();
+        foreach (var content in contents)
+        {
+            try
+            {
+                var item = store.Create(content, now.ToUnixTimeMilliseconds(), "PC");
+                if (item.Kind == "text") SyncMessageCodec.Encode(new SyncItem(item.Id, item.At, "pc", item.Text!));
+                else SyncMessageCodec.ValidateOffer(item.Offer);
+                store.AddAndEnqueue(item, now);
+                HistoryChanged?.Invoke();
+                added++;
+            }
+            catch (SyncProtocolException) { skipped++; }
+        }
+        if (skipped > 0) log($"clipboard skipped items={skipped} reason=size-or-format");
+        TrimConnectionQueues();
+        log($"queued pending={store.PendingCount}");
+        foreach (var c in connections.Values.ToArray())
+        {
+            if (c.Stage != 2) continue;
+            try { StartSending(c); }
+            catch (Exception e) { Drop(c, Failure(e)); }
+        }
+        Publish();
+        return new(added, skipped);
     }
 
     public async Task DisconnectAsync(ISyncPeer peer)
