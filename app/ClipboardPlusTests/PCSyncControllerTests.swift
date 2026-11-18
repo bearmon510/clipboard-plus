@@ -2570,7 +2570,7 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.send(.state(
             op: push.op, part: 1, total: 1,
             page: TemplateSyncPage(
-                version: SyncProtocol.version,
+                version: Int(SyncProtocol.version),
                 sentAt: nowMs,
                 templates: [
                     TemplateSyncItem(id: id1, kind: .text, text: "同期後本文", title: "更新済題", tag: "別タグ", order: 0, updatedAt: nowMs + 100),
@@ -2633,7 +2633,7 @@ final class PCSyncControllerTests: XCTestCase {
         let partialItem = TemplateSyncItem(id: UUID(), kind: .text, text: "part1", title: nil, tag: nil, order: 0,
                                            updatedAt: Int64(f.clock.date.timeIntervalSince1970 * 1000))
         try f.link.send(.state(op: op1, part: 1, total: 2,
-                               page: TemplateSyncPage(version: SyncProtocol.version,
+                               page: TemplateSyncPage(version: Int(SyncProtocol.version),
                                                       sentAt: Int64(f.clock.date.timeIntervalSince1970 * 1000),
                                                       templates: [partialItem], tombstones: [])))
         f.link.disconnect()
@@ -2679,7 +2679,7 @@ final class PCSyncControllerTests: XCTestCase {
         let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
         let bigState = try f.link.seal(.state(
             op: op3, part: 1, total: 1,
-            page: TemplateSyncPage(version: SyncProtocol.version, sentAt: nowMs,
+            page: TemplateSyncPage(version: Int(SyncProtocol.version), sentAt: nowMs,
                                    templates: [TemplateSyncItem(id: push3.id, kind: .text, text: bigText, title: nil, tag: nil, order: 0, updatedAt: nowMs)],
                                    tombstones: [])
         ))
@@ -2742,7 +2742,7 @@ final class PCSyncControllerTests: XCTestCase {
         dbNow = dbNow.addingTimeInterval(10)
         try f.link.send(.state(
             op: pcOp, part: 1, total: 2,
-            page: TemplateSyncPage(version: SyncProtocol.version, sentAt: nowMs,
+            page: TemplateSyncPage(version: Int(SyncProtocol.version), sentAt: nowMs,
                                    templates: [TemplateSyncItem(id: kept.id, kind: .text, text: "PC配信結果", title: "共有", tag: nil, order: 0, updatedAt: nowMs)],
                                    tombstones: [])
         ))
