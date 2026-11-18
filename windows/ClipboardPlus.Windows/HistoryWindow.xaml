@@ -1,50 +1,294 @@
 <Window x:Class="ClipboardPlus.Windows.HistoryWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="clipboard+ 履歴" Width="360" Height="460"
-        WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
+        Title="clipboard+ 履歴" Width="360" Height="460" MinWidth="300" MinHeight="320"
+        WindowStyle="None" ResizeMode="CanResize" ShowInTaskbar="False" Topmost="True"
         Background="{DynamicResource Bg}" Foreground="{DynamicResource Fg}"
         FontFamily="Yu Gothic UI, Segoe UI" FontSize="14"
-        PreviewKeyDown="OnPreviewKeyDown" Deactivated="OnDeactivated" Closing="OnClosing">
+        PreviewKeyDown="OnPreviewKeyDown" Activated="OnActivated" Deactivated="OnDeactivated" Closing="OnClosing">
+  <Window.Resources>
+    <Style x:Key="HeaderCloseButtonStyle" TargetType="Button">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{DynamicResource Sub}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Margin" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" CornerRadius="7" Background="{TemplateBinding Background}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource CloseHover}"/>
+                <Setter Property="Foreground" Value="{DynamicResource CloseHoverFg}"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource ClosePressed}"/>
+                <Setter Property="Foreground" Value="{DynamicResource CloseHoverFg}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="IconButtonStyle" TargetType="Button">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{DynamicResource Sub}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Margin" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" CornerRadius="7" Background="{TemplateBinding Background}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Hover}"/>
+                <Setter Property="Foreground" Value="{DynamicResource Fg}"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Line}"/>
+                <Setter Property="Foreground" Value="{DynamicResource Fg}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="GhostAccentButtonStyle" TargetType="Button">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{DynamicResource Accent}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Margin" Value="0"/>
+      <Setter Property="Padding" Value="10,4"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" CornerRadius="8" Padding="{TemplateBinding Padding}" Background="{TemplateBinding Background}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource AccentSoft}"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Selected}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ContextMenu">
+      <Setter Property="Background" Value="{DynamicResource Card}"/>
+      <Setter Property="Foreground" Value="{DynamicResource Fg}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="4"/>
+      <Setter Property="HasDropShadow" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ContextMenu">
+            <Border Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="10"
+                    Padding="{TemplateBinding Padding}">
+              <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="MenuItem">
+      <Setter Property="Foreground" Value="{DynamicResource Fg}"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Padding" Value="10,6"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="MenuItem">
+            <Border x:Name="Bd" CornerRadius="6" Padding="{TemplateBinding Padding}" Background="Transparent">
+              <ContentPresenter ContentSource="Header" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Hover}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="Separator">
+      <Setter Property="Margin" Value="8,4"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Separator">
+            <Border Height="1" Background="{DynamicResource Line}"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="ThinScrollBarThumb" TargetType="Thumb">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Thumb">
+            <Border x:Name="ThumbBorder" CornerRadius="3" Margin="2,0"
+                    Background="{DynamicResource ScrollThumb}"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="ThumbBorder" Property="Background" Value="{DynamicResource Sub}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ScrollBar">
+      <Setter Property="Width" Value="9"/>
+      <Setter Property="MinWidth" Value="9"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent" Margin="0,2">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageUpCommand" Opacity="0" IsTabStop="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Style="{StaticResource ThinScrollBarThumb}" MinHeight="24"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageDownCommand" Opacity="0" IsTabStop="False"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
   <Border BorderBrush="{DynamicResource Line}" BorderThickness="1">
     <Grid>
       <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition/>
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
-      <Grid Margin="12,12,12,8">
-        <TextBox x:Name="SearchBox" Padding="8,6" BorderThickness="1" BorderBrush="{DynamicResource Line}"
-                 Background="{DynamicResource Field}" Foreground="{DynamicResource Fg}" CaretBrush="{DynamicResource Fg}"
-                 TextChanged="OnSearchChanged"/>
-        <TextBlock x:Name="SearchHint" Text="履歴を検索" Margin="11,0,0,0" VerticalAlignment="Center"
-                   Foreground="{DynamicResource Sub}" IsHitTestVisible="False"/>
+      <!-- Title Strip -->
+      <Grid x:Name="TitleBar" Grid.Row="0" Height="34" Background="Transparent"
+            MouseLeftButtonDown="OnTitleBarMouseDown">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="14,0,8,0">
+          <Ellipse Width="7" Height="7" Fill="{DynamicResource Accent}" Margin="0,0,7,0" VerticalAlignment="Center"/>
+          <TextBlock Text="clipboard+" FontSize="12.5" FontWeight="SemiBold" Foreground="{DynamicResource Fg}"
+                     TextWrapping="NoWrap" VerticalAlignment="Center"/>
+          <TextBlock Text="履歴" FontSize="12" Foreground="{DynamicResource Sub}" Margin="6,0,0,0"
+                     TextWrapping="NoWrap" VerticalAlignment="Center"/>
+        </StackPanel>
+        <Button x:Name="CloseButton" Grid.Column="1" Width="30" Height="24" Margin="0,5,6,5"
+                Style="{StaticResource HeaderCloseButtonStyle}"
+                Click="OnCloseClicked" ToolTip="閉じる (Esc)" AutomationProperties.Name="閉じる">
+          <TextBlock Text="&#xE8BB;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="10"
+                     TextWrapping="NoWrap"/>
+        </Button>
       </Grid>
 
-      <ListBox x:Name="HistoryList" Grid.Row="1" BorderThickness="0" Background="Transparent" Padding="8,0"
+      <!-- Rounded Search Bar -->
+      <Border Grid.Row="1" Margin="12,2,12,8" Height="36" CornerRadius="11"
+              Background="{DynamicResource Field}" BorderThickness="1">
+        <Border.Style>
+          <Style TargetType="Border">
+            <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
+            <Style.Triggers>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                <Setter Property="BorderBrush" Value="{DynamicResource Accent}"/>
+              </Trigger>
+            </Style.Triggers>
+          </Style>
+        </Border.Style>
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <TextBlock Text="&#xE721;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="13"
+                     Foreground="{DynamicResource Sub}" VerticalAlignment="Center" Margin="11,0,7,0"
+                     TextWrapping="NoWrap" IsHitTestVisible="False"/>
+          <Grid Grid.Column="1" VerticalAlignment="Center">
+            <TextBox x:Name="SearchBox" BorderThickness="0" Background="Transparent"
+                     Foreground="{DynamicResource Fg}" CaretBrush="{DynamicResource Fg}"
+                     Padding="0,4" VerticalContentAlignment="Center"
+                     TextChanged="OnSearchChanged"/>
+            <TextBlock x:Name="SearchHint" Text="履歴を検索" VerticalAlignment="Center" Margin="2,0,0,0"
+                       Foreground="{DynamicResource Sub}" TextWrapping="NoWrap" IsHitTestVisible="False"/>
+          </Grid>
+          <Button x:Name="ClearSearchButton" Grid.Column="2" Width="26" Height="26" Margin="2,0,5,0"
+                  Style="{StaticResource IconButtonStyle}" Visibility="Collapsed"
+                  Click="OnClearSearch" ToolTip="検索をクリア" AutomationProperties.Name="検索をクリア">
+            <TextBlock Text="&#xE711;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="10"
+                       TextWrapping="NoWrap"/>
+          </Button>
+        </Grid>
+      </Border>
+
+      <!-- History List -->
+      <ListBox x:Name="HistoryList" Grid.Row="2" BorderThickness="0" Background="Transparent" Padding="12,2,6,4"
                Focusable="False"
                ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.ScrollUnit="Pixel"
-               PreviewMouseLeftButtonUp="OnListClick" PreviewMouseRightButtonDown="OnListRightDown"
+               PreviewMouseLeftButtonDown="OnListMouseDown"
+               PreviewMouseMove="OnListMouseMove"
+               PreviewMouseLeftButtonUp="OnListMouseUp"
+               PreviewMouseRightButtonDown="OnListRightDown"
                ContextMenuOpening="OnContextMenuOpening">
         <ListBox.ItemContainerStyle>
           <Style TargetType="ListBoxItem">
-            <Setter Property="Margin" Value="0,0,0,4"/>
+            <Setter Property="Margin" Value="0,0,6,8"/>
             <Setter Property="Focusable" Value="False"/>
             <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
             <Setter Property="Template">
               <Setter.Value>
                 <ControlTemplate TargetType="ListBoxItem">
-                  <Border x:Name="Card" CornerRadius="8" Padding="10,8" Background="{DynamicResource Card}">
+                  <Border x:Name="Card" CornerRadius="12" Padding="12,10"
+                          Background="{DynamicResource Card}"
+                          BorderBrush="{DynamicResource CardBorder}"
+                          BorderThickness="1">
                     <ContentPresenter/>
                   </Border>
                   <ControlTemplate.Triggers>
                     <Trigger Property="IsMouseOver" Value="True">
                       <Setter TargetName="Card" Property="Background" Value="{DynamicResource Hover}"/>
+                      <Setter TargetName="Card" Property="BorderBrush" Value="{DynamicResource HoverBorder}"/>
                     </Trigger>
                     <Trigger Property="IsSelected" Value="True">
                       <Setter TargetName="Card" Property="Background" Value="{DynamicResource Selected}"/>
+                      <Setter TargetName="Card" Property="BorderBrush" Value="{DynamicResource SelectedBorder}"/>
                     </Trigger>
                   </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -52,26 +296,112 @@
             </Setter>
           </Style>
         </ListBox.ItemContainerStyle>
+
         <ListBox.ItemTemplate>
           <DataTemplate>
             <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition/>
               </Grid.ColumnDefinitions>
-              <Border Width="56" Height="42" CornerRadius="4" Margin="0,0,10,0" ClipToBounds="True"
-                      Background="{DynamicResource Line}" Visibility="{Binding ThumbnailVisibility}">
+
+              <!-- Thumbnail for image items -->
+              <Border Grid.Row="0" Grid.Column="0" Width="58" Height="44" CornerRadius="8" Margin="0,0,10,0"
+                      ClipToBounds="True" Background="{DynamicResource Line}"
+                      Visibility="{Binding ThumbnailVisibility}">
                 <Image Source="{Binding Thumbnail}" Stretch="UniformToFill"/>
               </Border>
-              <TextBlock Text="&#xE8A5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="22"
-                         Margin="2,2,12,0" Foreground="{DynamicResource Sub}" Visibility="{Binding FileIconVisibility}"/>
-              <StackPanel Grid.Column="1">
-                <TextBlock Text="{Binding Title}" TextWrapping="Wrap" MaxHeight="40" TextTrimming="CharacterEllipsis"/>
-                <TextBlock Text="{Binding Meta}" FontSize="11" Foreground="{DynamicResource Sub}" Margin="0,3,0,0"/>
+
+              <!-- Fallback badge when image thumbnail failed to decode -->
+              <Border Grid.Row="0" Grid.Column="0" Width="44" Height="44" CornerRadius="8" Margin="0,0,10,0"
+                      Background="{DynamicResource ImageBadgeBg}"
+                      Visibility="{Binding ImageFallbackVisibility}">
+                <TextBlock Text="&#xE8B9;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="18"
+                           Foreground="{DynamicResource ImageTint}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextWrapping="NoWrap"/>
+              </Border>
+
+              <!-- Document badge for file items -->
+              <Border Grid.Row="0" Grid.Column="0" Width="40" Height="44" CornerRadius="8" Margin="0,0,10,0"
+                      Background="{DynamicResource FileBadgeBg}"
+                      Visibility="{Binding FileIconVisibility}">
+                <TextBlock Text="&#xE8A5;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="18"
+                           Foreground="{DynamicResource FileTint}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextWrapping="NoWrap"/>
+              </Border>
+
+              <!-- Color swatch for hex color items -->
+              <Border Grid.Row="0" Grid.Column="0" Width="34" Height="34" CornerRadius="8" Margin="0,0,10,0"
+                      Background="{Binding SwatchBrush}"
+                      BorderBrush="{DynamicResource CardBorder}" BorderThickness="1"
+                      VerticalAlignment="Center"
+                      Visibility="{Binding ColorSwatchVisibility}"/>
+
+              <!-- Primary content (text / image / file) -->
+              <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding Title}"
+                         TextWrapping="Wrap" MaxHeight="44" TextTrimming="CharacterEllipsis"
+                         LineHeight="20" VerticalAlignment="Center"
+                         Visibility="{Binding PlainTitleVisibility}"/>
+
+              <!-- Primary content (link: bold accent host + secondary path) -->
+              <StackPanel Grid.Row="0" Grid.Column="1" VerticalAlignment="Center"
+                          Visibility="{Binding LinkVisibility}">
+                <TextBlock Text="{Binding LinkHost}" FontWeight="SemiBold" Foreground="{DynamicResource LinkTint}"
+                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Text="{Binding LinkRemainder}" FontSize="12" Foreground="{DynamicResource Sub}"
+                           Margin="0,2,0,0" TextWrapping="Wrap" MaxHeight="34" TextTrimming="CharacterEllipsis"
+                           Visibility="{Binding LinkRemainderVisibility}"/>
               </StackPanel>
+
+              <!-- Bottom meta line: flavor icon + source/time + quick menu button -->
+              <Grid Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,7,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto"/>
+                  <ColumnDefinition/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="KindIcon" Grid.Column="0" Text="{Binding KindGlyph}"
+                           FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="11.5"
+                           Foreground="{DynamicResource Sub}" VerticalAlignment="Center" Margin="0,0,6,0"
+                           TextWrapping="NoWrap"/>
+                <TextBlock Grid.Column="1" Text="{Binding Meta}" FontSize="11.5"
+                           Foreground="{DynamicResource Sub}" VerticalAlignment="Center"
+                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
+                <Button Grid.Column="2" Width="26" Height="22" Margin="6,0,-2,0"
+                        Style="{StaticResource IconButtonStyle}"
+                        Click="OnCardMenuClick" ToolTip="操作" AutomationProperties.Name="この項目の操作">
+                  <TextBlock Text="&#xE712;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12"
+                             TextWrapping="NoWrap"/>
+                </Button>
+              </Grid>
             </Grid>
+            <DataTemplate.Triggers>
+              <DataTrigger Binding="{Binding Flavor}" Value="Link">
+                <Setter TargetName="KindIcon" Property="Foreground" Value="{DynamicResource LinkTint}"/>
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Flavor}" Value="Email">
+                <Setter TargetName="KindIcon" Property="Foreground" Value="{DynamicResource EmailPhoneTint}"/>
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Flavor}" Value="Phone">
+                <Setter TargetName="KindIcon" Property="Foreground" Value="{DynamicResource EmailPhoneTint}"/>
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Flavor}" Value="Color">
+                <Setter TargetName="KindIcon" Property="Foreground" Value="{DynamicResource ColorTint}"/>
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Flavor}" Value="Image">
+                <Setter TargetName="KindIcon" Property="Foreground" Value="{DynamicResource ImageTint}"/>
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Flavor}" Value="File">
+                <Setter TargetName="KindIcon" Property="Foreground" Value="{DynamicResource FileTint}"/>
+              </DataTrigger>
+            </DataTemplate.Triggers>
           </DataTemplate>
         </ListBox.ItemTemplate>
+
         <ListBox.ContextMenu>
           <ContextMenu Closed="OnContextMenuClosed">
             <MenuItem Header="貼り付ける" Click="OnMenuPaste"/>
@@ -82,15 +412,38 @@
         </ListBox.ContextMenu>
       </ListBox>
 
-      <TextBlock x:Name="EmptyText" Grid.Row="1" Margin="28" TextWrapping="Wrap" TextAlignment="Center"
-                 VerticalAlignment="Center" Foreground="{DynamicResource Sub}" Visibility="Collapsed"/>
+      <!-- Empty / Not-found State -->
+      <StackPanel x:Name="EmptyPanel" Grid.Row="2" Margin="28" VerticalAlignment="Center" HorizontalAlignment="Center"
+                  Visibility="Collapsed">
+        <Border Width="62" Height="62" CornerRadius="31" Background="{DynamicResource AccentSoft}"
+                HorizontalAlignment="Center">
+          <TextBlock x:Name="EmptyIcon" Text="&#xE77F;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                     FontSize="24" Foreground="{DynamicResource Accent}"
+                     HorizontalAlignment="Center" VerticalAlignment="Center" TextWrapping="NoWrap"/>
+        </Border>
+        <TextBlock x:Name="EmptyTitleText" FontSize="15" FontWeight="SemiBold" Foreground="{DynamicResource Fg}"
+                   TextAlignment="Center" Margin="0,12,0,4"/>
+        <TextBlock x:Name="EmptyDetailText" FontSize="12.5" Foreground="{DynamicResource Sub}"
+                   TextWrapping="Wrap" TextAlignment="Center" MaxWidth="260"/>
+        <Button x:Name="EmptyClearButton" Content="検索をクリア" Margin="0,12,0,0"
+                Style="{StaticResource GhostAccentButtonStyle}" HorizontalAlignment="Center"
+                Visibility="Collapsed" Click="OnClearSearch"/>
+      </StackPanel>
 
-      <Grid Grid.Row="2" Margin="12,4,6,8">
-        <TextBlock Text="Enter 貼り付け　Ctrl+Enter コピー　Delete 削除" FontSize="11"
-                   Foreground="{DynamicResource Sub}" VerticalAlignment="Center"/>
-        <Button Content="設定" HorizontalAlignment="Right" Padding="10,3" Cursor="Hand" Click="OnSettings" Focusable="False"
-                Background="Transparent" BorderThickness="0" Foreground="{DynamicResource Accent}"/>
-      </Grid>
+      <!-- Footer -->
+      <Border Grid.Row="3" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Padding="12,6,8,7">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <TextBlock Text="Enter 貼り付け　Ctrl+Enter コピー　Delete 削除" FontSize="11"
+                     Foreground="{DynamicResource Sub}" VerticalAlignment="Center"
+                     TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"/>
+          <Button Grid.Column="1" Content="設定" FontSize="12" Padding="8,3" Margin="6,0,0,0"
+                  Style="{StaticResource GhostAccentButtonStyle}" Click="OnSettings"/>
+        </Grid>
+      </Border>
     </Grid>
   </Border>
 </Window>

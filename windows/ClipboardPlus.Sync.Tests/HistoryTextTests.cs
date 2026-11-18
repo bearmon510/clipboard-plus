@@ -51,5 +51,59 @@ public sealed class HistoryTextTests
     {
         Assert.StartsWith("まだ履歴がありません", HistoryText.Empty(null));
         Assert.Equal("見つかりませんでした。", HistoryText.Empty("abc"));
+        Assert.Equal("コピーすると、ここに並びます", HistoryText.EmptyTitle(null));
+        Assert.Equal("コピーすると、ここに並びます", HistoryText.EmptyTitle("   "));
+        Assert.Equal("見つかりませんでした", HistoryText.EmptyTitle("abc"));
+        Assert.False(string.IsNullOrWhiteSpace(HistoryText.EmptyDetail(null)));
+        Assert.False(string.IsNullOrWhiteSpace(HistoryText.EmptyDetail("abc")));
+    }
+
+    [Fact]
+    public void DetectFlavorIdentifiesLinksColorsEmailsPhonesImagesAndFiles()
+    {
+        Assert.Equal(HistoryDisplayFlavor.Link, HistoryText.DetectFlavor(Item("text", "https://example.com/docs/guide?tab=1#top"), out var link, out _));
+        Assert.Equal(new HistoryLinkParts("example.com", "/docs/guide?tab=1#top"), link);
+
+        Assert.Equal(HistoryDisplayFlavor.Link, HistoryText.DetectFlavor(Item("text", "  http://localhost:8080/  "), out var rootLink, out _));
+        Assert.Equal(new HistoryLinkParts("localhost:8080", null), rootLink);
+
+        Assert.Equal(HistoryDisplayFlavor.Text, HistoryText.DetectFlavor(Item("text", "https://example.com\nsecond line")));
+        Assert.Equal(HistoryDisplayFlavor.Text, HistoryText.DetectFlavor(Item("text", "ftp://example.com/file")));
+
+        Assert.Equal(HistoryDisplayFlavor.Color, HistoryText.DetectFlavor(Item("text", "#2E6BF0"), out _, out var rgb));
+        Assert.Equal(new HistoryRgbColor(0x2E, 0x6B, 0xF0), rgb);
+        Assert.Equal(HistoryDisplayFlavor.Color, HistoryText.DetectFlavor(Item("text", "#F0A"), out _, out var shortRgb));
+        Assert.Equal(new HistoryRgbColor(0xFF, 0x00, 0xAA), shortRgb);
+        Assert.Equal(HistoryDisplayFlavor.Color, HistoryText.DetectFlavor(Item("text", "#10203080"), out _, out var rgba));
+        Assert.Equal(new HistoryRgbColor(0x10, 0x20, 0x30), rgba);
+
+        Assert.Equal(HistoryDisplayFlavor.Email, HistoryText.DetectFlavor(Item("text", "user+tag@example.co.jp")));
+        Assert.Equal(HistoryDisplayFlavor.Phone, HistoryText.DetectFlavor(Item("text", "090-1234-5678")));
+        Assert.Equal(HistoryDisplayFlavor.Phone, HistoryText.DetectFlavor(Item("text", "+81 3 1234 5678")));
+        Assert.Equal(HistoryDisplayFlavor.Text, HistoryText.DetectFlavor(Item("text", "2026-11-18")));
+
+        Assert.Equal(HistoryDisplayFlavor.Image, HistoryText.DetectFlavor(Item("image")));
+        Assert.Equal(HistoryDisplayFlavor.File, HistoryText.DetectFlavor(Item("file", filename: "a.pdf")));
+    }
+
+    [Fact]
+    public void FlavorGlyphReturnsDistinctIconsAndDragFileNameSanitizesAndPreservesExtensions()
+    {
+        var glyphs = Enum.GetValues<HistoryDisplayFlavor>().Select(HistoryText.FlavorGlyph).ToArray();
+        Assert.Equal(glyphs.Length, glyphs.Distinct().Count());
+
+        var png = new HistoryItem(Guid.NewGuid(), "image", null, null, null, 0, 0, "PC", new string('a', 64), "public.png");
+        var jpg = new HistoryItem(Guid.NewGuid(), "image", null, "photo", null, 0, 0, "PC", new string('a', 64), "public.jpeg");
+        var namedPng = new HistoryItem(Guid.NewGuid(), "image", null, "shot.PNG", null, 0, 0, "PC", new string('a', 64), "public.png");
+        var reserved = new HistoryItem(Guid.NewGuid(), "file", null, "CON.txt", null, 0, 0, "PC", new string('a', 64), "public.data");
+        var traversal = new HistoryItem(Guid.NewGuid(), "file", null, "../../secret:doc?.pdf", null, 0, 0, "PC", new string('a', 64), "public.data");
+
+        Assert.Equal("image.png", HistoryText.DragFileName(png));
+        Assert.Equal("photo.jpg", HistoryText.DragFileName(jpg));
+        Assert.Equal("shot.PNG", HistoryText.DragFileName(namedPng));
+        Assert.Equal("_CON.txt", HistoryText.DragFileName(reserved));
+        Assert.DoesNotContain("/", HistoryText.DragFileName(traversal));
+        Assert.DoesNotContain(":", HistoryText.DragFileName(traversal));
+        Assert.EndsWith(".pdf", HistoryText.DragFileName(traversal));
     }
 }

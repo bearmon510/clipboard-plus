@@ -79,7 +79,13 @@ public partial class App : System.Windows.Application
             activationWait = ThreadPool.RegisterWaitForSingleObject(activation, (_, _) => Dispatcher.BeginInvoke(OpenWindow), null, Timeout.Infinite, false);
             clipboard = new ClipboardMonitor(Dispatcher, log.Write);
             clipboard.Changed += ClipboardChanged;
-            historyWindow = new HistoryWindow(log.Write, () => Settings.PasteOnSelect, ForegroundContext.PasteAsync, OpenWindow);
+            historyWindow = new HistoryWindow(
+                log.Write,
+                () => Settings.PasteOnSelect,
+                ForegroundContext.PasteAsync,
+                OpenWindow,
+                () => Settings.HistoryWindow,
+                SaveHistoryPlacement);
             historyPresenter = historyWindow;
             StartSync(pairing);
             keyboardHook = new KeyboardHook(OpenHistory, action => Dispatcher.BeginInvoke(action), log.Write);
@@ -213,6 +219,14 @@ public partial class App : System.Windows.Application
         historyPresenter.Present(invocation);
     }
 
+    private void SaveHistoryPlacement(WindowPlacement placement)
+    {
+        if (Settings is null) return;
+        Settings.HistoryWindow = placement;
+        try { Settings.Save(); }
+        catch (Exception ex) { log?.Write($"settings save error={ex.GetType().Name}"); }
+    }
+
     internal void ApplyHotkeySettings()
     {
         if (exiting || keyboardHook is null) return;
@@ -250,6 +264,7 @@ public partial class App : System.Windows.Application
         {
             historyWindow.Attach(null);
             historyWindow.AllowClose = true;
+            historyWindow.Close();
         }
         try
         {

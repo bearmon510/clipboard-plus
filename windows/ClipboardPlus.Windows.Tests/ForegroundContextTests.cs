@@ -162,4 +162,167 @@ public sealed class ForegroundContextTests
         Assert.True(pasted);
         Assert.True(sendCtrlVCalled);
     }
+
+    [Fact]
+    public void BringToFrontReturnsTrueImmediatelyWhenDirectSetForegroundSucceeds()
+    {
+        var foreground = OtherWindow;
+        var attachedCalls = 0;
+        var altDownCalls = 0;
+        var managedActivated = false;
+
+        var ops = new ForegroundContext.ActivateOperations(
+            IsWindow: w => w == TargetWindow,
+            GetForegroundWindow: () => foreground,
+            SetForegroundWindow: w => { foreground = w; return true; },
+            BringWindowToTop: _ => true,
+            SetActiveWindow: w => w,
+            IsHungAppWindow: _ => false,
+            GetWindowThreadProcessId: _ => 200,
+            GetCurrentThreadId: () => 100,
+            AttachThreadInput: (_, _, _) => { attachedCalls++; return true; },
+            IsAltDown: () => false,
+            SendAltDown: () => { altDownCalls++; return true; },
+            SendAltUp: _ => true,
+            ActivateManaged: () => managedActivated = true);
+
+        Assert.True(ForegroundContext.BringToFront(TargetWindow, ops));
+        Assert.True(managedActivated);
+        Assert.Equal(0, attachedCalls);
+        Assert.Equal(0, altDownCalls);
+    }
+
+    [Fact]
+    public void BringToFrontUsesAttachThreadInputWhenDirectSetForegroundFails()
+    {
+        var foreground = OtherWindow;
+        var attached = false;
+        var attachEvents = new List<bool>();
+        var bringToTopCalled = false;
+        var setActiveCalled = false;
+        var altDownCalls = 0;
+
+        var ops = new ForegroundContext.ActivateOperations(
+            IsWindow: w => w == TargetWindow,
+            GetForegroundWindow: () => foreground,
+            SetForegroundWindow: w =>
+            {
+                if (attached)
+                {
+                    foreground = w;
+                    return true;
+                }
+                return false;
+            },
+            BringWindowToTop: _ => { bringToTopCalled = true; return true; },
+            SetActiveWindow: w => { setActiveCalled = true; return w; },
+            IsHungAppWindow: _ => false,
+            GetWindowThreadProcessId: _ => 200,
+            GetCurrentThreadId: () => 100,
+            AttachThreadInput: (_, _, value) =>
+            {
+                attached = value;
+                attachEvents.Add(value);
+                return true;
+            },
+            IsAltDown: () => false,
+            SendAltDown: () => { altDownCalls++; return true; },
+            SendAltUp: _ => true,
+            ActivateManaged: () => { });
+
+        Assert.True(ForegroundContext.BringToFront(TargetWindow, ops));
+        Assert.Equal([true, false], attachEvents);
+        Assert.True(bringToTopCalled);
+        Assert.True(setActiveCalled);
+        Assert.Equal(0, altDownCalls);
+    }
+
+    [Fact]
+    public void BringToFrontFallsBackToAltTapWhenForegroundWindowIsHungOrRefusesAttach()
+    {
+        var foreground = OtherWindow;
+        var altDown = false;
+        var attachAttempts = 0;
+        var maskFlags = new List<bool>();
+
+        var ops = new ForegroundContext.ActivateOperations(
+            IsWindow: w => w == TargetWindow,
+            GetForegroundWindow: () => foreground,
+            SetForegroundWindow: w =>
+            {
+                if (altDown)
+                {
+                    foreground = w;
+                    return true;
+                }
+                return false;
+            },
+            BringWindowToTop: _ => true,
+            SetActiveWindow: w => w,
+            IsHungAppWindow: w => w == OtherWindow,
+            GetWindowThreadProcessId: _ => 200,
+            GetCurrentThreadId: () => 100,
+            AttachThreadInput: (_, _, _) => { attachAttempts++; return true; },
+            IsAltDown: () => false,
+            SendAltDown: () => { altDown = true; return true; },
+            SendAltUp: mask => { altDown = false; maskFlags.Add(mask); return true; },
+            ActivateManaged: () => { });
+
+        Assert.True(ForegroundContext.BringToFront(TargetWindow, ops));
+        Assert.Equal(0, attachAttempts);
+        Assert.False(altDown);
+        Assert.Equal([false], maskFlags);
+    }
+
+    [Fact]
+    public void BringToFrontReleasesAltWithMenuMaskAndReturnsFalseWhenAllAttemptsFail()
+    {
+        var altDown = false;
+        var maskFlags = new List<bool>();
+        var managedActivated = false;
+
+        var ops = new ForegroundContext.ActivateOperations(
+            IsWindow: w => w == TargetWindow,
+            GetForegroundWindow: () => OtherWindow,
+            SetForegroundWindow: _ => false,
+            BringWindowToTop: _ => false,
+            SetActiveWindow: _ => 0,
+            IsHungAppWindow: _ => false,
+            GetWindowThreadProcessId: _ => 200,
+            GetCurrentThreadId: () => 100,
+            AttachThreadInput: (_, _, _) => false,
+            IsAltDown: () => false,
+            SendAltDown: () => { altDown = true; return true; },
+            SendAltUp: mask => { altDown = false; maskFlags.Add(mask); return true; },
+            ActivateManaged: () => managedActivated = true);
+
+        Assert.False(ForegroundContext.BringToFront(TargetWindow, ops));
+        Assert.True(managedActivated);
+        Assert.False(altDown);
+        Assert.Equal([true], maskFlags);
+    }
+
+    [Fact]
+    public void BringToFrontSkipsAltInjectionWhenAltIsAlreadyPhysicallyHeld()
+    {
+        var altDownCalls = 0;
+
+        var ops = new ForegroundContext.ActivateOperations(
+            IsWindow: w => w == TargetWindow,
+            GetForegroundWindow: () => OtherWindow,
+            SetForegroundWindow: _ => false,
+            BringWindowToTop: _ => false,
+            SetActiveWindow: _ => 0,
+            IsHungAppWindow: _ => false,
+            GetWindowThreadProcessId: _ => 200,
+            GetCurrentThreadId: () => 100,
+            AttachThreadInput: (_, _, _) => false,
+            IsAltDown: () => true,
+            SendAltDown: () => { altDownCalls++; return true; },
+            SendAltUp: _ => true,
+            ActivateManaged: () => { });
+
+        Assert.False(ForegroundContext.BringToFront(TargetWindow, ops));
+        Assert.Equal(0, altDownCalls);
+    }
 }

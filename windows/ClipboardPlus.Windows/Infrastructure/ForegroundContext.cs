@@ -55,6 +55,97 @@ public static class ForegroundContext
         () => Environment.TickCount64,
         static (ms, ct) => Task.Delay(ms, ct));
 
+    internal sealed record ActivateOperations(
+        Func<nint, bool> IsWindow,
+        Func<nint> GetForegroundWindow,
+        Func<nint, bool> SetForegroundWindow,
+        Func<nint, bool> BringWindowToTop,
+        Func<nint, nint> SetActiveWindow,
+        Func<nint, bool> IsHungAppWindow,
+        Func<nint, uint> GetWindowThreadProcessId,
+        Func<uint> GetCurrentThreadId,
+        Func<uint, uint, bool, bool> AttachThreadInput,
+        Func<bool> IsAltDown,
+        Func<bool> SendAltDown,
+        Func<bool, bool> SendAltUp,
+        Action ActivateManaged);
+
+    private static ActivateOperations CreateDefaultActivateOperations(Action activateManaged) => new(
+        IsWindow,
+        GetForegroundWindow,
+        SetForegroundWindow,
+        BringWindowToTop,
+        SetActiveWindow,
+        IsHungAppWindow,
+        hwnd => GetWindowThreadProcessId(hwnd, out _),
+        GetCurrentThreadId,
+        AttachThreadInput,
+        NativeInput.IsAltDown,
+        NativeInput.SendAltDown,
+        NativeInput.SendAltUp,
+        activateManaged);
+
+    public static bool BringToFront(nint hwnd, Action activateManaged) =>
+        BringToFront(hwnd, CreateDefaultActivateOperations(activateManaged));
+
+    internal static bool BringToFront(nint hwnd, ActivateOperations ops)
+    {
+        if (hwnd == 0 || !ops.IsWindow(hwnd)) return false;
+
+        if (ops.GetForegroundWindow() == hwnd)
+        {
+            ops.ActivateManaged();
+            return true;
+        }
+
+        if (ops.SetForegroundWindow(hwnd) && ops.GetForegroundWindow() == hwnd)
+        {
+            ops.ActivateManaged();
+            return true;
+        }
+
+        var front = ops.GetForegroundWindow();
+        if (front != 0 && front != hwnd && !ops.IsHungAppWindow(front))
+        {
+            var frontThread = ops.GetWindowThreadProcessId(front);
+            var selfThread = ops.GetCurrentThreadId();
+            var attached = frontThread != 0 && frontThread != selfThread && ops.AttachThreadInput(selfThread, frontThread, true);
+            try
+            {
+                ops.SetForegroundWindow(hwnd);
+                ops.BringWindowToTop(hwnd);
+                ops.SetActiveWindow(hwnd);
+            }
+            finally
+            {
+                if (attached) ops.AttachThreadInput(selfThread, frontThread, false);
+            }
+        }
+
+        if (ops.GetForegroundWindow() == hwnd)
+        {
+            ops.ActivateManaged();
+            return true;
+        }
+
+        if (!ops.IsAltDown() && ops.SendAltDown())
+        {
+            try
+            {
+                ops.SetForegroundWindow(hwnd);
+                ops.BringWindowToTop(hwnd);
+                ops.SetActiveWindow(hwnd);
+            }
+            finally
+            {
+                ops.SendAltUp(ops.GetForegroundWindow() != hwnd);
+            }
+        }
+
+        ops.ActivateManaged();
+        return ops.GetForegroundWindow() == hwnd;
+    }
+
     public static Task<bool> PasteAsync(nint window, CancellationToken token) =>
         PasteAsync(window, token, DefaultPasteOperations);
 
@@ -137,13 +228,33 @@ public static class ForegroundContext
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetForegroundWindow(nint hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool BringWindowToTop(nint hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern nint SetActiveWindow(nint hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsHungAppWindow(nint hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, [MarshalAs(UnmanagedType.Bool)] bool attach);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
 }
 
 internal static class NativeInput
 {
     private const uint InputKeyboard = 1;
+    private const uint KeyEventExtendedKey = 0x0001;
     private const uint KeyEventKeyUp = 0x0002;
     private const ushort VkControl = 0x11;
+    private const ushort VkMenu = 0x12;
     private const ushort VkV = 0x56;
     private const ushort VkMenuMask = 0xE8;
 
@@ -157,6 +268,8 @@ internal static class NativeInput
     public static readonly nuint SelfExtraInfo = 0x43504B01u;
 
     public static bool IsKeyDown(int virtualKey) => (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+
+    public static bool IsAltDown() => IsKeyDown(VkMenu) || IsKeyDown(0xA4) || IsKeyDown(0xA5);
 
     public static bool IsAnyModifierDown()
     {
@@ -177,6 +290,26 @@ internal static class NativeInput
         return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
     }
 
+    public static bool SendAltDown()
+    {
+        var scan = (ushort)MapVirtualKey(VkMenu, 0);
+        INPUT[] inputs = [KeyboardInputWithFlags(VkMenu, scan, KeyEventExtendedKey)];
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
+    }
+
+    public static bool SendAltUp(bool includeMenuMask)
+    {
+        var scan = (ushort)MapVirtualKey(VkMenu, 0);
+        INPUT[] inputs = includeMenuMask
+            ? [
+                KeyboardInputWithFlags(VkMenuMask, 0, 0),
+                KeyboardInputWithFlags(VkMenuMask, 0, KeyEventKeyUp),
+                KeyboardInputWithFlags(VkMenu, scan, KeyEventExtendedKey | KeyEventKeyUp),
+              ]
+            : [KeyboardInputWithFlags(VkMenu, scan, KeyEventExtendedKey | KeyEventKeyUp)];
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
+    }
+
     public static bool SendCtrlV()
     {
         var ctrlScan = (ushort)MapVirtualKey(VkControl, 0);
@@ -191,7 +324,10 @@ internal static class NativeInput
         return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
     }
 
-    private static INPUT KeyboardInput(ushort vk, ushort scan, bool keyUp) => new()
+    private static INPUT KeyboardInput(ushort vk, ushort scan, bool keyUp) =>
+        KeyboardInputWithFlags(vk, scan, keyUp ? KeyEventKeyUp : 0);
+
+    private static INPUT KeyboardInputWithFlags(ushort vk, ushort scan, uint flags) => new()
     {
         type = InputKeyboard,
         U = new InputUnion
@@ -200,7 +336,7 @@ internal static class NativeInput
             {
                 wVk = vk,
                 wScan = scan,
-                dwFlags = keyUp ? KeyEventKeyUp : 0,
+                dwFlags = flags,
                 dwExtraInfo = SelfExtraInfo,
             },
         },

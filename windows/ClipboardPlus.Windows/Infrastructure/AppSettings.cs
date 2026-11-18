@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using ClipboardPlus.Windows.Core;
 
 namespace ClipboardPlus.Windows.Infrastructure;
@@ -11,11 +12,21 @@ internal sealed class AppSettings
         WriteIndented = true,
     };
 
+    private sealed class WindowBoundsData
+    {
+        public int? Left { get; set; }
+        public int? Top { get; set; }
+        public double? Width { get; set; }
+        public double? Height { get; set; }
+    }
+
     private sealed class SettingsData
     {
         public bool? HotkeyEnabled { get; set; }
         public string? Hotkey { get; set; }
         public bool? PasteOnSelect { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public WindowBoundsData? HistoryWindow { get; set; }
     }
 
     private readonly string directory;
@@ -26,6 +37,7 @@ internal sealed class AppSettings
     public bool HotkeyEnabled { get; set; } = true;
     public string Hotkey { get; set; } = HotkeyChord.Default.ToString();
     public bool PasteOnSelect { get; set; } = true;
+    public WindowPlacement? HistoryWindow { get; set; }
 
     public HotkeyChord ParsedHotkey => HotkeyChord.TryParse(Hotkey, out var chord) ? chord : HotkeyChord.Default;
 
@@ -73,6 +85,17 @@ internal sealed class AppSettings
                     Hotkey = HotkeyChord.Default.ToString();
                     log?.Invoke("settings invalid hotkey");
                 }
+
+                if (data.HistoryWindow is { } bounds)
+                {
+                    if (HistoryWindowPlacement.TryNormalize(bounds.Left, bounds.Top, bounds.Width, bounds.Height, out var placement))
+                        HistoryWindow = placement;
+                    else
+                    {
+                        HistoryWindow = null;
+                        log?.Invoke("settings invalid history window");
+                    }
+                }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or NotSupportedException)
             {
@@ -89,11 +112,30 @@ internal sealed class AppSettings
             var chord = ParsedHotkey;
             Hotkey = chord.ToString();
 
+            WindowBoundsData? historyBounds = null;
+            if (HistoryWindow is { } current &&
+                HistoryWindowPlacement.TryNormalize(current.Left, current.Top, current.Width, current.Height, out var normalized))
+            {
+                HistoryWindow = normalized;
+                historyBounds = new WindowBoundsData
+                {
+                    Left = normalized.Left,
+                    Top = normalized.Top,
+                    Width = normalized.Width,
+                    Height = normalized.Height,
+                };
+            }
+            else
+            {
+                HistoryWindow = null;
+            }
+
             var data = new SettingsData
             {
                 HotkeyEnabled = HotkeyEnabled,
                 Hotkey = Hotkey,
                 PasteOnSelect = PasteOnSelect,
+                HistoryWindow = historyBounds,
             };
 
             Directory.CreateDirectory(directory);
@@ -121,5 +163,6 @@ internal sealed class AppSettings
         HotkeyEnabled = true;
         Hotkey = HotkeyChord.Default.ToString();
         PasteOnSelect = true;
+        HistoryWindow = null;
     }
 }

@@ -135,4 +135,63 @@ public sealed class AppSettingsTests : IDisposable
         var expected = IntPtr.Size == 8 ? 40 : 28;
         Assert.Equal(expected, Marshal.SizeOf<NativeInput.INPUT>());
     }
+
+    [Fact]
+    public void HistoryWindowBoundsRoundTripThroughSettings()
+    {
+        var logs = new List<string>();
+        var settings = new AppSettings(tempDir, logs.Add);
+        Assert.Null(settings.HistoryWindow);
+
+        settings.HistoryWindow = new WindowPlacement(-420, 180, 440, 560);
+        settings.Save();
+
+        var reloaded = new AppSettings(tempDir, logs.Add);
+        Assert.Equal(new WindowPlacement(-420, 180, 440, 560), reloaded.HistoryWindow);
+        Assert.Empty(logs);
+    }
+
+    [Fact]
+    public void InvalidHistoryWindowBoundsFallBackToNullWhilePreservingOtherSettings()
+    {
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(
+            Path.Combine(tempDir, "settings.json"),
+            """
+            {
+              "HotkeyEnabled": false,
+              "Hotkey": "Ctrl+NonConvert",
+              "PasteOnSelect": false,
+              "HistoryWindow": { "Left": 100, "Top": 200, "Width": -50, "Height": 400 }
+            }
+            """,
+            new UTF8Encoding(false));
+
+        var logs = new List<string>();
+        var settings = new AppSettings(tempDir, logs.Add);
+
+        Assert.False(settings.HotkeyEnabled);
+        Assert.Equal("Ctrl+NonConvert", settings.Hotkey);
+        Assert.False(settings.PasteOnSelect);
+        Assert.Null(settings.HistoryWindow);
+        Assert.Equal(["settings invalid history window"], logs);
+    }
+
+    [Fact]
+    public void UndersizedHistoryWindowBoundsClampToMinimumOnLoad()
+    {
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(
+            Path.Combine(tempDir, "settings.json"),
+            """{"HistoryWindow": { "Left": 80, "Top": 90, "Width": 120, "Height": 150 }}""",
+            new UTF8Encoding(false));
+
+        var logs = new List<string>();
+        var settings = new AppSettings(tempDir, logs.Add);
+
+        Assert.Equal(
+            new WindowPlacement(80, 90, HistoryWindowPlacement.MinWidth, HistoryWindowPlacement.MinHeight),
+            settings.HistoryWindow);
+        Assert.Empty(logs);
+    }
 }
