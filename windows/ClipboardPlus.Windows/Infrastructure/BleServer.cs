@@ -25,6 +25,22 @@ internal sealed class BleServer : IAsyncDisposable
     private readonly TimeSpan shutdownTimeout = TimeSpan.FromSeconds(5);
     private volatile bool adapterReady;
     private Task? polling;
+    // Write-rate diagnostics, logged from the polling loop while writes arrive (counts only).
+    private int writesInFlight, writesInFlightMax, writesSinceReport;
+    private readonly System.Diagnostics.Stopwatch writeReportClock = System.Diagnostics.Stopwatch.StartNew();
+    private static void InterlockedMax(ref int target, int value)
+    {
+        int current;
+        while (value > (current = Volatile.Read(ref target)) && Interlocked.CompareExchange(ref target, value, current) != current) { }
+    }
+    private void ReportWriteRate()
+    {
+        var seconds = writeReportClock.Elapsed.TotalSeconds;
+        writeReportClock.Restart();
+        var count = Interlocked.Exchange(ref writesSinceReport, 0);
+        var max = Interlocked.Exchange(ref writesInFlightMax, Volatile.Read(ref writesInFlight));
+        if (count > 0) log($"writes count={count} perSecond={count / Math.Max(seconds, 0.001):F1} inFlightMax={max}");
+    }
     private GattServiceProvider? provider;
     private GattLocalCharacteristic? inbound, outbound;
     private string? lastStatus;
@@ -53,6 +69,7 @@ internal sealed class BleServer : IAsyncDisposable
     {
         while (!stop.IsCancellationRequested)
         {
+            ReportWriteRate();
             try
             {
                 var offStatus = await ProbeRadioAsync();
@@ -348,6 +365,12 @@ internal sealed class BleServer : IAsyncDisposable
         var estimatedBytes = BleLimits.NotificationBytes(session.MaxPduSize);
         var sessionClosed = session.SessionStatus == GattSessionStatus.Closed;
         var deferral = args.GetDeferral();
+        var inFlight = Interlocked.Increment(ref writesInFlight);
+        Interlocked.Increment(ref writesSinceReport);
+        InterlockedMax(ref writesInFlightMax, inFlight);
+        // Start fetching the request now, so each packet's round trip overlaps the next one
+        // instead of running one after another in the ingest loop (about 39 ms per packet).
+        var requestTask = args.GetRequestAsync().AsTask();
         // Acquire deferral, subscription slot, session, and byte admission synchronously before awaiting GetRequestAsync.
         pipeline.EnqueueWrite(
             sender,
@@ -357,7 +380,7 @@ internal sealed class BleServer : IAsyncDisposable
             sessionClosed,
             async ct =>
             {
-                var request = await args.GetRequestAsync().AsTask(ct);
+                var request = await requestTask.WaitAsync(ct);
                 if (request is null) return null;
                 var length = (long)(request.Value?.Length ?? 0);
                 return new BleWriteRequestData(
@@ -368,7 +391,7 @@ internal sealed class BleServer : IAsyncDisposable
                     () => request.Respond(),
                     error => request.RespondWithProtocolError(error));
             },
-            () => deferral.Complete(),
+            () => { Interlocked.Decrement(ref writesInFlight); deferral.Complete(); },
             () => RejectWrite(args));
     }
 
