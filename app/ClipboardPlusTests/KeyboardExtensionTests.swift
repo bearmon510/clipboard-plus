@@ -240,6 +240,8 @@ final class KeyboardExtensionTests: XCTestCase {
 
         model.switchToList()
         XCTAssertEqual(model.mode, .list)
+        model.switchToAlphanumeric()
+        XCTAssertEqual(model.mode, .alphanumeric)
     }
 
     // MARK: - Full Access Gating & Inbox Save
@@ -412,6 +414,14 @@ final class KeyboardExtensionTests: XCTestCase {
             let list = KeyboardLayoutMetrics.listMetrics(width: width, availableHeight: height)
             XCTAssertLessThan(list.bottomBarHeight, height)
             XCTAssertGreaterThanOrEqual(list.bottomBarBottomPadding, 6)
+            XCTAssertLessThanOrEqual(list.alphanumericKeyWidth, list.compactKeyWidth)
+            XCTAssertLessThanOrEqual(list.bottomBarHeight, 48)
+            let reservedKeysWidth = list.bottomBarHorizontalPadding * 2
+                + list.compactKeyWidth * 2
+                + list.alphanumericKeyWidth
+                + list.returnWidth
+                + list.keySpacing * 4
+            XCTAssertGreaterThanOrEqual(width - reservedKeysWidth, 140)
         }
 
         let phoneFiveRow = KeyboardLayoutMetrics.alphanumericMetrics(width: 393, availableHeight: 284, rowCount: 5)

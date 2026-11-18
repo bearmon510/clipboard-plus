@@ -31,6 +31,6 @@ enum KeyboardTheme {
     static let field = Color(uiColor: .tertiarySystemFill)
     static let letterKey = Color(uiColor: letterKeyUIColor)
     static let specialKey = Color(uiColor: specialKeyUIColor)
-    static let cardRadius: CGFloat = 12
+    static let cardRadius: CGFloat = 10
     static let keyRadius: CGFloat = 6
 }

@@ -159,6 +159,7 @@ struct KeyboardAlphanumericMetrics: Equatable, Sendable {
 }
 
 struct KeyboardListMetrics: Equatable, Sendable {
+    let isWide: Bool
     let keyHeight: CGFloat
     let topBarVerticalPadding: CGFloat
     let bottomBarTopPadding: CGFloat
@@ -166,7 +167,7 @@ struct KeyboardListMetrics: Equatable, Sendable {
     let bottomBarHorizontalPadding: CGFloat
     let keySpacing: CGFloat
     let compactKeyWidth: CGFloat
-    let abcWidth: CGFloat
+    let alphanumericKeyWidth: CGFloat
     let returnWidth: CGFloat
 
     var bottomBarHeight: CGFloat {
@@ -245,17 +246,19 @@ enum KeyboardLayoutMetrics {
 
     static func listMetrics(width: CGFloat, availableHeight: CGFloat) -> KeyboardListMetrics {
         let isWide = width >= 600
+        let isNarrow = width > 0 && width <= 340
         let isCompactHeight = availableHeight > 0 && availableHeight < 235
         return KeyboardListMetrics(
-            keyHeight: isCompactHeight ? 34 : (isWide ? 42 : 38),
-            topBarVerticalPadding: isCompactHeight ? 4 : 6,
-            bottomBarTopPadding: isCompactHeight ? 4 : 6,
-            bottomBarBottomPadding: isCompactHeight ? 6 : (isWide ? 10 : 8),
-            bottomBarHorizontalPadding: isWide ? 10 : 6,
-            keySpacing: isWide ? 8 : 5,
-            compactKeyWidth: isWide ? 56 : 44,
-            abcWidth: isWide ? 66 : 52,
-            returnWidth: isWide ? 82 : 58
+            isWide: isWide,
+            keyHeight: isCompactHeight ? 30 : (isWide ? 36 : 34),
+            topBarVerticalPadding: isCompactHeight ? 3 : 4,
+            bottomBarTopPadding: isCompactHeight ? 3 : (isWide ? 5 : 4),
+            bottomBarBottomPadding: isCompactHeight ? 6 : (isWide ? 7 : 6),
+            bottomBarHorizontalPadding: isWide ? 10 : (isNarrow ? 5 : 8),
+            keySpacing: isWide ? 8 : (isNarrow ? 4 : 5),
+            compactKeyWidth: isWide ? 42 : (isNarrow ? 34 : 36),
+            alphanumericKeyWidth: isWide ? 36 : (isNarrow ? 30 : 32),
+            returnWidth: isWide ? 68 : (isNarrow ? 46 : 52)
         )
     }
 

@@ -41,10 +41,16 @@ struct KeyboardView: View {
             )
 
             VStack(spacing: 0) {
-                topBar(verticalPadding: metrics.topBarVerticalPadding)
-                    .layoutPriority(1)
+                if model.showsSaveClipboardButton {
+                    fullAccessTopBar(metrics: metrics)
+                        .layoutPriority(1)
+                }
                 ZStack(alignment: .bottom) {
-                    listContent(width: proxy.size.width, isCompactHeight: isCompactHeight)
+                    listContent(
+                        width: proxy.size.width,
+                        isCompactHeight: isCompactHeight,
+                        topPadding: model.showsSaveClipboardButton ? 2 : 6
+                    )
                     statusToast
                 }
                 .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
@@ -55,45 +61,40 @@ struct KeyboardView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func topBar(verticalPadding: CGFloat) -> some View {
+    private func fullAccessTopBar(metrics: KeyboardListMetrics) -> some View {
         HStack(spacing: 8) {
-            Picker("表示", selection: $model.selectedTab) {
-                ForEach(KeyboardTab.allCases) { tab in
-                    Text(tab.title).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(minWidth: 120, maxWidth: 210)
+            Text(pasteControlSlot == nil ? "クリップボード" : "直前のコピーを保存")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
 
             Spacer(minLength: 4)
 
-            if model.showsSaveClipboardButton {
-                if let pasteControlSlot {
-                    pasteControlSlot
-                } else {
-                    Button {
-                        model.saveFromPasteboard()
-                    } label: {
-                        Label("今のコピーを保存", systemImage: "doc.on.clipboard")
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.85)
-                            .padding(.horizontal, 4)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.small)
-                    .tint(KeyboardTheme.accentKey)
-                    .layoutPriority(1)
+            if let pasteControlSlot {
+                pasteControlSlot
+            } else {
+                Button {
+                    model.saveFromPasteboard()
+                } label: {
+                    Label("今のコピーを保存", systemImage: "doc.on.clipboard")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                        .padding(.horizontal, 4)
                 }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .tint(KeyboardTheme.accentKey)
+                .layoutPriority(1)
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, verticalPadding)
+        .padding(.vertical, metrics.topBarVerticalPadding)
     }
 
     @ViewBuilder
-    private func listContent(width: CGFloat, isCompactHeight: Bool) -> some View {
+    private func listContent(width: CGFloat, isCompactHeight: Bool, topPadding: CGFloat) -> some View {
         switch model.loadState {
         case .loading:
             Color.clear
@@ -121,7 +122,7 @@ struct KeyboardView: View {
                                 )
                                 .frame(maxWidth: .infinity, minHeight: listProxy.size.height)
                             } else {
-                                historyList(now: now, columnCount: columns)
+                                historyList(now: now, columnCount: columns, topPadding: topPadding)
                             }
                         } else {
                             if model.templateGroups.isEmpty {
@@ -133,7 +134,7 @@ struct KeyboardView: View {
                                 )
                                 .frame(maxWidth: .infinity, minHeight: listProxy.size.height)
                             } else {
-                                templateList(columnCount: columns)
+                                templateList(columnCount: columns, topPadding: topPadding)
                             }
                         }
                     }
@@ -143,7 +144,7 @@ struct KeyboardView: View {
         }
     }
 
-    private func historyList(now: Date, columnCount: Int) -> some View {
+    private func historyList(now: Date, columnCount: Int, topPadding: CGFloat) -> some View {
         entryCollection(model.historyEntries, columnCount: columnCount) { entry in
             KeyboardEntryRow(
                 entry: entry,
@@ -154,14 +155,15 @@ struct KeyboardView: View {
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 4)
+        .padding(.top, topPadding)
+        .padding(.bottom, 4)
     }
 
-    private func templateList(columnCount: Int) -> some View {
-        LazyVStack(alignment: .leading, spacing: 10) {
+    private func templateList(columnCount: Int, topPadding: CGFloat) -> some View {
+        LazyVStack(alignment: .leading, spacing: 8) {
             ForEach(model.templateGroups) { group in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: group.tag == nil ? "tray" : "tag")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(KeyboardTheme.accent)
@@ -190,7 +192,8 @@ struct KeyboardView: View {
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 4)
+        .padding(.top, topPadding)
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
@@ -200,17 +203,17 @@ struct KeyboardView: View {
         @ViewBuilder row: @escaping (KeyboardHistoryEntry) -> Row
     ) -> some View {
         if columnCount <= 1 {
-            LazyVStack(spacing: 6) {
+            LazyVStack(spacing: 5) {
                 ForEach(entries) { entry in
                     row(entry)
                 }
             }
         } else {
             let columns = Array(
-                repeating: GridItem(.flexible(), spacing: 8, alignment: .top),
+                repeating: GridItem(.flexible(), spacing: 7, alignment: .top),
                 count: columnCount
             )
-            LazyVGrid(columns: columns, spacing: 8) {
+            LazyVGrid(columns: columns, spacing: 6) {
                 ForEach(entries) { entry in
                     row(entry)
                         .frame(maxHeight: .infinity, alignment: .top)
@@ -289,55 +292,99 @@ struct KeyboardView: View {
     }
 
     private func listBottomBar(metrics: KeyboardListMetrics) -> some View {
-        HStack(spacing: metrics.keySpacing) {
-            if model.needsInputModeSwitchKey {
-                KeyboardGlobeKeyContainer(
-                    keyHeight: metrics.keyHeight,
-                    width: metrics.compactKeyWidth,
-                    slot: globeButtonSlot
-                )
-            }
-            Button {
-                model.switchToAlphanumeric()
-            } label: {
-                Text("ABC")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(Color.primary)
-                    .frame(width: metrics.abcWidth, height: metrics.keyHeight)
-            }
-            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.specialKey))
-            .accessibilityLabel("英数字キーボード")
-
-            Button {
-                model.tapSpace()
-            } label: {
-                Text("空白")
-                    .font(.subheadline)
-                    .foregroundStyle(Color.primary)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: metrics.keyHeight)
-            }
-            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.letterKey))
-            .accessibilityLabel("空白")
-
-            KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.compactKeyWidth) {
-                model.tapDelete()
+        HStack(spacing: 0) {
+            HStack(spacing: metrics.keySpacing) {
+                if model.needsInputModeSwitchKey {
+                    KeyboardGlobeKeyContainer(
+                        keyHeight: metrics.keyHeight,
+                        width: metrics.compactKeyWidth,
+                        slot: globeButtonSlot
+                    )
+                }
+                alphanumericButton(metrics: metrics)
             }
 
-            Button {
-                model.tapReturn()
-            } label: {
-                Text("改行")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Color.white)
-                    .frame(width: metrics.returnWidth, height: metrics.keyHeight)
+            Spacer(minLength: metrics.keySpacing)
+
+            tabSwitcher(keyHeight: metrics.keyHeight, isWide: metrics.isWide)
+                .layoutPriority(1)
+
+            Spacer(minLength: metrics.keySpacing)
+
+            HStack(spacing: metrics.keySpacing) {
+                KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.compactKeyWidth) {
+                    model.tapDelete()
+                }
+
+                Button {
+                    model.tapReturn()
+                } label: {
+                    Text("改行")
+                        .font((metrics.isWide ? Font.subheadline : Font.footnote).weight(.semibold))
+                        .foregroundStyle(Color.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                        .frame(width: metrics.returnWidth, height: metrics.keyHeight)
+                }
+                .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.accentKey))
+                .accessibilityLabel("改行")
             }
-            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.accentKey))
-            .accessibilityLabel("改行")
         }
         .padding(.horizontal, metrics.bottomBarHorizontalPadding)
         .padding(.top, metrics.bottomBarTopPadding)
         .padding(.bottom, metrics.bottomBarBottomPadding)
+    }
+
+    private func alphanumericButton(metrics: KeyboardListMetrics) -> some View {
+        Button {
+            model.switchToAlphanumeric()
+        } label: {
+            Image(systemName: "keyboard")
+                .font(.subheadline.weight(.regular))
+                .foregroundStyle(.secondary)
+                .frame(width: metrics.alphanumericKeyWidth, height: metrics.keyHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(KeyboardSubtleKeyStyle())
+        .accessibilityLabel("英数字キーボード")
+        .accessibilityHint("文字や記号の入力面に切り替えます")
+    }
+
+    private func tabSwitcher(keyHeight: CGFloat, isWide: Bool) -> some View {
+        let segmentHeight = max(26, keyHeight - 4)
+        let segmentRadius = max(4, KeyboardTheme.keyRadius - 1)
+        return HStack(spacing: 2) {
+            ForEach(KeyboardTab.allCases) { tab in
+                let isSelected = model.selectedTab == tab
+                Button {
+                    model.selectedTab = tab
+                } label: {
+                    Text(tab.title)
+                        .font((isWide ? Font.subheadline : Font.footnote).weight(isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                        .padding(.horizontal, isWide ? 14 : 9)
+                        .frame(height: segmentHeight)
+                        .background(
+                            isSelected ? KeyboardTheme.letterKey : Color.clear,
+                            in: RoundedRectangle(cornerRadius: segmentRadius, style: .continuous)
+                        )
+                        .shadow(color: Color.black.opacity(isSelected ? 0.12 : 0), radius: 0.5, y: 1)
+                        .contentShape(RoundedRectangle(cornerRadius: segmentRadius, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+            }
+        }
+        .padding(2)
+        .frame(height: keyHeight)
+        .background(
+            KeyboardTheme.field,
+            in: RoundedRectangle(cornerRadius: KeyboardTheme.keyRadius + 1, style: .continuous)
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("表示")
     }
 }
 
@@ -353,23 +400,49 @@ private struct KeyboardEntryRow: View {
         RoundedRectangle(cornerRadius: KeyboardTheme.cardRadius, style: .continuous)
     }
 
+    private var hasTitle: Bool {
+        guard let title = entry.title else { return false }
+        return !title.isEmpty
+    }
+
+    private var showsBottomMetaRow: Bool {
+        timeLabel != nil || (entry.isFromPC && !hasTitle)
+    }
+
     var body: some View {
         Button(action: onTap) {
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 3) {
                 if let title = entry.title, !title.isEmpty {
-                    Text(title)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(KeyboardTheme.accent)
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        Text(title)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(KeyboardTheme.accent)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 0)
+
+                        if entry.kind == .url && timeLabel == nil {
+                            Image(systemName: "link")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(KeyboardTheme.accent)
+                                .accessibilityHidden(true)
+                        }
+
+                        if entry.isFromPC && timeLabel == nil {
+                            pcBadge
+                        }
+                    }
                 }
 
                 contentPreview
 
-                metaRow
+                if showsBottomMetaRow {
+                    metaRow
+                }
             }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 44, alignment: .topLeading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
             .background(KeyboardTheme.card, in: shape)
             .overlay(
                 shape.fill(KeyboardTheme.accent.opacity(isFlashed ? 0.14 : 0))
@@ -393,10 +466,18 @@ private struct KeyboardEntryRow: View {
     private var contentPreview: some View {
         if entry.kind == .url, let link = KeyboardLinkFormatting.parts(entry.text) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(link.host)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(KeyboardTheme.accent)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    if !showsBottomMetaRow && !hasTitle {
+                        Image(systemName: "link")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(KeyboardTheme.accent)
+                            .accessibilityHidden(true)
+                    }
+                    Text(link.host)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(KeyboardTheme.accent)
+                        .lineLimit(1)
+                }
                 if let remainder = link.remainder {
                     Text(remainder)
                         .font(.caption)
@@ -428,17 +509,21 @@ private struct KeyboardEntryRow: View {
             }
 
             if entry.isFromPC {
-                Label("PC", systemImage: "laptopcomputer")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(KeyboardTheme.accent)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(KeyboardTheme.accent.opacity(0.12), in: Capsule())
-                    .accessibilityLabel("PCから受信")
+                pcBadge
             }
 
             Spacer(minLength: 0)
         }
+    }
+
+    private var pcBadge: some View {
+        Label("PC", systemImage: "laptopcomputer")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(KeyboardTheme.accent)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(KeyboardTheme.accent.opacity(0.12), in: Capsule())
+            .accessibilityLabel("PCから受信")
     }
 }
 
@@ -538,6 +623,19 @@ struct KeyboardKeyCapStyle: ButtonStyle {
                     .opacity(configuration.isPressed ? 0.72 : 1)
             )
             .shadow(color: Color.black.opacity(0.18), radius: 0.5, y: 1)
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+    }
+}
+
+private struct KeyboardSubtleKeyStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: KeyboardTheme.keyRadius, style: .continuous)
+                    .fill(KeyboardTheme.field)
+                    .opacity(configuration.isPressed ? 0.65 : 1)
+            )
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
     }

@@ -279,6 +279,16 @@ final class ScreenSnapshotTests: XCTestCase {
                 lastCollectedAt: now.addingTimeInterval(-1_800), isTemplate: false, isFromPC: false
             ),
             KeyboardHistoryEntry(
+                id: 8, kind: .text,
+                text: "hello@example.com",
+                lastCollectedAt: now.addingTimeInterval(-3_600), isTemplate: false, isFromPC: true
+            ),
+            KeyboardHistoryEntry(
+                id: 9, kind: .url,
+                text: "https://example.com/docs/checklist",
+                lastCollectedAt: now.addingTimeInterval(-7_200), isTemplate: false, isFromPC: false
+            ),
+            KeyboardHistoryEntry(
                 id: 4, kind: .text,
                 text: "いつもお世話になっております。試験 太郎です。",
                 lastCollectedAt: now, isTemplate: true, title: "あいさつ", tag: "メール", templateOrder: 0
