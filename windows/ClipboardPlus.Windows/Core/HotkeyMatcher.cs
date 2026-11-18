@@ -21,6 +21,7 @@ public sealed class HotkeyMatcher
     private readonly object gate = new();
     private readonly Dictionary<int, HotkeyModifier> heldModifiers = [];
     private readonly Dictionary<int, HotkeyModifier> recordingModifiers = [];
+    private readonly HashSet<int> passedKeys = [];
     private readonly HashSet<int> swallowedKeys = [];
     private HotkeyChord? target;
     private bool recording;
@@ -74,20 +75,39 @@ public sealed class HotkeyMatcher
         {
             heldModifiers.Clear();
             recordingModifiers.Clear();
+            passedKeys.Clear();
             swallowedKeys.Clear();
             recording = false;
         }
     }
 
-    /// <summary>Drops tracked keys whose key-up was missed (e.g., on lock screen or UAC).</summary>
+    /// <summary>
+    /// Drops passed keys whose key-up was missed (e.g., on lock screen or UAC).
+    /// Swallowed keys and recording modifiers are kept until their hook key-up arrives,
+    /// because swallowed key-downs are never reflected in Windows key state.
+    /// </summary>
     public void PruneReleasedKeys(Func<int, bool> isKeyDown)
     {
         ArgumentNullException.ThrowIfNull(isKeyDown);
         lock (gate)
         {
             PruneDictionary(heldModifiers, isKeyDown);
-            PruneDictionary(recordingModifiers, isKeyDown);
-            swallowedKeys.RemoveWhere(vk => !isKeyDown(vk));
+            passedKeys.RemoveWhere(vk => !isKeyDown(vk));
+        }
+    }
+
+    /// <summary>
+    /// Marks a key whose key-down was slated to be swallowed as passed instead
+    /// (e.g., when a Win+key menu mask fails to inject and the chord must fall through).
+    /// </summary>
+    public void RevertSwallowToPass(int virtualKey)
+    {
+        lock (gate)
+        {
+            swallowedKeys.Remove(virtualKey);
+            passedKeys.Add(virtualKey);
+            if (HotkeyChord.TryGetModifier(virtualKey, out var modifier))
+                heldModifiers[virtualKey] = modifier;
         }
     }
 
@@ -109,10 +129,18 @@ public sealed class HotkeyMatcher
         if (!isKeyDown)
         {
             recordingModifiers.Remove(virtualKey);
-            swallowedKeys.Remove(virtualKey);
             heldModifiers.Remove(virtualKey);
-            return new HotkeyMatchResult(HotkeyAction.Swallow);
+            passedKeys.Remove(virtualKey);
+            return swallowedKeys.Remove(virtualKey)
+                ? new HotkeyMatchResult(HotkeyAction.Swallow)
+                : new HotkeyMatchResult(HotkeyAction.Pass);
         }
+
+        if (swallowedKeys.Contains(virtualKey))
+            return new HotkeyMatchResult(HotkeyAction.Swallow);
+
+        if (passedKeys.Contains(virtualKey))
+            return new HotkeyMatchResult(HotkeyAction.Pass);
 
         swallowedKeys.Add(virtualKey);
 
@@ -130,7 +158,7 @@ public sealed class HotkeyMatcher
             else if (singleModifier.Value != mod) { multipleModifiers = true; break; }
         }
 
-        if (singleModifier is null && virtualKey == EscapeVirtualKey)
+        if (virtualKey == EscapeVirtualKey && (singleModifier is null || multipleModifiers))
         {
             recording = false;
             recordingModifiers.Clear();
@@ -152,21 +180,24 @@ public sealed class HotkeyMatcher
         if (!isKeyDown)
         {
             heldModifiers.Remove(virtualKey);
+            passedKeys.Remove(virtualKey);
             return swallowedKeys.Remove(virtualKey)
                 ? new HotkeyMatchResult(HotkeyAction.Swallow)
                 : new HotkeyMatchResult(HotkeyAction.Pass);
         }
 
+        if (swallowedKeys.Contains(virtualKey))
+            return new HotkeyMatchResult(HotkeyAction.Swallow);
+
+        if (passedKeys.Contains(virtualKey))
+            return new HotkeyMatchResult(HotkeyAction.Pass);
+
         if (HotkeyChord.TryGetModifier(virtualKey, out var modifier))
         {
-            if (swallowedKeys.Contains(virtualKey))
-                return new HotkeyMatchResult(HotkeyAction.Swallow);
+            passedKeys.Add(virtualKey);
             heldModifiers[virtualKey] = modifier;
             return new HotkeyMatchResult(HotkeyAction.Pass);
         }
-
-        if (swallowedKeys.Contains(virtualKey))
-            return new HotkeyMatchResult(HotkeyAction.Swallow);
 
         if (target is { } active &&
             virtualKey == active.VirtualKey &&
@@ -176,6 +207,7 @@ public sealed class HotkeyMatcher
             return new HotkeyMatchResult(HotkeyAction.SwallowAndTrigger, NeedsMenuMask: active.Modifier == HotkeyModifier.Win);
         }
 
+        passedKeys.Add(virtualKey);
         return new HotkeyMatchResult(HotkeyAction.Pass);
     }
 

@@ -27,6 +27,8 @@ public partial class MainWindow : Window
     {
         this.log = log; this.preview = preview;
         InitializeComponent();
+        // Recording swallows keys across the PC, so it never outlives this window being in front.
+        Deactivated += (_, _) => StopRecording();
         UpdatePairing(pairing);
         if (preview)
         {
@@ -97,7 +99,7 @@ public partial class MainWindow : Window
     {
         if (settings is null) return;
         change(settings);
-        try { settings.Save(); }
+        try { settings.Save(); ShowHotkeyMessage(null); }
         catch (Exception ex)
         {
             log($"settings save error={ex.GetType().Name}");
@@ -107,10 +109,13 @@ public partial class MainWindow : Window
         ShowHotkey();
     }
 
-    private void OnHotkeyEnabledChanged(object sender, RoutedEventArgs e) => SaveHotkey(s => s.HotkeyEnabled = HotkeyCheck.IsChecked == true);
-    private void OnPasteChanged(object sender, RoutedEventArgs e) => SaveHotkey(s => s.PasteOnSelect = PasteCheck.IsChecked == true);
+    private void StopRecording() => recording?.Cancel();
+
+    private void OnHotkeyEnabledChanged(object sender, RoutedEventArgs e) { StopRecording(); SaveHotkey(s => s.HotkeyEnabled = HotkeyCheck.IsChecked == true); }
+    private void OnPasteChanged(object sender, RoutedEventArgs e) { StopRecording(); SaveHotkey(s => s.PasteOnSelect = PasteCheck.IsChecked == true); }
     private void OnResetHotkey(object sender, RoutedEventArgs e)
     {
+        StopRecording();
         ShowHotkeyMessage(null);
         SaveHotkey(s => s.Hotkey = HotkeyChord.Default.ToString());
     }
@@ -121,7 +126,7 @@ public partial class MainWindow : Window
         if (recording is not null) { recording.Cancel(); return; } // The button reads "やめる" while recording.
         recording = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         RecordButton.Content = "やめる";
-        HotkeyText.Text = "新しい組み合わせを押してください…";
+        HotkeyText.Text = "新しい組み合わせを押してください（Escでやめる）";
         ShowHotkeyMessage(null);
         try
         {
@@ -141,9 +146,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnOpenHistory(object sender, RoutedEventArgs e) => HistoryRequested?.Invoke();
-    private void OnClosing(object? sender, CancelEventArgs e) { if (!preview) { e.Cancel = true; Hide(); } }
-    private void OnRepair(object sender, RoutedEventArgs e) => RepairRequested?.Invoke();
+    private void OnOpenHistory(object sender, RoutedEventArgs e) { StopRecording(); HistoryRequested?.Invoke(); }
+    private void OnClosing(object? sender, CancelEventArgs e) { StopRecording(); if (!preview) { e.Cancel = true; Hide(); } }
+    private void OnRepair(object sender, RoutedEventArgs e) { StopRecording(); RepairRequested?.Invoke(); }
     private void OnOpenLogs(object sender, RoutedEventArgs e)
     {
         try { Process.Start(new ProcessStartInfo(LocalStore.Logs) { UseShellExecute = true }); }

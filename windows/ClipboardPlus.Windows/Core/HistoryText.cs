@@ -20,7 +20,10 @@ public static class HistoryText
                     .Take(2);
                 var joined = string.Join("\n", lines);
                 if (joined.Length == 0) return "（空白だけの文章）";
-                return joined.Length > MaxTitleLength ? joined[..MaxTitleLength] + "…" : joined;
+                if (joined.Length <= MaxTitleLength) return joined;
+                // Never split a surrogate pair (an emoji, say) at the cut.
+                var cut = char.IsHighSurrogate(joined[MaxTitleLength - 1]) ? MaxTitleLength - 1 : MaxTitleLength;
+                return joined[..cut] + "…";
             case "image":
                 return string.IsNullOrWhiteSpace(item.Filename) ? "画像" : item.Filename!;
             default:

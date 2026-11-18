@@ -16,6 +16,9 @@ public sealed class HistoryTextTests
         var title = HistoryText.Title(Item("text", new string('あ', 300)));
         Assert.Equal(HistoryText.MaxTitleLength + 1, title.Length);
         Assert.EndsWith("…", title);
+        // An emoji straddling the cut is dropped whole rather than split into half a surrogate pair.
+        var emoji = HistoryText.Title(Item("text", new string('a', HistoryText.MaxTitleLength - 1) + "😀😀"));
+        Assert.Equal(new string('a', HistoryText.MaxTitleLength - 1) + "…", emoji);
     }
 
     [Fact]

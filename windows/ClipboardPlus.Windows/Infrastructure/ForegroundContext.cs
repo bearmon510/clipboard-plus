@@ -37,26 +37,49 @@ public static class ForegroundContext
         return new HistoryInvocation(previousWindow, caretX, caretY, cursor.x, cursor.y);
     }
 
-    public static async Task<bool> PasteAsync(nint window, CancellationToken token)
-    {
-        if (window == 0 || !IsWindow(window)) return false;
+    internal sealed record PasteOperations(
+        Func<nint, bool> IsWindow,
+        Func<nint, bool> SetForegroundWindow,
+        Func<nint> GetForegroundWindow,
+        Func<bool> IsAnyModifierDown,
+        Func<bool> SendCtrlV,
+        Func<long> GetTickCount64,
+        Func<int, CancellationToken, Task> Delay);
 
-        var deadline = Environment.TickCount64 + 1000;
-        while (NativeInput.IsAnyModifierDown())
+    private static readonly PasteOperations DefaultPasteOperations = new(
+        IsWindow,
+        SetForegroundWindow,
+        GetForegroundWindow,
+        NativeInput.IsAnyModifierDown,
+        NativeInput.SendCtrlV,
+        () => Environment.TickCount64,
+        static (ms, ct) => Task.Delay(ms, ct));
+
+    public static Task<bool> PasteAsync(nint window, CancellationToken token) =>
+        PasteAsync(window, token, DefaultPasteOperations);
+
+    internal static async Task<bool> PasteAsync(nint window, CancellationToken token, PasteOperations ops)
+    {
+        if (window == 0 || !ops.IsWindow(window)) return false;
+
+        var deadline = ops.GetTickCount64() + 1000;
+        while (ops.IsAnyModifierDown())
         {
-            if (Environment.TickCount64 >= deadline) break;
-            await Task.Delay(15, token);
+            if (ops.GetTickCount64() >= deadline) return false;
+            await ops.Delay(15, token);
         }
         token.ThrowIfCancellationRequested();
 
-        if (!IsWindow(window) || !SetForegroundWindow(window))
+        if (!ops.IsWindow(window) || !ops.SetForegroundWindow(window))
             return false;
 
         // Yield briefly so the target window completes activation before receiving Ctrl+V.
-        await Task.Delay(25, token);
-        if (!IsWindow(window)) return false;
+        await ops.Delay(25, token);
+        token.ThrowIfCancellationRequested();
+        if (!ops.IsWindow(window) || ops.GetForegroundWindow() != window || ops.IsAnyModifierDown())
+            return false;
 
-        return NativeInput.SendCtrlV();
+        return ops.SendCtrlV();
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -144,14 +167,14 @@ internal static class NativeInput
         return false;
     }
 
-    public static void SendMenuMask()
+    public static bool SendMenuMask()
     {
         INPUT[] inputs =
         [
             KeyboardInput(VkMenuMask, 0, keyUp: false),
             KeyboardInput(VkMenuMask, 0, keyUp: true),
         ];
-        _ = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
     }
 
     public static bool SendCtrlV()

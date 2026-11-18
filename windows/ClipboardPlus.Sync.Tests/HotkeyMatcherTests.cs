@@ -216,4 +216,149 @@ public sealed class HotkeyMatcherTests
         var matcher = new HotkeyMatcher(HotkeyChord.Default);
         Assert.Throws<ArgumentException>(() => matcher.Target = new HotkeyChord(HotkeyModifier.Ctrl, VkRMenu));
     }
+
+    [Fact]
+    public void KeyPressedBeforeRecordingKeepsPassingThroughRepeatAndRelease()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+
+        // Modifier and normal key pressed before recording starts must pass on repeat and key-up.
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLControl, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkA, true, false).Action);
+
+        matcher.StartRecording();
+
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLControl, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLControl, false, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkA, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkA, false, false).Action);
+        // Key-up for a key pressed before the hook existed must also pass.
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkB, false, false).Action);
+        Assert.True(matcher.IsRecording);
+    }
+
+    [Fact]
+    public void NormalModeKeyPressedBeforeModifierPassesOnRepeatAndRelease()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, false, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, false, false).Action);
+
+        // Extra-modifier chord that initially passed must keep passing on repeat after extra modifier lifts.
+        var ctrlNonConvert = new HotkeyMatcher(new HotkeyChord(HotkeyModifier.Ctrl, VkNonConvert));
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkLControl, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkLShift, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkNonConvert, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkLShift, false, false).Action);
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkNonConvert, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkNonConvert, false, false).Action);
+        Assert.Equal(HotkeyAction.Pass, ctrlNonConvert.Process(VkLControl, false, false).Action);
+    }
+
+    [Fact]
+    public void RecordingKeepsSwallowedModifierAcrossPruneAndCompletesChord()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+        matcher.StartRecording();
+
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkLControl, true, false).Action);
+        // Swallowed key-down is never reflected in GetAsyncKeyState, so prune reports false.
+        matcher.PruneReleasedKeys(_ => false);
+
+        var recorded = matcher.Process(VkNonConvert, true, false);
+        Assert.Equal(HotkeyAction.Swallow, recorded.Action);
+        Assert.Equal(new HotkeyChord(HotkeyModifier.Ctrl, VkNonConvert), recorded.RecordedChord);
+        Assert.False(matcher.IsRecording);
+
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkNonConvert, false, false).Action);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkLControl, false, false).Action);
+    }
+
+    [Fact]
+    public void RecordingEscapeCancelsEvenWhenMultipleModifiersAreHeld()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+        matcher.StartRecording();
+
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkLControl, true, false).Action);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkLShift, true, false).Action);
+
+        var cancelled = matcher.Process(VkEscape, true, false);
+        Assert.Equal(HotkeyAction.Swallow, cancelled.Action);
+        Assert.True(cancelled.RecordingCancelled);
+        Assert.Null(cancelled.RecordedChord);
+        Assert.False(matcher.IsRecording);
+
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkEscape, false, false).Action);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkLShift, false, false).Action);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkLControl, false, false).Action);
+    }
+
+    [Fact]
+    public void SwallowedTriggerKeyStaysSwallowedAcrossPruneWhenWinReleasedFirst()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, true, false).Action);
+        Assert.Equal(HotkeyAction.SwallowAndTrigger, matcher.Process(VkV, true, false).Action);
+
+        // Win key-up arrives while GetAsyncKeyState(V) is false because V was swallowed.
+        matcher.PruneReleasedKeys(vk => vk == VkLWin);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, false, false).Action);
+
+        matcher.PruneReleasedKeys(vk => vk == VkV);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkV, true, false).Action);
+        matcher.PruneReleasedKeys(_ => false);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkV, false, false).Action);
+
+        // Next plain V passes.
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, false, false).Action);
+    }
+
+    [Fact]
+    public void SwallowedTriggerKeyDoesNotRetriggerOnRepeatAfterAnotherKeyWhileWinHeld()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, true, false).Action);
+        Assert.Equal(HotkeyAction.SwallowAndTrigger, matcher.Process(VkV, true, false).Action);
+
+        // Press and release E while Win and V remain held; OS reports only Win (and E) down, not swallowed V.
+        matcher.PruneReleasedKeys(vk => vk == VkLWin || vk == VkE);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkE, true, false).Action);
+        matcher.PruneReleasedKeys(vk => vk == VkLWin || vk == VkE);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkE, false, false).Action);
+
+        // Auto-repeat of V must keep swallowing without triggering again.
+        matcher.PruneReleasedKeys(vk => vk == VkLWin);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkV, true, false).Action);
+        Assert.Equal(HotkeyAction.Swallow, matcher.Process(VkV, false, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, false, false).Action);
+    }
+
+    [Fact]
+    public void RevertSwallowToPassAllowsRepeatAndReleaseToPass()
+    {
+        var matcher = new HotkeyMatcher(HotkeyChord.Default);
+
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, true, false).Action);
+        var match = matcher.Process(VkV, true, false);
+        Assert.Equal(HotkeyAction.SwallowAndTrigger, match.Action);
+        Assert.True(match.NeedsMenuMask);
+
+        matcher.RevertSwallowToPass(VkV);
+
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, true, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkV, false, false).Action);
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, false, false).Action);
+
+        // Fresh Win+V still triggers afterwards.
+        Assert.Equal(HotkeyAction.Pass, matcher.Process(VkLWin, true, false).Action);
+        Assert.Equal(HotkeyAction.SwallowAndTrigger, matcher.Process(VkV, true, false).Action);
+    }
 }

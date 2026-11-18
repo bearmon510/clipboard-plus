@@ -85,7 +85,7 @@ public partial class App : System.Windows.Application
             keyboardHook = new KeyboardHook(OpenHistory, action => Dispatcher.BeginInvoke(action), log.Write);
             ApplyHotkeySettings();
             window.ConfigureHotkey(Settings, RecordHotkeyAsync, ApplyHotkeySettings);
-            window.HistoryRequested += OpenHistory;
+            window.HistoryRequested += OpenHistoryWithoutPaste;
             tray = new Forms.NotifyIcon
             {
                 Text = "clipboard+ for Windows",
@@ -93,7 +93,7 @@ public partial class App : System.Windows.Application
                 Visible = true,
                 ContextMenuStrip = new Forms.ContextMenuStrip()
             };
-            tray.ContextMenuStrip.Items.Add("履歴を開く", null, (_, _) => OpenHistory());
+            tray.ContextMenuStrip.Items.Add("履歴を開く", null, (_, _) => OpenHistoryWithoutPaste());
             tray.ContextMenuStrip.Items.Add("開く", null, (_, _) => OpenWindow());
             tray.ContextMenuStrip.Items.Add("終了", null, async (_, _) => await ExitAsync());
             tray.DoubleClick += (_, _) => OpenWindow();
@@ -162,6 +162,9 @@ public partial class App : System.Windows.Application
             var oldServer = server;
             coordinator = null;
             server = null;
+            // A stopped coordinator copies nothing, so choosing an item would paste stale content.
+            historyWindow?.Attach(null);
+            historyWindow?.Hide();
             try
             {
                 if (oldServer is not null) await oldServer.DisposeAsync();
@@ -192,10 +195,16 @@ public partial class App : System.Windows.Application
         window.Topmost = true; window.Topmost = false;
     }
 
-    private void OpenHistory()
+    private void OpenHistory() => OpenHistory(pasteTarget: true);
+
+    /// <summary>From the tray or the main window, the window in front is not where the user is typing.</summary>
+    private void OpenHistoryWithoutPaste() => OpenHistory(pasteTarget: false);
+
+    private void OpenHistory(bool pasteTarget)
     {
         if (exiting) return;
         var invocation = ForegroundContext.Capture();
+        if (!pasteTarget) invocation = invocation with { PreviousWindow = 0 };
         if (historyPresenter is null)
         {
             log?.Write("history presenter not ready");
@@ -207,8 +216,14 @@ public partial class App : System.Windows.Application
     internal void ApplyHotkeySettings()
     {
         if (exiting || keyboardHook is null) return;
+        var chord = Settings.ParsedHotkey;
+        if (HotkeyRules.Problem(chord) is not null)
+        {
+            log?.Write("hotkey from settings refused; using the default");
+            chord = HotkeyChord.Default;
+        }
         if (Settings.HotkeyEnabled)
-            keyboardHook.Enable(Settings.ParsedHotkey);
+            keyboardHook.Enable(chord);
         else
             keyboardHook.Disable();
     }
@@ -231,6 +246,11 @@ public partial class App : System.Windows.Application
         var currentCoordinator = coordinator;
         server = null;
         coordinator = null;
+        if (historyWindow is not null)
+        {
+            historyWindow.Attach(null);
+            historyWindow.AllowClose = true;
+        }
         try
         {
             if (currentServer is not null) await currentServer.DisposeAsync();

@@ -5,7 +5,7 @@
         WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
         Background="{DynamicResource Bg}" Foreground="{DynamicResource Fg}"
         FontFamily="Yu Gothic UI, Segoe UI" FontSize="14"
-        PreviewKeyDown="OnPreviewKeyDown" Deactivated="OnDeactivated">
+        PreviewKeyDown="OnPreviewKeyDown" Deactivated="OnDeactivated" Closing="OnClosing">
   <Border BorderBrush="{DynamicResource Line}" BorderThickness="1">
     <Grid>
       <Grid.RowDefinitions>
@@ -26,7 +26,8 @@
                Focusable="False"
                ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.ScrollUnit="Pixel"
-               PreviewMouseLeftButtonUp="OnListClick" PreviewMouseRightButtonDown="OnListRightDown">
+               PreviewMouseLeftButtonUp="OnListClick" PreviewMouseRightButtonDown="OnListRightDown"
+               ContextMenuOpening="OnContextMenuOpening">
         <ListBox.ItemContainerStyle>
           <Style TargetType="ListBoxItem">
             <Setter Property="Margin" Value="0,0,0,4"/>
@@ -72,7 +73,7 @@
           </DataTemplate>
         </ListBox.ItemTemplate>
         <ListBox.ContextMenu>
-          <ContextMenu>
+          <ContextMenu Closed="OnContextMenuClosed">
             <MenuItem Header="貼り付ける" Click="OnMenuPaste"/>
             <MenuItem Header="コピーだけする" Click="OnMenuCopy"/>
             <Separator/>
@@ -87,7 +88,7 @@
       <Grid Grid.Row="2" Margin="12,4,6,8">
         <TextBlock Text="Enter 貼り付け　Ctrl+Enter コピー　Delete 削除" FontSize="11"
                    Foreground="{DynamicResource Sub}" VerticalAlignment="Center"/>
-        <Button Content="設定" HorizontalAlignment="Right" Padding="10,3" Cursor="Hand" Click="OnSettings"
+        <Button Content="設定" HorizontalAlignment="Right" Padding="10,3" Cursor="Hand" Click="OnSettings" Focusable="False"
                 Background="Transparent" BorderThickness="0" Foreground="{DynamicResource Accent}"/>
       </Grid>
     </Grid>

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -42,12 +43,14 @@ public sealed class HistoryRow
         if (string.IsNullOrEmpty(path)) return null;
         try
         {
+            // The stream is closed here, and shared for deletion, so cleaning up bodies never waits on it.
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             var bitmap = new BitmapImage();
             bitmap.BeginInit();
             bitmap.CacheOption = BitmapCacheOption.OnLoad;
             bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
-            bitmap.DecodePixelWidth = 112; // Twice the 56-pixel slot, so a full-size image is never decoded.
-            bitmap.UriSource = new Uri(path);
+            bitmap.DecodePixelHeight = 84; // Twice the 42-pixel slot, so a full-size image is never decoded.
+            bitmap.StreamSource = stream;
             bitmap.EndInit();
             bitmap.Freeze();
             return bitmap;
@@ -62,6 +65,7 @@ public sealed class HistoryRow
 /// </summary>
 public partial class HistoryWindow : Window, IHistoryPresenter
 {
+    private const double CaretLineHeight = 32; // Room left for the caret's own line when opening upward.
     private readonly Action<string> log;
     private readonly Func<bool> pasteOnSelect;
     private readonly Func<nint, CancellationToken, Task<bool>> paste;
@@ -69,8 +73,11 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private readonly ObservableCollection<HistoryRow> rows = [];
     private SyncCoordinator? coordinator;
     private HistoryInvocation? invocation;
+    private CancellationTokenSource? pasteCancel;
     private int reloadVersion;
+    private int? preferredIndex;
     private bool choosing;
+    private bool deleting;
 
     public HistoryWindow(Action<string> log, Func<bool> pasteOnSelect,
         Func<nint, CancellationToken, Task<bool>> paste, Action openSettings)
@@ -83,9 +90,14 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         HistoryList.ItemsSource = rows;
         ApplyTheme();
         SourceInitialized += (_, _) => RoundCorners();
+        // Hidden rows keep decoded thumbnails alive, so they go with the window.
+        IsVisibleChanged += (_, _) => { if (!IsVisible) rows.Clear(); };
     }
 
-    /// <summary>Follows the coordinator, which re-pairing replaces.</summary>
+    /// <summary>Set when the app exits. Until then, closing (Alt+F4) only hides the reused window.</summary>
+    public bool AllowClose { get; set; }
+
+    /// <summary>Follows the coordinator, which re-pairing replaces. Null while there is none.</summary>
     public void Attach(SyncCoordinator? next)
     {
         if (coordinator is not null) coordinator.HistoryChanged -= OnHistoryChanged;
@@ -96,6 +108,8 @@ public partial class HistoryWindow : Window, IHistoryPresenter
 
     public void Present(HistoryInvocation value)
     {
+        // A paste still waiting for keys to be released belongs to the previous opening.
+        pasteCancel?.Cancel();
         // The hotkey a second time closes the window, as Win+V does.
         if (IsVisible) { Hide(); return; }
         invocation = value;
@@ -130,7 +144,10 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         foreach (var item in items) rows.Add(new HistoryRow(item, now));
         EmptyText.Text = HistoryText.Empty(search);
         EmptyText.Visibility = rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        // Keep the selected item; if it is gone (deleted), stay at the same place in the list.
         var index = selected is Guid id ? IndexOf(id) : -1;
+        if (index < 0 && preferredIndex is int place) index = Math.Min(place, rows.Count - 1);
+        preferredIndex = null;
         HistoryList.SelectedIndex = index >= 0 ? index : (rows.Count > 0 ? 0 : -1);
         if (HistoryList.SelectedItem is not null) HistoryList.ScrollIntoView(HistoryList.SelectedItem);
     }
@@ -156,24 +173,39 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         var current = coordinator;
         if (row is null || current is null || choosing) return;
         choosing = true;
+        nint target;
         try
         {
             await current.CopyHistoryAsync(row.Item.Id);
-            var target = invocation?.PreviousWindow ?? 0;
-            Hide();
+            target = invocation?.PreviousWindow ?? 0;
             // Opened from clipboard+'s own window or tray, there is nothing to paste into.
-            if (pasteAfter && target != 0 && !IsOwnWindow(target))
-            {
-                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-                if (!await paste(target, timeout.Token)) log("history paste not delivered");
-            }
+            pasteAfter = pasteAfter && target != 0 && IsWindow(target) && !IsOwnWindow(target);
+            // While this window still holds the foreground, hand it back; once hidden, Windows may refuse.
+            if (pasteAfter) SetForegroundWindow(target);
+            Hide();
         }
         catch (Exception ex)
         {
             // An item deleted meanwhile, or an image the clipboard refuses.
             log($"history choose error={ex.GetType().Name}");
+            return;
         }
         finally { choosing = false; }
+
+        if (!pasteAfter) return;
+        pasteCancel?.Cancel();
+        var cancel = pasteCancel = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        try
+        {
+            if (!await paste(target, cancel.Token)) log("history paste not delivered");
+        }
+        catch (OperationCanceledException) { log("history paste cancelled"); }
+        catch (Exception ex) { log($"history paste error={ex.GetType().Name}"); }
+        finally
+        {
+            if (pasteCancel == cancel) pasteCancel = null;
+            cancel.Dispose();
+        }
     }
 
     private static bool IsOwnWindow(nint window)
@@ -185,17 +217,19 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private async Task DeleteAsync(HistoryRow? row)
     {
         var current = coordinator;
-        if (row is null || current is null) return;
-        var index = HistoryList.SelectedIndex;
+        if (row is null || current is null || deleting) return;
+        deleting = true;
+        // HistoryChanged reloads the list; this keeps the selection at the same place.
+        preferredIndex = HistoryList.SelectedIndex;
         try { await current.DeleteHistoryAsync(row.Item.Id); }
-        catch (Exception ex) { log($"history delete error={ex.GetType().Name}"); return; }
-        await ReloadAsync();
-        if (rows.Count > 0) HistoryList.SelectedIndex = Math.Clamp(index, 0, rows.Count - 1);
+        catch (Exception ex) { log($"history delete error={ex.GetType().Name}"); preferredIndex = null; }
+        finally { deleting = false; }
     }
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
-        var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+        // AttachThreadInput can reset this thread's key state, so Ctrl is also asked of Windows.
+        var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0 || (GetAsyncKeyState(VirtualKeyControl) & 0x8000) != 0;
         switch (e.Key)
         {
             case Key.Escape: Hide(); break;
@@ -227,6 +261,18 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         if (RowAt(e.OriginalSource) is { } row) HistoryList.SelectedItem = row;
     }
 
+    /// <summary>The menu acts on the row under the pointer, so it does not open over empty space.</summary>
+    private void OnContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (RowAt(e.OriginalSource) is null) e.Handled = true;
+    }
+
+    private void OnContextMenuClosed(object sender, RoutedEventArgs e)
+    {
+        // Closing the menu by clicking another app leaves this window inactive without a new Deactivated.
+        if (IsVisible && !IsActive && !choosing) Hide();
+    }
+
     private HistoryRow? RowAt(object source) =>
         source is DependencyObject element && ItemsControl.ContainerFromElement(HistoryList, element) is ListBoxItem item
             ? item.DataContext as HistoryRow
@@ -249,6 +295,13 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         Hide();
     }
 
+    private void OnClosing(object? sender, CancelEventArgs e)
+    {
+        if (AllowClose) return;
+        e.Cancel = true; // Alt+F4 would destroy the window that the hotkey reuses.
+        Hide();
+    }
+
     /// <summary>Below the caret if known, else by the pointer, kept inside the work area of that screen.</summary>
     private void PlaceNear(HistoryInvocation value)
     {
@@ -256,47 +309,38 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         var fromDevice = source?.CompositionTarget?.TransformFromDevice ?? Matrix.Identity;
         var anchorX = value.CaretX ?? value.CursorX;
         var anchorY = value.CaretY ?? value.CursorY;
-        var work = WorkArea(anchorX, anchorY);
+        // Screen gives the work area in the same device units as the caret and pointer positions.
+        var work = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point(anchorX, anchorY)).WorkingArea;
         var topLeft = fromDevice.Transform(new Point(work.Left, work.Top));
         var bottomRight = fromDevice.Transform(new Point(work.Right, work.Bottom));
         var anchor = fromDevice.Transform(new Point(anchorX, anchorY));
-        var gap = value.CaretY is null ? 8.0 : 24.0; // Below the caret's line, or just off the pointer.
-        var x = anchor.X;
-        var y = anchor.Y + gap;
-        if (y + Height > bottomRight.Y) y = anchor.Y - Height - 8; // No room below: open upward.
-        Left = Math.Clamp(x, topLeft.X, Math.Max(topLeft.X, bottomRight.X - Width));
+        var caretKnown = value.CaretY is not null;
+        // CaretY is the bottom of the caret: open just below it, or above its line if there is no room.
+        var y = anchor.Y + (caretKnown ? 6 : 8);
+        if (y + Height > bottomRight.Y) y = anchor.Y - Height - (caretKnown ? CaretLineHeight : 8);
+        Left = Math.Clamp(anchor.X, topLeft.X, Math.Max(topLeft.X, bottomRight.X - Width));
         Top = Math.Clamp(y, topLeft.Y, Math.Max(topLeft.Y, bottomRight.Y - Height));
-    }
-
-    private static Rect WorkArea(int x, int y)
-    {
-        var monitor = MonitorFromPoint(new NativePoint { X = x, Y = y }, MonitorDefaultToNearest);
-        var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
-        if (monitor != 0 && GetMonitorInfo(monitor, ref info))
-            return new Rect(info.Work.Left, info.Work.Top, info.Work.Right - info.Work.Left, info.Work.Bottom - info.Work.Top);
-        return SystemParameters.WorkArea;
     }
 
     /// <summary>
     /// The hotkey arrives while another app is in front, and Windows may refuse to hand the
-    /// foreground to us. Joining the front window's input queue for the call is the usual way in.
+    /// foreground to us. Joining the front window's input queue for the call is the usual way in,
+    /// but not with a window that has stopped responding, which would stall this thread too.
     /// </summary>
     private void BringToFront(nint hwnd)
     {
         var front = GetForegroundWindow();
-        if (front == hwnd) { Activate(); return; }
-        var frontThread = GetWindowThreadProcessId(front, out _);
-        var selfThread = GetCurrentThreadId();
-        var attached = frontThread != 0 && frontThread != selfThread && AttachThreadInput(selfThread, frontThread, true);
-        try
+        if (front == hwnd || SetForegroundWindow(hwnd)) { Activate(); return; }
+        if (front != 0 && !IsHungAppWindow(front))
         {
-            SetForegroundWindow(hwnd);
-            Activate();
+            var frontThread = GetWindowThreadProcessId(front, out _);
+            var selfThread = GetCurrentThreadId();
+            var attached = frontThread != 0 && frontThread != selfThread && AttachThreadInput(selfThread, frontThread, true);
+            try { SetForegroundWindow(hwnd); }
+            finally { if (attached) AttachThreadInput(selfThread, frontThread, false); }
         }
-        finally
-        {
-            if (attached) AttachThreadInput(selfThread, frontThread, false);
-        }
+        Activate();
+        if (GetForegroundWindow() != hwnd) log("history window could not take the foreground");
     }
 
     private void ApplyTheme()
@@ -328,20 +372,16 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         _ = DwmSetWindowAttribute(new WindowInteropHelper(this).Handle, DwmWindowCornerPreference, ref preference, sizeof(int));
     }
 
-    private const int MonitorDefaultToNearest = 2;
+    private const int VirtualKeyControl = 0x11;
     private const int DwmWindowCornerPreference = 33;
     private const int DwmRound = 2;
 
-    [StructLayout(LayoutKind.Sequential)] private struct NativePoint { public int X, Y; }
-    [StructLayout(LayoutKind.Sequential)] private struct NativeRect { public int Left, Top, Right, Bottom; }
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MonitorInfo { public int Size; public NativeRect Monitor; public NativeRect Work; public uint Flags; }
-
-    [DllImport("user32.dll")] private static extern nint MonitorFromPoint(NativePoint point, int flags);
-    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetMonitorInfo(nint monitor, ref MonitorInfo info);
     [DllImport("user32.dll")] private static extern nint GetForegroundWindow();
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetForegroundWindow(nint hwnd);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindow(nint hwnd);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsHungAppWindow(nint hwnd);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out uint processId);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, [MarshalAs(UnmanagedType.Bool)] bool attach);
     [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
