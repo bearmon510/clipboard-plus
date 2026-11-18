@@ -22,8 +22,18 @@ final class ScreenSnapshotTests: XCTestCase {
     private static let narrow = CGSize(width: 360, height: 780)
     private static let wide = CGSize(width: 1_024, height: 768)
     private static let phone = CGSize(width: 393, height: 852)
-    private static let keyboardPhone = CGSize(width: 393, height: 284)
-    private static let keyboardPad = CGSize(width: 1_024, height: 340)
+    private static let keyboardPhone = CGSize(
+        width: 393,
+        height: KeyboardLayoutMetrics.preferredHeight(idiom: .phone, verticalSizeClass: .regular, width: 393)
+    )
+    private static let keyboardPad = CGSize(
+        width: 1_024,
+        height: KeyboardLayoutMetrics.preferredHeight(idiom: .pad, verticalSizeClass: .regular, width: 1_024)
+    )
+    private static let keyboardPadLandscape = CGSize(
+        width: 1_366,
+        height: KeyboardLayoutMetrics.preferredHeight(idiom: .pad, verticalSizeClass: .regular, width: 1_366)
+    )
 
     /// The first-run guide would otherwise open over every main screen.
     override func setUp() {
@@ -228,14 +238,27 @@ final class ScreenSnapshotTests: XCTestCase {
             referenceDateOverride: now
         )
         try save(renderKeyboard(fullAccessPhone, size: Self.keyboardPhone, style: .light), "keyboard-fullaccess-phone-light")
+
+        let historyPadLandscape = KeyboardViewModel(
+            entries: entries,
+            initialTab: .history,
+            loadState: .loaded,
+            hasFullAccess: false,
+            needsInputModeSwitchKey: true,
+            referenceDateOverride: now
+        )
+        try save(
+            renderKeyboard(historyPadLandscape, size: Self.keyboardPadLandscape, style: .light),
+            "keyboard-history-pad-landscape-light"
+        )
     }
 
     @MainActor
     private func renderKeyboard(_ model: KeyboardViewModel, size: CGSize, style: UIUserInterfaceStyle) -> UIImage {
         let view = KeyboardView(model: model)
-            .frame(width: size.width, height: size.height)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(KeyboardTheme.page)
-        return render(view, size: size, style: style)
+        return render(view, size: size, style: style, ignoresWindowSafeArea: true)
     }
 
     private func sampleKeyboardEntries(now: Date) -> [KeyboardHistoryEntry] {
@@ -398,8 +421,16 @@ final class ScreenSnapshotTests: XCTestCase {
     // MARK: Rendering
 
     @MainActor
-    private func render<Content: View>(_ view: Content, size: CGSize, style: UIUserInterfaceStyle) -> UIImage {
+    private func render<Content: View>(
+        _ view: Content,
+        size: CGSize,
+        style: UIUserInterfaceStyle,
+        ignoresWindowSafeArea: Bool = false
+    ) -> UIImage {
         let controller = UIHostingController(rootView: view)
+        if ignoresWindowSafeArea {
+            controller.safeAreaRegions = []
+        }
         controller.overrideUserInterfaceStyle = style
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: CGRect(origin: .zero, size: size))

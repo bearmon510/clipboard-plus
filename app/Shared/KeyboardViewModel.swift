@@ -135,6 +135,45 @@ enum KeyboardEntryPreview {
     }
 }
 
+struct KeyboardAlphanumericMetrics: Equatable, Sendable {
+    let keyHeight: CGFloat
+    let rowSpacing: CGFloat
+    let topPadding: CGFloat
+    let bottomPadding: CGFloat
+    let horizontalPadding: CGFloat
+    let keySpacing: CGFloat
+    let row2Indent: CGFloat
+    let modifierWidth: CGFloat
+    let compactBottomWidth: CGFloat
+    let backWidth: CGFloat
+    let returnWidth: CGFloat
+    let keyFontSize: CGFloat
+
+    func totalContentHeight(rowCount: Int) -> CGFloat {
+        let rows = max(1, rowCount)
+        return CGFloat(rows) * keyHeight
+            + CGFloat(rows - 1) * rowSpacing
+            + topPadding
+            + bottomPadding
+    }
+}
+
+struct KeyboardListMetrics: Equatable, Sendable {
+    let keyHeight: CGFloat
+    let topBarVerticalPadding: CGFloat
+    let bottomBarTopPadding: CGFloat
+    let bottomBarBottomPadding: CGFloat
+    let bottomBarHorizontalPadding: CGFloat
+    let keySpacing: CGFloat
+    let compactKeyWidth: CGFloat
+    let abcWidth: CGFloat
+    let returnWidth: CGFloat
+
+    var bottomBarHeight: CGFloat {
+        keyHeight + bottomBarTopPadding + bottomBarBottomPadding
+    }
+}
+
 enum KeyboardLayoutMetrics {
     static func preferredHeight(
         idiom: UIUserInterfaceIdiom,
@@ -156,11 +195,81 @@ enum KeyboardLayoutMetrics {
         width >= 600 ? 2 : 1
     }
 
-    static func keyHeight(idiom: UIUserInterfaceIdiom, availableHeight: CGFloat) -> CGFloat {
-        if availableHeight > 0 && availableHeight < 235 {
-            return 36
+    static func alphanumericMetrics(
+        width: CGFloat,
+        availableHeight: CGFloat,
+        rowCount: Int
+    ) -> KeyboardAlphanumericMetrics {
+        let isWide = width >= 600
+        let isCompactHeight = availableHeight > 0 && availableHeight < 235
+        let rows = max(1, rowCount)
+        let topPadding: CGFloat = isCompactHeight ? 4 : 6
+        let bottomPadding: CGFloat = isCompactHeight ? 6 : (isWide ? 10 : 8)
+        let rowSpacing: CGFloat = isCompactHeight ? 4 : (isWide ? 7 : 6)
+
+        let desiredKeyHeight: CGFloat
+        if isCompactHeight {
+            desiredKeyHeight = rows >= 5 ? 36 : 42
+        } else if isWide {
+            desiredKeyHeight = 56
+        } else {
+            desiredKeyHeight = rows >= 5 ? 48 : 52
         }
-        return idiom == .pad ? 48 : 42
+
+        let keyHeight: CGFloat
+        if availableHeight > 0 {
+            let chrome = topPadding + bottomPadding + CGFloat(rows - 1) * rowSpacing
+            let fitting = floor(max(0, availableHeight - chrome) / CGFloat(rows))
+            keyHeight = max(24, min(desiredKeyHeight, fitting))
+        } else {
+            keyHeight = desiredKeyHeight
+        }
+
+        let keyFontSize: CGFloat = keyHeight <= 36 ? 18 : (keyHeight >= 52 ? 21 : 20)
+
+        return KeyboardAlphanumericMetrics(
+            keyHeight: keyHeight,
+            rowSpacing: rowSpacing,
+            topPadding: topPadding,
+            bottomPadding: bottomPadding,
+            horizontalPadding: isWide ? 10 : 4,
+            keySpacing: isWide ? 7 : 4,
+            row2Indent: isWide ? 28 : 12,
+            modifierWidth: isWide ? 58 : 44,
+            compactBottomWidth: isWide ? 60 : 44,
+            backWidth: isWide ? 72 : 54,
+            returnWidth: isWide ? 84 : 60,
+            keyFontSize: keyFontSize
+        )
+    }
+
+    static func listMetrics(width: CGFloat, availableHeight: CGFloat) -> KeyboardListMetrics {
+        let isWide = width >= 600
+        let isCompactHeight = availableHeight > 0 && availableHeight < 235
+        return KeyboardListMetrics(
+            keyHeight: isCompactHeight ? 34 : (isWide ? 42 : 38),
+            topBarVerticalPadding: isCompactHeight ? 4 : 6,
+            bottomBarTopPadding: isCompactHeight ? 4 : 6,
+            bottomBarBottomPadding: isCompactHeight ? 6 : (isWide ? 10 : 8),
+            bottomBarHorizontalPadding: isWide ? 10 : 6,
+            keySpacing: isWide ? 8 : 5,
+            compactKeyWidth: isWide ? 56 : 44,
+            abcWidth: isWide ? 66 : 52,
+            returnWidth: isWide ? 82 : 58
+        )
+    }
+
+    static func keyHeight(
+        idiom: UIUserInterfaceIdiom,
+        availableHeight: CGFloat,
+        rowCount: Int = 5
+    ) -> CGFloat {
+        let width: CGFloat = idiom == .pad ? 768 : 393
+        return alphanumericMetrics(
+            width: width,
+            availableHeight: availableHeight,
+            rowCount: rowCount
+        ).keyHeight
     }
 }
 

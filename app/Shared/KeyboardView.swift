@@ -35,23 +35,27 @@ struct KeyboardView: View {
     private var listBody: some View {
         GeometryReader { proxy in
             let isCompactHeight = proxy.size.height > 0 && proxy.size.height < 235
-            let isWide = proxy.size.width >= 600
-            let keyHeight: CGFloat = isCompactHeight ? 34 : (isWide ? 42 : 38)
+            let metrics = KeyboardLayoutMetrics.listMetrics(
+                width: proxy.size.width,
+                availableHeight: proxy.size.height
+            )
 
             VStack(spacing: 0) {
-                topBar
+                topBar(verticalPadding: metrics.topBarVerticalPadding)
+                    .layoutPriority(1)
                 ZStack(alignment: .bottom) {
-                    listContent(width: proxy.size.width)
+                    listContent(width: proxy.size.width, isCompactHeight: isCompactHeight)
                     statusToast
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                listBottomBar(isWide: isWide, keyHeight: keyHeight)
+                .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                listBottomBar(metrics: metrics)
+                    .layoutPriority(1)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var topBar: some View {
+    private func topBar(verticalPadding: CGFloat) -> some View {
         HStack(spacing: 8) {
             Picker("表示", selection: $model.selectedTab) {
                 ForEach(KeyboardTab.allCases) { tab in
@@ -59,7 +63,7 @@ struct KeyboardView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(minWidth: 140, maxWidth: 210)
+            .frame(minWidth: 120, maxWidth: 210)
 
             Spacer(minLength: 4)
 
@@ -74,61 +78,67 @@ struct KeyboardView: View {
                             .font(.caption.weight(.semibold))
                             .lineLimit(1)
                             .minimumScaleFactor(0.85)
-                            .padding(.horizontal, 10)
-                            .frame(minHeight: 30)
+                            .padding(.horizontal, 4)
                     }
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.capsule)
-                    .tint(KeyboardTheme.accent)
+                    .controlSize(.small)
+                    .tint(KeyboardTheme.accentKey)
                     .layoutPriority(1)
                 }
             }
         }
         .padding(.horizontal, 10)
-        .padding(.top, 6)
-        .padding(.bottom, 6)
+        .padding(.vertical, verticalPadding)
     }
 
     @ViewBuilder
-    private func listContent(width: CGFloat) -> some View {
+    private func listContent(width: CGFloat, isCompactHeight: Bool) -> some View {
         switch model.loadState {
         case .loading:
             Color.clear
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .unavailable:
-            guidanceView(
+            guidanceScrollView(
                 symbol: "doc.on.clipboard",
                 title: "clipboard+ を一度開くと、ここに履歴が出ます",
-                subtitle: "本体アプリを開くと、コピーした履歴とテンプレートが使えます。"
+                subtitle: "本体アプリを開くと、コピーした履歴とテンプレートが使えます。",
+                isCompactHeight: isCompactHeight
             )
         case .loaded:
             let columns = KeyboardLayoutMetrics.columnCount(forWidth: width)
-            TimelineView(.periodic(from: .now, by: 30)) { context in
-                let now = model.referenceDateOverride ?? context.date
-                ScrollView {
-                    if model.selectedTab == .history {
-                        if model.historyEntries.isEmpty {
-                            guidanceView(
-                                symbol: "doc.on.clipboard",
-                                title: "履歴はまだありません",
-                                subtitle: "clipboard+ でコピーした文章やリンクが、ここに並びます。"
-                            )
+            GeometryReader { listProxy in
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    let now = model.referenceDateOverride ?? context.date
+                    ScrollView {
+                        if model.selectedTab == .history {
+                            if model.historyEntries.isEmpty {
+                                guidanceView(
+                                    symbol: "doc.on.clipboard",
+                                    title: "履歴はまだありません",
+                                    subtitle: "clipboard+ でコピーした文章やリンクが、ここに並びます。",
+                                    isCompactHeight: isCompactHeight
+                                )
+                                .frame(maxWidth: .infinity, minHeight: listProxy.size.height)
+                            } else {
+                                historyList(now: now, columnCount: columns)
+                            }
                         } else {
-                            historyList(now: now, columnCount: columns)
-                        }
-                    } else {
-                        if model.templateGroups.isEmpty {
-                            guidanceView(
-                                symbol: "square.stack",
-                                title: "テンプレートはまだありません",
-                                subtitle: "clipboard+ の「テンプレート」で作った定型文が、ここに並びます。"
-                            )
-                        } else {
-                            templateList(columnCount: columns)
+                            if model.templateGroups.isEmpty {
+                                guidanceView(
+                                    symbol: "square.stack",
+                                    title: "テンプレートはまだありません",
+                                    subtitle: "clipboard+ の「テンプレート」で作った定型文が、ここに並びます。",
+                                    isCompactHeight: isCompactHeight
+                                )
+                                .frame(maxWidth: .infinity, minHeight: listProxy.size.height)
+                            } else {
+                                templateList(columnCount: columns)
+                            }
                         }
                     }
+                    .id(model.selectedTab)
                 }
-                .id(model.selectedTab)
             }
         }
     }
@@ -162,7 +172,7 @@ struct KeyboardView: View {
                             .lineLimit(1)
                         Text("\(group.entries.count)")
                             .font(.caption2.weight(.medium))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                     }
                     .padding(.horizontal, 4)
@@ -209,25 +219,52 @@ struct KeyboardView: View {
         }
     }
 
-    private func guidanceView(symbol: String, title: String, subtitle: String) -> some View {
-        VStack(spacing: 8) {
+    private func guidanceScrollView(
+        symbol: String,
+        title: String,
+        subtitle: String,
+        isCompactHeight: Bool
+    ) -> some View {
+        GeometryReader { listProxy in
+            ScrollView {
+                guidanceView(
+                    symbol: symbol,
+                    title: title,
+                    subtitle: subtitle,
+                    isCompactHeight: isCompactHeight
+                )
+                .frame(maxWidth: .infinity, minHeight: listProxy.size.height)
+            }
+        }
+    }
+
+    private func guidanceView(
+        symbol: String,
+        title: String,
+        subtitle: String,
+        isCompactHeight: Bool
+    ) -> some View {
+        let iconSize: CGFloat = isCompactHeight ? 32 : 40
+        return VStack(spacing: isCompactHeight ? 5 : 8) {
             Image(systemName: symbol)
-                .font(.title3.weight(.medium))
+                .font((isCompactHeight ? Font.callout : Font.title3).weight(.medium))
                 .foregroundStyle(KeyboardTheme.accent)
-                .frame(width: 40, height: 40)
+                .frame(width: iconSize, height: iconSize)
                 .background(KeyboardTheme.accent.opacity(0.12), in: Circle())
                 .accessibilityHidden(true)
             Text(title)
-                .font(.subheadline.weight(.semibold))
+                .font((isCompactHeight ? Font.footnote : Font.subheadline).weight(.semibold))
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
             Text(subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.vertical, isCompactHeight ? 8 : 14)
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -251,15 +288,14 @@ struct KeyboardView: View {
         }
     }
 
-    private func listBottomBar(isWide: Bool, keyHeight: CGFloat) -> some View {
-        let spacing: CGFloat = isWide ? 8 : 5
-        let compactWidth: CGFloat = isWide ? 56 : 44
-        let abcWidth: CGFloat = isWide ? 66 : 52
-        let returnWidth: CGFloat = isWide ? 82 : 58
-
-        return HStack(spacing: spacing) {
+    private func listBottomBar(metrics: KeyboardListMetrics) -> some View {
+        HStack(spacing: metrics.keySpacing) {
             if model.needsInputModeSwitchKey {
-                KeyboardGlobeKeyContainer(keyHeight: keyHeight, width: compactWidth, slot: globeButtonSlot)
+                KeyboardGlobeKeyContainer(
+                    keyHeight: metrics.keyHeight,
+                    width: metrics.compactKeyWidth,
+                    slot: globeButtonSlot
+                )
             }
             Button {
                 model.switchToAlphanumeric()
@@ -267,7 +303,7 @@ struct KeyboardView: View {
                 Text("ABC")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(Color.primary)
-                    .frame(width: abcWidth, height: keyHeight)
+                    .frame(width: metrics.abcWidth, height: metrics.keyHeight)
             }
             .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.specialKey))
             .accessibilityLabel("英数字キーボード")
@@ -279,12 +315,12 @@ struct KeyboardView: View {
                     .font(.subheadline)
                     .foregroundStyle(Color.primary)
                     .frame(maxWidth: .infinity)
-                    .frame(height: keyHeight)
+                    .frame(height: metrics.keyHeight)
             }
             .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.letterKey))
             .accessibilityLabel("空白")
 
-            KeyboardRepeatableDeleteKey(keyHeight: keyHeight, width: compactWidth) {
+            KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.compactKeyWidth) {
                 model.tapDelete()
             }
 
@@ -294,14 +330,14 @@ struct KeyboardView: View {
                 Text("改行")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(Color.white)
-                    .frame(width: returnWidth, height: keyHeight)
+                    .frame(width: metrics.returnWidth, height: metrics.keyHeight)
             }
-            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.accent))
+            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.accentKey))
             .accessibilityLabel("改行")
         }
-        .padding(.horizontal, isWide ? 10 : 6)
-        .padding(.top, 4)
-        .padding(.bottom, 6)
+        .padding(.horizontal, metrics.bottomBarHorizontalPadding)
+        .padding(.top, metrics.bottomBarTopPadding)
+        .padding(.bottom, metrics.bottomBarBottomPadding)
     }
 }
 

@@ -39,21 +39,23 @@ struct SettingsView: View {
                     CaptureSettingsSection(screenshots: screenshots)
                 }
                 Section("キーボード") {
-                    Picker("開いたときのタブ", selection: Binding(
-                        get: { monitor.keyboardInitialTab },
-                        set: { monitor.setKeyboardInitialTab($0) }
-                    )) {
-                        ForEach(KeyboardTab.allCases) { tab in
-                            Text(tab.title).tag(tab)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("開いたときのタブ")
+                        Picker("開いたときのタブ", selection: Binding(
+                            get: { monitor.keyboardInitialTab },
+                            set: { monitor.setKeyboardInitialTab($0) }
+                        )) {
+                            ForEach(KeyboardTab.allCases) { tab in
+                                Text(tab.title).tag(tab)
+                            }
                         }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
                     }
-                    .pickerStyle(.segmented)
-                    .frame(minHeight: 44)
+                    .padding(.vertical, 4)
                     Text("この\(DeviceKind.current.name)でほかのアプリに履歴やテンプレートを入れるには、設定アプリ →「一般」→「キーボード」→「キーボード」→「新しいキーボードを追加…」で「clipboard+」を選び、入力中に地球儀キーで切り替えます。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("必要に応じて「フルアクセスを許可」をオンにすると、キーボード上の「今のコピーを保存」からコピーした文章やリンクを保存できます。オフのままでも履歴とテンプレートの挿入は使えます。")
+                    Text("必要に応じて「フルアクセスを許可」をオンにすると、キーボード上部の保存ボタンからクリップボードの文章やリンクを保存できます。オフのままでも履歴とテンプレートの挿入は使えます。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -63,6 +65,7 @@ struct SettingsView: View {
                         }
                     } label: {
                         Label("設定を開く", systemImage: "gear")
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(minHeight: 44)
                 }

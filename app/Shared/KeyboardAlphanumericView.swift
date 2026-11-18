@@ -18,86 +18,123 @@ struct KeyboardAlphanumericView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let isWide = proxy.size.width >= 600
-            let keySpacing: CGFloat = isWide ? 7 : 4
-            let rowSpacing: CGFloat = proxy.size.height < 235 ? 5 : 8
-            let sidePadding: CGFloat = isWide ? 10 : 4
-            let keyHeight = KeyboardLayoutMetrics.keyHeight(
-                idiom: isWide ? .pad : .phone,
-                availableHeight: proxy.size.height
+            let rowCount = model.alphanumericPage == .letters ? 5 : 4
+            let metrics = KeyboardLayoutMetrics.alphanumericMetrics(
+                width: proxy.size.width,
+                availableHeight: proxy.size.height,
+                rowCount: rowCount
             )
-            let modifierWidth: CGFloat = isWide ? 58 : 44
 
-            VStack(spacing: rowSpacing) {
+            VStack(spacing: metrics.rowSpacing) {
                 Spacer(minLength: 0)
                 switch model.alphanumericPage {
                 case .letters:
                     characterRow(
-                        Self.row1Letters.map { model.shiftState.isUppercased ? $0.uppercased() : $0 },
-                        spacing: keySpacing,
-                        keyHeight: keyHeight
+                        Self.row1Numbers,
+                        spacing: metrics.keySpacing,
+                        keyHeight: metrics.keyHeight,
+                        fontSize: metrics.keyFontSize
                     )
-                    HStack(spacing: keySpacing) {
-                        Spacer(minLength: isWide ? 24 : 12)
+                    characterRow(
+                        Self.row1Letters.map { model.shiftState.isUppercased ? $0.uppercased() : $0 },
+                        spacing: metrics.keySpacing,
+                        keyHeight: metrics.keyHeight,
+                        fontSize: metrics.keyFontSize
+                    )
+                    HStack(spacing: metrics.keySpacing) {
+                        Spacer(minLength: metrics.row2Indent)
                         characterRow(
                             Self.row2Letters.map { model.shiftState.isUppercased ? $0.uppercased() : $0 },
-                            spacing: keySpacing,
-                            keyHeight: keyHeight
+                            spacing: metrics.keySpacing,
+                            keyHeight: metrics.keyHeight,
+                            fontSize: metrics.keyFontSize
                         )
-                        Spacer(minLength: isWide ? 24 : 12)
+                        Spacer(minLength: metrics.row2Indent)
                     }
-                    HStack(spacing: keySpacing) {
-                        shiftKey(width: modifierWidth, height: keyHeight)
+                    HStack(spacing: metrics.keySpacing) {
+                        shiftKey(width: metrics.modifierWidth, height: metrics.keyHeight)
                         characterRow(
                             Self.row3Letters.map { model.shiftState.isUppercased ? $0.uppercased() : $0 },
-                            spacing: keySpacing,
-                            keyHeight: keyHeight
+                            spacing: metrics.keySpacing,
+                            keyHeight: metrics.keyHeight,
+                            fontSize: metrics.keyFontSize
                         )
-                        KeyboardRepeatableDeleteKey(keyHeight: keyHeight, width: modifierWidth) {
+                        KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.modifierWidth) {
                             model.tapDelete()
                         }
                     }
                 case .numbers:
-                    characterRow(Self.row1Numbers, spacing: keySpacing, keyHeight: keyHeight)
-                    characterRow(Self.row2Numbers, spacing: keySpacing, keyHeight: keyHeight)
-                    HStack(spacing: keySpacing) {
-                        specialActionKey("#+=", width: modifierWidth, height: keyHeight, labelFont: .caption.weight(.medium)) {
+                    characterRow(
+                        Self.row1Numbers,
+                        spacing: metrics.keySpacing,
+                        keyHeight: metrics.keyHeight,
+                        fontSize: metrics.keyFontSize
+                    )
+                    characterRow(
+                        Self.row2Numbers,
+                        spacing: metrics.keySpacing,
+                        keyHeight: metrics.keyHeight,
+                        fontSize: metrics.keyFontSize
+                    )
+                    HStack(spacing: metrics.keySpacing) {
+                        specialActionKey("#+=", width: metrics.modifierWidth, height: metrics.keyHeight, labelFont: .caption.weight(.medium)) {
                             model.alphanumericPage = .symbols
                         }
-                        characterRow(Self.row3Numbers, spacing: keySpacing, keyHeight: keyHeight)
-                        KeyboardRepeatableDeleteKey(keyHeight: keyHeight, width: modifierWidth) {
+                        characterRow(
+                            Self.row3Numbers,
+                            spacing: metrics.keySpacing,
+                            keyHeight: metrics.keyHeight,
+                            fontSize: metrics.keyFontSize
+                        )
+                        KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.modifierWidth) {
                             model.tapDelete()
                         }
                     }
                 case .symbols:
-                    characterRow(Self.row1Symbols, spacing: keySpacing, keyHeight: keyHeight)
-                    characterRow(Self.row2Symbols, spacing: keySpacing, keyHeight: keyHeight)
-                    HStack(spacing: keySpacing) {
-                        specialActionKey("123", width: modifierWidth, height: keyHeight, labelFont: .caption.weight(.medium)) {
+                    characterRow(
+                        Self.row1Symbols,
+                        spacing: metrics.keySpacing,
+                        keyHeight: metrics.keyHeight,
+                        fontSize: metrics.keyFontSize
+                    )
+                    characterRow(
+                        Self.row2Symbols,
+                        spacing: metrics.keySpacing,
+                        keyHeight: metrics.keyHeight,
+                        fontSize: metrics.keyFontSize
+                    )
+                    HStack(spacing: metrics.keySpacing) {
+                        specialActionKey("123", width: metrics.modifierWidth, height: metrics.keyHeight, labelFont: .caption.weight(.medium)) {
                             model.alphanumericPage = .numbers
                         }
-                        characterRow(Self.row3Symbols, spacing: keySpacing, keyHeight: keyHeight)
-                        KeyboardRepeatableDeleteKey(keyHeight: keyHeight, width: modifierWidth) {
+                        characterRow(
+                            Self.row3Symbols,
+                            spacing: metrics.keySpacing,
+                            keyHeight: metrics.keyHeight,
+                            fontSize: metrics.keyFontSize
+                        )
+                        KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.modifierWidth) {
                             model.tapDelete()
                         }
                     }
                 }
-                bottomRow(isWide: isWide, spacing: keySpacing, keyHeight: keyHeight)
+                bottomRow(metrics: metrics)
             }
-            .padding(.horizontal, sidePadding)
-            .padding(.vertical, proxy.size.height < 235 ? 4 : 8)
+            .padding(.horizontal, metrics.horizontalPadding)
+            .padding(.top, metrics.topPadding)
+            .padding(.bottom, metrics.bottomPadding)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    private func characterRow(_ keys: [String], spacing: CGFloat, keyHeight: CGFloat) -> some View {
+    private func characterRow(_ keys: [String], spacing: CGFloat, keyHeight: CGFloat, fontSize: CGFloat) -> some View {
         HStack(spacing: spacing) {
             ForEach(keys, id: \.self) { key in
                 Button {
                     model.tapCharacter(key)
                 } label: {
                     Text(key)
-                        .font(.system(size: 20, weight: .regular))
+                        .font(.system(size: fontSize, weight: .regular))
                         .foregroundStyle(Color.primary)
                         .frame(maxWidth: .infinity)
                         .frame(height: keyHeight)
@@ -140,14 +177,14 @@ struct KeyboardAlphanumericView: View {
         .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.specialKey))
     }
 
-    private func bottomRow(isWide: Bool, spacing: CGFloat, keyHeight: CGFloat) -> some View {
-        let compactWidth: CGFloat = isWide ? 60 : 44
-        let backWidth: CGFloat = isWide ? 72 : 54
-        let returnWidth: CGFloat = isWide ? 84 : 60
-
-        return HStack(spacing: spacing) {
+    private func bottomRow(metrics: KeyboardAlphanumericMetrics) -> some View {
+        HStack(spacing: metrics.keySpacing) {
             if model.needsInputModeSwitchKey {
-                KeyboardGlobeKeyContainer(keyHeight: keyHeight, width: compactWidth, slot: globeButtonSlot)
+                KeyboardGlobeKeyContainer(
+                    keyHeight: metrics.keyHeight,
+                    width: metrics.compactBottomWidth,
+                    slot: globeButtonSlot
+                )
             }
             Button {
                 model.switchToList()
@@ -156,17 +193,17 @@ struct KeyboardAlphanumericView: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(KeyboardTheme.accent)
                     .lineLimit(1)
-                    .frame(width: backWidth, height: keyHeight)
+                    .frame(width: metrics.backWidth, height: metrics.keyHeight)
             }
             .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.specialKey))
             .accessibilityLabel("履歴とテンプレートに戻る")
 
             if model.alphanumericPage == .letters {
-                specialActionKey("123", width: compactWidth, height: keyHeight) {
+                specialActionKey("123", width: metrics.compactBottomWidth, height: metrics.keyHeight) {
                     model.alphanumericPage = .numbers
                 }
             } else {
-                specialActionKey("ABC", width: compactWidth, height: keyHeight) {
+                specialActionKey("ABC", width: metrics.compactBottomWidth, height: metrics.keyHeight) {
                     model.alphanumericPage = .letters
                 }
             }
@@ -178,7 +215,7 @@ struct KeyboardAlphanumericView: View {
                     .font(.subheadline)
                     .foregroundStyle(Color.primary)
                     .frame(maxWidth: .infinity)
-                    .frame(height: keyHeight)
+                    .frame(height: metrics.keyHeight)
             }
             .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.letterKey))
             .accessibilityLabel("空白")
@@ -189,9 +226,9 @@ struct KeyboardAlphanumericView: View {
                 Text("改行")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(Color.white)
-                    .frame(width: returnWidth, height: keyHeight)
+                    .frame(width: metrics.returnWidth, height: metrics.keyHeight)
             }
-            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.accent))
+            .buttonStyle(KeyboardKeyCapStyle(background: KeyboardTheme.accentKey))
             .accessibilityLabel("改行")
         }
     }

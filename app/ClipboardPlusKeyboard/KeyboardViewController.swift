@@ -205,7 +205,7 @@ private struct KeyboardSystemPasteControl: UIViewRepresentable {
         let configuration = UIPasteControl.Configuration()
         configuration.displayMode = .iconAndLabel
         configuration.cornerStyle = .capsule
-        configuration.baseBackgroundColor = KeyboardTheme.accentUIColor
+        configuration.baseBackgroundColor = KeyboardTheme.accentKeyUIColor
         configuration.baseForegroundColor = .white
 
         let control = UIPasteControl(configuration: configuration)

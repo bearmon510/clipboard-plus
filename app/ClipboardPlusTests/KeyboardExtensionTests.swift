@@ -390,5 +390,51 @@ final class KeyboardExtensionTests: XCTestCase {
         XCTAssertEqual(KeyboardLayoutMetrics.preferredHeight(idiom: .phone, verticalSizeClass: .regular, width: 393), 284)
         XCTAssertEqual(KeyboardLayoutMetrics.preferredHeight(idiom: .phone, verticalSizeClass: .compact, width: 852), 204)
         XCTAssertEqual(KeyboardLayoutMetrics.preferredHeight(idiom: .pad, verticalSizeClass: .regular, width: 1_024), 340)
+        XCTAssertEqual(KeyboardLayoutMetrics.preferredHeight(idiom: .pad, verticalSizeClass: .regular, width: 1_366), 340)
+
+        let viewports: [(CGFloat, CGFloat)] = [
+            (320, 284),
+            (393, 284),
+            (852, 204),
+            (768, 316),
+            (1_024, 340),
+            (1_366, 340),
+        ]
+        for (width, height) in viewports {
+            let fiveRow = KeyboardLayoutMetrics.alphanumericMetrics(width: width, availableHeight: height, rowCount: 5)
+            XCTAssertLessThanOrEqual(fiveRow.totalContentHeight(rowCount: 5), height)
+            XCTAssertGreaterThanOrEqual(fiveRow.bottomPadding, 6)
+
+            let fourRow = KeyboardLayoutMetrics.alphanumericMetrics(width: width, availableHeight: height, rowCount: 4)
+            XCTAssertLessThanOrEqual(fourRow.totalContentHeight(rowCount: 4), height)
+            XCTAssertGreaterThanOrEqual(fourRow.bottomPadding, 6)
+
+            let list = KeyboardLayoutMetrics.listMetrics(width: width, availableHeight: height)
+            XCTAssertLessThan(list.bottomBarHeight, height)
+            XCTAssertGreaterThanOrEqual(list.bottomBarBottomPadding, 6)
+        }
+
+        let phoneFiveRow = KeyboardLayoutMetrics.alphanumericMetrics(width: 393, availableHeight: 284, rowCount: 5)
+        XCTAssertGreaterThan(phoneFiveRow.keyHeight, 42)
+    }
+
+    func testDarkModeAccentKeyContrastIsAtLeastFourPointFiveToOne() {
+        for style in [UIUserInterfaceStyle.light, UIUserInterfaceStyle.dark] {
+            let traits = UITraitCollection(userInterfaceStyle: style)
+            let bg = KeyboardTheme.accentKeyUIColor.resolvedColor(with: traits)
+            var r: CGFloat = 0
+            var g: CGFloat = 0
+            var b: CGFloat = 0
+            var a: CGFloat = 0
+            XCTAssertTrue(bg.getRed(&r, green: &g, blue: &b, alpha: &a))
+
+            func linearize(_ c: CGFloat) -> Double {
+                let value = Double(c)
+                return value <= 0.03928 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+            }
+            let bgLum = 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+            let contrastWithWhite = (1.0 + 0.05) / (bgLum + 0.05)
+            XCTAssertGreaterThanOrEqual(contrastWithWhite, 4.5)
+        }
     }
 }
