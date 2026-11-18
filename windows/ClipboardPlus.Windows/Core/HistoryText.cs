@@ -49,18 +49,23 @@ public static partial class HistoryText
         switch (item.Kind)
         {
             case "text":
-                var lines = (item.Text ?? "")
-                    .Split('\n')
-                    .Select(line => line.Trim())
-                    .Where(line => line.Length > 0)
-                    .Take(2);
-                var joined = string.Join("\n", lines);
-                return joined.Length == 0 ? "（空白だけの文章）" : TruncateWithEllipsis(joined, MaxTitleLength);
+                return TextPreview(item.Text);
             case "image":
                 return string.IsNullOrWhiteSpace(item.Filename) ? "画像" : item.Filename!;
             default:
                 return string.IsNullOrWhiteSpace(item.Filename) ? "ファイル" : item.Filename!;
         }
+    }
+
+    public static string TextPreview(string? text)
+    {
+        var lines = (text ?? "")
+            .Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0)
+            .Take(2);
+        var joined = string.Join("\n", lines);
+        return joined.Length == 0 ? "（空白だけの文章）" : TruncateWithEllipsis(joined, MaxTitleLength);
     }
 
     public static HistoryDisplayFlavor DetectFlavor(HistoryItem item) => DetectFlavor(item, out _, out _);
@@ -73,38 +78,49 @@ public static partial class HistoryText
         link = null;
         color = null;
 
-        switch (item.Kind)
+        return item.Kind switch
         {
-            case "image":
-                return HistoryDisplayFlavor.Image;
-            case "file":
-                return HistoryDisplayFlavor.File;
-            default:
-                var trimmed = (item.Text ?? "").Trim();
-                if (trimmed.Length == 0) return HistoryDisplayFlavor.Text;
-
-                if (TrySplitLink(trimmed, out var parsedLink))
-                {
-                    link = parsedLink;
-                    return HistoryDisplayFlavor.Link;
-                }
-
-                if (trimmed.Length <= 64)
-                {
-                    if (TryParseHexColor(trimmed, out var parsedColor))
-                    {
-                        color = parsedColor;
-                        return HistoryDisplayFlavor.Color;
-                    }
-                    if (EmailRegex().IsMatch(trimmed))
-                        return HistoryDisplayFlavor.Email;
-                    if (IsPhoneNumber(trimmed))
-                        return HistoryDisplayFlavor.Phone;
-                }
-
-                return HistoryDisplayFlavor.Text;
-        }
+            "image" => HistoryDisplayFlavor.Image,
+            "file" => HistoryDisplayFlavor.File,
+            _ => DetectTextFlavor(item.Text, out link, out color),
+        };
     }
+
+    public static HistoryDisplayFlavor DetectTextFlavor(
+        string? text,
+        out HistoryLinkParts? link,
+        out HistoryRgbColor? color)
+    {
+        link = null;
+        color = null;
+
+        var trimmed = (text ?? "").Trim();
+        if (trimmed.Length == 0) return HistoryDisplayFlavor.Text;
+
+        if (TrySplitLink(trimmed, out var parsedLink))
+        {
+            link = parsedLink;
+            return HistoryDisplayFlavor.Link;
+        }
+
+        if (trimmed.Length <= 64)
+        {
+            if (TryParseHexColor(trimmed, out var parsedColor))
+            {
+                color = parsedColor;
+                return HistoryDisplayFlavor.Color;
+            }
+            if (EmailRegex().IsMatch(trimmed))
+                return HistoryDisplayFlavor.Email;
+            if (IsPhoneNumber(trimmed))
+                return HistoryDisplayFlavor.Phone;
+        }
+
+        return HistoryDisplayFlavor.Text;
+    }
+
+    public static bool IsLinkText(string? text) =>
+        TrySplitLink((text ?? "").Trim(), out _);
 
     public static string FlavorGlyph(HistoryDisplayFlavor flavor) => flavor switch
     {

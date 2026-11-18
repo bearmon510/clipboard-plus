@@ -117,7 +117,12 @@ public partial class App : System.Windows.Application
 
     private void StartSync(SyncPairing pairing)
     {
-        coordinator = new(pairing, clipboard!, log!.Write, new SyncRepository(LocalStore.Root, pairing.PcId));
+        coordinator = new(
+            pairing,
+            clipboard!,
+            log!.Write,
+            new SyncRepository(LocalStore.Root, pairing.PcId),
+            templateRepository: new TemplateRepository(LocalStore.Root, log!.Write));
         var current = coordinator;
         historyWindow?.Attach(current);
         coordinator.Changed += state => Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(state); });
@@ -183,6 +188,7 @@ public partial class App : System.Windows.Application
                 if (oldCoordinator is not null) await oldCoordinator.DisposeAsync();
             }
             if (exiting) return;
+            new TemplateRepository(LocalStore.Root, log!.Write).ClearTombstones();
             window.UpdatePairing(pairing);
             StartSync(pairing);
             log!.Write("pairing replaced");

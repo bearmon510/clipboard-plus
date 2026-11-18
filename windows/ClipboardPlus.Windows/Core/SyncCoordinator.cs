@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Text.Json;
 using ClipboardPlus.Sync;
 
 namespace ClipboardPlus.Windows.Core;
@@ -33,7 +35,7 @@ public sealed class ClipboardContentRejectedException(ClipboardRejectReason reas
 public sealed record SyncStatus(int Connected, int Pending, DateTimeOffset? LastSent, DateTimeOffset? LastReceived, bool Paired = true, IReadOnlyList<DeviceStatus>? Devices = null, IReadOnlyList<TransferProgress>? Transfers = null, bool RequiresPeerUpdate = false);
 
 /// <summary>All protocol state is serialized here, independently of WinRT and the UI.</summary>
-public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipboard, Action<string> log, SyncRepository? repository = null, Func<DateTimeOffset>? clock = null) : IAsyncDisposable
+public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipboard, Action<string> log, SyncRepository? repository = null, Func<DateTimeOffset>? clock = null, TemplateRepository? templateRepository = null) : IAsyncDisposable
 {
     private sealed class Connection(SyncPairing pair, ISyncPeer peer, DateTimeOffset now)
     {
@@ -44,6 +46,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly Queue<byte[]> ControlFrames = new();
         public readonly List<Guid> AckQueue = [];
         public readonly Queue<SyncMessage> Replies = new();
+        public readonly Queue<TemplateSyncMessage> TemplateMessages = new();
+        public TemplateSyncPageAssembler? IncomingTemplatePush;
+        public readonly Dictionary<Guid, DateTimeOffset> AwaitingPeerTemplateAcks = [];
+        public bool SendingTemplateMessage;
         public readonly CancellationTokenSource Stop = new();
         public readonly SemaphoreSlim HandoffGate = new(1, 1);
         public readonly object HandoffStateGate = new();
@@ -93,9 +99,40 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
     private sealed record AttachmentReceive(DateTimeOffset StartedAt, int StartOffset);
     private sealed record PendingReply(DateTimeOffset InitialSentAt, DateTimeOffset Deadline, DateTimeOffset BaselineDeadline, ulong? ActiveFrameToken);
 
+    private enum TemplateSyncPhase { Collecting, Distributing }
+    private enum ParticipantState { AwaitingPush, PushReceived, AwaitingAck, AckReceived, Dropped, TimedOut }
+
+    private sealed class ParticipantProgress(Connection connection, DateTimeOffset startedAt, DateTimeOffset deadline)
+    {
+        public readonly Connection Connection = connection;
+        public readonly Guid DeviceId = connection.DeviceId;
+        public ParticipantState State = ParticipantState.AwaitingPush;
+        public TemplateSyncSnapshot? PushSnapshot;
+        public DateTimeOffset InitialSentAt = startedAt;
+        public DateTimeOffset Deadline = deadline;
+        public DateTimeOffset BaselineDeadline = deadline;
+        public ulong? ActiveFrameToken;
+    }
+
+    private sealed class TemplateSyncSession(Guid op, DateTimeOffset startedAt, List<ParticipantProgress> participants)
+    {
+        public readonly Guid Op = op;
+        public readonly DateTimeOffset StartedAt = startedAt;
+        public TemplateSyncPhase Phase = TemplateSyncPhase.Collecting;
+        public readonly List<ParticipantProgress> Participants = participants;
+        public readonly TaskCompletionSource<TemplateSyncRunResult> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TemplateSyncSideChanges? PcChanges;
+        public int RemoteChangesTotal;
+        public int ConflictCopyCount;
+        public long? ClockSkewSeconds;
+        public bool PcSaved;
+    }
+
     private const int MaxAttachmentChunksInFlight = 4;
+    private const int MaxQueuedTemplateMessages = SyncProtocol.MaxTemplatePages * 4;
     private static readonly TimeSpan HighThroughputIdleGrace = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ReplyTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan TemplateSyncTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MaxReplyExtension = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan PruneInterval = TimeSpan.FromMinutes(1);
     private const int MinExtendableFrameBytes = 64;
@@ -103,9 +140,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly Dictionary<ISyncPeer, Connection> connections = new(ReferenceEqualityComparer.Instance);
     private readonly SyncRepository store = repository ?? new SyncRepository(Path.Combine(Path.GetTempPath(), "clipboardplus-tests", Guid.NewGuid().ToString("N")), pairing.PcId);
+    private readonly TemplateRepository templateStore = templateRepository ?? new TemplateRepository(Path.Combine(Path.GetTempPath(), "clipboardplus-tests", Guid.NewGuid().ToString("N")), log);
     private readonly List<Guid> incompatibleDevices = [];
     private readonly HashSet<Guid> attempted = [];
     private readonly HashSet<Task> activeOutgoing = [];
+    private TemplateSyncSession? activeTemplateSync;
     private bool stopped;
     private uint? ownSequence;
     private uint? lastClipboardSequence;
@@ -114,6 +153,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
     private DateTimeOffset Now() => clock?.Invoke() ?? DateTimeOffset.UtcNow;
     private bool RequiresPeerUpdate => incompatibleDevices.Count > 0;
     public event Action<SyncStatus>? Changed;
+    public event Action? TemplatesChanged;
 
     private SyncStatus Snapshot() => new(connections.Values.Count(c => c.Stage == 2), store.PendingCount, lastSent, lastReceived, true,
         store.Devices.Select(d => new DeviceStatus(d.Id, d.Kind, connections.Values.Any(c => c.Stage == 2 && c.DeviceId == d.Id), d.LastConnected, store.Pending(d.Id).Count)).ToArray(),
@@ -166,6 +206,217 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             var item = store.List().FirstOrDefault(i => i.Id == id) ?? throw new KeyNotFoundException();
             ownSequence = await clipboard.WriteItemAsync(item);
         } finally { gate.Release(); }
+    }
+
+    public async Task<IReadOnlyList<TemplateSyncItem>> GetTemplatesAsync(string? search = null)
+    {
+        await gate.WaitAsync();
+        try { return templateStore.List(search); }
+        finally { gate.Release(); }
+    }
+
+    public async Task<IReadOnlyList<TemplateGroupView>> GetTemplateGroupsAsync(string? search = null)
+    {
+        await gate.WaitAsync();
+        try { return templateStore.GetGroups(search); }
+        finally { gate.Release(); }
+    }
+
+    public async Task<IReadOnlyList<string>> GetTemplateTagsAsync()
+    {
+        await gate.WaitAsync();
+        try { return templateStore.Tags(); }
+        finally { gate.Release(); }
+    }
+
+    public async Task<TemplateEditResult> CreateTemplateAsync(string text, string? title, string? tag)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return new(false, TemplateEditError.Stopped);
+            var result = templateStore.Create(text, title, tag, Now().ToUnixTimeMilliseconds());
+            if (result.Succeeded)
+            {
+                log($"template created count={templateStore.Count}");
+                TemplatesChanged?.Invoke();
+            }
+            return result;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<TemplateEditResult> UpdateTemplateAsync(Guid id, string text, string? title, string? tag)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return new(false, TemplateEditError.Stopped);
+            var result = templateStore.Update(id, text, title, tag, Now().ToUnixTimeMilliseconds());
+            if (result.Succeeded)
+            {
+                log($"template updated count={templateStore.Count}");
+                TemplatesChanged?.Invoke();
+            }
+            return result;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<TemplateDeleteResult> DeleteTemplateAsync(Guid id)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return new(false);
+            var result = templateStore.Delete(id, Now().ToUnixTimeMilliseconds());
+            if (result.Succeeded)
+            {
+                log($"template deleted count={templateStore.Count} tombs={templateStore.TombstoneCount}");
+                TemplatesChanged?.Invoke();
+            }
+            return result;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<TemplateEditResult> RestoreDeletedTemplateAsync(TemplateSyncItem deletedItem)
+    {
+        ArgumentNullException.ThrowIfNull(deletedItem);
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return new(false, TemplateEditError.Stopped);
+            var result = templateStore.Restore(deletedItem, Now().ToUnixTimeMilliseconds());
+            if (result.Succeeded)
+            {
+                log($"template restored count={templateStore.Count} tombs={templateStore.TombstoneCount}");
+                TemplatesChanged?.Invoke();
+            }
+            return result;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<bool> MoveTemplateInGroupAsync(Guid id, int delta)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return false;
+            var moved = templateStore.MoveInGroup(id, delta, Now().ToUnixTimeMilliseconds());
+            if (moved)
+            {
+                log("template reordered");
+                TemplatesChanged?.Invoke();
+            }
+            return moved;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<int> RenameTemplateTagAsync(string? oldTag, string? newTag)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return 0;
+            var moved = templateStore.RenameTag(oldTag, newTag, Now().ToUnixTimeMilliseconds());
+            if (moved > 0)
+            {
+                log($"template tag renamed items={moved}");
+                TemplatesChanged?.Invoke();
+            }
+            return moved;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<TemplateEditResult> MoveHistoryToTemplatesAsync(Guid historyId)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return new(false, TemplateEditError.Stopped);
+            var historyItem = store.List().FirstOrDefault(i => i.Id == historyId);
+            if (historyItem is null) return new(false, TemplateEditError.NotFound);
+            if (historyItem.Kind != "text") return new(false, TemplateEditError.UnsupportedKind);
+
+            var created = templateStore.Create(historyItem.Text ?? "", title: null, tag: null, Now().ToUnixTimeMilliseconds());
+            if (!created.Succeeded) return created;
+
+            store.Delete(historyId);
+            TrimConnectionQueues();
+            foreach (var c in connections.Values.Where(x => x.Stage == 2).ToArray()) StartSending(c);
+            log($"template moved from history count={templateStore.Count}");
+            HistoryChanged?.Invoke();
+            TemplatesChanged?.Invoke();
+            Publish();
+            return created;
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task CopyTemplateAsync(Guid id)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return;
+            var item = templateStore.Get(id) ?? throw new KeyNotFoundException();
+            ownSequence = await clipboard.WriteTextAsync(item.Text);
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task ClearTemplateTombstonesAsync()
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (stopped) return;
+            templateStore.ClearTombstones();
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<TemplateSyncRunResult> SyncTemplatesAsync(CancellationToken cancellationToken = default)
+    {
+        Task<TemplateSyncRunResult> completion;
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (stopped) return TemplateSyncRunResult.StoppedResult();
+            if (activeTemplateSync is not null) return TemplateSyncRunResult.AlreadyInProgressResult();
+
+            var stage2 = connections.Values.Where(c => c.Stage == 2 && !c.Retired).ToList();
+            if (stage2.Count == 0)
+            {
+                return RequiresPeerUpdate
+                    ? TemplateSyncRunResult.PeerUpdateRequiredResult()
+                    : TemplateSyncRunResult.NoConnectedDevicesResult();
+            }
+
+            var now = Now();
+            var op = Guid.NewGuid();
+            var deadline = now + TemplateSyncTimeout;
+            var participants = stage2.Select(c => new ParticipantProgress(c, now, deadline)).ToList();
+            activeTemplateSync = new TemplateSyncSession(op, now, participants);
+
+            var pull = new TemplateSyncPull(op);
+            foreach (var c in stage2)
+            {
+                EnqueueTemplateMessage(c, pull);
+                StartSending(c);
+            }
+            log($"template sync started devices={stage2.Count}");
+            completion = activeTemplateSync.Completion.Task;
+        }
+        finally { gate.Release(); }
+
+        return cancellationToken.CanBeCanceled
+            ? await completion.WaitAsync(cancellationToken)
+            : await completion;
     }
     // These events carry immutable snapshots; WPF consumers post them with Dispatcher.BeginInvoke.
     private static string RejectReasonText(ClipboardRejectReason reason) => reason switch
@@ -308,7 +559,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     c.IncomingFrameBytes = 0;
                 }
                 if (c.Stage == 2 && frame is null && frameBytes > MinExtendableFrameBytes)
+                {
                     ExtendReplyDeadlines(c, frameToken, c.LastPacket);
+                    ExtendTemplateSyncDeadline(c, frameToken, c.LastPacket);
+                }
                 if (frame is null) return true;
                 if (c.Stage == 0)
                 {
@@ -351,15 +605,39 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 }
                 else
                 {
-                    var message = SyncMessageCodec.Decode(c.Receiver!.Open(frame));
-                    if (message is SyncPing or SyncPong)
+                    var decoded = DecodeStage2Message(c.Receiver!.Open(frame));
+                    if (decoded is SyncPing or SyncPong)
+                    {
                         RevertReplyExtension(c, frameToken);
+                        RevertTemplateSyncExtension(c, frameToken);
+                    }
                     else
                     {
                         if (frameBytes > MinExtendableFrameBytes)
+                        {
                             ExtendReplyDeadlines(c, frameToken, c.LastPacket);
+                            ExtendTemplateSyncDeadline(c, frameToken, c.LastPacket);
+                        }
                         ConfirmReplyExtension(c, frameToken);
+                        ConfirmTemplateSyncExtension(c, frameToken, resetForNextTemplatePage: decoded is TemplateSyncPush);
                     }
+                    if (decoded is TemplateSyncMessage templateMessage)
+                    {
+                        switch (templateMessage)
+                        {
+                            case TemplateSyncPush push:
+                                HandleTemplatePush(c, push);
+                                break;
+                            case TemplateSyncAck ack:
+                                HandleTemplateAck(c, ack);
+                                break;
+                            default:
+                                throw new SyncProtocolException(SyncError.Format);
+                        }
+                    }
+                    else
+                    {
+                    var message = (SyncMessage)decoded;
                     switch (message)
                     {
                         case SyncDevice device:
@@ -463,6 +741,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         case SyncPing: QueueReply(c, new SyncPong()); break;
                         case SyncPong: break;
                     }
+                    }
                 }
                 Publish();
                 return true;
@@ -553,6 +832,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             if (hasExpiredPending || lastPrune == DateTimeOffset.MinValue || now < lastPrune || now - lastPrune >= PruneInterval)
             {
                 store.Prune(now);
+                templateStore.PruneTombstones(ClampTimestamp(now.ToUnixTimeMilliseconds()));
                 lastPrune = now;
                 TrimConnectionQueues();
             }
@@ -588,6 +868,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         continue;
                     }
                     foreach (var id in expired) c.Sent.Remove(id);
+                    foreach (var expiredAck in c.AwaitingPeerTemplateAcks.Where(p => now > p.Value).Select(p => p.Key).ToArray())
+                        c.AwaitingPeerTemplateAcks.Remove(expiredAck);
                     var incomingPacketActive = c.ActiveIncomingAttachments.Count > 0 &&
                         c.Assembler.HasPartialFrame &&
                         now - c.LastPacket < HighThroughputIdleGrace;
@@ -607,6 +889,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     catch (Exception e) { Drop(c, Failure(e)); }
                 }
             }
+            TickTemplateSyncSession(now);
             Publish();
         }
         finally { gate.Release(); }
@@ -628,6 +911,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             {
                 stopped = true;
                 foreach (var c in connections.Values.ToArray()) Drop(c, "stopped");
+                if (activeTemplateSync is { } dangling)
+                {
+                    activeTemplateSync = null;
+                    dangling.Completion.TrySetResult(TemplateSyncRunResult.StoppedResult());
+                }
             }
         }
         finally { gate.Release(); }
@@ -691,6 +979,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             {
                 byte[] frame;
                 HistoryItem? item = null;
+                TemplateSyncStateMessage? sendingTemplateState = null;
+                var sendingTemplate = false;
                 var finishesItem = false;
                 var retransmission = false;
                 var isChunk = false;
@@ -710,6 +1000,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     }
                     else if (c.Stage == 2 && c.Replies.TryDequeue(out var reply))
                         frame = c.Sender!.Seal(SyncMessageCodec.Encode(reply));
+                    else if (c.Stage == 2 && c.TemplateMessages.TryDequeue(out var templateMsg))
+                    {
+                        sendingTemplate = true;
+                        sendingTemplateState = templateMsg as TemplateSyncStateMessage;
+                        c.SendingTemplateMessage = true;
+                        frame = c.Sender!.Seal(TemplateSyncMessageCodec.Encode(templateMsg));
+                    }
                     else
                     {
                         var pendingList = store.Pending(c.DeviceId);
@@ -841,8 +1138,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 await gate.WaitAsync();
                 try
                 {
+                    if (sendingTemplate) c.SendingTemplateMessage = false;
                     if (c.Retired) return;
                     if (c.Peer.IsRejected) { Drop(c, "peer retired"); return; }
+                    if (sendingTemplateState is { } sentState)
+                        OnTemplateStateFrameSent(c, sentState);
                     // An ACK may arrive before NotifyValueAsync completes.
                     if (item is not null)
                     {
@@ -929,6 +1229,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             c.FinalChunkSentAttachments.Clear();
         }
         c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.Sent.Clear();
+        c.TemplateMessages.Clear(); c.AwaitingPeerTemplateAcks.Clear(); c.SendingTemplateMessage = false;
+        if (c.IncomingTemplatePush is { } pushAssembler)
+        {
+            c.IncomingTemplatePush = null;
+            try { pushAssembler.Finish(); }
+            catch (SyncProtocolException e) { log($"template push ended error={e.Code}"); }
+        }
         c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
         c.OfferedThisConnection.Clear(); c.Progress = null;
         if (c.HighThroughputRequested) { c.HighThroughputRequested = false; c.Peer.SetHighThroughput(false); }
@@ -937,9 +1244,462 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         try { c.Assembler.Finish(); }
         catch (SyncProtocolException e) { log($"assembly ended error={e.Code}"); }
         c.Peer.Reject();
+        OnTemplateParticipantDropped(c);
         log($"connection retired reason={reason}");
         Publish();
     }
+
+    private static object DecodeStage2Message(byte[] plaintext)
+    {
+        // Peek "t" only to dispatch to the right strict codec; both codecs perform full validation.
+        if (plaintext.Length >= 2)
+        {
+            var headerLen = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
+            if (headerLen > 0 && headerLen <= plaintext.Length - 2)
+            {
+                var headerSpan = plaintext.AsSpan(2, headerLen);
+                if (headerSpan.IndexOf("tpl_"u8) >= 0 || headerSpan.IndexOf("\\u"u8) >= 0)
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(plaintext.AsMemory(2, headerLen), new JsonDocumentOptions { MaxDepth = 8 });
+                        if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                            doc.RootElement.TryGetProperty("t", out var tProp) &&
+                            tProp.ValueKind == JsonValueKind.String &&
+                            tProp.GetString() is string t &&
+                            t.StartsWith("tpl_", StringComparison.Ordinal))
+                        {
+                            return TemplateSyncMessageCodec.Decode(plaintext);
+                        }
+                    }
+                    catch (JsonException) { /* Fall through to SyncMessageCodec.Decode which throws SyncError.Format. */ }
+                }
+            }
+        }
+        return SyncMessageCodec.Decode(plaintext);
+    }
+
+    private void EnqueueTemplateMessage(Connection c, TemplateSyncMessage message)
+    {
+        if (c.TemplateMessages.Count >= MaxQueuedTemplateMessages)
+            throw new SyncProtocolException(SyncError.Limit);
+        c.TemplateMessages.Enqueue(message);
+    }
+
+    private void HandleTemplatePush(Connection c, TemplateSyncPush push)
+    {
+        c.IncomingTemplatePush ??= new TemplateSyncPageAssembler(expectedOp: push.Op, expectedIsState: false);
+        TemplateSyncSnapshot? snapshot;
+        try
+        {
+            snapshot = c.IncomingTemplatePush.Append(push);
+        }
+        catch
+        {
+            c.IncomingTemplatePush = null;
+            throw;
+        }
+        if (snapshot is null)
+            return;
+
+        c.IncomingTemplatePush.Finish();
+        c.IncomingTemplatePush = null;
+
+        if (activeTemplateSync is { } active && push.Op == active.Op)
+        {
+            var participant = active.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+            if (active.Phase == TemplateSyncPhase.Collecting && participant is { State: ParticipantState.AwaitingPush })
+            {
+                participant.PushSnapshot = snapshot;
+                participant.State = ParticipantState.PushReceived;
+                participant.ActiveFrameToken = null;
+                TryAdvanceTemplateSyncSession();
+                return;
+            }
+            if (participant is { State: ParticipantState.PushReceived or ParticipantState.AwaitingAck or ParticipantState.AckReceived })
+                throw new SyncProtocolException(SyncError.State);
+
+            log("template sync late push ignored");
+            return;
+        }
+
+        HandlePeerInitiatedTemplateSync(c, push.Op, snapshot);
+    }
+
+    private void HandlePeerInitiatedTemplateSync(Connection c, Guid op, TemplateSyncSnapshot remoteSnapshot)
+    {
+        var now = Now();
+        var nowMillis = ClampTimestamp(now.ToUnixTimeMilliseconds());
+        var pcBefore = templateStore.GetState();
+        var merged = TemplateSyncMerge.Merge(
+            pcBefore,
+            new TemplateSyncState(remoteSnapshot.Templates, remoteSnapshot.Tombstones),
+            nowMillis,
+            remoteSnapshot.SentAt);
+        var stateMessages = TemplateSyncMessageCodec.SplitPages(
+            op,
+            new TemplateSyncSnapshot(nowMillis, merged.Templates, merged.Tombstones),
+            isState: true);
+
+        templateStore.ApplyMerged(merged.Templates, merged.Tombstones);
+
+        if (merged.ClockSkewSeconds is long skew)
+            log($"template sync clock-skew seconds={skew}");
+        if (merged.PcChanges.Total > 0)
+            TemplatesChanged?.Invoke();
+
+        foreach (var msg in stateMessages)
+            EnqueueTemplateMessage(c, msg);
+        c.AwaitingPeerTemplateAcks[op] = now + TemplateSyncTimeout;
+        StartSending(c);
+
+        log($"template sync peer-initiated items={merged.Templates.Count} tombs={merged.Tombstones.Count} pcAdded={merged.PcChanges.Added} pcUpdated={merged.PcChanges.Updated} pcDeleted={merged.PcChanges.Deleted} remoteAdded={merged.RemoteChanges.Added} remoteUpdated={merged.RemoteChanges.Updated} remoteDeleted={merged.RemoteChanges.Deleted} conflicts={merged.ConflictCopyCount}");
+    }
+
+    private void HandleTemplateAck(Connection c, TemplateSyncAck ack)
+    {
+        if (activeTemplateSync is { } active &&
+            active.Phase == TemplateSyncPhase.Distributing &&
+            ack.Op == active.Op &&
+            active.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c)) is { State: ParticipantState.AwaitingAck } participant)
+        {
+            participant.State = ParticipantState.AckReceived;
+            participant.ActiveFrameToken = null;
+            log("template sync ack pc-initiated");
+            if (!active.Participants.Any(p => p.State == ParticipantState.AwaitingAck))
+                FinishTemplateSyncSession();
+            return;
+        }
+
+        if (c.AwaitingPeerTemplateAcks.Remove(ack.Op))
+            log("template sync ack peer-initiated");
+        else
+            log("template sync ack ignored");
+    }
+
+    private void OnTemplateStateFrameSent(Connection c, TemplateSyncStateMessage sentState)
+    {
+        var now = Now();
+        if (sentState.Part < sentState.Total - 1)
+        {
+            if (activeTemplateSync is { } activePage &&
+                activePage.Phase == TemplateSyncPhase.Distributing &&
+                sentState.Op == activePage.Op &&
+                activePage.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c)) is { State: ParticipantState.AwaitingAck } pPage)
+            {
+                var maxDeadline = pPage.InitialSentAt + TemplateSyncTimeout + MaxReplyExtension;
+                var candidate = now + TemplateSyncTimeout;
+                pPage.Deadline = candidate > maxDeadline ? maxDeadline : candidate;
+                pPage.BaselineDeadline = pPage.Deadline;
+            }
+            return;
+        }
+
+        if (activeTemplateSync is { } active &&
+            active.Phase == TemplateSyncPhase.Distributing &&
+            sentState.Op == active.Op &&
+            active.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c)) is { State: ParticipantState.AwaitingAck } p)
+        {
+            p.InitialSentAt = now;
+            p.Deadline = now + TemplateSyncTimeout;
+            p.BaselineDeadline = p.Deadline;
+            p.ActiveFrameToken = null;
+        }
+        if (c.AwaitingPeerTemplateAcks.ContainsKey(sentState.Op))
+            c.AwaitingPeerTemplateAcks[sentState.Op] = now + TemplateSyncTimeout;
+    }
+
+    private void OnTemplateParticipantDropped(Connection c)
+    {
+        if (activeTemplateSync is not { } session) return;
+        var participant = session.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+        if (participant is null) return;
+
+        if (session.Phase == TemplateSyncPhase.Collecting && participant.State == ParticipantState.AwaitingPush)
+        {
+            participant.State = ParticipantState.Dropped;
+            TryAdvanceTemplateSyncSession();
+        }
+        else if (session.Phase == TemplateSyncPhase.Distributing && participant.State == ParticipantState.AwaitingAck)
+        {
+            participant.State = ParticipantState.Dropped;
+            if (!session.Participants.Any(p => p.State == ParticipantState.AwaitingAck))
+                FinishTemplateSyncSession();
+        }
+    }
+
+    private void TickTemplateSyncSession(DateTimeOffset now)
+    {
+        if (activeTemplateSync is not { } session) return;
+
+        if (session.Phase == TemplateSyncPhase.Collecting)
+        {
+            var changed = false;
+            foreach (var p in session.Participants)
+            {
+                if (p.State == ParticipantState.AwaitingPush && now > p.Deadline)
+                {
+                    p.State = ParticipantState.TimedOut;
+                    changed = true;
+                }
+            }
+            if (changed) TryAdvanceTemplateSyncSession();
+        }
+        else
+        {
+            var changed = false;
+            foreach (var p in session.Participants)
+            {
+                if (p.State == ParticipantState.AwaitingAck &&
+                    p.Connection.TemplateMessages.Count == 0 &&
+                    !p.Connection.SendingTemplateMessage &&
+                    now > p.Deadline)
+                {
+                    p.State = ParticipantState.TimedOut;
+                    changed = true;
+                }
+            }
+            if (changed && !session.Participants.Any(p => p.State == ParticipantState.AwaitingAck))
+                FinishTemplateSyncSession();
+        }
+    }
+
+    private void TryAdvanceTemplateSyncSession()
+    {
+        if (activeTemplateSync is not { } session || session.Phase != TemplateSyncPhase.Collecting)
+            return;
+        if (session.Participants.Any(p => p.State == ParticipantState.AwaitingPush))
+            return;
+
+        var responded = session.Participants.Where(p => p.State == ParticipantState.PushReceived).ToList();
+        if (responded.Count == 0)
+        {
+            var timedOut = session.Participants.Any(p => p.State == ParticipantState.TimedOut);
+            var status = timedOut ? TemplateSyncRunStatus.TimedOut : TemplateSyncRunStatus.Disconnected;
+            activeTemplateSync = null;
+            log($"template sync failed reason={status}");
+            session.Completion.TrySetResult(new TemplateSyncRunResult(
+                status,
+                TargetDevices: session.Participants.Count,
+                SucceededDevices: 0,
+                FailedDevices: session.Participants.Count));
+            return;
+        }
+
+        var now = Now();
+        var nowMillis = ClampTimestamp(now.ToUnixTimeMilliseconds());
+        var pcBefore = templateStore.GetState();
+        var current = pcBefore;
+        var totalConflicts = 0;
+        long? maxSkew = null;
+        IReadOnlyList<TemplateSyncMessage> stateMessages;
+
+        try
+        {
+            foreach (var p in responded.OrderBy(x => x.DeviceId))
+            {
+                var snap = p.PushSnapshot!;
+                var step = TemplateSyncMerge.Merge(
+                    current,
+                    new TemplateSyncState(snap.Templates, snap.Tombstones),
+                    nowMillis,
+                    snap.SentAt);
+                current = new TemplateSyncState(step.Templates, step.Tombstones);
+                totalConflicts += step.ConflictCopyCount;
+                if (step.ClockSkewSeconds is long skew && (maxSkew is null || skew > maxSkew.Value))
+                    maxSkew = skew;
+            }
+
+            stateMessages = TemplateSyncMessageCodec.SplitPages(
+                session.Op,
+                new TemplateSyncSnapshot(nowMillis, current.Templates, current.Tombstones),
+                isState: true);
+            templateStore.ApplyMerged(current.Templates, current.Tombstones);
+        }
+        catch (SyncProtocolException ex)
+        {
+            activeTemplateSync = null;
+            log($"template sync aborted error={ex.Code}");
+            session.Completion.TrySetResult(ex.Code == SyncError.Limit
+                ? TemplateSyncRunResult.LimitExceededResult()
+                : new TemplateSyncRunResult(TemplateSyncRunStatus.Stopped));
+            return;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            activeTemplateSync = null;
+            log($"template sync save error={ex.GetType().Name}");
+            session.Completion.TrySetResult(TemplateSyncRunResult.StoppedResult());
+            return;
+        }
+
+        var pcChanges = ComputeTemplateChanges(pcBefore.Templates, current.Templates);
+        var remoteChangesTotal = 0;
+        foreach (var p in responded)
+            remoteChangesTotal += ComputeTemplateChanges(p.PushSnapshot!.Templates, current.Templates).Total;
+
+        session.PcSaved = true;
+        session.PcChanges = pcChanges;
+        session.RemoteChangesTotal = remoteChangesTotal;
+        session.ConflictCopyCount = totalConflicts;
+        session.ClockSkewSeconds = maxSkew;
+
+        if (maxSkew is long loggedSkew)
+            log($"template sync clock-skew seconds={loggedSkew}");
+        if (pcChanges.Total > 0)
+            TemplatesChanged?.Invoke();
+
+        session.Phase = TemplateSyncPhase.Distributing;
+        var distributing = 0;
+        foreach (var p in responded)
+        {
+            if (p.Connection.Retired || !connections.ContainsValue(p.Connection))
+            {
+                p.State = ParticipantState.Dropped;
+                continue;
+            }
+            p.State = ParticipantState.AwaitingAck;
+            p.InitialSentAt = now;
+            p.Deadline = now + TemplateSyncTimeout;
+            p.BaselineDeadline = p.Deadline;
+            p.ActiveFrameToken = null;
+            foreach (var msg in stateMessages)
+                EnqueueTemplateMessage(p.Connection, msg);
+            StartSending(p.Connection);
+            distributing++;
+        }
+
+        log($"template sync merged devices={responded.Count} items={current.Templates.Count} tombs={current.Tombstones.Count} pcAdded={pcChanges.Added} pcUpdated={pcChanges.Updated} pcDeleted={pcChanges.Deleted} remoteChanges={remoteChangesTotal} conflicts={totalConflicts}");
+
+        if (distributing == 0)
+            FinishTemplateSyncSession();
+    }
+
+    private void FinishTemplateSyncSession()
+    {
+        if (activeTemplateSync is not { } session) return;
+        activeTemplateSync = null;
+
+        var succeeded = session.Participants.Count(p => p.State == ParticipantState.AckReceived);
+        var failed = session.Participants.Count - succeeded;
+        var pcChanges = session.PcChanges ?? new TemplateSyncSideChanges(0, 0, 0);
+
+        TemplateSyncRunStatus status;
+        if (succeeded > 0)
+        {
+            status = TemplateSyncRunStatus.Completed;
+        }
+        else if (session.Participants.Any(p => p.State == ParticipantState.TimedOut))
+        {
+            status = TemplateSyncRunStatus.TimedOut;
+        }
+        else
+        {
+            status = TemplateSyncRunStatus.Disconnected;
+        }
+
+        log($"template sync finished status={status} succeeded={succeeded} failed={failed}");
+        session.Completion.TrySetResult(new TemplateSyncRunResult(
+            status,
+            TargetDevices: session.Participants.Count,
+            SucceededDevices: succeeded,
+            FailedDevices: failed,
+            PcSaved: session.PcSaved,
+            PcAdded: pcChanges.Added,
+            PcUpdated: pcChanges.Updated,
+            PcDeleted: pcChanges.Deleted,
+            RemoteChangesTotal: session.RemoteChangesTotal,
+            ConflictCopyCount: session.ConflictCopyCount,
+            ClockSkewSeconds: session.ClockSkewSeconds));
+    }
+
+    private void ExtendTemplateSyncDeadline(Connection c, ulong frameToken, DateTimeOffset now)
+    {
+        if (activeTemplateSync is not { Phase: TemplateSyncPhase.Collecting } session) return;
+        var p = session.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+        if (p is null || p.State != ParticipantState.AwaitingPush) return;
+
+        if (p.ActiveFrameToken != frameToken)
+        {
+            p.BaselineDeadline = p.Deadline;
+            p.ActiveFrameToken = frameToken;
+        }
+        var maxDeadline = p.InitialSentAt + TemplateSyncTimeout + MaxReplyExtension;
+        var candidate = now + TemplateSyncTimeout;
+        var updated = candidate > maxDeadline ? maxDeadline : candidate;
+        if (updated > p.Deadline)
+            p.Deadline = updated;
+    }
+
+    private void RevertTemplateSyncExtension(Connection c, ulong frameToken)
+    {
+        if (activeTemplateSync is not { Phase: TemplateSyncPhase.Collecting } session) return;
+        var p = session.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+        if (p is null || p.State != ParticipantState.AwaitingPush) return;
+        if (p.ActiveFrameToken == frameToken)
+        {
+            p.Deadline = p.BaselineDeadline;
+            p.ActiveFrameToken = null;
+        }
+    }
+
+    private void ConfirmTemplateSyncExtension(Connection c, ulong frameToken, bool resetForNextTemplatePage)
+    {
+        if (activeTemplateSync is not { Phase: TemplateSyncPhase.Collecting } session) return;
+        var p = session.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+        if (p is null || p.State != ParticipantState.AwaitingPush) return;
+
+        if (p.ActiveFrameToken == frameToken)
+        {
+            p.BaselineDeadline = p.Deadline;
+            p.ActiveFrameToken = null;
+        }
+        if (resetForNextTemplatePage)
+        {
+            var maxDeadline = p.InitialSentAt + TemplateSyncTimeout + MaxReplyExtension;
+            var candidate = c.LastPacket + TemplateSyncTimeout;
+            var updated = candidate > maxDeadline ? maxDeadline : candidate;
+            if (updated > p.Deadline)
+                p.Deadline = updated;
+            p.BaselineDeadline = p.Deadline;
+            p.ActiveFrameToken = null;
+        }
+    }
+
+    private static TemplateSyncSideChanges ComputeTemplateChanges(
+        IReadOnlyList<TemplateSyncItem> before,
+        IReadOnlyList<TemplateSyncItem> after)
+    {
+        var beforeById = before.ToDictionary(i => i.Id);
+        var afterById = after.ToDictionary(i => i.Id);
+        var added = 0;
+        var updated = 0;
+        var deleted = 0;
+
+        foreach (var (id, afterItem) in afterById)
+        {
+            if (!beforeById.TryGetValue(id, out var beforeItem))
+            {
+                added++;
+            }
+            else if (beforeItem.Kind != afterItem.Kind ||
+                     !string.Equals(beforeItem.Text, afterItem.Text, StringComparison.Ordinal) ||
+                     !string.Equals(beforeItem.Title, afterItem.Title, StringComparison.Ordinal) ||
+                     !string.Equals(beforeItem.Tag, afterItem.Tag, StringComparison.Ordinal) ||
+                     beforeItem.Order != afterItem.Order)
+            {
+                updated++;
+            }
+        }
+        foreach (var id in beforeById.Keys)
+        {
+            if (!afterById.ContainsKey(id)) deleted++;
+        }
+        return new TemplateSyncSideChanges(added, updated, deleted);
+    }
+
+    private static long ClampTimestamp(long value) =>
+        Math.Clamp(value, -SyncProtocol.MaxTimestamp, SyncProtocol.MaxTimestamp);
 
     private static PendingReply ExtendReply(PendingReply entry, ulong frameToken, DateTimeOffset candidate)
     {

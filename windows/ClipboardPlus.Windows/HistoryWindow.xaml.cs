@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -8,6 +9,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using ClipboardPlus.Sync;
 using ClipboardPlus.Windows.Core;
@@ -19,6 +21,7 @@ using Button = System.Windows.Controls.Button;
 using ButtonBase = System.Windows.Controls.Primitives.ButtonBase;
 using Color = System.Windows.Media.Color;
 using ColorConverter = System.Windows.Media.ColorConverter;
+using ContextMenu = System.Windows.Controls.ContextMenu;
 using DataFormats = System.Windows.DataFormats;
 using DataObject = System.Windows.DataObject;
 using DispatcherPriority = System.Windows.Threading.DispatcherPriority;
@@ -28,8 +31,10 @@ using DragDropEffects = System.Windows.DragDropEffects;
 using DragEventArgs = System.Windows.DragEventArgs;
 using IDataObject = System.Windows.IDataObject;
 using KeyEventArgs = System.Windows.Input.KeyEventArgs;
+using MenuItem = System.Windows.Controls.MenuItem;
 using MouseEventArgs = System.Windows.Input.MouseEventArgs;
 using Point = System.Windows.Point;
+using TextBox = System.Windows.Controls.TextBox;
 
 namespace ClipboardPlus.Windows;
 
@@ -112,14 +117,80 @@ public sealed class HistoryRow
     }
 }
 
+public abstract class TemplateListRow
+{
+    public abstract bool IsHeader { get; }
+}
+
+public sealed class TemplateHeaderRow(TemplateGroupView group, bool isExpanded) : TemplateListRow
+{
+    public override bool IsHeader => true;
+    public TemplateGroupView Group { get; } = group;
+    public bool IsExpanded { get; } = isExpanded;
+    public string Title => Group.Title;
+    public string Count => Group.Items.Count.ToString(CultureInfo.InvariantCulture);
+    public bool IsUntagged => Group.Tag is null;
+    public string ChevronGlyph => IsExpanded ? "\uE70D" : "\uE76C";
+    public string TagGlyph => Group.Tag is null ? "\uE7B8" : "\uE8EC";
+}
+
+public sealed class TemplateCardRow : TemplateListRow
+{
+    public TemplateCardRow(TemplateListEntry entry)
+    {
+        Entry = entry;
+        Flavor = HistoryText.DetectTextFlavor(Item.Text, out var link, out var color);
+        PreviewText = HistoryText.TextPreview(Item.Text);
+        LinkHost = link?.Host;
+        LinkRemainder = link?.Remainder;
+        KindGlyph = HistoryText.FlavorGlyph(Flavor);
+        KindLabel = Flavor switch
+        {
+            HistoryDisplayFlavor.Link => "リンク",
+            HistoryDisplayFlavor.Email => "メール",
+            HistoryDisplayFlavor.Phone => "電話",
+            HistoryDisplayFlavor.Color => "色",
+            _ => "定型文",
+        };
+        if (color is { } rgb)
+        {
+            var brush = new SolidColorBrush(Color.FromRgb(rgb.Red, rgb.Green, rgb.Blue));
+            brush.Freeze();
+            SwatchBrush = brush;
+        }
+    }
+
+    public override bool IsHeader => false;
+    public TemplateListEntry Entry { get; }
+    public TemplateSyncItem Item => Entry.Item!;
+    public string? Name => Item.Title;
+    public HistoryDisplayFlavor Flavor { get; }
+    public string PreviewText { get; }
+    public string? LinkHost { get; }
+    public string? LinkRemainder { get; }
+    public string KindGlyph { get; }
+    public string KindLabel { get; }
+    public Brush? SwatchBrush { get; }
+
+    public Visibility NameVisibility => !string.IsNullOrEmpty(Name) ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility LinkVisibility => Flavor == HistoryDisplayFlavor.Link ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility LinkRemainderVisibility => !string.IsNullOrEmpty(LinkRemainder) ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility PlainTextVisibility => Flavor != HistoryDisplayFlavor.Link ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility ColorSwatchVisibility => Flavor == HistoryDisplayFlavor.Color ? Visibility.Visible : Visibility.Collapsed;
+    public bool CanMoveUp => TemplateWindowLogic.CanMoveInGroup(Entry, -1);
+    public bool CanMoveDown => TemplateWindowLogic.CanMoveInGroup(Entry, +1);
+}
+
 /// <summary>
-/// The history window opened by the hotkey: search, pick, drag out, and paste into the window that was in front.
+/// The history window opened by the hotkey: search, pick, drag out, manage templates, and paste into the window that was in front.
 /// It is created once and hidden between uses.
 /// </summary>
 public partial class HistoryWindow : Window, IHistoryPresenter
 {
     private const double ResizeBorderDip = 5;
     internal const string SelfDragFormat = "ClipboardPlus.HistoryDrag";
+
+    private enum EditorMode { None, CreateTemplate, EditTemplate, RenameTag }
 
     private readonly Action<string> log;
     private readonly Func<bool> pasteOnSelect;
@@ -128,6 +199,9 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private readonly Func<WindowPlacement?>? loadPlacement;
     private readonly Action<WindowPlacement>? savePlacement;
     private readonly ObservableCollection<HistoryRow> rows = [];
+    private readonly ObservableCollection<TemplateListRow> templateRows = [];
+    private readonly HashSet<string> openTemplateTags = new(StringComparer.Ordinal);
+    private readonly HashSet<string> closedTemplateTags = new(StringComparer.Ordinal);
     private readonly PasteTargetTracker pasteTarget = new();
 
     private SyncCoordinator? coordinator;
@@ -136,17 +210,31 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private WinEventDelegate? foregroundHookProc;
     private nint foregroundHook;
     private DispatcherTimer? noticeTimer;
+    private HistoryWindowTab activeTab = TemplateWindowLogic.InitialTab();
     private int reloadVersion;
     private int? preferredIndex;
+    private int? preferredTemplateIndex;
+    private Guid? preferredTemplateId;
+    private string? preferredHeaderTag;
+    private bool hasPreferredHeaderTag;
     private bool choosing;
     private bool deleting;
     private bool dragging;
     private bool dropOverlayActive;
     private bool pendingReloadAfterDrag;
     private bool placedForDisplay;
+    private bool syncingTemplates;
+    private bool savingEditor;
     private Point? dragStartPoint;
     private HistoryRow? dragCandidate;
     private HistoryRow? pendingClickRow;
+    private TemplateCardRow? dragTemplateCandidate;
+    private TemplateCardRow? pendingTemplateClickRow;
+    private TemplateHeaderRow? pendingTemplateHeaderClick;
+    private TemplateSyncItem? pendingUndoTemplate;
+    private EditorMode editorMode = EditorMode.None;
+    private Guid? editingTemplateId;
+    private string? renamingOldTag;
 
     public HistoryWindow(Action<string> log, Func<bool> pasteOnSelect,
         Func<nint, CancellationToken, Task<bool>> paste, Action openSettings)
@@ -166,7 +254,9 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         this.savePlacement = savePlacement;
         InitializeComponent();
         HistoryList.ItemsSource = rows;
+        TemplateList.ItemsSource = templateRows;
         ApplyTheme();
+        UpdateTabVisuals();
         SourceInitialized += OnSourceInitialized;
         Closed += OnWindowClosed;
         IsVisibleChanged += OnWindowVisibleChanged;
@@ -177,12 +267,22 @@ public partial class HistoryWindow : Window, IHistoryPresenter
 
     internal static string DragStagingRoot => Path.Combine(LocalStore.Root, "drag");
 
+    private bool IsEditorOpen => editorMode != EditorMode.None;
+
     /// <summary>Follows the coordinator, which re-pairing replaces. Null while there is none.</summary>
     public void Attach(SyncCoordinator? next)
     {
-        if (coordinator is not null) coordinator.HistoryChanged -= OnHistoryChanged;
+        if (coordinator is not null)
+        {
+            coordinator.HistoryChanged -= OnHistoryChanged;
+            coordinator.TemplatesChanged -= OnTemplatesChanged;
+        }
         coordinator = next;
-        if (coordinator is not null) coordinator.HistoryChanged += OnHistoryChanged;
+        if (coordinator is not null)
+        {
+            coordinator.HistoryChanged += OnHistoryChanged;
+            coordinator.TemplatesChanged += OnTemplatesChanged;
+        }
         if (IsVisible) _ = ReloadAsync();
     }
 
@@ -200,6 +300,10 @@ public partial class HistoryWindow : Window, IHistoryPresenter
 
         pasteTarget.Reset(value.PreviousWindow);
         ApplyTheme();
+        CloseEditor();
+        ClearPendingUndo();
+        activeTab = TemplateWindowLogic.InitialTab();
+        UpdateTabVisuals();
         SearchBox.Text = "";
 
         var hwnd = new WindowInteropHelper(this).EnsureHandle();
@@ -241,7 +345,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             pendingReloadAfterDrag = true;
             return;
         }
-        if (IsVisible)
+        if (IsVisible && activeTab == HistoryWindowTab.History)
         {
             _ = ReloadAsync();
             return;
@@ -250,11 +354,137 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             _ = PruneDragStagingAsync();
     });
 
+    private void OnTemplatesChanged() => Dispatcher.BeginInvoke(() =>
+    {
+        if (dragging)
+        {
+            pendingReloadAfterDrag = true;
+            return;
+        }
+        if (IsVisible && activeTab == HistoryWindowTab.Templates)
+            _ = ReloadAsync();
+    });
+
+    private void SwitchTab(HistoryWindowTab nextTab)
+    {
+        if (activeTab == nextTab) return;
+        CloseEditor();
+        ClearPendingUndo();
+        HideNotice();
+        ResetDragState();
+        activeTab = nextTab;
+        UpdateTabVisuals();
+        SearchBox.Focus();
+        Keyboard.Focus(SearchBox);
+        if (IsVisible) _ = ReloadAsync();
+    }
+
+    private void UpdateTabVisuals()
+    {
+        var isTemplates = activeTab == HistoryWindowTab.Templates;
+        TabHistoryButton.Tag = isTemplates ? null : "Active";
+        TabTemplatesButton.Tag = isTemplates ? "Active" : null;
+        TemplateActionsPanel.Visibility = isTemplates ? Visibility.Visible : Visibility.Collapsed;
+        TitleModeText.Text = TemplateWindowLogic.TitleModeLabel(activeTab);
+        SearchHint.Text = TemplateWindowLogic.SearchHint(activeTab);
+        FooterHintText.Text = TemplateWindowLogic.FooterHint(activeTab);
+        UpdateSyncButtonVisuals();
+
+        if (isTemplates)
+        {
+            HistoryList.Visibility = Visibility.Collapsed;
+            TemplateList.Visibility = templateRows.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        else
+        {
+            TemplateList.Visibility = Visibility.Collapsed;
+            HistoryList.Visibility = rows.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+
+    private void UpdateSyncButtonVisuals()
+    {
+        TemplateSyncButton.IsEnabled = !syncingTemplates;
+        TemplateSyncText.Text = syncingTemplates ? "同期中" : "同期";
+    }
+
+    private void SetTemplateSyncing(bool syncing)
+    {
+        syncingTemplates = syncing;
+        UpdateSyncButtonVisuals();
+        if (syncing)
+        {
+            var anim = new DoubleAnimation(0, 360, TimeSpan.FromMilliseconds(900))
+            {
+                RepeatBehavior = RepeatBehavior.Forever,
+            };
+            TemplateSyncRotate.BeginAnimation(RotateTransform.AngleProperty, anim);
+        }
+        else
+        {
+            TemplateSyncRotate.BeginAnimation(RotateTransform.AngleProperty, null);
+            TemplateSyncRotate.Angle = 0;
+        }
+    }
+
     private async Task ReloadAsync()
     {
         var version = ++reloadVersion;
+        var tab = activeTab;
         var current = coordinator;
         var search = SearchBox.Text.Trim();
+
+        if (tab == HistoryWindowTab.Templates)
+        {
+            IReadOnlyList<TemplateGroupView> groups = [];
+            if (current is not null)
+            {
+                try { groups = await current.GetTemplateGroupsAsync(search.Length == 0 ? null : search); }
+                catch (Exception ex) { log($"template load error={ex.GetType().Name}"); return; }
+            }
+            if (version != reloadVersion || !IsVisible || activeTab != HistoryWindowTab.Templates)
+                return;
+
+            var selectedCardId = (SelectedTemplateRow as TemplateCardRow)?.Item.Id;
+            var selectedHeaderTag = (SelectedTemplateRow as TemplateHeaderRow)?.Group.Tag;
+            var hasSelectedHeader = SelectedTemplateRow is TemplateHeaderRow;
+
+            var entries = TemplateWindowLogic.BuildVisibleEntries(groups, search, openTemplateTags, closedTemplateTags);
+            templateRows.Clear();
+            foreach (var entry in entries)
+            {
+                templateRows.Add(entry.IsHeader
+                    ? new TemplateHeaderRow(entry.Group, entry.IsExpanded)
+                    : new TemplateCardRow(entry));
+            }
+
+            UpdateEmptyState(tab, search);
+            TemplateList.Visibility = templateRows.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            HistoryList.Visibility = Visibility.Collapsed;
+
+            var nextIndex = -1;
+            if (preferredTemplateId is Guid prefId)
+                nextIndex = IndexOfTemplateCard(prefId);
+            else if (hasPreferredHeaderTag)
+                nextIndex = IndexOfTemplateHeader(preferredHeaderTag);
+            else if (selectedCardId is Guid prevId)
+                nextIndex = IndexOfTemplateCard(prevId);
+            else if (hasSelectedHeader)
+                nextIndex = IndexOfTemplateHeader(selectedHeaderTag);
+
+            if (nextIndex < 0 && preferredTemplateIndex is int place && templateRows.Count > 0)
+                nextIndex = Math.Clamp(place, 0, templateRows.Count - 1);
+
+            preferredTemplateId = null;
+            preferredHeaderTag = null;
+            hasPreferredHeaderTag = false;
+            preferredTemplateIndex = null;
+
+            TemplateList.SelectedIndex = nextIndex >= 0 ? nextIndex : (templateRows.Count > 0 ? 0 : -1);
+            if (TemplateList.SelectedItem is not null) TemplateList.ScrollIntoView(TemplateList.SelectedItem);
+            return;
+        }
+
         IReadOnlyList<HistoryItem> items = [];
         if (current is not null)
         {
@@ -271,16 +501,18 @@ public partial class HistoryWindow : Window, IHistoryPresenter
                 _ = PruneDragStagingAsync();
         }
 
-        if (!IsVisible) return;
+        if (!IsVisible || activeTab != HistoryWindowTab.History) return;
 
         var selected = Selected?.Item.Id;
         var now = DateTimeOffset.Now;
         rows.Clear();
         foreach (var item in items) rows.Add(new HistoryRow(item, now));
-        UpdateEmptyState(search);
+        UpdateEmptyState(tab, search);
+        HistoryList.Visibility = rows.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        TemplateList.Visibility = Visibility.Collapsed;
         // Keep the selected item; if it is gone (deleted), stay at the same place in the list.
         var index = selected is Guid id ? IndexOf(id) : -1;
-        if (index < 0 && preferredIndex is int place) index = Math.Min(place, rows.Count - 1);
+        if (index < 0 && preferredIndex is int placeHistory) index = Math.Min(placeHistory, rows.Count - 1);
         preferredIndex = null;
         HistoryList.SelectedIndex = index >= 0 ? index : (rows.Count > 0 ? 0 : -1);
         if (HistoryList.SelectedItem is not null) HistoryList.ScrollIntoView(HistoryList.SelectedItem);
@@ -302,22 +534,36 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         }
     }
 
-    private void UpdateEmptyState(string search)
+    private void UpdateEmptyState(HistoryWindowTab tab, string search)
     {
-        if (rows.Count > 0)
+        var count = tab == HistoryWindowTab.Templates ? templateRows.Count : rows.Count;
+        if (count > 0)
         {
             EmptyPanel.Visibility = Visibility.Collapsed;
             return;
         }
         var searching = !string.IsNullOrWhiteSpace(search);
-        EmptyIcon.Text = searching ? "\uE721" : "\uE77F";
-        EmptyTitleText.Text = HistoryText.EmptyTitle(search);
-        EmptyDetailText.Text = HistoryText.EmptyDetail(search);
-        EmptyClearButton.Visibility = searching ? Visibility.Visible : Visibility.Collapsed;
+        if (tab == HistoryWindowTab.Templates)
+        {
+            EmptyIcon.Text = searching ? "\uE721" : "\uE8EC";
+            EmptyTitleText.Text = TemplateWindowLogic.TemplateEmptyTitle(search);
+            EmptyDetailText.Text = TemplateWindowLogic.TemplateEmptyDetail(search);
+            EmptyClearButton.Visibility = searching ? Visibility.Visible : Visibility.Collapsed;
+            EmptyAddTemplateButton.Visibility = searching ? Visibility.Collapsed : Visibility.Visible;
+        }
+        else
+        {
+            EmptyIcon.Text = searching ? "\uE721" : "\uE77F";
+            EmptyTitleText.Text = HistoryText.EmptyTitle(search);
+            EmptyDetailText.Text = HistoryText.EmptyDetail(search);
+            EmptyClearButton.Visibility = searching ? Visibility.Visible : Visibility.Collapsed;
+            EmptyAddTemplateButton.Visibility = Visibility.Collapsed;
+        }
         EmptyPanel.Visibility = Visibility.Visible;
     }
 
     private HistoryRow? Selected => HistoryList.SelectedItem as HistoryRow;
+    private TemplateListRow? SelectedTemplateRow => TemplateList.SelectedItem as TemplateListRow;
 
     private int IndexOf(Guid id)
     {
@@ -325,8 +571,30 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         return -1;
     }
 
+    private int IndexOfTemplateCard(Guid id)
+    {
+        for (var i = 0; i < templateRows.Count; i++)
+            if (templateRows[i] is TemplateCardRow card && card.Item.Id == id) return i;
+        return -1;
+    }
+
+    private int IndexOfTemplateHeader(string? tag)
+    {
+        for (var i = 0; i < templateRows.Count; i++)
+            if (templateRows[i] is TemplateHeaderRow header && string.Equals(header.Group.Tag, tag, StringComparison.Ordinal)) return i;
+        return -1;
+    }
+
     private void Move(int step)
     {
+        if (activeTab == HistoryWindowTab.Templates)
+        {
+            if (templateRows.Count == 0) return;
+            var idx = Math.Clamp(TemplateList.SelectedIndex + step, 0, templateRows.Count - 1);
+            TemplateList.SelectedIndex = idx;
+            TemplateList.ScrollIntoView(templateRows[idx]);
+            return;
+        }
         if (rows.Count == 0) return;
         var index = Math.Clamp(HistoryList.SelectedIndex + step, 0, rows.Count - 1);
         HistoryList.SelectedIndex = index;
@@ -337,12 +605,24 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     {
         var current = coordinator;
         if (row is null || current is null || choosing) return;
+        await CopyAndPasteAsync(() => current.CopyHistoryAsync(row.Item.Id), explicitPaste, ctrlPressed, "history");
+    }
+
+    private async Task ChooseTemplateAsync(TemplateCardRow? row, bool? explicitPaste, bool ctrlPressed = false)
+    {
+        var current = coordinator;
+        if (row is null || current is null || choosing) return;
+        await CopyAndPasteAsync(() => current.CopyTemplateAsync(row.Item.Id), explicitPaste, ctrlPressed, "template");
+    }
+
+    private async Task CopyAndPasteAsync(Func<Task> copyAction, bool? explicitPaste, bool ctrlPressed, string logKind)
+    {
         choosing = true;
         nint target;
         HistorySelectionDecision decision;
         try
         {
-            await current.CopyHistoryAsync(row.Item.Id);
+            await copyAction();
             target = pasteTarget.CurrentTarget;
             // Opened from clipboard+'s own window or tray with no other window visited, there is nothing to paste into.
             var validTarget = target != 0 && ForegroundContext.IsWindowHandle(target) && !ForegroundContext.IsOwnProcessWindow(target);
@@ -354,7 +634,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         catch (Exception ex)
         {
             // An item deleted meanwhile, or an image the clipboard refuses.
-            log($"history choose error={ex.GetType().Name}");
+            log($"{logKind} choose error={ex.GetType().Name}");
             return;
         }
         finally { choosing = false; }
@@ -364,10 +644,10 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         var cancel = pasteCancel = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         try
         {
-            if (!await paste(target, cancel.Token)) log("history paste not delivered");
+            if (!await paste(target, cancel.Token)) log($"{logKind} paste not delivered");
         }
-        catch (OperationCanceledException) { log("history paste cancelled"); }
-        catch (Exception ex) { log($"history paste error={ex.GetType().Name}"); }
+        catch (OperationCanceledException) { log($"{logKind} paste cancelled"); }
+        catch (Exception ex) { log($"{logKind} paste error={ex.GetType().Name}"); }
         finally
         {
             if (pasteCancel == cancel) pasteCancel = null;
@@ -387,11 +667,101 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         finally { deleting = false; }
     }
 
+    private async Task DeleteTemplateAsync(TemplateCardRow? row)
+    {
+        var current = coordinator;
+        if (row is null || current is null || deleting) return;
+        deleting = true;
+        preferredTemplateIndex = TemplateList.SelectedIndex;
+        try
+        {
+            var result = await current.DeleteTemplateAsync(row.Item.Id);
+            if (result.Succeeded && result.Deleted is { } deleted && IsVisible)
+            {
+                pendingUndoTemplate = deleted;
+                ShowNotice("テンプレートを削除しました", isWarning: false, showUndo: true, durationMs: 5000);
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"template delete error={ex.GetType().Name}");
+            preferredTemplateIndex = null;
+        }
+        finally { deleting = false; }
+    }
+
+    private async Task MoveTemplateInGroupAsync(TemplateCardRow? row, int delta)
+    {
+        var current = coordinator;
+        if (row is null || current is null || !TemplateWindowLogic.CanMoveInGroup(row.Entry, delta)) return;
+        preferredTemplateId = row.Item.Id;
+        try
+        {
+            if (!await current.MoveTemplateInGroupAsync(row.Item.Id, delta))
+                preferredTemplateId = null;
+        }
+        catch (Exception ex)
+        {
+            log($"template reorder error={ex.GetType().Name}");
+            preferredTemplateId = null;
+        }
+    }
+
+    private void ToggleTemplateGroup(TemplateHeaderRow header)
+    {
+        var search = SearchBox.Text.Trim();
+        var groupCount = templateRows.OfType<TemplateHeaderRow>().Count();
+        TemplateWindowLogic.ToggleGroupExpansion(header.Group.Tag, groupCount, search, openTemplateTags, closedTemplateTags);
+        preferredHeaderTag = header.Group.Tag;
+        hasPreferredHeaderTag = true;
+        _ = ReloadAsync();
+    }
+
+    private void EnsureGroupExpanded(string? tag)
+    {
+        var key = TemplateWindowLogic.GroupKey(tag);
+        openTemplateTags.Add(key);
+        closedTemplateTags.Remove(key);
+    }
+
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
         // AttachThreadInput can reset this thread's key state, so Ctrl is also asked of Windows.
-        var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0 || (GetAsyncKeyState(VirtualKeyControl) & 0x8000) != 0;
-        switch (e.Key)
+        var ctrl = IsCtrlPressed();
+        var alt = (Keyboard.Modifiers & ModifierKeys.Alt) != 0;
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+
+        if (IsEditorOpen)
+        {
+            if (key == Key.Escape)
+            {
+                CloseEditor();
+                e.Handled = true;
+            }
+            else if (key == Key.Enter && (ctrl || !ReferenceEquals(Keyboard.FocusedElement, TemplateBodyBox)))
+            {
+                _ = SaveEditorAsync();
+                e.Handled = true;
+            }
+            return;
+        }
+
+        if (ctrl && key == Key.Tab)
+        {
+            SwitchTab(TemplateWindowLogic.ToggleTab(activeTab));
+            e.Handled = true;
+            return;
+        }
+
+        if (alt && activeTab == HistoryWindowTab.Templates && key is Key.Up or Key.Down)
+        {
+            if (SelectedTemplateRow is TemplateCardRow cardRow)
+                _ = MoveTemplateInGroupAsync(cardRow, key == Key.Up ? -1 : 1);
+            e.Handled = true;
+            return;
+        }
+
+        switch (key)
         {
             case Key.Escape:
                 if (HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.EscapeKey, IsActive))
@@ -401,13 +771,44 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             case Key.Up: Move(-1); break;
             case Key.PageDown: Move(5); break;
             case Key.PageUp: Move(-5); break;
-            case Key.Enter: _ = ChooseAsync(Selected, explicitPaste: null, ctrlPressed: ctrl); break;
+            case Key.Enter:
+                if (activeTab == HistoryWindowTab.Templates)
+                {
+                    var decision = TemplateWindowLogic.DecideTemplateActivation(
+                        SelectedTemplateRow is TemplateHeaderRow,
+                        pasteOnSelect(),
+                        ctrl,
+                        explicitPaste: null,
+                        hasValidExternalTarget: false);
+                    if (decision.Action == TemplateActivationAction.ToggleGroup && SelectedTemplateRow is TemplateHeaderRow header)
+                        ToggleTemplateGroup(header);
+                    else if (decision.Action == TemplateActivationAction.SelectItem && SelectedTemplateRow is TemplateCardRow card)
+                        _ = ChooseTemplateAsync(card, explicitPaste: null, ctrlPressed: ctrl);
+                }
+                else
+                {
+                    _ = ChooseAsync(Selected, explicitPaste: null, ctrlPressed: ctrl);
+                }
+                break;
             // While a search is typed, Delete edits the search; with an empty box it removes the item.
-            case Key.Delete when SearchBox.Text.Length == 0: _ = DeleteAsync(Selected); break;
+            case Key.Delete when SearchBox.Text.Length == 0:
+                if (activeTab == HistoryWindowTab.Templates)
+                {
+                    if (SelectedTemplateRow is TemplateCardRow card)
+                        _ = DeleteTemplateAsync(card);
+                }
+                else
+                {
+                    _ = DeleteAsync(Selected);
+                }
+                break;
             default: return;
         }
         e.Handled = true;
     }
+
+    private bool IsCtrlPressed() =>
+        (Keyboard.Modifiers & ModifierKeys.Control) != 0 || (GetAsyncKeyState(VirtualKeyControl) & 0x8000) != 0;
 
     private void OnTitleBarMouseDown(object sender, MouseButtonEventArgs e)
     {
@@ -422,6 +823,223 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         if (HistoryWindowPlacement.ShouldCloseWindow(HistoryWindowTrigger.CloseButton))
             Hide();
     }
+
+    private void OnTabHistoryClick(object sender, RoutedEventArgs e) => SwitchTab(HistoryWindowTab.History);
+    private void OnTabTemplatesClick(object sender, RoutedEventArgs e) => SwitchTab(HistoryWindowTab.Templates);
+
+    private async void OnTemplateSyncClick(object sender, RoutedEventArgs e)
+    {
+        if (syncingTemplates) return;
+        var current = coordinator;
+        if (current is null)
+        {
+            ShowNotice("いまは同期できません", isWarning: true);
+            return;
+        }
+        SetTemplateSyncing(true);
+        try
+        {
+            var result = await current.SyncTemplatesAsync();
+            if (IsVisible && TemplateWindowLogic.FormatSyncNotice(result) is { } notice)
+                ShowNotice(notice.Message, notice.IsWarning, showUndo: false, durationMs: 4200);
+        }
+        catch (Exception ex)
+        {
+            log($"template sync ui error={ex.GetType().Name}");
+            if (IsVisible)
+                ShowNotice("テンプレートの同期に失敗しました", isWarning: true);
+        }
+        finally
+        {
+            SetTemplateSyncing(false);
+        }
+    }
+
+    private void OnAddTemplateClick(object sender, RoutedEventArgs e) => OpenTemplateEditor(existing: null, presetTag: null);
+
+    private void OpenTemplateEditor(TemplateSyncItem? existing, string? presetTag)
+    {
+        ClearEditorError();
+        if (existing is null)
+        {
+            editorMode = EditorMode.CreateTemplate;
+            editingTemplateId = null;
+            EditorTitleText.Text = "テンプレートを追加";
+            TemplateNameBox.Text = "";
+            TemplateTagBox.Text = presetTag ?? "";
+            TemplateBodyBox.Text = "";
+        }
+        else
+        {
+            editorMode = EditorMode.EditTemplate;
+            editingTemplateId = existing.Id;
+            EditorTitleText.Text = "テンプレートを編集";
+            TemplateNameBox.Text = existing.Title ?? "";
+            TemplateTagBox.Text = existing.Tag ?? "";
+            TemplateBodyBox.Text = existing.Text;
+        }
+        EditorSaveButton.Content = "保存";
+        TemplateEditFields.Visibility = Visibility.Visible;
+        RenameTagFields.Visibility = Visibility.Collapsed;
+        TemplateEditorOverlay.Visibility = Visibility.Visible;
+        TemplateBodyBox.Focus();
+        TemplateBodyBox.CaretIndex = TemplateBodyBox.Text.Length;
+    }
+
+    private void OpenRenameTagEditor(string? currentTag)
+    {
+        ClearEditorError();
+        editorMode = EditorMode.RenameTag;
+        editingTemplateId = null;
+        renamingOldTag = currentTag;
+        EditorTitleText.Text = currentTag is null ? "タグを付ける" : "タグ名を変更";
+        RenameTagBox.Text = currentTag ?? "";
+        EditorSaveButton.Content = "変更";
+        TemplateEditFields.Visibility = Visibility.Collapsed;
+        RenameTagFields.Visibility = Visibility.Visible;
+        TemplateEditorOverlay.Visibility = Visibility.Visible;
+        RenameTagBox.Focus();
+        RenameTagBox.SelectAll();
+    }
+
+    private void CloseEditor()
+    {
+        editorMode = EditorMode.None;
+        editingTemplateId = null;
+        renamingOldTag = null;
+        savingEditor = false;
+        ClearEditorError();
+        TemplateEditorOverlay.Visibility = Visibility.Collapsed;
+        if (IsVisible)
+        {
+            SearchBox.Focus();
+            Keyboard.Focus(SearchBox);
+        }
+    }
+
+    private void ShowEditorError(string message)
+    {
+        EditorErrorText.Text = message;
+        EditorErrorText.Visibility = Visibility.Visible;
+    }
+
+    private void ClearEditorError()
+    {
+        EditorErrorText.Text = "";
+        EditorErrorText.Visibility = Visibility.Collapsed;
+    }
+
+    private async Task SaveEditorAsync()
+    {
+        if (savingEditor || !IsEditorOpen) return;
+        var current = coordinator;
+        if (current is null)
+        {
+            ShowEditorError("いまは保存できません");
+            return;
+        }
+        savingEditor = true;
+        try
+        {
+            if (editorMode == EditorMode.RenameTag)
+            {
+                var newTag = TemplateRepository.SanitizeTag(RenameTagBox.Text);
+                TemplateWindowLogic.TransferGroupExpansionOnRename(renamingOldTag, newTag, openTemplateTags, closedTemplateTags);
+                preferredHeaderTag = newTag;
+                hasPreferredHeaderTag = true;
+                await current.RenameTemplateTagAsync(renamingOldTag, newTag);
+                CloseEditor();
+                return;
+            }
+
+            var body = TemplateBodyBox.Text;
+            var name = TemplateNameBox.Text;
+            var tag = TemplateTagBox.Text;
+            var result = editorMode == EditorMode.EditTemplate && editingTemplateId is Guid editId
+                ? await current.UpdateTemplateAsync(editId, body, name, tag)
+                : await current.CreateTemplateAsync(body, name, tag);
+
+            if (!result.Succeeded)
+            {
+                ShowEditorError(result.ErrorMessage ?? "保存できませんでした");
+                return;
+            }
+
+            if (result.Item is { } saved)
+            {
+                EnsureGroupExpanded(saved.Tag);
+                preferredTemplateId = saved.Id;
+            }
+            CloseEditor();
+        }
+        catch (Exception ex)
+        {
+            log($"template save error={ex.GetType().Name}");
+            ShowEditorError("テンプレートを保存できませんでした");
+        }
+        finally
+        {
+            savingEditor = false;
+        }
+    }
+
+    private async void OnPickTagClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn)
+            await ShowTagPickerMenuAsync(btn, TemplateTagBox, includeUntaggedOption: true);
+    }
+
+    private async void OnPickRenameTagClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn)
+            await ShowTagPickerMenuAsync(btn, RenameTagBox, includeUntaggedOption: true);
+    }
+
+    private async Task ShowTagPickerMenuAsync(Button anchor, TextBox targetBox, bool includeUntaggedOption)
+    {
+        var current = coordinator;
+        if (current is null) return;
+        IReadOnlyList<string> tags;
+        try { tags = await current.GetTemplateTagsAsync(); }
+        catch (Exception ex) { log($"template tag list error={ex.GetType().Name}"); return; }
+
+        if (!IsVisible || !IsEditorOpen) return;
+        var menu = new ContextMenu { PlacementTarget = anchor, Placement = PlacementMode.Bottom };
+        foreach (var tag in tags)
+        {
+            var chosen = tag;
+            var item = new MenuItem { Header = chosen };
+            item.Click += (_, _) =>
+            {
+                targetBox.Text = chosen;
+                targetBox.Focus();
+                targetBox.CaretIndex = targetBox.Text.Length;
+            };
+            menu.Items.Add(item);
+        }
+        if (includeUntaggedOption)
+        {
+            if (tags.Count > 0) menu.Items.Add(new Separator());
+            var untagged = new MenuItem { Header = "タグなし（その他）" };
+            untagged.Click += (_, _) =>
+            {
+                targetBox.Text = "";
+                targetBox.Focus();
+            };
+            menu.Items.Add(untagged);
+        }
+        menu.IsOpen = true;
+    }
+
+    private void OnEditorBackdropMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        CloseEditor();
+        e.Handled = true;
+    }
+
+    private void OnEditorCardMouseDown(object sender, MouseButtonEventArgs e) => e.Handled = true;
+    private void OnEditorCancel(object sender, RoutedEventArgs e) => CloseEditor();
+    private void OnEditorSave(object sender, RoutedEventArgs e) => _ = SaveEditorAsync();
 
     private void OnClearSearch(object sender, RoutedEventArgs e)
     {
@@ -485,6 +1103,68 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             _ = ChooseAsync(clickRow, explicitPaste: null, ctrlPressed: false);
     }
 
+    private void OnTemplateListMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        ResetDragState();
+        if (IsInsideButton(e.OriginalSource as DependencyObject)) return;
+        var row = TemplateRowAt(e.OriginalSource);
+        if (row is TemplateHeaderRow header)
+        {
+            TemplateList.SelectedItem = header;
+            pendingTemplateHeaderClick = header;
+            return;
+        }
+        if (row is TemplateCardRow card)
+        {
+            dragStartPoint = e.GetPosition(this);
+            dragTemplateCandidate = card;
+            pendingTemplateClickRow = card;
+        }
+    }
+
+    private void OnTemplateListMouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed)
+        {
+            ResetDragState();
+            return;
+        }
+        if (dragging || dragStartPoint is not { } start || dragTemplateCandidate is not { } row)
+            return;
+
+        var current = e.GetPosition(this);
+        if (!HistoryWindowPlacement.IsDragDistanceReached(
+                current.X - start.X,
+                current.Y - start.Y,
+                SystemParameters.MinimumHorizontalDragDistance,
+                SystemParameters.MinimumVerticalDragDistance))
+        {
+            return;
+        }
+
+        pendingTemplateClickRow = null;
+        dragStartPoint = null;
+        dragTemplateCandidate = null;
+        StartTemplateDrag(row);
+    }
+
+    private void OnTemplateListMouseUp(object sender, MouseButtonEventArgs e)
+    {
+        var clickHeader = pendingTemplateHeaderClick;
+        var clickCard = pendingTemplateClickRow;
+        ResetDragState();
+        if (dragging || IsInsideButton(e.OriginalSource as DependencyObject))
+            return;
+        var currentRow = TemplateRowAt(e.OriginalSource);
+        if (clickHeader is not null && ReferenceEquals(currentRow, clickHeader))
+        {
+            ToggleTemplateGroup(clickHeader);
+            return;
+        }
+        if (clickCard is not null && ReferenceEquals(currentRow, clickCard))
+            _ = ChooseTemplateAsync(clickCard, explicitPaste: null, ctrlPressed: false);
+    }
+
     private void OnThumbnailImageSizeChanged(object sender, SizeChangedEventArgs e)
     {
         if (sender is not FrameworkElement element) return;
@@ -503,11 +1183,22 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         if (dragging) return;
         var data = BuildDragDataObject(row.Item, DragStagingRoot, log);
         if (data is null) return;
+        RunDragDrop(HistoryList, data);
+    }
 
+    private void StartTemplateDrag(TemplateCardRow row)
+    {
+        if (dragging) return;
+        var data = BuildTextDragDataObject(row.Item.Text);
+        RunDragDrop(TemplateList, data);
+    }
+
+    private void RunDragDrop(DependencyObject source, DataObject data)
+    {
         dragging = true;
         try
         {
-            DragDrop.DoDragDrop(HistoryList, data, DragDropEffects.Copy);
+            DragDrop.DoDragDrop(source, data, DragDropEffects.Copy);
         }
         catch (Exception ex)
         {
@@ -527,6 +1218,14 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         }
     }
 
+    internal static DataObject BuildTextDragDataObject(string text)
+    {
+        var data = new DataObject();
+        data.SetData(SelfDragFormat, true);
+        data.SetText(text);
+        return data;
+    }
+
     internal static DataObject? BuildDragDataObject(
         HistoryItem item,
         string stagingRoot,
@@ -535,13 +1234,11 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     {
         try
         {
+            if (item.Kind == "text")
+                return BuildTextDragDataObject(item.Text ?? "");
+
             var data = new DataObject();
             data.SetData(SelfDragFormat, true);
-            if (item.Kind == "text")
-            {
-                data.SetText(item.Text ?? "");
-                return data;
-            }
 
             if (string.IsNullOrEmpty(item.Path) || !File.Exists(item.Path))
                 return null;
@@ -691,6 +1388,9 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         dragStartPoint = null;
         dragCandidate = null;
         pendingClickRow = null;
+        dragTemplateCandidate = null;
+        pendingTemplateClickRow = null;
+        pendingTemplateHeaderClick = null;
     }
 
     private void OnListRightDown(object sender, MouseButtonEventArgs e)
@@ -701,11 +1401,12 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     /// <summary>The menu acts on the row under the pointer, so it does not open over empty space.</summary>
     private void OnContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
-        if (RowAt(e.OriginalSource) is null)
+        if (RowAt(e.OriginalSource) is not { } row)
         {
             e.Handled = true;
             return;
         }
+        HistoryMenuMoveToTemplates.Visibility = row.Item.Kind == "text" ? Visibility.Visible : Visibility.Collapsed;
         if (HistoryList.ContextMenu is { } menu)
         {
             menu.PlacementTarget = HistoryList;
@@ -716,7 +1417,11 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private void OnCardMenuClick(object sender, RoutedEventArgs e)
     {
         if (sender is not Button button) return;
-        if (button.DataContext is HistoryRow row) HistoryList.SelectedItem = row;
+        if (button.DataContext is HistoryRow row)
+        {
+            HistoryList.SelectedItem = row;
+            HistoryMenuMoveToTemplates.Visibility = row.Item.Kind == "text" ? Visibility.Visible : Visibility.Collapsed;
+        }
         if (HistoryList.ContextMenu is not { } menu) return;
         menu.PlacementTarget = button;
         menu.Placement = PlacementMode.Bottom;
@@ -724,14 +1429,95 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         e.Handled = true;
     }
 
+    private void OnTemplateListRightDown(object sender, MouseButtonEventArgs e)
+    {
+        if (TemplateRowAt(e.OriginalSource) is { } row) TemplateList.SelectedItem = row;
+    }
+
+    private void OnTemplateContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (TemplateRowAt(e.OriginalSource) is not { } row)
+        {
+            e.Handled = true;
+            return;
+        }
+        ConfigureTemplateContextMenu(row);
+        if (TemplateList.ContextMenu is { } menu)
+        {
+            menu.PlacementTarget = TemplateList;
+            menu.Placement = PlacementMode.MousePoint;
+        }
+    }
+
+    private void OnTemplateRowMenuClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button) return;
+        if (button.DataContext is TemplateListRow row)
+        {
+            TemplateList.SelectedItem = row;
+            ConfigureTemplateContextMenu(row);
+        }
+        if (TemplateList.ContextMenu is not { } menu) return;
+        menu.PlacementTarget = button;
+        menu.Placement = PlacementMode.Bottom;
+        menu.IsOpen = true;
+        e.Handled = true;
+    }
+
+    private void ConfigureTemplateContextMenu(TemplateListRow row)
+    {
+        if (row is TemplateCardRow card)
+        {
+            TplMenuPaste.Visibility = Visibility.Visible;
+            TplMenuCopy.Visibility = Visibility.Visible;
+            TplMenuSep1.Visibility = Visibility.Visible;
+            TplMenuEdit.Visibility = Visibility.Visible;
+            TplMenuMoveUp.Visibility = Visibility.Visible;
+            TplMenuMoveUp.IsEnabled = card.CanMoveUp;
+            TplMenuMoveDown.Visibility = Visibility.Visible;
+            TplMenuMoveDown.IsEnabled = card.CanMoveDown;
+            TplMenuSep2.Visibility = Visibility.Visible;
+            TplMenuDelete.Visibility = Visibility.Visible;
+            TplMenuAddInTag.Visibility = Visibility.Collapsed;
+            TplMenuRenameTag.Visibility = Visibility.Collapsed;
+        }
+        else if (row is TemplateHeaderRow header)
+        {
+            TplMenuPaste.Visibility = Visibility.Collapsed;
+            TplMenuCopy.Visibility = Visibility.Collapsed;
+            TplMenuSep1.Visibility = Visibility.Collapsed;
+            TplMenuEdit.Visibility = Visibility.Collapsed;
+            TplMenuMoveUp.Visibility = Visibility.Collapsed;
+            TplMenuMoveDown.Visibility = Visibility.Collapsed;
+            TplMenuSep2.Visibility = Visibility.Collapsed;
+            TplMenuDelete.Visibility = Visibility.Collapsed;
+            TplMenuAddInTag.Visibility = Visibility.Visible;
+            TplMenuRenameTag.Visibility = Visibility.Visible;
+            TplMenuRenameTag.Header = header.IsUntagged ? "タグを付ける…" : "タグ名を変更…";
+        }
+    }
+
     private HistoryRow? RowAt(object source)
     {
-        var current = source as DependencyObject;
-        while (current is ContentElement content)
-            current = ContentOperations.GetParent(content) ?? LogicalTreeHelper.GetParent(content);
+        var current = UnwrapContentElement(source as DependencyObject);
         return current is not null && ItemsControl.ContainerFromElement(HistoryList, current) is ListBoxItem item
             ? item.DataContext as HistoryRow
             : null;
+    }
+
+    private TemplateListRow? TemplateRowAt(object source)
+    {
+        var current = UnwrapContentElement(source as DependencyObject);
+        return current is not null && ItemsControl.ContainerFromElement(TemplateList, current) is ListBoxItem item
+            ? item.DataContext as TemplateListRow
+            : null;
+    }
+
+    private static DependencyObject? UnwrapContentElement(DependencyObject? current)
+    {
+        while (current is ContentElement content)
+            current = ContentOperations.GetParent(content) ?? LogicalTreeHelper.GetParent(content);
+        return current;
     }
 
     internal static bool IsInsideButton(DependencyObject? source)
@@ -755,14 +1541,114 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private void OnMenuCopy(object sender, RoutedEventArgs e) => _ = ChooseAsync(Selected, explicitPaste: false);
     private void OnMenuDelete(object sender, RoutedEventArgs e) => _ = DeleteAsync(Selected);
 
-    private void OnDismissNotice(object sender, RoutedEventArgs e) => HideDropNotice();
+    private async void OnMenuMoveToTemplates(object sender, RoutedEventArgs e)
+    {
+        var row = Selected;
+        var current = coordinator;
+        if (row is null || current is null || row.Item.Kind != "text") return;
+        try
+        {
+            var result = await current.MoveHistoryToTemplatesAsync(row.Item.Id);
+            if (!IsVisible) return;
+            if (result.Succeeded)
+                ShowNotice("テンプレートの「その他」に移動しました", isWarning: false);
+            else
+                ShowNotice(result.ErrorMessage ?? "テンプレートに移動できませんでした", isWarning: true);
+        }
+        catch (Exception ex)
+        {
+            log($"template move error={ex.GetType().Name}");
+            if (IsVisible) ShowNotice("テンプレートに移動できませんでした", isWarning: true);
+        }
+    }
+
+    private void OnTemplateMenuPaste(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateCardRow card)
+            _ = ChooseTemplateAsync(card, explicitPaste: true);
+    }
+
+    private void OnTemplateMenuCopy(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateCardRow card)
+            _ = ChooseTemplateAsync(card, explicitPaste: false);
+    }
+
+    private void OnTemplateMenuEdit(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateCardRow card)
+            OpenTemplateEditor(card.Item, presetTag: null);
+    }
+
+    private void OnTemplateMenuMoveUp(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateCardRow card)
+            _ = MoveTemplateInGroupAsync(card, -1);
+    }
+
+    private void OnTemplateMenuMoveDown(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateCardRow card)
+            _ = MoveTemplateInGroupAsync(card, 1);
+    }
+
+    private void OnTemplateMenuDelete(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateCardRow card)
+            _ = DeleteTemplateAsync(card);
+    }
+
+    private void OnTemplateMenuAddInTag(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateHeaderRow header)
+            OpenTemplateEditor(existing: null, presetTag: header.Group.Tag);
+    }
+
+    private void OnTemplateMenuRenameTag(object sender, RoutedEventArgs e)
+    {
+        if (SelectedTemplateRow is TemplateHeaderRow header)
+            OpenRenameTagEditor(header.Group.Tag);
+    }
+
+    private async void OnUndoNoticeClick(object sender, RoutedEventArgs e)
+    {
+        var deleted = pendingUndoTemplate;
+        var current = coordinator;
+        ClearPendingUndo();
+        HideNotice();
+        if (deleted is null || current is null) return;
+        try
+        {
+            var result = await current.RestoreDeletedTemplateAsync(deleted);
+            if (result.Succeeded && result.Item is { } restored)
+            {
+                EnsureGroupExpanded(restored.Tag);
+                preferredTemplateId = restored.Id;
+            }
+            else if (!result.Succeeded && IsVisible)
+            {
+                ShowNotice(result.ErrorMessage ?? "元に戻せませんでした", isWarning: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"template undo error={ex.GetType().Name}");
+            if (IsVisible) ShowNotice("元に戻せませんでした", isWarning: true);
+        }
+    }
+
+    private void OnDismissNotice(object sender, RoutedEventArgs e)
+    {
+        ClearPendingUndo();
+        HideNotice();
+    }
 
     private void OnPreviewDragEnter(object sender, DragEventArgs e) => HandleDragOver(e);
     private void OnPreviewDragOver(object sender, DragEventArgs e) => HandleDragOver(e);
 
     private void HandleDragOver(DragEventArgs e)
     {
-        var sourceKind = DetectDropSource(e.Data, dragging);
+        var sourceKind = IsEditorOpen ? DropSourceKind.None : DetectDropSource(e.Data, dragging);
         var acceptable = sourceKind != DropSourceKind.None && (e.AllowedEffects & DragDropEffects.Copy) != 0;
         if (acceptable)
         {
@@ -792,6 +1678,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     {
         e.Handled = true;
         SetDropOverlayActive(false);
+        if (IsEditorOpen) return;
 
         var sourceKind = DetectDropSource(e.Data, dragging);
         if (sourceKind == DropSourceKind.None || (e.AllowedEffects & DragDropEffects.Copy) == 0)
@@ -813,7 +1700,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         catch (Exception ex)
         {
             log($"history drop error={ex.GetType().Name}");
-            if (IsVisible) ShowDropNotice("追加できない項目がありました", isWarning: true);
+            if (IsVisible) ShowNotice("追加できない項目がありました", isWarning: true);
             return;
         }
 
@@ -824,7 +1711,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             var current = coordinator;
             if (current is null)
             {
-                if (IsVisible) ShowDropNotice("いまは履歴に追加できません", isWarning: true);
+                if (IsVisible) ShowNotice("いまは履歴に追加できません", isWarning: true);
                 return;
             }
             try
@@ -836,7 +1723,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             catch (Exception ex)
             {
                 log($"history drop add error={ex.GetType().Name}");
-                if (IsVisible) ShowDropNotice("履歴に追加できませんでした", isWarning: true);
+                if (IsVisible) ShowNotice("履歴に追加できませんでした", isWarning: true);
                 return;
             }
         }
@@ -852,7 +1739,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             TextTooLarge: extracted.TextTooLarge || (sourceKind == DropSourceKind.Text && protocolSkipped > 0));
 
         if (IsVisible && HistoryDrop.FormatDropNotice(summary) is { } notice)
-            ShowDropNotice(notice.Message, notice.IsWarning);
+            ShowNotice(notice.Message, notice.IsWarning);
     }
 
     private void SetDropOverlayActive(bool active)
@@ -861,28 +1748,38 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         DropOverlay.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    private void ShowDropNotice(string message, bool isWarning)
+    private void ShowNotice(string message, bool isWarning, bool showUndo = false, int durationMs = 3500)
     {
+        if (!showUndo) ClearPendingUndo();
         NoticeBanner.SetResourceReference(Border.BackgroundProperty, isWarning ? "NoticeWarningBg" : "NoticeBg");
         NoticeBanner.SetResourceReference(Border.BorderBrushProperty, isWarning ? "NoticeWarningBorder" : "NoticeBorder");
         NoticeIcon.SetResourceReference(TextBlock.ForegroundProperty, isWarning ? "NoticeWarningFg" : "NoticeFg");
         NoticeText.SetResourceReference(TextBlock.ForegroundProperty, isWarning ? "NoticeWarningFg" : "NoticeFg");
         NoticeIcon.Text = isWarning ? "\uE7BA" : "\uE73E";
         NoticeText.Text = message;
+        NoticeUndoButton.Visibility = showUndo ? Visibility.Visible : Visibility.Collapsed;
         NoticeBanner.Visibility = Visibility.Visible;
 
         if (noticeTimer is null)
         {
-            noticeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(3500) };
-            noticeTimer.Tick += (_, _) => HideDropNotice();
+            noticeTimer = new DispatcherTimer();
+            noticeTimer.Tick += (_, _) =>
+            {
+                ClearPendingUndo();
+                HideNotice();
+            };
         }
         noticeTimer.Stop();
+        noticeTimer.Interval = TimeSpan.FromMilliseconds(durationMs);
         noticeTimer.Start();
     }
 
-    private void HideDropNotice()
+    private void ClearPendingUndo() => pendingUndoTemplate = null;
+
+    private void HideNotice()
     {
         noticeTimer?.Stop();
+        NoticeUndoButton.Visibility = Visibility.Collapsed;
         NoticeBanner.Visibility = Visibility.Collapsed;
         NoticeText.Text = "";
     }
@@ -1211,7 +2108,15 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         openSettings();
     }
 
-    private void OnActivated(object? sender, EventArgs e) => SearchBox.Focus();
+    private void OnActivated(object? sender, EventArgs e)
+    {
+        if (editorMode == EditorMode.RenameTag)
+            RenameTagBox.Focus();
+        else if (IsEditorOpen)
+            TemplateBodyBox.Focus();
+        else
+            SearchBox.Focus();
+    }
 
     private void OnDeactivated(object? sender, EventArgs e)
     {
@@ -1232,9 +2137,12 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         pasteTarget.Reset();
         ResetDragState();
         SetDropOverlayActive(false);
-        HideDropNotice();
+        CloseEditor();
+        ClearPendingUndo();
+        HideNotice();
         // Hidden rows keep decoded thumbnails alive, so they go with the window.
         rows.Clear();
+        templateRows.Clear();
     }
 
     private void OnClosing(object? sender, CancelEventArgs e)
@@ -1455,6 +2363,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             Resources[name] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(dark ? darkColor : light));
 
         Set("Bg", "#F2F4F8", "#181A1F");
+        Set("TabTrack", "#E7EBF2", "#20232B");
         Set("Card", "#FFFFFF", "#25272E");
         Set("CardBorder", "#0F000000", "#14FFFFFF");
         Set("Hover", "#EEF3FA", "#2E313A");
@@ -1470,6 +2379,8 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         Set("CloseHover", "#FEE2E2", "#4C1D24");
         Set("ClosePressed", "#FECACA", "#68252E");
         Set("CloseHoverFg", "#DC2626", "#FCA5A5");
+        Set("ErrorFg", "#DC2626", "#FCA5A5");
+        Set("OverlayScrim", "#660F172A", "#88000000");
         Set("ScrollThumb", "#CBD5E1", "#474C59");
         Set("LinkTint", "#2663EB", "#73A3FF");
         Set("ImageTint", "#7C3AED", "#A78BFA");
