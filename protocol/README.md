@@ -1,6 +1,6 @@
 # clipboard+ 同期の共通部品と試験データ
 
-現在は第2版。[通信の決まり](../docs/Windows同期の方針.md)、[保存・状態API・移行時の制約](../docs/Windows同期の段階3メモ.md)を参照。1つのQR／鍵を複数のiPhone・iPadで使う。QRの書式番号1と通信の版2は独立している。
+現在は第3版。[通信の決まり](../docs/Windows同期の方針.md)、[テンプレート同期の方針](../docs/テンプレート同期の方針.md)、[保存・状態API・移行時の制約](../docs/Windows同期の段階3メモ.md)を参照。1つのQR／鍵を複数のiPhone・iPadで使う。QRの書式番号1と通信の版3は独立している。
 
 `make-test-vectors.mjs` はSwift/C#から独立した実装。Node標準のcrypto/fsだけを使う。鍵・乱数・識別子・時刻は公開の固定試験値で、実運用には使わない。
 
@@ -8,9 +8,9 @@
 node protocol/make-test-vectors.mjs
 ```
 
-`test-vectors.json` はQR、版2のHELLO/WELCOME/AUTH、PC ID入り版違い応答（同一PC／別PC／旧全ゼロID）、両IDを含むHMAC、方向別の鍵、12個の平文例、7個の暗号フレーム、20/182/512バイト分割、改ざん・巻き戻し・Cc制御文字名等の失敗例を持つ。item / ack / ping / pong / device / offer / chunk / resume、日本語ファイル名、ゼロ幅接合子（`U+200D`）入りファイル名、画像、途中offsetからのchunkを含む。大きい境界例は長さとパターンからテスト内で生成する。
+`test-vectors.json` はQR、版3のHELLO/WELCOME/AUTH、PC ID入り版違い応答（同一PC・版2／別PC・版2／旧全ゼロID）、両IDを含むHMAC（先頭バイト `0x03`）、方向別の鍵（`clipboardplus v3`）、12個の平文例、7個の暗号フレーム、20/182/512バイト分割、改ざん・巻き戻し・Cc制御文字名等の失敗例を持つ。さらに第3版としてテンプレート同期の6個の平文例（`tpl_pull` / `tpl_push` 単一・複数ページ / `tpl_state` / `tpl_ack`、日本語・改行・絵文字・`U+200D`・墓標入り）、6個の暗号フレーム、3段階パケット分割、各種失敗例、10個の共通マージ例（`templateMergeCases`）を持つ。大きい境界例（4MiB境界・64KiB本文・300件・1,000墓標・256KiBページ境界など）は長さとパターンからテスト内で生成する。
 
-Swift/C#は同じJSONからQR、認証、版違い応答、HMAC、鍵、平文、暗号文、タグ、パケットのバイト一致を検証する。期待値を製品実装自身から計算しない。失敗後の再利用禁止、厳格な構文（標準8-4-4-4-12 UUID表記を含む）、4MiBちょうどの境界も検証する。
+Swift/C#は同じJSONからQR、認証、版違い応答、HMAC、鍵、平文、暗号文、タグ、パケット、テンプレートメッセージとマージ結果の一致を検証する。期待値を製品実装自身から計算しない。失敗後の再利用禁止、厳格な構文（標準8-4-4-4-12 UUID表記を含む）、4MiBちょうどの境界も検証する。
 
 ## 共通API
 
@@ -21,14 +21,18 @@ Swiftのプロトコル型はFoundation/CryptoKitで動作する。状態を持�
 | SyncPairing | init(pcId:key:name:)、create(name:)、parse、qrString、pcId/key/name。QRの読み書き |
 | SyncPadHandshake | init(pairing:padId:testNonce:) → createHello → acceptWelcome。authを先に送り、keysを使う。acceptWelcomeはPC ID（非ゼロかつ組にしたPC ID一致）を版より先に検証 |
 | SyncPcHandshake | init(pairing:expectedPadId:testNonce:) → acceptHello → acceptAuth / createVersionMismatch。authenticatedPadIdはAUTH成功後だけ公開 |
-| SyncSessionKeys | padToPc / pcToPad。HKDFのinfoはclipboardplus v2の方向別文字列 |
+| SyncSessionKeys | padToPc / pcToPad。HKDFのinfoは `clipboardplus v3` の方向別文字列 |
 | SyncFrameSender / SyncFrameReceiver | init(key:)、seal / open。AES-256-GCMと単調増加番号 |
 | SyncPacketizer | split(_:packetLimit:)。GATT値上限に分割 |
 | SyncPacketAssembler | init(packetLimit:frameLimit:)、append、hasPartialFrame、finish。認証前はPCで50／33バイト、iOSで82バイト |
 | SyncMessage | item(id:at:from:text:)、ack(ids:)、ping、pong、device(kind:)、offer(SyncOffer)、chunk(id:offset:data:)、resume(id:offset:) |
 | SyncOffer | id / at / from / kind / size / sha256 / name64 / type。添付全体の見出し。`name64` 復号後は `Cc`（`U+0000`〜`U+001F`、`U+007F`〜`U+009F`）不可、`Cf`（`U+200D` 等）は許可 |
 | SyncMessageCodec | encode / decode。ASCII JSON見出しと本体 |
-| SyncProtocol | version=2、maxItemBytes=10MiB、chunkBytes=32KiB、maxPending=100、pendingLifetime=24時間。既存フレーム・見出し・ack・時刻上限も維持 |
+| TemplateSyncMessage | pull(op:)、push(op:part:total:page:)、state(op:part:total:page:)、ack(op:)（C#は `TemplateSyncPull` / `TemplateSyncPush` / `TemplateSyncStateMessage` / `TemplateSyncAck`）。見出しはASCII JSON、本体はUTF-8 JSON |
+| TemplateSyncMessageCodec | encode / decode、splitPages。300件、墓標1,000件、本文64KiB、名前100文字/400B、タグ30文字/120B（`Cc`・改行不可）、ページ256KiB・最大80ページ・合計20MiBを検証 |
+| TemplateSyncPageAssembler | append / finish。`tpl_push` / `tpl_state` の複数ページを連結し重複IDと合計上限を検証 |
+| TemplateSyncMerge | merge / contentHash / normalizedTitle / normalizedTag / nextUpdatedAt / clockSkewSeconds / makeConflictTitle。`syncId`・`updatedAt`・`baseHash`・180日墓標・同一本文統合・衝突写し・単調増加時刻を両言語共通で実装 |
+| SyncProtocol | version=3、maxItemBytes=10MiB、chunkBytes=32KiB、maxPending=100、pendingLifetime=24時間、テンプレート同期上限一式（300件、墓標1,000件/180日、本文64KiB、名前100文字/400B、タグ30文字/120B、ページ256KiB/80頁/20MiB）。既存フレーム・見出し・ack・時刻上限も維持 |
 | SyncProtocolError | format / limit / packet / state / authentication / identity / sequence / version |
 
 C#のメッセージはSyncItem / SyncAck / SyncPing / SyncPong / SyncDevice / SyncOffer / SyncChunk / SyncResume。SyncProtocolはPC用の履歴300件、重複窓10分、ファイル10件、画像40,000,000ピクセルの定数も公開する。

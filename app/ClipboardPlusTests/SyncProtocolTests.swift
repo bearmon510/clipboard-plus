@@ -308,4 +308,222 @@ final class SyncProtocolTests: XCTestCase {
             error(.format) { try offer.validate() }
         }
     }
+
+    func testTemplateMessagesFramesAndFragmentsMatchIndependentVectors() throws {
+        let v = try vectors(), h = try object(v, "handshake")
+        XCTAssertEqual(v["version"] as? Int, Int(SyncProtocol.version))
+        let limits = try object(v, "limits")
+        XCTAssertEqual(limits["maxTemplates"] as? Int, SyncProtocol.maxTemplates)
+        XCTAssertEqual(limits["maxTemplateTombstones"] as? Int, SyncProtocol.maxTemplateTombstones)
+        XCTAssertEqual(limits["maxTemplateTextBytes"] as? Int, SyncProtocol.maxTemplateTextBytes)
+        XCTAssertEqual(limits["maxTemplateTitleChars"] as? Int, SyncProtocol.maxTemplateTitleCharacters)
+        XCTAssertEqual(limits["maxTemplateTitleUtf8Bytes"] as? Int, SyncProtocol.maxTemplateTitleBytes)
+        XCTAssertEqual(limits["maxTemplateTagChars"] as? Int, SyncProtocol.maxTemplateTagCharacters)
+        XCTAssertEqual(limits["maxTemplateTagUtf8Bytes"] as? Int, SyncProtocol.maxTemplateTagBytes)
+        XCTAssertEqual(limits["maxTemplatePageBodyBytes"] as? Int, SyncProtocol.maxTemplatePageBodyBytes)
+        XCTAssertEqual(limits["maxTemplatePages"] as? Int, SyncProtocol.maxTemplatePages)
+        XCTAssertEqual(limits["maxTemplateTotalBytes"] as? Int, SyncProtocol.maxTemplateTotalBytes)
+
+        let tplMessages = try object(v, "templateMessages")
+        var decoded: [String: TemplateSyncMessage] = [:]
+        for (name, raw) in tplMessages {
+            let fixture = try XCTUnwrap(raw as? [String: Any])
+            let plaintext = try bytes(fixture, "plaintextHex")
+            let message = try TemplateSyncMessageCodec.decode(plaintext)
+            decoded[name] = message
+            XCTAssertEqual(try TemplateSyncMessageCodec.encode(message), plaintext)
+            let length = Int(plaintext[0]) << 8 | Int(plaintext[1])
+            XCTAssertEqual(String(data: plaintext.subdata(in: 2..<(length + 2)), encoding: .utf8), try string(fixture, "headerJson"))
+        }
+
+        let assembler = TemplateSyncPageAssembler(expectedIsState: false)
+        XCTAssertNil(try assembler.append(try XCTUnwrap(decoded["tplPushPage0"])))
+        XCTAssertTrue(assembler.hasPartialSnapshot)
+        let combined = try XCTUnwrap(try assembler.append(try XCTUnwrap(decoded["tplPushPage1"])))
+        XCTAssertFalse(assembler.hasPartialSnapshot)
+        XCTAssertEqual(combined.templates.count, 2)
+        XCTAssertEqual(combined.tombstones.count, 1)
+        try assembler.finish()
+
+        let templateFrames = try XCTUnwrap(v["templateFrames"] as? [[String: Any]])
+        for direction in ["pad->pc", "pc->pad"] {
+            let key = try bytes(h, direction == "pad->pc" ? "padToPcKeyHex" : "pcToPadKeyHex")
+            let sender = try SyncFrameSender(key: key), receiver = try SyncFrameReceiver(key: key)
+            for f in templateFrames where f["direction"] as? String == direction {
+                let plaintext = try bytes(object(tplMessages, string(f, "message")), "plaintextHex")
+                let expected = try bytes(f, "frameHex")
+                XCTAssertEqual(try sender.seal(plaintext), expected)
+                XCTAssertEqual(try receiver.open(expected), plaintext)
+                XCTAssertEqual(Data(expected.prefix(9)), try bytes(f, "aadHex"))
+                XCTAssertEqual(Data(expected.suffix(16)), try bytes(f, "tagHex"))
+            }
+        }
+
+        for fixture in try XCTUnwrap(v["templateFragmentation"] as? [[String: Any]]) {
+            let limit = try XCTUnwrap(fixture["packetLimit"] as? Int)
+            let frame = try bytes(templateFrames[XCTUnwrap(fixture["frameIndex"] as? Int)], "frameHex")
+            let packets = try SyncPacketizer.split(frame, packetLimit: limit)
+            let expected = try XCTUnwrap(fixture["packetsHex"] as? [String]).map(hex)
+            XCTAssertEqual(packets, expected)
+            let packetAssembler = try SyncPacketAssembler(packetLimit: limit)
+            var assembled: Data?
+            for packet in packets { assembled = try packetAssembler.append(packet) }
+            XCTAssertEqual(assembled, frame)
+            try packetAssembler.finish()
+        }
+    }
+
+    func testTemplateFailuresRejectExpectedVectors() throws {
+        let v = try vectors(), failures = try object(v, "templateFailures")
+        for (name, raw) in failures {
+            let fixture = try XCTUnwrap(raw as? [String: Any])
+            let expected: SyncProtocolError
+            switch try string(fixture, "error") {
+            case "format": expected = .format
+            case "limit": expected = .limit
+            default: return XCTFail("Unknown error for \(name)")
+            }
+            if let hexText = fixture["plaintextHex"] as? String {
+                let data = try hex(hexText)
+                error(expected) { _ = try TemplateSyncMessageCodec.decode(data) }
+            }
+        }
+
+        let op = UUID()
+        let oversizedBytes = try XCTUnwrap((try object(failures, "oversizedTemplateText"))["textBytes"] as? Int)
+        let maxTextItem = TemplateSyncItem(id: UUID(), kind: .text, text: String(repeating: "a", count: SyncProtocol.maxTemplateTextBytes),
+                                           order: 0, updatedAt: 1)
+        _ = try TemplateSyncMessageCodec.decode(TemplateSyncMessageCodec.encode(
+            .push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: [maxTextItem], tombstones: []))))
+        let overTextItem = TemplateSyncItem(id: maxTextItem.id, kind: .text, text: String(repeating: "a", count: oversizedBytes),
+                                            order: 0, updatedAt: 1)
+        error(.limit) {
+            _ = try TemplateSyncMessageCodec.encode(
+                .push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: [overTextItem], tombstones: [])))
+        }
+
+        let maxTemplates = (0..<SyncProtocol.maxTemplates).map { i in
+            TemplateSyncItem(id: UUID(), kind: .text, text: "t\(i)", order: i, updatedAt: 1)
+        }
+        _ = try TemplateSyncMessageCodec.decode(TemplateSyncMessageCodec.encode(
+            .push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: maxTemplates, tombstones: []))))
+        let overTemplates = maxTemplates + [TemplateSyncItem(id: UUID(), kind: .text, text: "extra", order: 300, updatedAt: 1)]
+        error(.limit) {
+            _ = try TemplateSyncMessageCodec.encode(
+                .push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: overTemplates, tombstones: [])))
+        }
+
+        let tooManyTombCount = try XCTUnwrap((try object(failures, "tooManyTombstones"))["count"] as? Int)
+        let maxTombs = (0..<SyncProtocol.maxTemplateTombstones).map { i in
+            TemplateSyncTombstone(id: UUID(), deletedAt: Int64(i))
+        }
+        _ = try TemplateSyncMessageCodec.decode(TemplateSyncMessageCodec.encode(
+            .push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: [], tombstones: maxTombs))))
+        let overTombs = maxTombs + [TemplateSyncTombstone(id: UUID(), deletedAt: Int64(tooManyTombCount))]
+        error(.limit) {
+            _ = try TemplateSyncMessageCodec.encode(
+                .push(op: op, part: 0, total: 1, page: TemplateSyncPage(version: 1, sentAt: 0, templates: [], tombstones: overTombs)))
+        }
+
+        let oversizedBodyLen = try XCTUnwrap((try object(failures, "oversizedPageBody"))["bodyBytes"] as? Int)
+        let bigBody = Data(("{\"sentAt\":0,\"templates\":[{\"id\":\"44444444-5555-4666-8777-888888888881\",\"kind\":\"text\",\"order\":0,\"text\":\"" +
+            String(repeating: "a", count: oversizedBodyLen) + "\",\"updatedAt\":1}],\"tombstones\":[],\"v\":1}").utf8)
+        let hdr = Data("{\"op\":\"\(op.uuidString)\",\"part\":0,\"t\":\"tpl_push\",\"total\":1}".utf8)
+        let oversizedPlain = Data([UInt8(hdr.count >> 8), UInt8(truncatingIfNeeded: hdr.count)]) + hdr + bigBody
+        error(.limit) { _ = try TemplateSyncMessageCodec.decode(oversizedPlain) }
+    }
+
+    func testTemplateMergeCasesMatchIndependentVectors() throws {
+        func parseInt64(_ raw: Any?) throws -> Int64 {
+            if let v = raw as? Int64 { return v }
+            if let v = raw as? Int { return Int64(v) }
+            if let v = raw as? NSNumber { return v.int64Value }
+            throw SyncProtocolError.format
+        }
+        func parseItem(_ dict: [String: Any]) throws -> TemplateSyncItem {
+            let id = try XCTUnwrap(UUID(uuidString: try string(dict, "id")))
+            let kind = try XCTUnwrap(TemplateSyncKind(rawValue: try string(dict, "kind")))
+            let text = try string(dict, "text")
+            let title = dict["title"] as? String
+            let tag = dict["tag"] as? String
+            let order = try XCTUnwrap(dict["order"] as? Int)
+            let updatedAt = try parseInt64(dict["updatedAt"])
+            let baseHash = dict["baseHash"] as? String
+            return TemplateSyncItem(id: id, kind: kind, text: text, title: title, tag: tag, order: order, updatedAt: updatedAt, baseHash: baseHash)
+        }
+        func parseTomb(_ dict: [String: Any]) throws -> TemplateSyncTombstone {
+            let id = try XCTUnwrap(UUID(uuidString: try string(dict, "id")))
+            let deletedAt = try parseInt64(dict["deletedAt"])
+            let baseHash = dict["baseHash"] as? String
+            return TemplateSyncTombstone(id: id, deletedAt: deletedAt, baseHash: baseHash)
+        }
+        func parseSide(_ dict: [String: Any]) throws -> TemplateSyncState {
+            let items = try XCTUnwrap(dict["templates"] as? [[String: Any]]).map(parseItem)
+            let tombs = try XCTUnwrap(dict["tombstones"] as? [[String: Any]]).map(parseTomb)
+            return TemplateSyncState(templates: items, tombstones: tombs)
+        }
+        func parseChanges(_ dict: [String: Any]) throws -> TemplateSyncSideChanges {
+            TemplateSyncSideChanges(
+                added: try XCTUnwrap(dict["added"] as? Int),
+                updated: try XCTUnwrap(dict["updated"] as? Int),
+                deleted: try XCTUnwrap(dict["deleted"] as? Int)
+            )
+        }
+
+        let v = try vectors()
+        for testCase in try XCTUnwrap(v["templateMergeCases"] as? [[String: Any]]) {
+            let nowMillis = try parseInt64(testCase["nowMillis"])
+            let remoteSentAt: Int64?
+            if let rawSent = testCase["remoteSentAtMillis"], !(rawSent is NSNull) {
+                remoteSentAt = try parseInt64(rawSent)
+            } else {
+                remoteSentAt = nil
+            }
+            let pc = try parseSide(try object(testCase, "pc"))
+            let remote = try parseSide(try object(testCase, "remote"))
+            let actual = try TemplateSyncMerge.merge(pc: pc, remote: remote, nowMillis: nowMillis, remoteSentAtMillis: remoteSentAt)
+
+            let expected = try object(testCase, "expected")
+            let expectedTemplates = try XCTUnwrap(expected["templates"] as? [[String: Any]]).map(parseItem)
+            let expectedTombs = try XCTUnwrap(expected["tombstones"] as? [[String: Any]]).map(parseTomb)
+
+            XCTAssertEqual(actual.templates, expectedTemplates)
+            XCTAssertEqual(actual.tombstones, expectedTombs)
+            XCTAssertEqual(actual.conflictCopyCount, try XCTUnwrap(expected["conflictCopyCount"] as? Int))
+            XCTAssertEqual(actual.subsumedDuplicateCount, try XCTUnwrap(expected["subsumedDuplicateCount"] as? Int))
+            XCTAssertEqual(actual.pcChanges, try parseChanges(try object(expected, "pcChanges")))
+            XCTAssertEqual(actual.remoteChanges, try parseChanges(try object(expected, "remoteChanges")))
+            let expectedSkew: Int64?
+            if let rawSkew = expected["clockSkewSeconds"], !(rawSkew is NSNull) {
+                expectedSkew = try parseInt64(rawSkew)
+            } else {
+                expectedSkew = nil
+            }
+            XCTAssertEqual(actual.clockSkewSeconds, expectedSkew)
+
+            if testCase["alsoCheckCommutative"] as? Bool == true {
+                let swapped = try TemplateSyncMerge.merge(pc: remote, remote: pc, nowMillis: nowMillis, remoteSentAtMillis: remoteSentAt)
+                XCTAssertEqual(actual.templates, swapped.templates)
+                XCTAssertEqual(actual.tombstones, swapped.tombstones)
+            }
+
+            if testCase["alsoCheckIdempotent"] as? Bool == true {
+                let pc2 = TemplateSyncState(templates: actual.templates, tombstones: actual.tombstones)
+                let remote2 = TemplateSyncState(
+                    templates: actual.templates.map {
+                        TemplateSyncItem(id: $0.id, kind: $0.kind, text: $0.text, title: $0.title, tag: $0.tag,
+                                         order: $0.order, updatedAt: $0.updatedAt, baseHash: TemplateSyncMerge.contentHash($0))
+                    },
+                    tombstones: actual.tombstones
+                )
+                let resync = try TemplateSyncMerge.merge(pc: pc2, remote: remote2, nowMillis: nowMillis + 1000, remoteSentAtMillis: nowMillis + 1000)
+                XCTAssertEqual(resync.pcChanges.total, 0)
+                XCTAssertEqual(resync.remoteChanges.total, 0)
+                XCTAssertEqual(resync.conflictCopyCount, 0)
+                XCTAssertEqual(resync.subsumedDuplicateCount, 0)
+                XCTAssertEqual(actual.templates, resync.templates)
+                XCTAssertEqual(actual.tombstones, resync.tombstones)
+            }
+        }
+    }
 }

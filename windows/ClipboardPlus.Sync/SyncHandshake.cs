@@ -11,8 +11,8 @@ public sealed class SyncSessionKeys
     internal SyncSessionKeys(byte[] key, byte[] ni, byte[] np)
     {
         byte[] salt = [.. ni, .. np];
-        padToPc = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes("clipboardplus v2 pad->pc"));
-        pcToPad = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes("clipboardplus v2 pc->pad"));
+        padToPc = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{SyncProtocol.Version} pad->pc"));
+        pcToPad = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{SyncProtocol.Version} pc->pad"));
     }
 }
 
@@ -20,7 +20,7 @@ internal static class SyncHandshakeWire
 {
     internal static byte[] Mac(byte[] key, string label, byte[] ni, byte[] np, Guid pcId, Guid padId)
     {
-        byte[] data = [2, .. Encoding.ASCII.GetBytes(label), .. SyncProtocol.IdBytes(pcId), .. SyncProtocol.IdBytes(padId), .. ni, .. np];
+        byte[] data = [SyncProtocol.Version, .. Encoding.ASCII.GetBytes(label), .. SyncProtocol.IdBytes(pcId), .. SyncProtocol.IdBytes(padId), .. ni, .. np];
         return HMACSHA256.HashData(key, data);
     }
     internal static void Check(ReadOnlySpan<byte> frame, int count, byte type)

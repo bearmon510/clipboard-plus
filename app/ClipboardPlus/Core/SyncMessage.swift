@@ -24,7 +24,7 @@ public struct SyncOffer: Codable, Equatable {
     func validate() throws {
         try SyncProtocol.require(at >= -SyncProtocol.maxTimestamp && at <= SyncProtocol.maxTimestamp && ["pc", "pad"].contains(from))
         try SyncProtocol.require(["image", "file"].contains(kind) && (0...SyncProtocol.maxItemBytes).contains(size))
-        try SyncProtocol.require(sha256.utf8.count == 64 && sha256.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) })
+        try SyncProtocol.require(SyncProtocol.isLowerHex64(sha256))
         try SyncProtocol.require((1...255).contains(type.utf8.count) && type.utf8.allSatisfy { (32..<127).contains($0) })
         try SyncProtocol.require(kind != "image" || ["public.png", "public.jpeg"].contains(type))
         guard let name = Data(base64Encoded: name64), name.count <= 1024, name.base64EncodedString() == name64,
@@ -72,12 +72,15 @@ public enum SyncMessageCodec {
             header = "{\"t\":\"pong\"}"
             body = Data()
         }
-        let bytes = Data(header.utf8)
-        try SyncProtocol.require(bytes.count <= SyncProtocol.maxHeaderBytes && 2 + bytes.count + body.count <= SyncProtocol.maxPlaintextBytes, .limit)
-        return Data([UInt8(bytes.count >> 8), UInt8(truncatingIfNeeded: bytes.count)]) + bytes + body
+        return try framePlaintext(header: Data(header.utf8), body: body)
     }
 
-    public static func decode(_ input: Data) throws -> SyncMessage {
+    static func framePlaintext(header: Data, body: Data) throws -> Data {
+        try SyncProtocol.require(header.count <= SyncProtocol.maxHeaderBytes && 2 + header.count + body.count <= SyncProtocol.maxPlaintextBytes, .limit)
+        return Data([UInt8(header.count >> 8), UInt8(truncatingIfNeeded: header.count)]) + header + body
+    }
+
+    static func splitPlaintext(_ input: Data) throws -> (header: Data, body: Data) {
         try SyncProtocol.require(input.count <= SyncProtocol.maxPlaintextBytes, .limit)
         try SyncProtocol.require(input.count >= 2)
         let plaintext = Data(input)
@@ -86,6 +89,11 @@ public enum SyncMessageCodec {
         let header = plaintext.subdata(in: 2..<(2 + length))
         try SyncProtocol.require(header.allSatisfy { $0 < 128 })
         let body = plaintext.subdata(in: (2 + length)..<plaintext.count)
+        return (header, body)
+    }
+
+    public static func decode(_ input: Data) throws -> SyncMessage {
+        let (header, body) = try splitPlaintext(input)
         do {
             // Scan only member boundaries, preserving the lexical integer and detecting duplicates.
             // Foundation remains responsible for the actual JSON grammar and string decoding.

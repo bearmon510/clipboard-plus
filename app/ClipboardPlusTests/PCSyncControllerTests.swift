@@ -1420,7 +1420,7 @@ final class PCSyncControllerTests: XCTestCase {
 
         // Different PC returning a mismatched version must be ignored for 10 minutes without stopping sync.
         f.link.welcomePcId = UUID()
-        f.link.welcomeVersion = 3
+        f.link.welcomeVersion = 2
         try f.link.connect(pairing)
         XCTAssertEqual(f.link.rejected, [true])
         XCTAssertFalse(f.controller.requiresPeerUpdate)
@@ -1445,7 +1445,7 @@ final class PCSyncControllerTests: XCTestCase {
 
         // Paired PC ID with mismatched version stops sync with requiresPeerUpdate.
         f.link.disconnect()
-        f.link.welcomeVersion = 3
+        f.link.welcomeVersion = 2
         try f.link.connect(pairing)
         XCTAssertTrue(f.controller.requiresPeerUpdate)
         XCTAssertFalse(f.controller.requiresRepair)

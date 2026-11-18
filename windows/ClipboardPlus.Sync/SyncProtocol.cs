@@ -13,7 +13,7 @@ public sealed class SyncProtocolException(SyncError code) : Exception($"Sync pro
 
 public static class SyncProtocol
 {
-    public const byte Version = 2;
+    public const byte Version = 3;
     public const int MaxItemBytes = 10 * 1024 * 1024;
     public const int ChunkBytes = 32 * 1024;
     public const int MaxPending = 100;
@@ -22,12 +22,29 @@ public static class SyncProtocol
     public const long MaxImagePixels = 40_000_000;
     public static readonly TimeSpan PendingLifetime = TimeSpan.FromHours(24);
     public static readonly TimeSpan DuplicateWindow = TimeSpan.FromMinutes(10);
+    public const int MaxTemplates = 300;
+    public const int MaxTemplateTombstones = 1000;
+    public static readonly TimeSpan TemplateTombstoneLifetime = TimeSpan.FromDays(180);
+    public const long TemplateTombstoneLifetimeMillis = 180L * 24 * 60 * 60 * 1000;
+    public const int MaxTemplateTextBytes = 64 * 1024;
+    public const int MaxTemplateTitleCharacters = 100;
+    public const int MaxTemplateTitleBytes = 400;
+    public const int MaxTemplateTagCharacters = 30;
+    public const int MaxTemplateTagBytes = 120;
+    public const int MaxTemplatePageBodyBytes = 256 * 1024;
+    public const int MaxTemplatePages = 80;
+    public const int MaxTemplateTotalBytes = 20 * 1024 * 1024;
+    public const long TemplateClockSkewWarningMillis = 5L * 60 * 1000;
+    public const long TemplateFutureTimestampCapMillis = 365L * 24 * 60 * 60 * 1000;
     public const int MaxFrameBytes = 4 * 1024 * 1024;
     public const int MaxPlaintextBytes = MaxFrameBytes - 9 - 16;
     public const int MaxHeaderBytes = ushort.MaxValue;
     public const int MaxAckIds = 1024;
     public const long MaxTimestamp = 9_007_199_254_740_991;
     internal static readonly UTF8Encoding Utf8 = new(false, true);
+    internal static bool IsControlOrNewline(char c) => char.IsControl(c) || c is '\u2028' or '\u2029';
+    internal static bool IsLowerHex64(string? value) =>
+        value is { Length: 64 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
     internal static void Require([DoesNotReturnIf(false)] bool condition, SyncError code = SyncError.Format)
     {
         if (!condition) throw new SyncProtocolException(code);

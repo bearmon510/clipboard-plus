@@ -71,25 +71,61 @@ public static class SyncMessageCodec
                 default: throw new SyncProtocolException(SyncError.Format);
             }
             json.WriteEndObject(); json.Flush();
-            var header = stream.ToArray();
-            SyncProtocol.Require(header.Length <= SyncProtocol.MaxHeaderBytes && 2 + header.Length + body.Length <= SyncProtocol.MaxPlaintextBytes, SyncError.Limit);
-            var result = new byte[2 + header.Length + body.Length];
-            BinaryPrimitives.WriteUInt16BigEndian(result, (ushort)header.Length);
-            header.CopyTo(result, 2); body.CopyTo(result, 2 + header.Length);
-            return result;
+            return FramePlaintext(stream.ToArray(), body);
         }
         catch (EncoderFallbackException) { throw new SyncProtocolException(SyncError.Format); }
     }
 
-    public static SyncMessage Decode(ReadOnlySpan<byte> plaintext)
+    internal static byte[] FramePlaintext(ReadOnlySpan<byte> header, ReadOnlySpan<byte> body)
+    {
+        SyncProtocol.Require(header.Length <= SyncProtocol.MaxHeaderBytes && 2 + header.Length + body.Length <= SyncProtocol.MaxPlaintextBytes, SyncError.Limit);
+        var result = new byte[2 + header.Length + body.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(result, (ushort)header.Length);
+        header.CopyTo(result.AsSpan(2));
+        body.CopyTo(result.AsSpan(2 + header.Length));
+        return result;
+    }
+
+    internal static (byte[] Header, ReadOnlyMemory<byte> Body) SplitPlaintext(byte[] plaintext)
     {
         SyncProtocol.Require(plaintext.Length <= SyncProtocol.MaxPlaintextBytes, SyncError.Limit);
         SyncProtocol.Require(plaintext.Length >= 2);
         var length = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
         SyncProtocol.Require(length > 0 && length <= plaintext.Length - 2);
-        var header = plaintext.Slice(2, length).ToArray();
+        var header = plaintext.AsSpan(2, length).ToArray();
         SyncProtocol.Require(header.All(b => b < 128));
-        var body = plaintext[(2 + length)..];
+        return (header, plaintext.AsMemory(2 + length));
+    }
+
+    internal static void CheckAsciiJson(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.String) SyncProtocol.Require(element.GetString()!.All(c => c < 128));
+        if (element.ValueKind == JsonValueKind.Array) foreach (var e in element.EnumerateArray()) CheckAsciiJson(e);
+        if (element.ValueKind == JsonValueKind.Object) foreach (var p in element.EnumerateObject())
+        { SyncProtocol.Require(p.Name.All(c => c < 128)); CheckAsciiJson(p.Value); }
+    }
+
+    internal static void CheckNoDuplicateKeys(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray()) CheckNoDuplicateKeys(item);
+        }
+        else if (element.ValueKind == JsonValueKind.Object)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var p in element.EnumerateObject())
+            {
+                SyncProtocol.Require(seen.Add(p.Name));
+                CheckNoDuplicateKeys(p.Value);
+            }
+        }
+    }
+
+    public static SyncMessage Decode(ReadOnlySpan<byte> plaintext)
+    {
+        var (header, bodyMemory) = SplitPlaintext(plaintext.ToArray());
+        var body = bodyMemory.Span;
         try
         {
             using var doc = JsonDocument.Parse(header, new JsonDocumentOptions { MaxDepth = 8 });
@@ -98,14 +134,7 @@ public static class SyncMessageCodec
             var properties = root.EnumerateObject().ToArray();
             SyncProtocol.Require(properties.Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() == properties.Length);
             // ASCII applies to decoded header strings too (including JSON escapes).
-            static void Ascii(JsonElement element)
-            {
-                if (element.ValueKind == JsonValueKind.String) SyncProtocol.Require(element.GetString()!.All(c => c < 128));
-                if (element.ValueKind == JsonValueKind.Array) foreach (var e in element.EnumerateArray()) Ascii(e);
-                if (element.ValueKind == JsonValueKind.Object) foreach (var p in element.EnumerateObject())
-                { SyncProtocol.Require(p.Name.All(c => c < 128)); Ascii(p.Value); }
-            }
-            Ascii(root);
+            CheckAsciiJson(root);
             void Keys(params string[] expected) => SyncProtocol.Require(properties.Length == expected.Length && expected.All(k => root.TryGetProperty(k, out _)));
             var messageType = String(root, "t");
             switch (messageType)
@@ -160,13 +189,13 @@ public static class SyncMessageCodec
         { throw new SyncProtocolException(SyncError.Format); }
     }
 
-    private static string String(JsonElement root, string key)
+    internal static string String(JsonElement root, string key)
     {
         var value = root.GetProperty(key);
         SyncProtocol.Require(value.ValueKind == JsonValueKind.String);
         return value.GetString()!;
     }
-    private static long Integer(JsonElement root, string key)
+    internal static long Integer(JsonElement root, string key)
     {
         var value = root.GetProperty(key);
         SyncProtocol.Require(value.ValueKind == JsonValueKind.Number && value.GetRawText().All(c => c is >= '0' and <= '9' or '-') && value.TryGetInt64(out _));
@@ -176,7 +205,7 @@ public static class SyncMessageCodec
     {
         SyncProtocol.Require(o.At >= -SyncProtocol.MaxTimestamp && o.At <= SyncProtocol.MaxTimestamp && o.From is "pc" or "pad");
         SyncProtocol.Require(o.Kind is "image" or "file" && o.Size is >= 0 and <= SyncProtocol.MaxItemBytes);
-        SyncProtocol.Require(o.Sha256 is { Length: 64 } && o.Sha256.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'));
+        SyncProtocol.Require(SyncProtocol.IsLowerHex64(o.Sha256));
         SyncProtocol.Require(o.Type is { Length: > 0 and <= 255 } && o.Type.All(c => c is >= (char)32 and < (char)127));
         SyncProtocol.Require(o.Kind != "image" || o.Type is "public.png" or "public.jpeg");
         SyncProtocol.Require(o.Name64 is not null);

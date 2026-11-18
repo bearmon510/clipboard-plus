@@ -307,4 +307,200 @@ public sealed class SyncProtocolTests : IDisposable
             Error(SyncError.Format, () => SyncMessageCodec.ValidateOffer(offer));
         }
     }
+
+    [Fact]
+    public void TemplateMessagesFramesAndFragmentsMatchIndependentVectors()
+    {
+        Assert.Equal(SyncProtocol.Version, V.GetProperty("version").GetInt32());
+        var limits = V.GetProperty("limits");
+        Assert.Equal(SyncProtocol.MaxTemplates, limits.GetProperty("maxTemplates").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTombstones, limits.GetProperty("maxTemplateTombstones").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTextBytes, limits.GetProperty("maxTemplateTextBytes").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTitleCharacters, limits.GetProperty("maxTemplateTitleChars").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTitleBytes, limits.GetProperty("maxTemplateTitleUtf8Bytes").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTagCharacters, limits.GetProperty("maxTemplateTagChars").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTagBytes, limits.GetProperty("maxTemplateTagUtf8Bytes").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplatePageBodyBytes, limits.GetProperty("maxTemplatePageBodyBytes").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplatePages, limits.GetProperty("maxTemplatePages").GetInt32());
+        Assert.Equal(SyncProtocol.MaxTemplateTotalBytes, limits.GetProperty("maxTemplateTotalBytes").GetInt32());
+
+        var tplMessages = V.GetProperty("templateMessages");
+        var decoded = new Dictionary<string, TemplateSyncMessage>();
+        foreach (var fixture in tplMessages.EnumerateObject())
+        {
+            var plaintext = Hex(fixture.Value, "plaintextHex");
+            var msg = TemplateSyncMessageCodec.Decode(plaintext);
+            decoded[fixture.Name] = msg;
+            Assert.Equal(plaintext, TemplateSyncMessageCodec.Encode(msg));
+            var length = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
+            Assert.Equal(fixture.Value.GetProperty("headerJson").GetString(), Encoding.ASCII.GetString(plaintext, 2, length));
+        }
+
+        var assembler = new TemplateSyncPageAssembler(expectedIsState: false);
+        Assert.Null(assembler.Append(decoded["tplPushPage0"]));
+        Assert.True(assembler.HasPartialSnapshot);
+        var combined = assembler.Append(decoded["tplPushPage1"]);
+        Assert.NotNull(combined);
+        Assert.False(assembler.HasPartialSnapshot);
+        Assert.Equal(2, combined!.Templates.Count);
+        Assert.Single(combined.Tombstones);
+        assembler.Finish();
+
+        foreach (var direction in new[] { "pad->pc", "pc->pad" })
+        {
+            var sender = new SyncFrameSender(Key(direction));
+            var receiver = new SyncFrameReceiver(Key(direction));
+            foreach (var f in V.GetProperty("templateFrames").EnumerateArray().Where(f => f.GetProperty("direction").GetString() == direction))
+            {
+                var plaintext = Hex(tplMessages.GetProperty(f.GetProperty("message").GetString()!), "plaintextHex");
+                var expected = Hex(f, "frameHex");
+                Assert.Equal(expected, sender.Seal(plaintext));
+                Assert.Equal(plaintext, receiver.Open(expected));
+                Assert.Equal(Hex(f, "aadHex"), expected[..9]);
+                Assert.Equal(Hex(f, "tagHex"), expected[^16..]);
+            }
+        }
+
+        foreach (var fixture in V.GetProperty("templateFragmentation").EnumerateArray())
+        {
+            var limit = fixture.GetProperty("packetLimit").GetInt32();
+            var frame = Hex(V.GetProperty("templateFrames")[fixture.GetProperty("frameIndex").GetInt32()], "frameHex");
+            var packets = SyncPacketizer.Split(frame, limit);
+            Assert.Equal(fixture.GetProperty("packetsHex").EnumerateArray().Select(p => p.GetString()),
+                packets.Select(p => Convert.ToHexString(p).ToLowerInvariant()));
+            var packetAssembler = new SyncPacketAssembler(limit);
+            byte[]? assembled = null;
+            foreach (var packet in packets) assembled = packetAssembler.Append(packet);
+            Assert.Equal(frame, assembled);
+            packetAssembler.Finish();
+        }
+    }
+
+    [Fact]
+    public void TemplateFailuresRejectExpectedVectors()
+    {
+        var failures = V.GetProperty("templateFailures");
+        foreach (var prop in failures.EnumerateObject())
+        {
+            var expectedError = prop.Value.GetProperty("error").GetString() switch
+            {
+                "format" => SyncError.Format,
+                "limit" => SyncError.Limit,
+                _ => throw new InvalidOperationException($"Unknown error {prop.Name}"),
+            };
+            if (prop.Value.TryGetProperty("plaintextHex", out var hexElem))
+            {
+                var bytes = Convert.FromHexString(hexElem.GetString()!);
+                Error(expectedError, () => TemplateSyncMessageCodec.Decode(bytes));
+            }
+        }
+
+        var op = Guid.NewGuid();
+        var oversizedBytes = failures.GetProperty("oversizedTemplateText").GetProperty("textBytes").GetInt32();
+        var maxTextItem = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, new string('a', SyncProtocol.MaxTemplateTextBytes), null, null, 0, 1);
+        Assert.IsType<TemplateSyncPush>(TemplateSyncMessageCodec.Decode(TemplateSyncMessageCodec.Encode(
+            new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, [maxTextItem], [])))));
+        Error(SyncError.Limit, () => TemplateSyncMessageCodec.Encode(
+            new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, [maxTextItem with { Text = new string('a', oversizedBytes) }], []))));
+
+        var tooManyCount = failures.GetProperty("tooManyTemplates").GetProperty("count").GetInt32();
+        var maxTemplates = Enumerable.Range(0, SyncProtocol.MaxTemplates)
+            .Select(i => new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, $"t{i}", null, null, i, 1)).ToArray();
+        Assert.IsType<TemplateSyncPush>(TemplateSyncMessageCodec.Decode(TemplateSyncMessageCodec.Encode(
+            new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, maxTemplates, [])))));
+        var overTemplates = maxTemplates.Append(new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "extra", null, null, 300, 1)).ToArray();
+        Error(SyncError.Limit, () => TemplateSyncMessageCodec.Encode(
+            new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, overTemplates, []))));
+
+        var tooManyTombCount = failures.GetProperty("tooManyTombstones").GetProperty("count").GetInt32();
+        var maxTombs = Enumerable.Range(0, SyncProtocol.MaxTemplateTombstones)
+            .Select(i => new TemplateSyncTombstone(Guid.NewGuid(), i)).ToArray();
+        Assert.IsType<TemplateSyncPush>(TemplateSyncMessageCodec.Decode(TemplateSyncMessageCodec.Encode(
+            new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, [], maxTombs)))));
+        var overTombs = maxTombs.Append(new TemplateSyncTombstone(Guid.NewGuid(), tooManyTombCount)).ToArray();
+        Error(SyncError.Limit, () => TemplateSyncMessageCodec.Encode(
+            new TemplateSyncPush(op, 0, 1, new TemplateSyncPage(1, 0, [], overTombs))));
+
+        var oversizedBodyLen = failures.GetProperty("oversizedPageBody").GetProperty("bodyBytes").GetInt32();
+        var bigBody = Encoding.UTF8.GetBytes("{\"sentAt\":0,\"templates\":[{\"id\":\"44444444-5555-4666-8777-888888888881\",\"kind\":\"text\",\"order\":0,\"text\":\"" +
+            new string('a', oversizedBodyLen) + "\",\"updatedAt\":1}],\"tombstones\":[],\"v\":1}");
+        var hdr = Encoding.ASCII.GetBytes($"{{\"op\":\"{op.ToString("D").ToUpperInvariant()}\",\"part\":0,\"t\":\"tpl_push\",\"total\":1}}");
+        var oversizedPlain = new byte[2 + hdr.Length + bigBody.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(oversizedPlain, (ushort)hdr.Length);
+        hdr.CopyTo(oversizedPlain, 2);
+        bigBody.CopyTo(oversizedPlain, 2 + hdr.Length);
+        Error(SyncError.Limit, () => TemplateSyncMessageCodec.Decode(oversizedPlain));
+    }
+
+    [Fact]
+    public void TemplateMergeCasesMatchIndependentVectors()
+    {
+        static TemplateSyncItem ParseItem(JsonElement el) => new(
+            Guid.Parse(el.GetProperty("id").GetString()!),
+            el.GetProperty("kind").GetString()! == "url" ? TemplateSyncKind.Url : TemplateSyncKind.Text,
+            el.GetProperty("text").GetString()!,
+            el.TryGetProperty("title", out var t) ? t.GetString() : null,
+            el.TryGetProperty("tag", out var g) ? g.GetString() : null,
+            el.GetProperty("order").GetInt32(),
+            el.GetProperty("updatedAt").GetInt64(),
+            el.TryGetProperty("baseHash", out var bh) ? bh.GetString() : null);
+
+        static TemplateSyncTombstone ParseTomb(JsonElement el) => new(
+            Guid.Parse(el.GetProperty("id").GetString()!),
+            el.GetProperty("deletedAt").GetInt64(),
+            el.TryGetProperty("baseHash", out var bh) ? bh.GetString() : null);
+
+        static TemplateSyncState ParseSide(JsonElement el) => new(
+            el.GetProperty("templates").EnumerateArray().Select(ParseItem).ToArray(),
+            el.GetProperty("tombstones").EnumerateArray().Select(ParseTomb).ToArray());
+
+        static TemplateSyncSideChanges ParseChanges(JsonElement el) => new(
+            el.GetProperty("added").GetInt32(),
+            el.GetProperty("updated").GetInt32(),
+            el.GetProperty("deleted").GetInt32());
+
+        foreach (var testCase in V.GetProperty("templateMergeCases").EnumerateArray())
+        {
+            var nowMillis = testCase.GetProperty("nowMillis").GetInt64();
+            long? remoteSentAt = testCase.TryGetProperty("remoteSentAtMillis", out var rs) ? rs.GetInt64() : null;
+            var pc = ParseSide(testCase.GetProperty("pc"));
+            var remote = ParseSide(testCase.GetProperty("remote"));
+            var actual = TemplateSyncMerge.Merge(pc, remote, nowMillis, remoteSentAt);
+
+            var expected = testCase.GetProperty("expected");
+            var expectedTemplates = expected.GetProperty("templates").EnumerateArray().Select(ParseItem).ToArray();
+            var expectedTombs = expected.GetProperty("tombstones").EnumerateArray().Select(ParseTomb).ToArray();
+
+            Assert.Equal(expectedTemplates, actual.Templates);
+            Assert.Equal(expectedTombs, actual.Tombstones);
+            Assert.Equal(expected.GetProperty("conflictCopyCount").GetInt32(), actual.ConflictCopyCount);
+            Assert.Equal(expected.GetProperty("subsumedDuplicateCount").GetInt32(), actual.SubsumedDuplicateCount);
+            Assert.Equal(ParseChanges(expected.GetProperty("pcChanges")), actual.PcChanges);
+            Assert.Equal(ParseChanges(expected.GetProperty("remoteChanges")), actual.RemoteChanges);
+            long? expectedSkew = expected.TryGetProperty("clockSkewSeconds", out var cs) ? cs.GetInt64() : null;
+            Assert.Equal(expectedSkew, actual.ClockSkewSeconds);
+
+            if (testCase.TryGetProperty("alsoCheckCommutative", out var comm) && comm.GetBoolean())
+            {
+                var swapped = TemplateSyncMerge.Merge(remote, pc, nowMillis, remoteSentAt);
+                Assert.Equal(actual.Templates, swapped.Templates);
+                Assert.Equal(actual.Tombstones, swapped.Tombstones);
+            }
+
+            if (testCase.TryGetProperty("alsoCheckIdempotent", out var idem) && idem.GetBoolean())
+            {
+                var pc2 = new TemplateSyncState(actual.Templates, actual.Tombstones);
+                var remote2 = new TemplateSyncState(
+                    actual.Templates.Select(t => t with { BaseHash = TemplateSyncMerge.ContentHash(t) }).ToArray(),
+                    actual.Tombstones);
+                var resync = TemplateSyncMerge.Merge(pc2, remote2, nowMillis + 1000, nowMillis + 1000);
+                Assert.Equal(0, resync.PcChanges.Total);
+                Assert.Equal(0, resync.RemoteChanges.Total);
+                Assert.Equal(0, resync.ConflictCopyCount);
+                Assert.Equal(0, resync.SubsumedDuplicateCount);
+                Assert.Equal(actual.Templates, resync.Templates);
+                Assert.Equal(actual.Tombstones, resync.Tombstones);
+            }
+        }
+    }
 }

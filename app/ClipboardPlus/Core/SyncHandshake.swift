@@ -7,7 +7,7 @@ public struct SyncSessionKeys {
     init(key: Data, ni: Data, np: Data) {
         func derive(_ direction: String) -> Data {
             let derived = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: key), salt: ni + np,
-                info: Data("clipboardplus v2 \(direction)".utf8), outputByteCount: 32)
+                info: Data("clipboardplus v\(SyncProtocol.version) \(direction)".utf8), outputByteCount: 32)
             return derived.withUnsafeBytes { Data($0) }
         }
         padToPc = derive("pad->pc"); pcToPad = derive("pc->pad")
@@ -17,11 +17,11 @@ public struct SyncSessionKeys {
 enum SyncHandshakeWire {
     static func randomNonce() -> Data { SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) } }
     static func mac(key: Data, label: String, ni: Data, np: Data, pcId: UUID, padId: UUID) -> Data {
-        Data(HMAC<SHA256>.authenticationCode(for: Data([2]) + Data(label.utf8) + SyncProtocol.idBytes(pcId) + SyncProtocol.idBytes(padId) + ni + np, using: SymmetricKey(data: key)))
+        Data(HMAC<SHA256>.authenticationCode(for: Data([SyncProtocol.version]) + Data(label.utf8) + SyncProtocol.idBytes(pcId) + SyncProtocol.idBytes(padId) + ni + np, using: SymmetricKey(data: key)))
     }
     static func verify(_ code: Data, key: Data, label: String, ni: Data, np: Data, pcId: UUID, padId: UUID) throws {
         try SyncProtocol.require(HMAC<SHA256>.isValidAuthenticationCode(code,
-            authenticating: Data([2]) + Data(label.utf8) + SyncProtocol.idBytes(pcId) + SyncProtocol.idBytes(padId) + ni + np, using: SymmetricKey(data: key)), .authentication)
+            authenticating: Data([SyncProtocol.version]) + Data(label.utf8) + SyncProtocol.idBytes(pcId) + SyncProtocol.idBytes(padId) + ni + np, using: SymmetricKey(data: key)), .authentication)
     }
     static func check(_ frame: Data, count: Int, type: UInt8) throws {
         try SyncProtocol.require(frame.count == count && frame.first == type)
