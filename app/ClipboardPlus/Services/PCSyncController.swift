@@ -56,8 +56,27 @@ final class PCSyncController: ObservableObject {
     private var pumping = false
     private let disk: SyncDiskStore
     private var seen: [UUID] { disk.state.seen }
-    private var offsets: [UUID: Int] = [:]
-    private var awaitingOffsets: [UUID: Int] = [:]
+    private struct PendingChunk {
+        let endOffset: Int
+        var completedAt: Date?
+    }
+    private struct AttachmentTransfer {
+        let id: UUID
+        let size: Int
+        var awaitingInitialResume = true
+        var nextSendOffset = 0
+        var ackedOffset = 0
+        let startedAt: Date
+        var startOffset = 0
+        var chunks: [PendingChunk] = []
+        var canSendChunk: Bool {
+            !awaitingInitialResume && nextSendOffset < size && chunks.count < PCSyncController.maxAttachmentChunksInFlight
+        }
+    }
+    private static let maxAttachmentChunksInFlight = 4
+    private var activeAttachment: AttachmentTransfer?
+    private var activeReadHandle: (id: UUID, handle: FileHandle)?
+    private var attachmentReceives: [UUID: (startedAt: Date, startOffset: Int)] = [:]
     private var replies: [SyncMessage] = []
     private var attempted: Set<UUID> = []
     private static let replyTimeout: TimeInterval = 60
@@ -95,6 +114,7 @@ final class PCSyncController: ObservableObject {
         var progressed: Date
         let id: UUID?
         let isAuth: Bool
+        let chunkEndOffset: Int?
         let finishesAttachment: Bool
         let bytes: Int
     }
@@ -271,7 +291,8 @@ final class PCSyncController: ObservableObject {
         lastActivity = nil; pingRequestedAt = nil; pingQueued = false
         output = nil; controlFrames.removeAll(); ackQueue.removeAll()
         sentThisConnection.removeAll(); sentAt.removeAll()
-        offsets.removeAll(); awaitingOffsets.removeAll(); replies.removeAll()
+        closeReadHandle()
+        activeAttachment = nil; attachmentReceives.removeAll(); replies.removeAll()
         offeredThisConnection.removeAll(); resumedAttachments.removeAll(); finalChunkSentAttachments.removeAll()
         transferProgress = nil
     }
@@ -304,13 +325,22 @@ final class PCSyncController: ObservableObject {
         }
     }
 
+    private func closeReadHandle(for id: UUID? = nil) {
+        if let active = activeReadHandle, id == nil || active.id == id {
+            try? active.handle.close()
+            activeReadHandle = nil
+        }
+    }
+
     private func refreshPending() {
         pendingCount = pending.count
         let ids = Set(pending.map(\.id))
         sentThisConnection.formIntersection(ids)
         sentAt = sentAt.filter { ids.contains($0.key) }
-        offsets = offsets.filter { ids.contains($0.key) }
-        awaitingOffsets = awaitingOffsets.filter { ids.contains($0.key) }
+        if let active = activeAttachment, !ids.contains(active.id) {
+            closeReadHandle(for: active.id)
+            activeAttachment = nil
+        }
         resumedAttachments.formIntersection(ids)
         finalChunkSentAttachments.formIntersection(ids)
         if let progress = transferProgress {
@@ -379,10 +409,14 @@ final class PCSyncController: ObservableObject {
 
     private func nextPendingItem() -> SyncPending? {
         guard status == .connected, historyReady else { return nil }
-        let attachmentBusy = !awaitingOffsets.isEmpty || !offsets.isEmpty
-        return pending.first {
-            !sentThisConnection.contains($0.id) &&
-            ($0.offer == nil || !attachmentBusy || offsets[$0.id] != nil)
+        return pending.first { item in
+            if item.offer == nil {
+                return !sentThisConnection.contains(item.id)
+            }
+            if let active = activeAttachment {
+                return active.id == item.id && active.canSendChunk
+            }
+            return !sentThisConnection.contains(item.id)
         }
     }
 
@@ -398,6 +432,7 @@ final class PCSyncController: ObservableObject {
                     let frame: Data
                     var id: UUID?
                     var isAuth = false
+                    var chunkEndOffset: Int?
                     var finishesAttachment = false
                     if !controlFrames.isEmpty {
                         frame = controlFrames.removeFirst(); isAuth = frame.first == 3
@@ -415,31 +450,49 @@ final class PCSyncController: ObservableObject {
                             id = item.id
                             let message: SyncMessage
                             if let offer = item.offer {
-                                if let offset = offsets.removeValue(forKey: item.id) {
+                                if var active = activeAttachment, active.id == item.id {
+                                    let offset = active.nextSendOffset
                                     try SyncProtocol.require(offset < offer.size, .state)
-                                    let file = try FileHandle(forReadingFrom: disk.body(item.id))
-                                    defer { try? file.close() }
+                                    let file: FileHandle
+                                    if let opened = activeReadHandle, opened.id == item.id {
+                                        file = opened.handle
+                                    } else {
+                                        closeReadHandle()
+                                        let opened = try FileHandle(forReadingFrom: disk.body(item.id))
+                                        activeReadHandle = (item.id, opened)
+                                        file = opened
+                                    }
                                     try file.seek(toOffset: UInt64(offset))
                                     let data = try file.read(upToCount: min(SyncProtocol.chunkBytes, offer.size - offset)) ?? Data()
                                     try SyncProtocol.require(!data.isEmpty)
+                                    let end = offset + data.count
+                                    if end == offer.size { closeReadHandle(for: item.id) }
                                     message = .chunk(id: item.id, offset: offset, data: data)
-                                    awaitingOffsets[item.id] = offset + data.count
-                                    finishesAttachment = offset + data.count == offer.size
-                                    transferProgress = TransferProgress(direction: "send", itemID: item.id, bytes: offset + data.count, totalBytes: offer.size)
-                                } else { message = .offer(offer); awaitingOffsets[item.id] = -1 }
+                                    active.nextSendOffset = end
+                                    active.chunks.append(PendingChunk(endOffset: end, completedAt: nil))
+                                    activeAttachment = active
+                                    chunkEndOffset = end
+                                    finishesAttachment = end == offer.size
+                                    transferProgress = TransferProgress(direction: "send", itemID: item.id, bytes: end, totalBytes: offer.size)
+                                } else {
+                                    message = .offer(offer)
+                                    activeAttachment = AttachmentTransfer(id: item.id, size: offer.size, startedAt: now())
+                                    finishesAttachment = offer.size == 0
+                                }
                             } else {
                                 let data = try Data(contentsOf: disk.body(item.id))
                                 message = .item(id: item.id, at: item.at, from: "pad", text: String(decoding: data, as: UTF8.self))
                                 transferProgress = TransferProgress(direction: "send", itemID: item.id, bytes: data.count, totalBytes: data.count)
+                                sentThisConnection.insert(item.id)
                             }
-                            sentThisConnection.insert(item.id)
                             frame = try sender.seal(SyncMessageCodec.encode(message))
                             if !attempted.insert(item.id).inserted { record("再送または継続; 件数=1") }
                         } else { return }
                     } else { return }
                     let packets = try SyncPacketizer.split(frame, packetLimit: writeLimit)
                     output = Output(packets: packets, started: now(), progressed: now(), id: id,
-                                    isAuth: isAuth, finishesAttachment: finishesAttachment,
+                                    isAuth: isAuth, chunkEndOffset: chunkEndOffset,
+                                    finishesAttachment: finishesAttachment,
                                     bytes: packets.reduce(0) { $0 + $1.count })
                 }
                 guard var current = output else { return }
@@ -453,12 +506,28 @@ final class PCSyncController: ObservableObject {
                     let completedNow = now()
                     if pending.contains(where: { $0.id == id }) {
                         let initialDeadline = completedNow.addingTimeInterval(Self.replyTimeout)
-                        sentAt[id] = PendingReply(
-                            initialSentAt: completedNow,
-                            deadline: initialDeadline,
-                            baselineDeadline: initialDeadline,
-                            activeFrameToken: nil
-                        )
+                        if let endOffset = current.chunkEndOffset {
+                            if var active = activeAttachment, active.id == id,
+                               let idx = active.chunks.firstIndex(where: { $0.endOffset == endOffset }) {
+                                active.chunks[idx].completedAt = completedNow
+                                activeAttachment = active
+                                if idx == 0 || sentAt[id] == nil {
+                                    sentAt[id] = PendingReply(
+                                        initialSentAt: completedNow,
+                                        deadline: initialDeadline,
+                                        baselineDeadline: initialDeadline,
+                                        activeFrameToken: nil
+                                    )
+                                }
+                            }
+                        } else if activeAttachment == nil || activeAttachment?.id != id || activeAttachment?.awaitingInitialResume == true || activeAttachment?.size == 0 {
+                            sentAt[id] = PendingReply(
+                                initialSentAt: completedNow,
+                                deadline: initialDeadline,
+                                baselineDeadline: initialDeadline,
+                                activeFrameToken: nil
+                            )
+                        }
                     }
                     if current.finishesAttachment { finalChunkSentAttachments.insert(id) }
                     lastSentAt = completedNow
@@ -474,7 +543,7 @@ final class PCSyncController: ObservableObject {
                         record("接続確認成功")
                         if let peerId { settings.peripheralId = peerId; transport.authenticated(peerId) }
                     }
-                    if current.id != nil {
+                    if current.id != nil && current.chunkEndOffset == nil {
                         record("送信; 件数=1; バイト数=\(current.bytes); 所要ms=\(milliseconds(since: current.started))")
                     }
                 }
@@ -574,8 +643,10 @@ final class PCSyncController: ObservableObject {
                 if seen.contains(offer.id) { queueAck(offer.id); return }
                 guard offeredThisConnection.insert(offer.id).inserted else { throw SyncProtocolError.state }
                 guard !receiving.contains(offer.id) else { return }
-                let offset = try disk.begin(offer, now: now())
+                let offerNow = now()
+                let offset = try disk.begin(offer, now: offerNow)
                 transferProgress = TransferProgress(direction: "receive", itemID: offer.id, bytes: offset, totalBytes: offer.size)
+                attachmentReceives[offer.id] = (startedAt: offerNow, startOffset: offset)
                 if offset == offer.size { try finishIncoming(offer) }
                 else { try queueReply(.resume(id: offer.id, offset: offset)) }
             case let .chunk(id, offset, data):
@@ -588,11 +659,43 @@ final class PCSyncController: ObservableObject {
                 else { try queueReply(.resume(id: id, offset: saved)) }
             case let .resume(id, offset):
                 guard let item = pending.first(where: { $0.id == id }) else { return }
-                guard let offer = item.offer, offset < offer.size, let expected = awaitingOffsets[id],
-                      expected < 0 || expected == offset else { throw SyncProtocolError.state }
-                awaitingOffsets.removeValue(forKey: id); offsets[id] = offset
-                sentAt.removeValue(forKey: id); sentThisConnection.remove(id)
-                resumedAttachments.insert(id); finalChunkSentAttachments.remove(id)
+                guard let offer = item.offer, offset < offer.size,
+                      var active = activeAttachment, active.id == id else { throw SyncProtocolError.state }
+                if active.awaitingInitialResume {
+                    active.awaitingInitialResume = false
+                    active.ackedOffset = offset
+                    active.nextSendOffset = offset
+                    active.startOffset = offset
+                    sentAt.removeValue(forKey: id)
+                    finalChunkSentAttachments.remove(id)
+                } else {
+                    guard let idx = active.chunks.firstIndex(where: { $0.endOffset == offset }) else {
+                        throw SyncProtocolError.state
+                    }
+                    active.chunks.removeFirst(idx + 1)
+                    active.ackedOffset = offset
+                    if let frontCompleted = active.chunks.first?.completedAt {
+                        let baseDeadline = frontCompleted.addingTimeInterval(Self.replyTimeout)
+                        let maxDeadline = frontCompleted.addingTimeInterval(Self.replyTimeout + Self.maxReplyExtension)
+                        let existing = sentAt[id]
+                        let deadline: Date
+                        if let existing, existing.activeFrameToken != nil, existing.deadline > baseDeadline {
+                            deadline = min(existing.deadline, maxDeadline)
+                        } else {
+                            deadline = baseDeadline
+                        }
+                        sentAt[id] = PendingReply(
+                            initialSentAt: frontCompleted,
+                            deadline: deadline,
+                            baselineDeadline: baseDeadline,
+                            activeFrameToken: existing?.activeFrameToken
+                        )
+                    } else {
+                        sentAt.removeValue(forKey: id)
+                    }
+                }
+                activeAttachment = active
+                resumedAttachments.insert(id)
                 pump()
             case .ack(let ids):
                 for id in ids {
@@ -601,6 +704,14 @@ final class PCSyncController: ObservableObject {
                     }
                 }
                 let accepted = Set(ids.filter { sentAt[$0] != nil })
+                if let active = activeAttachment, accepted.contains(active.id) {
+                    closeReadHandle(for: active.id)
+                    let ms = milliseconds(since: active.startedAt)
+                    let transferred = resumedAttachments.contains(active.id) ? max(0, active.size - active.startOffset) : 0
+                    let kbps = ms > 0 ? (Double(transferred) / 1024.0) / (Double(ms) / 1000.0) : 0.0
+                    record("添付送信完了; バイト数=\(active.size); 所要ms=\(ms); KB秒=\(String(format: "%.1f", kbps))")
+                    activeAttachment = nil
+                }
                 try disk.ack(accepted); refreshPending()
                 resumedAttachments.subtract(accepted)
                 finalChunkSentAttachments.subtract(accepted)
@@ -626,6 +737,7 @@ final class PCSyncController: ObservableObject {
         }
     }
     private func finishIncoming(_ offer: SyncOffer) throws {
+        let rxInfo = attachmentReceives.removeValue(forKey: offer.id)
         let url: URL
         do { url = try disk.verified(offer) }
         catch {
@@ -652,7 +764,12 @@ final class PCSyncController: ObservableObject {
                 if case .rejected(let reason) = outcome {
                     self.record("受信見送り; 理由=\(reason.rawValue); 件数=1")
                 } else {
-                    self.lastReceivedAt = self.now()
+                    let finishNow = self.now()
+                    self.lastReceivedAt = finishNow
+                    let ms = rxInfo.map { Int(max(0, finishNow.timeIntervalSince($0.startedAt)) * 1000) } ?? 0
+                    let transferred = rxInfo.map { max(0, offer.size - $0.startOffset) } ?? offer.size
+                    let kbps = ms > 0 ? (Double(transferred) / 1024.0) / (Double(ms) / 1000.0) : 0.0
+                    self.record("添付受信完了; バイト数=\(offer.size); 所要ms=\(ms); KB秒=\(String(format: "%.1f", kbps))")
                 }
                 if self.status == .connected { self.queueAck(offer.id) }
             case .failed:
@@ -721,7 +838,9 @@ final class PCSyncController: ObservableObject {
             if historyLoaded, !historyReady {
                 pruneWithHistoryIDs(Set(monitor.entries.map(\.id)))
             } else {
+                let hadActive = activeAttachment != nil
                 do { try disk.prune(now: date); refreshPending() } catch { record("送信待ち保存失敗") }
+                if hadActive && activeAttachment == nil && status == .connected { pump() }
             }
         }
         if let start = handshakeStart, date.timeIntervalSince(start) > 30 {

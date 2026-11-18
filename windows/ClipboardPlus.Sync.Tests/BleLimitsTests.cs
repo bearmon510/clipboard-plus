@@ -87,4 +87,24 @@ public sealed class BleLimitsTests
         Assert.Equal(64, leases.Count);
         foreach (var lease in leases) lease.Dispose();
     }
+
+    [Fact]
+    public void CustomAdmissionLimitsSupportPipelinedBurstAndRejectExcess()
+    {
+        var admission = new WriteAdmission(globalLimit: 512, peerLimit: 256);
+        var peerA = new List<IDisposable>();
+        for (var i = 0; i < 256; i++)
+            peerA.Add(Assert.IsAssignableFrom<IDisposable>(admission.TryEnter("a")));
+        Assert.Null(admission.TryEnter("a"));
+
+        var peerB = new List<IDisposable>();
+        for (var i = 0; i < 256; i++)
+            peerB.Add(Assert.IsAssignableFrom<IDisposable>(admission.TryEnter("b")));
+        Assert.Null(admission.TryEnter("c"));
+
+        foreach (var lease in peerA) lease.Dispose();
+        foreach (var lease in peerB) lease.Dispose();
+        using var reused = admission.TryEnter("a");
+        Assert.NotNull(reused);
+    }
 }

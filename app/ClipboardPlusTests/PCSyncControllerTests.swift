@@ -1071,7 +1071,7 @@ final class PCSyncControllerTests: XCTestCase {
     @MainActor
     func testOnlyOneAttachmentTransfersAtATimeWhileAllowingTextAndReplies() async throws {
         let f = try Fixture(test: self), pairing = try pair(f)
-        let data1 = Data(repeating: 11, count: SyncProtocol.chunkBytes + 5)
+        let data1 = Data(repeating: 11, count: SyncProtocol.chunkBytes * 4 + 5)
         let data2 = Data([22, 23, 24])
         // Items older than 24 hours on the fixture clock (which starts now) are pruned from the queue.
         let baseDate = f.clock.date
@@ -1098,15 +1098,16 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.link.offers.count, 1)
 
         try f.link.send(.resume(id: offer1.id, offset: 0))
-        XCTAssertEqual(f.link.chunks.count, 1)
+        XCTAssertEqual(f.link.chunks.count, 4)
         XCTAssertEqual(f.link.chunks[0].id, offer1.id)
         XCTAssertEqual(f.link.chunks[0].data.count, SyncProtocol.chunkBytes)
         XCTAssertEqual(f.link.offers.count, 1)
 
         try f.link.send(.resume(id: offer1.id, offset: SyncProtocol.chunkBytes))
-        XCTAssertEqual(f.link.chunks.count, 2)
-        XCTAssertEqual(f.link.chunks[1].id, offer1.id)
-        XCTAssertEqual(f.link.chunks[1].data.count, 5)
+        XCTAssertEqual(f.link.chunks.count, 5)
+        XCTAssertEqual(f.link.chunks[4].id, offer1.id)
+        XCTAssertEqual(f.link.chunks[4].offset, SyncProtocol.chunkBytes * 4)
+        XCTAssertEqual(f.link.chunks[4].data.count, 5)
         XCTAssertEqual(f.link.offers.count, 1)
 
         try f.link.send(.ack(ids: [textId]))
@@ -1702,7 +1703,7 @@ final class PCSyncControllerTests: XCTestCase {
         f.link.disconnect()
 
         // 2. Reject ack after resume before first chunk is sent.
-        let data2 = Data(repeating: 2, count: SyncProtocol.chunkBytes + 9)
+        let data2 = Data(repeating: 2, count: SyncProtocol.chunkBytes * 4 + 9)
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: data2, name: "two.bin")], receivedAt: f.clock.date.addingTimeInterval(1))
         await awaitSave(f, savedCount: 2)
         try f.link.connect(pairing, limit: 512)
@@ -1714,11 +1715,11 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.link.rejected, [false])
         XCTAssertEqual(f.controller.pendingCount, 1)
 
-        // 3. Reconnect (resends offer2, offers.count == 3); reject ack after non-final chunk 1.
+        // 3. Reconnect (resends offer2, offers.count == 3); reject ack after first 4-chunk window (non-final).
         try f.link.connect(pairing, limit: 512)
         XCTAssertEqual(f.link.offers.count, 3)
         try f.link.send(.resume(id: offer2.id, offset: 0))
-        XCTAssertEqual(f.link.chunks.count, 1)
+        XCTAssertEqual(f.link.chunks.count, 4)
         try f.link.send(.ack(ids: [offer2.id]))
         XCTAssertEqual(f.link.rejected, [false, false])
         XCTAssertEqual(f.controller.pendingCount, 1)
@@ -1727,7 +1728,7 @@ final class PCSyncControllerTests: XCTestCase {
         try f.link.connect(pairing, limit: 20)
         XCTAssertEqual(f.link.offers.count, 4)
         try f.link.send(.resume(id: offer2.id, offset: 0))
-        XCTAssertEqual(f.link.chunks.count, 2)
+        XCTAssertEqual(f.link.chunks.count, 8)
         f.link.stopAfterPackets = 1
         try f.link.send(.resume(id: offer2.id, offset: SyncProtocol.chunkBytes))
         XCTAssertFalse(f.link.canSend)
@@ -1998,5 +1999,148 @@ final class PCSyncControllerTests: XCTestCase {
         f.clock.date = sentAt.addingTimeInterval(241)
         f.controller.checkTimeouts()
         XCTAssertEqual(f.link.rejected, [false])
+    }
+
+    @MainActor
+    func testPipelinedChunksSlideWindowRejectInvalidResumesAndLogThroughput() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        try f.link.connect(pairing, limit: 512)
+
+        let txData = Data((0..<(SyncProtocol.chunkBytes * 6 + 17)).map { UInt8(truncatingIfNeeded: $0 * 7 + 3) })
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: txData, name: "secret-send.bin")], receivedAt: f.clock.date)
+        await awaitSave(f, savedCount: 1)
+        await drain(f)
+        let txOffer = try XCTUnwrap(f.link.offers.first)
+
+        // Window size = 4 chunks (128 KiB).
+        try f.link.send(.resume(id: txOffer.id, offset: 0))
+        XCTAssertEqual(f.link.chunks.count, 4)
+        XCTAssertEqual(f.link.chunks.map(\.offset), [0, SyncProtocol.chunkBytes, SyncProtocol.chunkBytes * 2, SyncProtocol.chunkBytes * 3])
+
+        // Sliding by 1 chunk releases chunk 4; coalesced resume releases chunks 5 and 6.
+        f.clock.date = f.clock.date.addingTimeInterval(1)
+        try f.link.send(.resume(id: txOffer.id, offset: SyncProtocol.chunkBytes))
+        XCTAssertEqual(f.link.chunks.count, 5)
+        XCTAssertEqual(f.link.chunks[4].offset, SyncProtocol.chunkBytes * 4)
+
+        f.clock.date = f.clock.date.addingTimeInterval(1)
+        try f.link.send(.resume(id: txOffer.id, offset: SyncProtocol.chunkBytes * 4))
+        XCTAssertEqual(f.link.chunks.count, 7)
+        XCTAssertEqual(f.link.chunks[5].offset, SyncProtocol.chunkBytes * 5)
+        XCTAssertEqual(f.link.chunks[6].offset, SyncProtocol.chunkBytes * 6)
+        XCTAssertEqual(f.link.chunks[6].data.count, 17)
+
+        f.clock.date = f.clock.date.addingTimeInterval(1)
+        try f.link.send(.ack(ids: [txOffer.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+
+        // Pipelined receive without waiting between chunks.
+        let rxData = Data((0..<(SyncProtocol.chunkBytes * 5 + 11)).map { UInt8(truncatingIfNeeded: $0 * 11 + 5) })
+        let rxOffer = SyncOffer(
+            id: UUID(),
+            at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+            from: "pc",
+            kind: "file",
+            size: rxData.count,
+            sha256: SyncEchoGuard.hash(rxData),
+            name64: Data("secret-recv.bin".utf8).base64EncodedString(),
+            type: "public.data"
+        )
+        let msgStart = f.link.messages.count
+        try f.link.send(.offer(rxOffer))
+        XCTAssertEqual(f.link.messages.last, .resume(id: rxOffer.id, offset: 0))
+
+        f.clock.date = f.clock.date.addingTimeInterval(2)
+        var offset = 0
+        while offset < rxData.count {
+            let end = min(rxData.count, offset + SyncProtocol.chunkBytes)
+            try f.link.send(.chunk(id: rxOffer.id, offset: offset, data: rxData.subdata(in: offset..<end)))
+            offset = end
+        }
+        await drain(f)
+
+        let rxReplies = Array(f.link.messages.dropFirst(msgStart))
+        let resumeCount = rxReplies.filter { if case .resume(id: rxOffer.id, offset: _) = $0 { return true }; return false }.count
+        XCTAssertEqual(resumeCount, 6)
+        XCTAssertTrue(f.link.ackIDs.contains(rxOffer.id))
+        let rxEntry = try XCTUnwrap(f.monitor.entries.first { $0.source == .pc && $0.kind == .file })
+        let rxFile = try XCTUnwrap(rxEntry.file)
+        XCTAssertEqual(try Data(contentsOf: f.monitor.fileURL(rxFile)), rxData)
+
+        let log = try String(contentsOf: f.root.appendingPathComponent("log.tsv"), encoding: .utf8)
+        XCTAssertTrue(log.contains("添付送信完了; バイト数=\(txData.count); 所要ms="))
+        XCTAssertTrue(log.contains("添付受信完了; バイト数=\(rxData.count); 所要ms="))
+        XCTAssertTrue(log.contains("KB秒="))
+        XCTAssertFalse(log.contains("secret-send"))
+        XCTAssertFalse(log.contains("secret-recv"))
+        XCTAssertFalse(log.contains(rxOffer.sha256))
+
+        // Invalid non-boundary resume inside window is rejected.
+        let f2 = try Fixture(test: self), pairing2 = try pair(f2)
+        let badData = Data(repeating: 9, count: SyncProtocol.chunkBytes * 2 + 1)
+        f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: badData, name: "bad-resume.bin")], receivedAt: f2.clock.date)
+        await awaitSave(f2, savedCount: 1)
+        try f2.link.connect(pairing2, limit: 512)
+        let badOffer = try XCTUnwrap(f2.link.offers.first)
+        try f2.link.send(.resume(id: badOffer.id, offset: 0))
+        try f2.link.send(.resume(id: badOffer.id, offset: 123))
+        XCTAssertEqual(f2.link.rejected, [false])
+    }
+
+    @MainActor
+    func testCompatibleWithOldStopAndWaitPeerInBothDirections() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.controller.copiesReceivedToPasteboard = false
+        try f.link.connect(pairing, limit: 512)
+
+        // Old stop-and-wait sender -> new receiver gets resume after every chunk.
+        let rxData = Data((0..<(SyncProtocol.chunkBytes * 2 + 7)).map { UInt8(truncatingIfNeeded: $0) })
+        let rxOffer = SyncOffer(
+            id: UUID(),
+            at: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+            from: "pc",
+            kind: "file",
+            size: rxData.count,
+            sha256: SyncEchoGuard.hash(rxData),
+            name64: Data("old-sender.bin".utf8).base64EncodedString(),
+            type: "public.data"
+        )
+        try f.link.send(.offer(rxOffer))
+        XCTAssertEqual(f.link.messages.last, .resume(id: rxOffer.id, offset: 0))
+        try f.link.send(.chunk(id: rxOffer.id, offset: 0, data: rxData.subdata(in: 0..<SyncProtocol.chunkBytes)))
+        XCTAssertEqual(f.link.messages.last, .resume(id: rxOffer.id, offset: SyncProtocol.chunkBytes))
+        try f.link.send(.chunk(id: rxOffer.id, offset: SyncProtocol.chunkBytes, data: rxData.subdata(in: SyncProtocol.chunkBytes..<(SyncProtocol.chunkBytes * 2))))
+        XCTAssertEqual(f.link.messages.last, .resume(id: rxOffer.id, offset: SyncProtocol.chunkBytes * 2))
+        try f.link.send(.chunk(id: rxOffer.id, offset: SyncProtocol.chunkBytes * 2, data: rxData.subdata(in: (SyncProtocol.chunkBytes * 2)..<rxData.count)))
+        await drain(f)
+        XCTAssertTrue(f.link.ackIDs.contains(rxOffer.id))
+
+        // New sender -> old receiver sending resume for every single chunk completes without error.
+        let txData = Data((0..<(SyncProtocol.chunkBytes * 5 + 3)).map { UInt8(truncatingIfNeeded: $0 * 3) })
+        let expectedSavedCount = f.monitor.savedCount + 1
+        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: txData, name: "to-old.bin")], receivedAt: f.clock.date.addingTimeInterval(1))
+        await awaitSave(f, savedCount: expectedSavedCount)
+        await drain(f)
+        let txOffer = try XCTUnwrap(f.link.offers.last)
+
+        var received = Data()
+        var processedChunks = f.link.chunks.count
+        try f.link.send(.resume(id: txOffer.id, offset: 0))
+        while received.count < txData.count {
+            let newChunks = Array(f.link.chunks.dropFirst(processedChunks))
+            XCTAssertFalse(newChunks.isEmpty)
+            processedChunks += newChunks.count
+            for ch in newChunks {
+                XCTAssertEqual(ch.offset, received.count)
+                received.append(ch.data)
+                if received.count < txData.count {
+                    try f.link.send(.resume(id: txOffer.id, offset: received.count))
+                }
+            }
+        }
+        XCTAssertEqual(received, txData)
+        try f.link.send(.ack(ids: [txOffer.id]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
     }
 }

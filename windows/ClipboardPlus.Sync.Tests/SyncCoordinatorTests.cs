@@ -13,6 +13,7 @@ public sealed class SyncCoordinatorTests
         public bool FailSend { get; set; }
         public Func<byte[], Task>? OnSend;
         public readonly List<byte[]> Packets = [];
+        public readonly List<bool> HighThroughputHistory = [];
         public Task SendPacketAsync(byte[] packet)
         {
             Assert.False(Rejected);
@@ -22,6 +23,7 @@ public sealed class SyncCoordinatorTests
             return OnSend?.Invoke(packet) ?? Task.CompletedTask;
         }
         public void Reject() => Rejected = true;
+        public void SetHighThroughput(bool enabled) => HighThroughputHistory.Add(enabled);
         public byte[][] DrainFrames()
         {
             var assembler = new SyncPacketAssembler(ushort.MaxValue);
@@ -481,13 +483,15 @@ public sealed class SyncCoordinatorTests
     public async Task BinarySendWaitsForDurableOffsetsAndPrioritizesPong()
     {
         var r = new Rig(); var pad = await r.ConnectAsync(512);
-        var data = new byte[SyncProtocol.ChunkBytes + 1]; data[^1] = 42;
+        var data = new byte[SyncProtocol.ChunkBytes * 4 + 1]; data[^1] = 42;
         await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "a.txt", Data: data)]));
         await r.Pc.WaitForOutgoingAsync(); var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
         await pad.SendAsync(new SyncPing()); Assert.IsType<SyncPong>(Assert.Single(pad.Drain()));
         await pad.SendAsync(new SyncResume(offer.Id, 0));
-        var first = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain())); Assert.Equal(SyncProtocol.ChunkBytes, first.Data.Length);
-        await pad.SendAsync(new SyncResume(offer.Id, first.Data.Length));
+        var window = pad.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(4, window.Length);
+        Assert.All(window, ch => Assert.Equal(SyncProtocol.ChunkBytes, ch.Data.Length));
+        await pad.SendAsync(new SyncResume(offer.Id, SyncProtocol.ChunkBytes));
         var last = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain())); Assert.Equal(new byte[] { 42 }, last.Data);
         await pad.SendAsync(new SyncAck([offer.Id])); Assert.Equal(0, r.State.Pending);
     }
@@ -635,7 +639,7 @@ public sealed class SyncCoordinatorTests
     public async Task OnlyOneAttachmentTransfersAtATimePerConnectionWhileAllowingTextAndControl()
     {
         var r = new Rig(); var pad = await r.ConnectAsync(512);
-        var data1 = new byte[SyncProtocol.ChunkBytes + 5]; data1[^1] = 1;
+        var data1 = new byte[SyncProtocol.ChunkBytes * 4 + 5]; data1[^1] = 1;
         var data2 = new byte[] { 2, 3, 4 };
         await r.Pc.ClipboardChangedAsync(new(1, null, false, [
             new("file", Filename: "one.bin", Data: data1),
@@ -655,11 +659,13 @@ public sealed class SyncCoordinatorTests
         Assert.IsType<SyncPong>(Assert.Single(pad.Drain()));
 
         await pad.SendAsync(new SyncResume(offer1.Id, 0));
-        var chunk1 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
-        Assert.Equal(offer1.Id, chunk1.Id);
-        await pad.SendAsync(new SyncResume(offer1.Id, chunk1.Data.Length));
-        var chunk2 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
-        Assert.Equal(offer1.Id, chunk2.Id);
+        var chunks1 = pad.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(4, chunks1.Length);
+        Assert.All(chunks1, ch => Assert.Equal(offer1.Id, ch.Id));
+        await pad.SendAsync(new SyncResume(offer1.Id, SyncProtocol.ChunkBytes));
+        var chunk5 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(offer1.Id, chunk5.Id);
+        Assert.Equal(5, chunk5.Data.Length);
 
         // Wait for final ACK of file 1 before offering file 2.
         await pad.SendAsync(new SyncAck([textItem.Id]));
@@ -889,7 +895,7 @@ public sealed class SyncCoordinatorTests
     {
         var r = new Rig();
         var pad = await r.ConnectAsync(512);
-        var data1 = new byte[SyncProtocol.ChunkBytes + 5];
+        var data1 = new byte[SyncProtocol.ChunkBytes * 4 + 5];
         data1[0] = 11;
         data1[^1] = 22;
         var data2 = new byte[] { 33, 44 };
@@ -906,7 +912,7 @@ public sealed class SyncCoordinatorTests
             ]));
             await offerEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-            // 60-second tick while offer 1 is InFlight must not clear AwaitingOffsets or start offer 2.
+            // 60-second tick while offer 1 is InFlight must not clear ActiveAttachment or start offer 2.
             await r.Pc.TickAsync(DateTimeOffset.UtcNow.AddSeconds(61)).WaitAsync(TimeSpan.FromSeconds(2));
         }
         finally { offerRelease.TrySetResult(); }
@@ -916,15 +922,16 @@ public sealed class SyncCoordinatorTests
         Assert.Equal("one.bin", offer1.Filename);
 
         await pad.SendAsync(new SyncResume(offer1.Id, 0));
-        var chunk1 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
-        Assert.Equal(SyncProtocol.ChunkBytes, chunk1.Data.Length);
+        var initialChunks = pad.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(4, initialChunks.Length);
+        Assert.All(initialChunks, ch => Assert.Equal(SyncProtocol.ChunkBytes, ch.Data.Length));
 
         var chunkEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var chunkRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         pad.Peer.OnSend = _ => { chunkEntered.TrySetResult(); return chunkRelease.Task; };
         try
         {
-            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer1.Id, chunk1.Data.Length)), pad.Peer.PacketLimit))
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(offer1.Id, SyncProtocol.ChunkBytes)), pad.Peer.PacketLimit))
                 Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
             await chunkEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
@@ -933,8 +940,8 @@ public sealed class SyncCoordinatorTests
         finally { chunkRelease.TrySetResult(); }
         await r.Pc.WaitForOutgoingAsync(pad.Peer);
 
-        var chunk2 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
-        Assert.Equal(data1[SyncProtocol.ChunkBytes..], chunk2.Data);
+        var finalChunk = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(data1[(SyncProtocol.ChunkBytes * 4)..], finalChunk.Data);
         Assert.False(pad.Peer.Rejected);
 
         await pad.SendAsync(new SyncAck([offer1.Id]));
@@ -948,7 +955,7 @@ public sealed class SyncCoordinatorTests
     {
         var r = new Rig();
         var pad = await r.ConnectAsync(512);
-        var data = new byte[SyncProtocol.ChunkBytes + 3];
+        var data = new byte[SyncProtocol.ChunkBytes * 4 + 3];
         data[^1] = 77;
 
         var offerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -983,10 +990,11 @@ public sealed class SyncCoordinatorTests
         var freshOffer = Assert.IsType<SyncOffer>(Assert.Single(fresh.Drain()));
         Assert.Equal(offer.Id, freshOffer.Id);
         await fresh.SendAsync(new SyncResume(freshOffer.Id, 0));
-        var chunk1 = Assert.IsType<SyncChunk>(Assert.Single(fresh.Drain()));
-        await fresh.SendAsync(new SyncResume(freshOffer.Id, chunk1.Data.Length));
-        var chunk2 = Assert.IsType<SyncChunk>(Assert.Single(fresh.Drain()));
-        Assert.Equal(data[SyncProtocol.ChunkBytes..], chunk2.Data);
+        var firstWindow = fresh.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(4, firstWindow.Length);
+        await fresh.SendAsync(new SyncResume(freshOffer.Id, SyncProtocol.ChunkBytes));
+        var finalChunk = Assert.IsType<SyncChunk>(Assert.Single(fresh.Drain()));
+        Assert.Equal(data[(SyncProtocol.ChunkBytes * 4)..], finalChunk.Data);
         await fresh.SendAsync(new SyncAck([freshOffer.Id]));
         Assert.Equal(0, r.State.Pending);
 
@@ -1327,7 +1335,7 @@ public sealed class SyncCoordinatorTests
     public async Task AttachmentAckBeforeFinalChunkCompletesDropsConnectionAndPreservesPending()
     {
         var r = new Rig();
-        var data = new byte[SyncProtocol.ChunkBytes + 9];
+        var data = new byte[SyncProtocol.ChunkBytes * 4 + 9];
         data[^1] = 99;
         await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "twochunks.bin", Data: data)]));
 
@@ -1360,12 +1368,13 @@ public sealed class SyncCoordinatorTests
         finally { chunk1Release.TrySetResult(); }
         await r.Pc.WaitForOutgoingAsync(pad.Peer);
 
-        // 3. Reject ack immediately after non-final chunk 1 completes.
+        // 3. Reject ack immediately after initial non-final window completes.
         var padNonFinal = await r.ConnectAsync(512);
         var offerNonFinal = Assert.IsType<SyncOffer>(Assert.Single(padNonFinal.Drain()));
         await padNonFinal.SendAsync(new SyncResume(offerNonFinal.Id, 0));
-        var chunk1 = Assert.IsType<SyncChunk>(Assert.Single(padNonFinal.Drain()));
-        Assert.Equal(SyncProtocol.ChunkBytes, chunk1.Data.Length);
+        var nonFinalChunks = padNonFinal.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(4, nonFinalChunks.Length);
+        Assert.All(nonFinalChunks, ch => Assert.Equal(SyncProtocol.ChunkBytes, ch.Data.Length));
         ok = true;
         foreach (var packet in SyncPacketizer.Split(padNonFinal.Seal(new SyncAck([offerNonFinal.Id])), padNonFinal.Peer.PacketLimit))
             ok = await r.Pc.ReceiveAsync(padNonFinal.Peer, packet);
@@ -1377,7 +1386,7 @@ public sealed class SyncCoordinatorTests
         var pad3 = await r.ConnectAsync(20);
         var offerAgain = Assert.IsType<SyncOffer>(Assert.Single(pad3.Drain()));
         await pad3.SendAsync(new SyncResume(offerAgain.Id, 0));
-        pad3.Drain();
+        Assert.Equal(4, pad3.Drain().Length);
         var firstPacketSent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allowSecondPacket = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var packetCount = 0;
@@ -1406,6 +1415,8 @@ public sealed class SyncCoordinatorTests
         // 5. Reconnect, complete final chunk, and ack succeeds.
         var pad4 = await r.ConnectAsync(512);
         Assert.IsType<SyncOffer>(Assert.Single(pad4.Drain()));
+        await pad4.SendAsync(new SyncResume(offerAgain.Id, 0));
+        Assert.Equal(4, pad4.Drain().Length);
         await pad4.SendAsync(new SyncResume(offerAgain.Id, SyncProtocol.ChunkBytes));
         Assert.IsType<SyncChunk>(Assert.Single(pad4.Drain()));
         await pad4.SendAsync(new SyncAck([offerAgain.Id]));
@@ -1634,5 +1645,128 @@ public sealed class SyncCoordinatorTests
         r.Now = sentAt.AddSeconds(241);
         await r.Pc.TickAsync(r.Now);
         Assert.True(pad.Peer.Rejected);
+    }
+
+    [Fact]
+    public async Task PipelinedChunksSlideWindowRejectInvalidResumesAndLogThroughputWithoutSecrets()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+        var data = Enumerable.Range(0, SyncProtocol.ChunkBytes * 6 + 17).Select(i => (byte)(i * 7 + 3)).ToArray();
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "secret-send.bin", Data: data)]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var offer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        Assert.Equal([true], pad.Peer.HighThroughputHistory);
+
+        // Window size = 4 chunks (128 KiB).
+        await pad.SendAsync(new SyncResume(offer.Id, 0));
+        var firstWindow = pad.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(4, firstWindow.Length);
+        Assert.Equal(new[] { 0, SyncProtocol.ChunkBytes, SyncProtocol.ChunkBytes * 2, SyncProtocol.ChunkBytes * 3 }, firstWindow.Select(c => c.Offset).ToArray());
+
+        // Sliding by 1 chunk releases chunk 4; coalesced resume releases chunks 5 and 6.
+        r.Now = r.Now.AddSeconds(1);
+        await pad.SendAsync(new SyncResume(offer.Id, SyncProtocol.ChunkBytes));
+        var chunk4 = Assert.IsType<SyncChunk>(Assert.Single(pad.Drain()));
+        Assert.Equal(SyncProtocol.ChunkBytes * 4, chunk4.Offset);
+
+        r.Now = r.Now.AddSeconds(1);
+        await pad.SendAsync(new SyncResume(offer.Id, SyncProtocol.ChunkBytes * 4));
+        var tail = pad.Drain().Cast<SyncChunk>().ToArray();
+        Assert.Equal(2, tail.Length);
+        Assert.Equal(SyncProtocol.ChunkBytes * 5, tail[0].Offset);
+        Assert.Equal(SyncProtocol.ChunkBytes * 6, tail[1].Offset);
+        Assert.Equal(17, tail[1].Data.Length);
+
+        r.Now = r.Now.AddSeconds(1);
+        await pad.SendAsync(new SyncAck([offer.Id]));
+        Assert.Equal(0, r.State.Pending);
+        Assert.Contains(r.Logs, l => l.Contains($"attachment sent bytes={data.Length}") && l.Contains("elapsedMs=") && l.Contains("speedKBps="));
+
+        // High throughput disables after 5s idle grace.
+        r.Now = r.Now.AddSeconds(6);
+        await r.Pc.TickAsync(r.Now);
+        Assert.Equal([true, false], pad.Peer.HighThroughputHistory);
+
+        // Pipelined receive without waiting between chunks.
+        var rxData = Enumerable.Range(0, SyncProtocol.ChunkBytes * 5 + 11).Select(i => (byte)(i * 11 + 5)).ToArray();
+        var rxOffer = new SyncOffer(Guid.NewGuid(), r.Now.ToUnixTimeMilliseconds(), "pad", "file", rxData.Length,
+            Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(rxData)),
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("secret-recv.bin")), "public.data");
+        await pad.SendAsync(rxOffer);
+        Assert.Equal(new SyncResume(rxOffer.Id, 0), Assert.Single(pad.Drain()));
+        Assert.Equal([true, false, true], pad.Peer.HighThroughputHistory);
+
+        r.Now = r.Now.AddSeconds(2);
+        for (var offset = 0; offset < rxData.Length; offset += SyncProtocol.ChunkBytes)
+        {
+            var count = Math.Min(SyncProtocol.ChunkBytes, rxData.Length - offset);
+            foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncChunk(rxOffer.Id, offset, rxData[offset..(offset + count)])), pad.Peer.PacketLimit))
+                Assert.True(await r.Pc.ReceiveAsync(pad.Peer, packet));
+        }
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var rxReplies = pad.Drain();
+        Assert.Equal(5, rxReplies.OfType<SyncResume>().Count());
+        Assert.Equal(rxOffer.Id, Assert.Single(Assert.IsType<SyncAck>(rxReplies[^1]).Ids));
+        var saved = Assert.Single(await r.Pc.GetHistoryAsync("secret-recv"));
+        Assert.Equal(rxData, File.ReadAllBytes(saved.Path!));
+        Assert.Contains(r.Logs, l => l.Contains($"attachment received bytes={rxData.Length}") && l.Contains("elapsedMs=") && l.Contains("speedKBps="));
+        Assert.DoesNotContain(r.Logs, l => l.Contains("secret-send") || l.Contains("secret-recv") || l.Contains(rxOffer.Sha256));
+
+        // Rollback or non-boundary resume in-window is rejected as invalid state.
+        await r.Pc.ClipboardChangedAsync(new(2, null, false, [new("file", Filename: "bad-resume.bin", Data: new byte[SyncProtocol.ChunkBytes * 2 + 1])]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var badOffer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncResume(badOffer.Id, 0));
+        pad.Drain();
+        var ok = true;
+        foreach (var packet in SyncPacketizer.Split(pad.Seal(new SyncResume(badOffer.Id, 123)), pad.Peer.PacketLimit))
+            ok = await r.Pc.ReceiveAsync(pad.Peer, packet);
+        Assert.False(ok);
+        Assert.True(pad.Peer.Rejected);
+    }
+
+    [Fact]
+    public async Task CompatibleWithOldStopAndWaitPeerInBothDirections()
+    {
+        var r = new Rig();
+        var pad = await r.ConnectAsync(512);
+
+        // Old stop-and-wait sender -> new receiver gets resume after every chunk.
+        var rxData = Enumerable.Range(0, SyncProtocol.ChunkBytes * 2 + 7).Select(i => (byte)i).ToArray();
+        var rxOffer = new SyncOffer(Guid.NewGuid(), r.Now.ToUnixTimeMilliseconds(), "pad", "file", rxData.Length,
+            Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(rxData)),
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("old-sender.bin")), "public.data");
+        await pad.SendAsync(rxOffer);
+        Assert.Equal(new SyncResume(rxOffer.Id, 0), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(rxOffer.Id, 0, rxData[..SyncProtocol.ChunkBytes]));
+        Assert.Equal(new SyncResume(rxOffer.Id, SyncProtocol.ChunkBytes), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(rxOffer.Id, SyncProtocol.ChunkBytes, rxData[SyncProtocol.ChunkBytes..(SyncProtocol.ChunkBytes * 2)]));
+        Assert.Equal(new SyncResume(rxOffer.Id, SyncProtocol.ChunkBytes * 2), Assert.Single(pad.Drain()));
+        await pad.SendAsync(new SyncChunk(rxOffer.Id, SyncProtocol.ChunkBytes * 2, rxData[(SyncProtocol.ChunkBytes * 2)..]));
+        Assert.Equal(rxOffer.Id, Assert.Single(Assert.IsType<SyncAck>(Assert.Single(pad.Drain())).Ids));
+
+        // New sender -> old receiver sending resume for every single chunk completes without error.
+        var txData = Enumerable.Range(0, SyncProtocol.ChunkBytes * 5 + 3).Select(i => (byte)(i * 3)).ToArray();
+        await r.Pc.ClipboardChangedAsync(new(1, null, false, [new("file", Filename: "to-old.bin", Data: txData)]));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var txOffer = Assert.IsType<SyncOffer>(Assert.Single(pad.Drain()));
+        var received = new List<byte>();
+        await pad.SendAsync(new SyncResume(txOffer.Id, 0));
+        while (received.Count < txData.Length)
+        {
+            var chunks = pad.Drain().Cast<SyncChunk>().ToArray();
+            Assert.NotEmpty(chunks);
+            foreach (var ch in chunks)
+            {
+                Assert.Equal(received.Count, ch.Offset);
+                received.AddRange(ch.Data);
+                if (received.Count < txData.Length)
+                    await pad.SendAsync(new SyncResume(txOffer.Id, received.Count));
+            }
+        }
+        Assert.Equal(txData, received.ToArray());
+        await pad.SendAsync(new SyncAck([txOffer.Id]));
+        Assert.Equal(0, r.State.Pending);
     }
 }

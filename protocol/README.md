@@ -45,9 +45,9 @@ C#のメッセージはSyncItem / SyncAck / SyncPing / SyncPong / SyncDevice / S
 | Windows Core/SyncRepository.cs | 端末別キュー、既知端末、履歴、受信途中、重複記録。原子的JSONと別ファイルの本体 |
 | Windows Core/SyncCoordinator.cs | 認証ID別の配送、まとめackキュー、進捗、履歴一覧／検索／通知／削除／コピー、状態API。Windows非依存Coreをテストにもリンク |
 
-offer→resume→chunkを繰り返し、受信者はディスクへ保存した位置だけをresumeする。最後に全体SHA-256を確認し、履歴保存後に項目単位のack（両側とも1通に最大1,024件までまとめる）。添付の60秒応答期限切れは接続を切って再接続でofferからやり直し、同一接続内で未完了の重複offerを受けた場合やresume後に最終chunk送信完了前のackを受けた場合は状態誤り（state）として切断する（offer直後のackは維持）。受信中の複数パケットフレームが進んでいる間は返信の60秒期限で切断せず、受信が止まった場合は組み立て期限で切断する。1台のackで他端末のキューは消さない。端末間の中継はしない。
+offer→初回resume→最大4チャンク（128KiB）までのスライディングウィンドウでchunkを先送りし、受信者はディスクへ順番どおり書き込んだ位置をresumeで返す（1チャンクずつの旧stop-and-wait相手とも互換動作）。最後に全体SHA-256を確認し、履歴保存後に項目単位のack（両側とも1通に最大1,024件までまとめる）。添付の60秒応答期限切れは接続を切って再接続でofferからやり直し、同一接続内で未完了の重複offerを受けた場合やresume後に最終chunk送信完了前のackを受けた場合は状態誤り（state）として切断する（offer直後のackは維持）。受信中の複数パケットフレームが進んでいる間は返信の60秒期限で切断せず、受信が止まった場合は組み立て期限で切断する。1台のackで他端末のキューは消さない。端末間の中継はしない。
 
-端末は最後のパケット送受信から30秒でping、キュー投入から10秒以内にpongがなければ再接続。PCだけがpingへpongを返し、pongには返信しない。ack/pong/resumeは次の項目より優先する。GATT値上限はWindowsでmax(20,min(512,MaxPduSize-3))、iOSでmin(512,maximumWriteValueLength)。Windowsの入口上限（全体64件・相手16件）、接続ごとの送信、認証前の制限を維持する。
+端末は最後のパケット送受信から30秒でping、キュー投入から10秒以内にpongがなければ再接続。PCだけがpingへpongを返し、pongには返信しない。ack/pong/resumeは次の項目より優先する。GATT値上限はWindowsでmax(20,min(512,MaxPduSize-3))、iOSでmin(512,maximumWriteValueLength)。WindowsのGATTサーバー（`BleServer`）は入口上限を全体512件・相手256件（`WriteAdmission`既定値64/16は維持）とし、`WriteWithoutResponse` のdeferral即時完了、添付転送中の高スループット接続パラメータ要求（対応OSのみ）、接続ごとの送信、認証前の制限を維持する。
 
 ## 実行
 

@@ -9,6 +9,7 @@ public interface ISyncPeer
     Task SendPacketAsync(byte[] packet);
     // Retire this connection, including after a protocol/notification failure.
     void Reject();
+    void SetHighThroughput(bool enabled) { }
 }
 
 public sealed record ClipboardSnapshot(uint Sequence, string? Text, bool Excluded, IReadOnlyList<ClipboardContent>? Contents = null);
@@ -46,8 +47,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public bool Retired;
         public Guid? InFlight;
         public Guid DeviceId;
-        public readonly Dictionary<Guid, int> Offsets = [];
-        public readonly Dictionary<Guid, int> AwaitingOffsets = [];
+        public AttachmentTransfer? ActiveAttachment;
+        public readonly HashSet<Guid> ActiveIncomingAttachments = [];
+        public readonly Dictionary<Guid, AttachmentReceive> AttachmentReceives = [];
+        public bool HighThroughputRequested;
+        public DateTimeOffset LastAttachmentActivity = now;
         public readonly HashSet<Guid> Attempted = [];
         public readonly HashSet<Guid> OfferedThisConnection = [];
         public readonly HashSet<Guid> ResumedAttachments = [];
@@ -66,10 +70,27 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public SyncFrameReceiver? Receiver;
     }
 
+    private sealed record PendingChunk(int EndOffset, DateTimeOffset? CompletedAt);
+    private sealed class AttachmentTransfer(Guid id, int size, DateTimeOffset startedAt)
+    {
+        public readonly Guid Id = id;
+        public readonly int Size = size;
+        public readonly DateTimeOffset StartedAt = startedAt;
+        public bool AwaitingInitialResume = true;
+        public int NextSendOffset;
+        public int AckedOffset;
+        public int StartOffset;
+        public readonly List<PendingChunk> Chunks = [];
+        public bool CanSendChunk => !AwaitingInitialResume && NextSendOffset < Size && Chunks.Count < MaxAttachmentChunksInFlight;
+    }
+    private sealed record AttachmentReceive(DateTimeOffset StartedAt, int StartOffset);
     private sealed record PendingReply(DateTimeOffset InitialSentAt, DateTimeOffset Deadline, DateTimeOffset BaselineDeadline, ulong? ActiveFrameToken);
 
+    private const int MaxAttachmentChunksInFlight = 4;
+    private static readonly TimeSpan HighThroughputIdleGrace = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ReplyTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan MaxReplyExtension = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan PruneInterval = TimeSpan.FromMinutes(1);
     private const int MinExtendableFrameBytes = 64;
 
     private readonly SemaphoreSlim gate = new(1, 1);
@@ -82,6 +103,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
     private uint? ownSequence;
     private uint? lastClipboardSequence;
     private DateTimeOffset? lastSent, lastReceived;
+    private DateTimeOffset lastPrune = DateTimeOffset.MinValue;
     private DateTimeOffset Now() => clock?.Invoke() ?? DateTimeOffset.UtcNow;
     private bool RequiresPeerUpdate => incompatibleDevices.Count > 0;
     public event Action<SyncStatus>? Changed;
@@ -118,8 +140,9 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             var ids = store.Pending(c.DeviceId).Select(i => i.Id).ToHashSet();
             if (c.InFlight is Guid current && !ids.Contains(current)) { Drop(c, "pending item removed"); continue; }
             foreach (var id in c.Sent.Keys.Where(id => !ids.Contains(id)).ToArray()) c.Sent.Remove(id);
-            foreach (var id in c.Offsets.Keys.Where(id => !ids.Contains(id)).ToArray()) c.Offsets.Remove(id);
-            foreach (var id in c.AwaitingOffsets.Keys.Where(id => !ids.Contains(id)).ToArray()) c.AwaitingOffsets.Remove(id);
+            if (c.ActiveAttachment is { } att && !ids.Contains(att.Id)) c.ActiveAttachment = null;
+            c.ActiveIncomingAttachments.RemoveWhere(id => store.Incoming(c.DeviceId, id) is null);
+            foreach (var id in c.AttachmentReceives.Keys.Where(id => store.Incoming(c.DeviceId, id) is null).ToArray()) c.AttachmentReceives.Remove(id);
             c.Attempted.RemoveWhere(id => !ids.Contains(id));
             c.ResumedAttachments.RemoveWhere(id => !ids.Contains(id));
             c.FinalChunkSentAttachments.RemoveWhere(id => !ids.Contains(id));
@@ -146,6 +169,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         var now = Now();
         var duplicate = store.Duplicate(item, c.DeviceId, now);
         c.Progress = new(c.DeviceId, "receive", item.Id, 1, 1, item.Size, item.Size); Publish();
+        AttachmentReceive? rx = null;
+        if (item.Kind != "text")
+        {
+            c.ActiveIncomingAttachments.Remove(item.Id);
+            c.AttachmentReceives.Remove(item.Id, out rx);
+            c.LastAttachmentActivity = now;
+        }
         if (!duplicate)
         {
             try { ownSequence = await clipboard.WriteItemAsync(item); }
@@ -161,6 +191,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         lastReceived = now;
         if (!duplicate) HistoryChanged?.Invoke();
         log(duplicate ? "duplicate content items=1" : $"received items=1 bytes={item.Size}");
+        if (item.Kind != "text")
+        {
+            var elapsedMs = rx is null ? 0 : Math.Max(0, (now - rx.StartedAt).TotalMilliseconds);
+            var transferred = rx is null ? item.Size : Math.Max(0, item.Size - rx.StartOffset);
+            var kbps = elapsedMs > 0 ? (transferred / 1024.0) / (elapsedMs / 1000.0) : 0.0;
+            log($"attachment received bytes={item.Size} elapsedMs={elapsedMs:F0} speedKBps={kbps:F1}");
+        }
         QueueAck(c, item.Id); c.Progress = null;
     }
     private string Source(Connection c) => store.Devices.First(d => d.Id == c.DeviceId).Kind == "phone" ? "iPhone" : "iPad";
@@ -174,6 +211,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         catch
         {
             c.Progress = null;
+            c.ActiveIncomingAttachments.Remove(offer.Id);
+            c.AttachmentReceives.Remove(offer.Id);
             try { store.DiscardPartial(c.DeviceId, offer.Id); }
             catch { /* Best effort cleanup before dropping connection. */ }
             throw;
@@ -272,6 +311,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     var now = Now();
                     store.Register(c.DeviceId, null, now);
                     store.Prune(now);
+                    lastPrune = now;
                     TrimConnectionQueues();
                     c.Assembler = new(512);
                     log($"handshake authenticated elapsedMs={(now - c.Started).TotalMilliseconds:F0}");
@@ -301,15 +341,23 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             if (offer.From != "pad") throw new SyncProtocolException(SyncError.Format);
                             if (store.Seen(c.DeviceId, offer.Id)) { QueueAck(c, offer.Id); break; }
                             if (!c.OfferedThisConnection.Add(offer.Id)) throw new SyncProtocolException(SyncError.State);
-                            var offset = store.Begin(c.DeviceId, offer, Now());
+                            var offerNow = Now();
+                            var offset = store.Begin(c.DeviceId, offer, offerNow);
                             c.Progress = new(c.DeviceId, "receive", offer.Id, 1, 1, offset, offer.Size);
+                            c.AttachmentReceives[offer.Id] = new(offerNow, offset);
                             if (offset == offer.Size) await FinishIncomingAsync(c, offer);
-                            else QueueReply(c, new SyncResume(offer.Id, offset));
+                            else
+                            {
+                                c.ActiveIncomingAttachments.Add(offer.Id);
+                                EnableHighThroughput(c, offerNow);
+                                QueueReply(c, new SyncResume(offer.Id, offset));
+                            }
                             break;
                         case SyncChunk chunk:
                             if (store.Seen(c.DeviceId, chunk.Id)) { QueueAck(c, chunk.Id); break; }
                             var incoming = store.Incoming(c.DeviceId, chunk.Id) ?? throw new SyncProtocolException(SyncError.State);
                             var saved = store.Append(c.DeviceId, chunk);
+                            c.LastAttachmentActivity = c.LastPacket;
                             c.Progress = new(c.DeviceId, "receive", chunk.Id, 1, 1, saved, incoming.Size);
                             if (saved == incoming.Size) await FinishIncomingAsync(c, incoming);
                             else QueueReply(c, new SyncResume(chunk.Id, saved));
@@ -317,22 +365,59 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         case SyncResume resume:
                             var queued = store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == resume.Id);
                             if (queued is null) break; // Deleted or expired during transfer.
-                            if (queued.Kind == "text" || resume.Offset >= queued.Size ||
-                                !c.AwaitingOffsets.TryGetValue(resume.Id, out var expected) || (expected >= 0 && expected != resume.Offset))
+                            if (queued.Kind == "text" || resume.Offset >= queued.Size || c.ActiveAttachment?.Id != resume.Id)
                                 throw new SyncProtocolException(SyncError.State);
-                            c.AwaitingOffsets.Remove(resume.Id); c.Offsets[resume.Id] = resume.Offset;
-                            c.Sent.Remove(resume.Id);
-                            c.ResumedAttachments.Add(resume.Id); c.FinalChunkSentAttachments.Remove(resume.Id);
+                            var att = c.ActiveAttachment;
+                            if (att.AwaitingInitialResume)
+                            {
+                                att.AwaitingInitialResume = false;
+                                att.AckedOffset = resume.Offset;
+                                att.NextSendOffset = resume.Offset;
+                                att.StartOffset = resume.Offset;
+                                c.Sent.Remove(resume.Id);
+                                c.FinalChunkSentAttachments.Remove(resume.Id);
+                            }
+                            else
+                            {
+                                var idx = att.Chunks.FindIndex(ch => ch.EndOffset == resume.Offset);
+                                if (idx < 0) throw new SyncProtocolException(SyncError.State);
+                                att.Chunks.RemoveRange(0, idx + 1);
+                                att.AckedOffset = resume.Offset;
+                                if (att.Chunks.Count > 0 && att.Chunks[0].CompletedAt is DateTimeOffset frontAt)
+                                {
+                                    var baseDeadline = frontAt + ReplyTimeout;
+                                    var maxDeadline = frontAt + ReplyTimeout + MaxReplyExtension;
+                                    var deadline = c.Sent.TryGetValue(resume.Id, out var prev) && prev.ActiveFrameToken is not null && prev.Deadline > baseDeadline
+                                        ? (prev.Deadline > maxDeadline ? maxDeadline : prev.Deadline)
+                                        : baseDeadline;
+                                    c.Sent[resume.Id] = new(frontAt, deadline, baseDeadline, prev?.ActiveFrameToken);
+                                }
+                                else c.Sent.Remove(resume.Id);
+                            }
+                            c.ResumedAttachments.Add(resume.Id);
+                            c.LastAttachmentActivity = Now();
                             StartSending(c); break;
                         case SyncAck ack:
                             foreach (var id in ack.Ids)
                                 if (c.ResumedAttachments.Contains(id) && !c.FinalChunkSentAttachments.Contains(id))
                                     throw new SyncProtocolException(SyncError.State);
-                            var ids = ack.Ids.Where(id => c.Sent.ContainsKey(id) || c.InFlight == id || c.Offsets.ContainsKey(id) || c.AwaitingOffsets.ContainsKey(id) || c.Attempted.Contains(id)).ToHashSet();
+                            var ids = ack.Ids.Where(id => c.Sent.ContainsKey(id) || c.InFlight == id || c.ActiveAttachment?.Id == id || c.Attempted.Contains(id)).ToHashSet();
                             store.Ack(c.DeviceId, ids);
+                            if (c.ActiveAttachment is { } activeAtt && ids.Contains(activeAtt.Id))
+                            {
+                                var ackNow = Now();
+                                var elapsedMs = Math.Max(0, (ackNow - activeAtt.StartedAt).TotalMilliseconds);
+                                var transferred = c.ResumedAttachments.Contains(activeAtt.Id)
+                                    ? Math.Max(0, activeAtt.Size - activeAtt.StartOffset)
+                                    : 0;
+                                var kbps = elapsedMs > 0 ? (transferred / 1024.0) / (elapsedMs / 1000.0) : 0.0;
+                                log($"attachment sent bytes={activeAtt.Size} elapsedMs={elapsedMs:F0} speedKBps={kbps:F1}");
+                                c.ActiveAttachment = null;
+                                c.LastAttachmentActivity = ackNow;
+                            }
                             foreach (var id in ids)
                             {
-                                c.Sent.Remove(id); c.Offsets.Remove(id); c.AwaitingOffsets.Remove(id); c.Attempted.Remove(id);
+                                c.Sent.Remove(id); c.Attempted.Remove(id);
                                 c.ResumedAttachments.Remove(id); c.FinalChunkSentAttachments.Remove(id);
                             }
                             if (c.InFlight is Guid current && ids.Contains(current)) c.InFlight = null;
@@ -400,8 +485,14 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         try
         {
             if (stopped) return;
-            store.Prune(now);
-            TrimConnectionQueues();
+            var cutoff = now.Subtract(SyncProtocol.PendingLifetime).ToUnixTimeMilliseconds();
+            var hasExpiredPending = store.Devices.Any(d => store.Pending(d.Id).Any(i => i.At < cutoff));
+            if (hasExpiredPending || lastPrune == DateTimeOffset.MinValue || now < lastPrune || now - lastPrune >= PruneInterval)
+            {
+                store.Prune(now);
+                lastPrune = now;
+                TrimConnectionQueues();
+            }
             foreach (var c in connections.Values.ToArray())
             {
                 if ((c.Stage < 2 && now - c.Started > TimeSpan.FromSeconds(20)) ||
@@ -412,13 +503,19 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     // An attachment whose 60-second reply deadline expires drops the connection so the
                     // next session restarts cleanly from offer; text items may resend on the same link.
                     var expired = c.Sent.Where(p => p.Key != c.InFlight && now > p.Value.Deadline).Select(p => p.Key).ToArray();
-                    if (expired.Any(id => c.AwaitingOffsets.ContainsKey(id) || c.Offsets.ContainsKey(id) ||
+                    if (expired.Any(id => c.ActiveAttachment?.Id == id ||
                         store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == id)?.Kind is "image" or "file"))
                     {
                         Drop(c, "attachment timeout");
                         continue;
                     }
                     foreach (var id in expired) c.Sent.Remove(id);
+                    if (c.HighThroughputRequested && c.ActiveAttachment is null && c.ActiveIncomingAttachments.Count == 0 &&
+                        now - c.LastAttachmentActivity >= HighThroughputIdleGrace)
+                    {
+                        c.HighThroughputRequested = false;
+                        c.Peer.SetHighThroughput(false);
+                    }
                     try { StartSending(c); }
                     catch (Exception e) { Drop(c, Failure(e)); }
                 }
@@ -509,11 +606,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 HistoryItem? item = null;
                 var finishesItem = false;
                 var retransmission = false;
+                var isChunk = false;
+                int? chunkEndOffset = null;
                 await gate.WaitAsync();
                 try
                 {
                     if (c.Retired) return;
-                    var attachmentBusy = c.AwaitingOffsets.Count > 0 || c.Offsets.Count > 0;
                     if (c.ControlFrames.TryDequeue(out var control)) frame = control;
                     else if (c.Stage == 2 && c.AckQueue.Count > 0)
                     {
@@ -524,34 +622,70 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     }
                     else if (c.Stage == 2 && c.Replies.TryDequeue(out var reply))
                         frame = c.Sender!.Seal(SyncMessageCodec.Encode(reply));
-                    else if (c.Stage == 2 && (item = store.Pending(c.DeviceId).FirstOrDefault(i =>
-                        !c.Sent.ContainsKey(i.Id) &&
-                        (i.Kind == "text" || !attachmentBusy || c.Offsets.ContainsKey(i.Id)))) is not null)
+                    else
                     {
-                        SyncMessage message;
-                        if (item.Kind == "text") {
-                            message = new SyncItem(item.Id, item.At, "pc", item.Text!); finishesItem = true;
-                            c.Progress = new(c.DeviceId, "send", item.Id, store.Pending(c.DeviceId).IndexOf(item) + 1, store.Pending(c.DeviceId).Count, item.Size, item.Size);
+                        var pendingList = store.Pending(c.DeviceId);
+                        if (c.Stage == 2 && (item = pendingList.FirstOrDefault(i =>
+                            i.Kind == "text"
+                                ? !c.Sent.ContainsKey(i.Id)
+                                : (c.ActiveAttachment is null ? !c.Sent.ContainsKey(i.Id) : c.ActiveAttachment.Id == i.Id && c.ActiveAttachment.CanSendChunk))) is not null)
+                        {
+                            SyncMessage message;
+                            var sentNow = Now();
+                            var itemIndex = pendingList.IndexOf(item) + 1;
+                            var itemCount = pendingList.Count;
+                            if (item.Kind == "text")
+                            {
+                                message = new SyncItem(item.Id, item.At, "pc", item.Text!);
+                                finishesItem = true;
+                                c.Progress = new(c.DeviceId, "send", item.Id, itemIndex, itemCount, item.Size, item.Size);
+                                var initialDeadline = sentNow + ReplyTimeout;
+                                c.Sent[item.Id] = new(sentNow, initialDeadline, initialDeadline, null);
+                                store.MarkSent(item, sentNow);
+                            }
+                            else if (c.ActiveAttachment is { } att)
+                            {
+                                isChunk = true;
+                                var offset = att.NextSendOffset;
+                                if (offset >= item.Size) throw new SyncProtocolException(SyncError.State);
+                                byte[] data;
+                                using (var file = File.OpenRead(item.Path!))
+                                {
+                                    file.Position = offset;
+                                    data = new byte[Math.Min(SyncProtocol.ChunkBytes, item.Size - offset)];
+                                    file.ReadExactly(data);
+                                }
+                                message = new SyncChunk(item.Id, offset, data);
+                                var end = offset + data.Length;
+                                att.NextSendOffset = end;
+                                att.Chunks.Add(new(end, null));
+                                chunkEndOffset = end;
+                                finishesItem = end == item.Size;
+                                c.Progress = new(c.DeviceId, "send", item.Id, itemIndex, itemCount, end, item.Size);
+                                c.LastAttachmentActivity = sentNow;
+                                if (!c.Sent.ContainsKey(item.Id))
+                                {
+                                    var initialDeadline = sentNow + ReplyTimeout;
+                                    c.Sent[item.Id] = new(sentNow, initialDeadline, initialDeadline, null);
+                                }
+                            }
+                            else
+                            {
+                                message = item.Offer;
+                                c.ActiveAttachment = new(item.Id, item.Size, sentNow);
+                                finishesItem = item.Size == 0;
+                                var initialDeadline = sentNow + ReplyTimeout;
+                                c.Sent[item.Id] = new(sentNow, initialDeadline, initialDeadline, null);
+                                store.MarkSent(item, sentNow);
+                                if (item.Size > 0) EnableHighThroughput(c, sentNow);
+                            }
+                            c.Attempted.Add(item.Id);
+                            frame = c.Sender!.Seal(SyncMessageCodec.Encode(message));
+                            retransmission = !attempted.Add(item.Id);
+                            c.InFlight = item.Id;
                         }
-                        else if (c.Offsets.Remove(item.Id, out var offset)) {
-                            if (offset >= item.Size) throw new SyncProtocolException(SyncError.State);
-                            using var file = File.OpenRead(item.Path!); file.Position = offset;
-                            var data = new byte[Math.Min(SyncProtocol.ChunkBytes, item.Size - offset)]; file.ReadExactly(data);
-                            message = new SyncChunk(item.Id, offset, data);
-                            c.AwaitingOffsets[item.Id] = offset + data.Length; finishesItem = offset + data.Length == item.Size;
-                            c.Progress = new(c.DeviceId, "send", item.Id, store.Pending(c.DeviceId).IndexOf(item) + 1, store.Pending(c.DeviceId).Count, offset + data.Length, item.Size);
-                        } else { message = item.Offer; c.AwaitingOffsets[item.Id] = -1; finishesItem = item.Size == 0; }
-                        // Mark before I/O: resume/ack may arrive before notification completion.
-                        var sentNow = Now();
-                        var initialDeadline = sentNow + ReplyTimeout;
-                        c.Sent[item.Id] = new(sentNow, initialDeadline, initialDeadline, null);
-                        c.Attempted.Add(item.Id);
-                        store.MarkSent(item, sentNow);
-                        frame = c.Sender!.Seal(SyncMessageCodec.Encode(message));
-                        retransmission = !attempted.Add(item.Id);
-                        c.InFlight = item.Id;
+                        else { c.Sending = false; return; }
                     }
-                    else { c.Sending = false; return; }
                 }
                 finally { gate.Release(); }
 
@@ -570,7 +704,11 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         }
                         finally { gate.Release(); }
                     }
-                    await c.Peer.SendPacketAsync(packets[packetIndex]).WaitAsync(TimeSpan.FromSeconds(10), c.Stop.Token);
+                    var sendTask = c.Peer.SendPacketAsync(packets[packetIndex]);
+                    if (!sendTask.IsCompleted)
+                        await sendTask.WaitAsync(TimeSpan.FromSeconds(10), c.Stop.Token);
+                    else
+                        await sendTask;
                 }
                 await gate.WaitAsync();
                 try
@@ -579,17 +717,53 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     // An ACK may arrive before NotifyValueAsync completes.
                     if (item is not null)
                     {
-                        if ((item.Kind == "text" || c.AwaitingOffsets.ContainsKey(item.Id)) && store.Pending(c.DeviceId).Any(i => i.Id == item.Id))
+                        var stillPending = store.Pending(c.DeviceId).Any(i => i.Id == item.Id);
+                        if (item.Kind == "text")
                         {
-                            var completedNow = Now();
-                            var completedDeadline = completedNow + ReplyTimeout;
-                            c.Sent[item.Id] = new(completedNow, completedDeadline, completedDeadline, null);
+                            if (stillPending && c.Sent.ContainsKey(item.Id))
+                            {
+                                var completedNow = Now();
+                                var completedDeadline = completedNow + ReplyTimeout;
+                                c.Sent[item.Id] = new(completedNow, completedDeadline, completedDeadline, null);
+                            }
+                            c.InFlight = null;
+                            lastSent = Now();
+                            log($"sent items=1 resend={retransmission} pending={store.PendingCount}");
                         }
-                        c.InFlight = null;
-                        if (finishesItem) lastSent = Now();
-                        log($"sent items=1 resend={retransmission} pending={store.PendingCount}");
+                        else if (isChunk)
+                        {
+                            if (stillPending && c.ActiveAttachment is { } att && att.Id == item.Id && chunkEndOffset is int end)
+                            {
+                                var idx = att.Chunks.FindIndex(ch => ch.EndOffset == end);
+                                if (idx >= 0)
+                                {
+                                    var completedNow = Now();
+                                    att.Chunks[idx] = att.Chunks[idx] with { CompletedAt = completedNow };
+                                    if (idx == 0)
+                                    {
+                                        var completedDeadline = completedNow + ReplyTimeout;
+                                        c.Sent[item.Id] = new(completedNow, completedDeadline, completedDeadline, null);
+                                    }
+                                }
+                            }
+                            c.InFlight = null;
+                            if (finishesItem) lastSent = Now();
+                        }
+                        else
+                        {
+                            if (stillPending && c.ActiveAttachment is { } att && att.Id == item.Id && (att.AwaitingInitialResume || item.Size == 0))
+                            {
+                                var completedNow = Now();
+                                var completedDeadline = completedNow + ReplyTimeout;
+                                c.Sent[item.Id] = new(completedNow, completedDeadline, completedDeadline, null);
+                            }
+                            c.InFlight = null;
+                            if (finishesItem) lastSent = Now();
+                            log($"sent items=1 resend={retransmission} pending={store.PendingCount}");
+                        }
                     }
-                    log($"notify packets={packets.Count} bytes={frame.Length} elapsedMs={watch.ElapsedMilliseconds}");
+                    if (!isChunk)
+                        log($"notify packets={packets.Count} bytes={frame.Length} elapsedMs={watch.ElapsedMilliseconds}");
                     if (c.VersionRejected) { Drop(c, "version mismatch; update peer"); return; }
                     Publish();
                 }
@@ -604,13 +778,22 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         }
     }
 
+    private static void EnableHighThroughput(Connection c, DateTimeOffset now)
+    {
+        c.LastAttachmentActivity = now;
+        if (c.HighThroughputRequested) return;
+        c.HighThroughputRequested = true;
+        c.Peer.SetHighThroughput(true);
+    }
+
     private void Drop(Connection c, string reason)
     {
         c.Retired = true;
         c.Stop.Cancel();
         c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.Sent.Clear();
-        c.Offsets.Clear(); c.AwaitingOffsets.Clear(); c.OfferedThisConnection.Clear();
-        c.ResumedAttachments.Clear(); c.FinalChunkSentAttachments.Clear(); c.Progress = null;
+        c.ActiveAttachment = null; c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
+        c.OfferedThisConnection.Clear(); c.ResumedAttachments.Clear(); c.FinalChunkSentAttachments.Clear(); c.Progress = null;
+        if (c.HighThroughputRequested) { c.HighThroughputRequested = false; c.Peer.SetHighThroughput(false); }
         connections.Remove(c.Peer);
         attempted.RemoveWhere(id => !store.Devices.Any(d => store.Pending(d.Id).Any(i => i.Id == id)));
         try { c.Assembler.Finish(); }

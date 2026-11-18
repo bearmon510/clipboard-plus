@@ -5,12 +5,17 @@ public enum SyncPacketizer {
     public static func split(_ frame: Data, packetLimit: Int) throws -> [Data] {
         try SyncProtocol.require(packetLimit >= 2, .limit)
         try SyncProtocol.require((1...SyncProtocol.maxFrameBytes).contains(frame.count), .limit)
-        let bytes = Data(frame)
-        var result: [Data] = [], offset = 0
-        while offset < bytes.count {
-            let count = min(packetLimit - 1, bytes.count - offset)
-            let flags: UInt8 = (offset == 0 ? 1 : 0) | (offset + count == bytes.count ? 2 : 0)
-            result.append(Data([flags]) + bytes.subdata(in: offset..<(offset + count)))
+        let payloadLimit = packetLimit - 1
+        var result: [Data] = []
+        result.reserveCapacity((frame.count + payloadLimit - 1) / payloadLimit)
+        var offset = frame.startIndex
+        while offset < frame.endIndex {
+            let count = min(payloadLimit, frame.endIndex - offset)
+            let flags: UInt8 = (offset == frame.startIndex ? 1 : 0) | (offset + count == frame.endIndex ? 2 : 0)
+            var packet = Data(capacity: count + 1)
+            packet.append(flags)
+            packet.append(frame[offset..<(offset + count)])
+            result.append(packet)
             offset += count
         }
         return result
