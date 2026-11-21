@@ -306,12 +306,12 @@ struct KeyboardView: View {
                 alphanumericButton(metrics: metrics)
             }
 
-            Spacer(minLength: metrics.keySpacing)
-
+            // The switcher fills the space between the side keys, and both halves get the same width,
+            // so neither label is a smaller target and there is no dead gap on either side.
             tabSwitcher(keyHeight: metrics.keyHeight, isWide: metrics.isWide)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, metrics.keySpacing)
                 .layoutPriority(1)
-
-            Spacer(minLength: metrics.keySpacing)
 
             HStack(spacing: metrics.keySpacing) {
                 KeyboardRepeatableDeleteKey(keyHeight: metrics.keyHeight, width: metrics.compactKeyWidth) {
@@ -367,6 +367,7 @@ struct KeyboardView: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.85)
                         .padding(.horizontal, isWide ? 14 : 9)
+                        .frame(maxWidth: .infinity)
                         .frame(height: segmentHeight)
                         .background(
                             isSelected ? KeyboardTheme.letterKey : Color.clear,
