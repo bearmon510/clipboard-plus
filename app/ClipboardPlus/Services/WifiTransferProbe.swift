@@ -39,10 +39,67 @@ private enum WifiTransferProbeError: Error {
     }
 }
 
+enum WifiProbeReceivePolicy {
+    static let minimumChunkBytes: Int64 = 65_536
+    static let maximumChunkBytes: Int64 = 524_288
+    static let progressByteInterval: Int64 = 524_288
+    static let progressTimeIntervalNs: UInt64 = 150_000_000
+
+    static func receiveLengths(remaining: Int64) -> (minimum: Int, maximum: Int) {
+        let clamped = max(remaining, 1)
+        return (
+            minimum: Int(min(clamped, minimumChunkBytes)),
+            maximum: Int(min(clamped, maximumChunkBytes))
+        )
+    }
+
+    static func shouldReportProgress(
+        received: Int64,
+        totalBytes: Int64,
+        lastReportedBytes: Int64,
+        lastReportTimeNs: UInt64,
+        nowNs: UInt64
+    ) -> Bool {
+        if received >= totalBytes {
+            return true
+        }
+        guard received - lastReportedBytes >= progressByteInterval else {
+            return false
+        }
+        guard nowNs >= lastReportTimeNs else {
+            return false
+        }
+        return (nowNs - lastReportTimeNs) >= progressTimeIntervalNs
+    }
+}
+
 private final class WifiProbeSocket: @unchecked Sendable {
+    private final class DrainState: @unchecked Sendable {
+        let totalBytes: Int64
+        let onProgress: @MainActor (Int64) -> Void
+        var continuation: CheckedContinuation<Int, Error>?
+        var received: Int64 = 0
+        var lastReportedBytes: Int64 = 0
+        var lastReportTimeNs: UInt64
+        var receiveCount: Int = 0
+
+        init(
+            totalBytes: Int64,
+            startTimeNs: UInt64,
+            onProgress: @escaping @MainActor (Int64) -> Void,
+            continuation: CheckedContinuation<Int, Error>
+        ) {
+            self.totalBytes = totalBytes
+            self.lastReportTimeNs = startTimeNs
+            self.onProgress = onProgress
+            self.continuation = continuation
+        }
+    }
+
     private let connection: NWConnection
-    private let queue = DispatchQueue(label: "clipboardplus.wifi-probe.socket")
+    private let queue = DispatchQueue(label: "clipboardplus.wifi-probe.socket", qos: .userInitiated)
     private var connectContinuation: CheckedContinuation<Void, Error>?
+    private var activeDrain: DrainState?
     private var timeoutItem: DispatchWorkItem?
     private var sawLocalNetworkDenied = false
     private var cancelled = false
@@ -51,7 +108,9 @@ private final class WifiProbeSocket: @unchecked Sendable {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw WifiTransferProbeError.invalidEndpoint
         }
-        let parameters = NWParameters.tcp
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         parameters.requiredInterfaceType = .wifi
         self.connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
     }
@@ -95,14 +154,15 @@ private final class WifiProbeSocket: @unchecked Sendable {
         }
     }
 
-    func send(_ data: Data) async throws {
+    func send(_ data: Data, isFinal: Bool = false) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
                 if cancelled {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                connection.send(content: data, completion: .contentProcessed { error in
+                let context: NWConnection.ContentContext = isFinal ? .finalMessage : .defaultMessage
+                connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
                     if let error {
                         continuation.resume(throwing: WifiTransferProbeError.network(error))
                     } else {
@@ -128,21 +188,26 @@ private final class WifiProbeSocket: @unchecked Sendable {
         return buffer
     }
 
-    func drainExact(_ totalBytes: Int64, onProgress: @escaping @MainActor (Int64) -> Void) async throws {
-        var received: Int64 = 0
-        var lastReported: Int64 = 0
-        while received < totalBytes {
-            let remaining = Int(min(totalBytes - received, 262_144))
-            let (content, isComplete) = try await receiveChunk(maximumLength: remaining)
-            if let content, !content.isEmpty {
-                received += Int64(content.count)
-                if received - lastReported >= 524_288 || received == totalBytes {
-                    lastReported = received
-                    let snapshot = received
-                    Task { @MainActor in onProgress(snapshot) }
+    func drainExact(_ totalBytes: Int64, onProgress: @escaping @MainActor (Int64) -> Void) async throws -> Int {
+        if totalBytes <= 0 {
+            let snapshot: Int64 = 0
+            Task { @MainActor in onProgress(snapshot) }
+            return 0
+        }
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
+            queue.async { [self] in
+                if cancelled || activeDrain != nil {
+                    continuation.resume(throwing: CancellationError())
+                    return
                 }
-            } else if isComplete {
-                throw WifiTransferProbeError.unexpectedClose
+                let drain = DrainState(
+                    totalBytes: totalBytes,
+                    startTimeNs: DispatchTime.now().uptimeNanoseconds,
+                    onProgress: onProgress,
+                    continuation: continuation
+                )
+                activeDrain = drain
+                scheduleNextDrainReceive(drain)
             }
         }
     }
@@ -152,7 +217,80 @@ private final class WifiProbeSocket: @unchecked Sendable {
             cancelled = true
             connection.cancel()
             finishConnect(.failure(CancellationError()))
+            if let drain = activeDrain {
+                finishDrain(drain, result: .failure(CancellationError()))
+            }
         }
+    }
+
+    private func scheduleNextDrainReceive(_ drain: DrainState) {
+        guard drain.continuation != nil else { return }
+        if cancelled {
+            finishDrain(drain, result: .failure(CancellationError()))
+            return
+        }
+        let remaining = drain.totalBytes - drain.received
+        guard remaining > 0 else {
+            finishDrain(drain, result: .success(drain.receiveCount))
+            return
+        }
+        let lengths = WifiProbeReceivePolicy.receiveLengths(remaining: remaining)
+        connection.receive(minimumIncompleteLength: lengths.minimum, maximumLength: lengths.maximum) { [self] content, _, isComplete, error in
+            handleDrainReceive(drain, content: content, isComplete: isComplete, error: error)
+        }
+    }
+
+    private func handleDrainReceive(_ drain: DrainState, content: Data?, isComplete: Bool, error: NWError?) {
+        guard drain.continuation != nil else { return }
+        if cancelled {
+            finishDrain(drain, result: .failure(CancellationError()))
+            return
+        }
+
+        drain.receiveCount += 1
+
+        if let content, !content.isEmpty {
+            drain.received += Int64(content.count)
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            if WifiProbeReceivePolicy.shouldReportProgress(
+                received: drain.received,
+                totalBytes: drain.totalBytes,
+                lastReportedBytes: drain.lastReportedBytes,
+                lastReportTimeNs: drain.lastReportTimeNs,
+                nowNs: nowNs
+            ) {
+                drain.lastReportedBytes = drain.received
+                drain.lastReportTimeNs = nowNs
+                let snapshot = drain.received
+                let onProgress = drain.onProgress
+                Task { @MainActor in onProgress(snapshot) }
+            }
+            if drain.received >= drain.totalBytes {
+                finishDrain(drain, result: .success(drain.receiveCount))
+                return
+            }
+        }
+
+        if let error {
+            finishDrain(drain, result: .failure(WifiTransferProbeError.network(error)))
+            return
+        }
+
+        if isComplete {
+            finishDrain(drain, result: .failure(WifiTransferProbeError.unexpectedClose))
+            return
+        }
+
+        scheduleNextDrainReceive(drain)
+    }
+
+    private func finishDrain(_ drain: DrainState, result: Result<Int, Error>) {
+        guard let continuation = drain.continuation else { return }
+        drain.continuation = nil
+        if activeDrain === drain {
+            activeDrain = nil
+        }
+        continuation.resume(with: result)
     }
 
     private func receiveChunk(maximumLength: Int) async throws -> (Data?, Bool) {
@@ -190,7 +328,7 @@ private enum WifiPathWatcher {
 
     static func isWifiSatisfied(timeoutSeconds: Double = 0.35) async -> Bool {
         let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
-        let queue = DispatchQueue(label: "clipboardplus.wifi-probe.check")
+        let queue = DispatchQueue(label: "clipboardplus.wifi-probe.check", qos: .userInitiated)
         let state = WatcherState()
         return await withCheckedContinuation { continuation in
             let timeoutItem = DispatchWorkItem {
@@ -217,7 +355,7 @@ private enum WifiPathWatcher {
         removeAction: @escaping @MainActor () -> Void
     ) async -> Bool {
         let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
-        let queue = DispatchQueue(label: "clipboardplus.wifi-probe.restore")
+        let queue = DispatchQueue(label: "clipboardplus.wifi-probe.restore", qos: .userInitiated)
         let state = WatcherState()
         return await withCheckedContinuation { continuation in
             let timeoutItem = DispatchWorkItem {
@@ -362,15 +500,16 @@ final class WifiTransferProbe: ObservableObject {
 
             statusMessage = "\(size.title) の返送データをPCから受け取っています…"
             progressText = "受信: 0 B / \(size.title)"
-            try await createdSocket.drainExact(size.byteCount) { [weak self] received in
-                guard let self, self.activeRunID == runID else { return }
+            let receiveCount = try await createdSocket.drainExact(size.byteCount) { [weak self] received in
+                guard let self, self.activeRunID == runID, self.timeline.receivedAt == nil else { return }
                 self.progressText = "受信: \(WifiProbeMetrics.formatBytes(received)) / \(size.title)"
             }
             guard activeRunID == runID else { throw CancellationError() }
             timeline.receivedAt = Date()
+            timeline.receiveCallCount = receiveCount
 
-            // Tell PC we finished reading all echoed bytes before tearing down the socket.
-            try? await createdSocket.send(Data([WifiProbeWire.ackOK]))
+            // Wait for .contentProcessed of the final ack before closing the connection.
+            try? await createdSocket.send(Data([WifiProbeWire.ackOK]), isFinal: true)
             createdSocket.cancel()
             activeSocket = nil
             socket = nil

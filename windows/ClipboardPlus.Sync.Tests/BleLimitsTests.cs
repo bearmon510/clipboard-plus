@@ -348,11 +348,22 @@ public sealed class BleLimitsTests
         var characteristic = new object();
         var peerObj = new object();
         var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failCompleteCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failDeferralErrorLogged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var peer2Delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var okCompleteCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var okDeferralErrorLogged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var pipeline = new BleWritePipeline(
             admission,
-            logs.Enqueue,
+            msg =>
+            {
+                logs.Enqueue(msg);
+                if (msg == "write deferral error=ObjectDisposedException")
+                    failDeferralErrorLogged.TrySetResult();
+                else if (msg == "write deferral error=InvalidOperationException")
+                    okDeferralErrorLogged.TrySetResult();
+            },
             () => Task.CompletedTask,
             (peer, offset, bytes) => { delivered.Add(bytes); peer2Delivered.TrySetResult(); return Task.FromResult(true); },
             _ => { disconnected.TrySetResult(); return Task.CompletedTask; });
@@ -367,10 +378,18 @@ public sealed class BleLimitsTests
         var failCompleteAttempts = 0;
         pipeline.EnqueueWrite(characteristic, "peer-err", session1, 128, false,
             _ => Task.FromException<BleWriteRequestData?>(new IOException("request failed")),
-            () => { Interlocked.Increment(ref failCompleteAttempts); throw new ObjectDisposedException("deferral"); },
+            () =>
+            {
+                Interlocked.Increment(ref failCompleteAttempts);
+                failCompleteCalled.TrySetResult();
+                throw new ObjectDisposedException("deferral");
+            },
             () => { });
 
-        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.WhenAll(disconnected.Task, failCompleteCalled.Task, failDeferralErrorLogged.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        using var leaseTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (admission.TotalBytes > 0 && !leaseTimeout.IsCancellationRequested)
+            await Task.Yield();
         Assert.Equal(1, failCompleteAttempts);
         Assert.True(slot1.Rejected);
         Assert.Equal(0, admission.TotalBytes);
@@ -381,10 +400,15 @@ public sealed class BleLimitsTests
         var okCompleteAttempts = 0;
         pipeline.EnqueueWrite(characteristic, "peer-ok", session2, 128, false,
             _ => Task.FromResult<BleWriteRequestData?>(new(0, [9, 8, 7], false, () => { }, _ => { })),
-            () => { Interlocked.Increment(ref okCompleteAttempts); throw new InvalidOperationException("complete failed"); },
+            () =>
+            {
+                Interlocked.Increment(ref okCompleteAttempts);
+                okCompleteCalled.TrySetResult();
+                throw new InvalidOperationException("complete failed");
+            },
             () => { });
 
-        await peer2Delivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.WhenAll(peer2Delivered.Task, okCompleteCalled.Task, okDeferralErrorLogged.Task).WaitAsync(TimeSpan.FromSeconds(5));
         await pipeline.QueueWork(() => Task.CompletedTask);
 
         Assert.Equal(1, okCompleteAttempts);

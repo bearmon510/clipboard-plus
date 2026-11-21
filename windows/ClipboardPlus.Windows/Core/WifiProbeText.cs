@@ -139,7 +139,7 @@ public static class WifiProbeWire
     public const byte AckAuthFailed = 0x01;
     public const byte AckInvalidSize = 0x02;
     public const long MaxPayloadBytes = 64L * 1024 * 1024;
-    private const int ChunkBytes = 64 * 1024;
+    public const int SendChunkBytes = 256 * 1024;
 
     public static byte[] EncodeHeader(string token, long payloadBytes)
     {
@@ -192,7 +192,8 @@ public static class WifiProbeWire
         string expectedToken,
         Action<long>? onAccepted = null,
         Action<long, TimeSpan>? onReceived = null,
-        Action<long, TimeSpan>? onSent = null,
+        Action<WifiProbeSentMetrics>? onSent = null,
+        TimeSpan? ackTimeout = null,
         CancellationToken cancellationToken = default)
     {
         var (ok, statusCode, payloadBytes) = await ReadHeaderAsync(stream, expectedToken, cancellationToken);
@@ -203,7 +204,7 @@ public static class WifiProbeWire
 
         onAccepted?.Invoke(payloadBytes);
 
-        var buffer = new byte[ChunkBytes];
+        var buffer = new byte[SendChunkBytes];
         var uploadClock = System.Diagnostics.Stopwatch.StartNew();
         long remaining = payloadBytes;
         while (remaining > 0)
@@ -217,6 +218,10 @@ public static class WifiProbeWire
         uploadClock.Stop();
         onReceived?.Invoke(payloadBytes, uploadClock.Elapsed);
 
+        // Prepare dummy send data once before echoing so the write loop stays allocation- and RNG-free.
+        var sendSampleLength = (int)Math.Min(payloadBytes, buffer.Length);
+        RandomNumberGenerator.Fill(buffer.AsSpan(0, sendSampleLength));
+
         await stream.WriteAsync(new[] { AckOk }, cancellationToken);
         await stream.FlushAsync(cancellationToken);
 
@@ -225,29 +230,43 @@ public static class WifiProbeWire
         while (remaining > 0)
         {
             var toWrite = (int)Math.Min(remaining, buffer.Length);
-            RandomNumberGenerator.Fill(buffer.AsSpan(0, toWrite));
             await stream.WriteAsync(buffer.AsMemory(0, toWrite), cancellationToken);
             remaining -= toWrite;
         }
         await stream.FlushAsync(cancellationToken);
+        var writeElapsed = downloadClock.Elapsed;
 
         // Wait briefly for the client's 1-byte completion ack so timing reflects real reception.
-        using var ackTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        ackTimeout.CancelAfter(TimeSpan.FromSeconds(5));
+        var ackTimedOut = false;
+        var ackBuffer = new byte[1];
+        using var ackTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        ackTimeoutCts.CancelAfter(ackTimeout ?? TimeSpan.FromSeconds(5));
         try
         {
-            _ = await stream.ReadAsync(buffer.AsMemory(0, 1), ackTimeout.Token);
+            _ = await stream.ReadAsync(ackBuffer, ackTimeoutCts.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            ackTimedOut = true;
         }
         catch (IOException)
         {
         }
 
         downloadClock.Stop();
-        onSent?.Invoke(payloadBytes, downloadClock.Elapsed);
-        return new WifiProbeTransferOutcome(true, AckOk, payloadBytes, uploadClock.Elapsed, downloadClock.Elapsed);
+        var totalElapsed = downloadClock.Elapsed;
+        var ackWaitElapsed = totalElapsed - writeElapsed;
+        var sentMetrics = new WifiProbeSentMetrics(payloadBytes, totalElapsed, writeElapsed, ackWaitElapsed, ackTimedOut);
+        onSent?.Invoke(sentMetrics);
+        return new WifiProbeTransferOutcome(
+            true,
+            AckOk,
+            payloadBytes,
+            uploadClock.Elapsed,
+            totalElapsed,
+            writeElapsed,
+            ackWaitElapsed,
+            ackTimedOut);
     }
 
     public static async Task ReadExactAsync(Stream stream, byte[] destination, CancellationToken cancellationToken)
@@ -263,12 +282,22 @@ public static class WifiProbeWire
     }
 }
 
+public sealed record WifiProbeSentMetrics(
+    long PayloadBytes,
+    TimeSpan TotalElapsed,
+    TimeSpan WriteElapsed,
+    TimeSpan AckWaitElapsed,
+    bool AckTimedOut);
+
 public sealed record WifiProbeTransferOutcome(
     bool Accepted,
     byte StatusCode,
     long PayloadBytes,
     TimeSpan UploadElapsed,
-    TimeSpan DownloadElapsed);
+    TimeSpan DownloadElapsed,
+    TimeSpan DownloadWriteElapsed = default,
+    TimeSpan AckWaitElapsed = default,
+    bool AckTimedOut = false);
 
 public sealed record NetworkAdapterSnapshot(
     string Description,
@@ -433,5 +462,13 @@ public static class WifiProbeText
         if (state.CompletedRuns > 0)
             lines.Add($"この起動での完了回数: {state.CompletedRuns} 回");
         return string.Join(Environment.NewLine, lines);
+    }
+
+    public static string FormatSentLog(WifiProbeSentMetrics metrics)
+    {
+        var speed = SpeedMBPerSecond(metrics.PayloadBytes, metrics.TotalElapsed);
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"wifi probe sent bytes={metrics.PayloadBytes} elapsedMs={(long)metrics.TotalElapsed.TotalMilliseconds} writeMs={(long)metrics.WriteElapsed.TotalMilliseconds} ackWaitMs={(long)metrics.AckWaitElapsed.TotalMilliseconds} ackTimedOut={(metrics.AckTimedOut ? "true" : "false")} speedMBps={speed ?? 0:0.00}");
     }
 }

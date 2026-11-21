@@ -117,5 +117,63 @@ final class WifiProbeTests: XCTestCase {
         XCTAssertEqual(rows[3].detailText, "1.00 秒 · 10.00 MB/秒")
         XCTAssertEqual(rows[4].detailText, "0.50 秒 · 20.00 MB/秒")
         XCTAssertEqual(rows[5].detailText, "復帰 2.00 秒 · 合計 7.10 秒")
+
+        var withCount = timeline
+        withCount.receiveCallCount = 40
+        let rowsWithCount = withCount.rows(timeZone: TimeZone(secondsFromGMT: 0)!)
+        XCTAssertEqual(rowsWithCount[4].detailText, "0.50 秒 · 20.00 MB/秒 · 受け取り回数 40 回")
+    }
+
+    func testReceivePolicyChunkSizesAndProgressThrottling() {
+        let small = WifiProbeReceivePolicy.receiveLengths(remaining: 1_000)
+        XCTAssertEqual(small.minimum, 1_000)
+        XCTAssertEqual(small.maximum, 1_000)
+
+        let medium = WifiProbeReceivePolicy.receiveLengths(remaining: 100_000)
+        XCTAssertEqual(medium.minimum, 65_536)
+        XCTAssertEqual(medium.maximum, 100_000)
+
+        let large = WifiProbeReceivePolicy.receiveLengths(remaining: 1_000_000)
+        XCTAssertEqual(large.minimum, 65_536)
+        XCTAssertEqual(large.maximum, 524_288)
+
+        let total: Int64 = 2_097_152
+        let t0: UInt64 = 1_000_000_000
+
+        // Not enough bytes even after >= 150ms
+        XCTAssertFalse(WifiProbeReceivePolicy.shouldReportProgress(
+            received: 262_144,
+            totalBytes: total,
+            lastReportedBytes: 0,
+            lastReportTimeNs: t0,
+            nowNs: t0 + 200_000_000
+        ))
+
+        // Enough bytes, but < 150ms since last report
+        XCTAssertFalse(WifiProbeReceivePolicy.shouldReportProgress(
+            received: 524_288,
+            totalBytes: total,
+            lastReportedBytes: 0,
+            lastReportTimeNs: t0,
+            nowNs: t0 + 149_999_999
+        ))
+
+        // Enough bytes and >= 150ms
+        XCTAssertTrue(WifiProbeReceivePolicy.shouldReportProgress(
+            received: 524_288,
+            totalBytes: total,
+            lastReportedBytes: 0,
+            lastReportTimeNs: t0,
+            nowNs: t0 + 150_000_000
+        ))
+
+        // Completion always reports regardless of byte/time delta
+        XCTAssertTrue(WifiProbeReceivePolicy.shouldReportProgress(
+            received: total,
+            totalBytes: total,
+            lastReportedBytes: total - 1_000,
+            lastReportTimeNs: t0,
+            nowNs: t0
+        ))
     }
 }

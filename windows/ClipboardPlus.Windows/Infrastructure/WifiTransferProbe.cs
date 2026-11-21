@@ -426,6 +426,7 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
             try
             {
                 client = await tcpListener.AcceptTcpClientAsync(ct);
+                // Keep default SendBufferSize so Windows TCP auto-tuning stays active.
                 client.NoDelay = true;
                 client.ReceiveTimeout = 30_000;
                 client.SendTimeout = 30_000;
@@ -469,18 +470,15 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
                                 UploadDuration = elapsed,
                             });
                         },
-                        onSent: (size, elapsed) =>
+                        onSent: metrics =>
                         {
                             var sentAt = DateTimeOffset.Now;
-                            var speed = WifiProbeText.SpeedMBPerSecond(size, elapsed);
-                            log(string.Create(
-                                CultureInfo.InvariantCulture,
-                                $"wifi probe sent bytes={size} elapsedMs={(long)elapsed.TotalMilliseconds} speedMBps={speed ?? 0:0.00}"));
+                            log(WifiProbeText.FormatSentLog(metrics));
                             UpdateSnapshot(s => s with
                             {
                                 StatusMessage = $"1回の往復試験が終わりました（送信・返送とも完了）。続けて試すこともできます。",
                                 SentAt = sentAt,
-                                DownloadDuration = elapsed,
+                                DownloadDuration = metrics.TotalElapsed,
                                 CompletedRuns = s.CompletedRuns + 1,
                             });
                         },

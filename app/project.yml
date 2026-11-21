@@ -12,7 +12,7 @@ settings:
     # The real Bundle ID is passed from a GitHub secret at archive time.
     APP_BUNDLE_ID: example.clipboardplus
     APP_GROUP_ID: group.$(APP_BUNDLE_ID)
-    MARKETING_VERSION: "0.17.0"
+    MARKETING_VERSION: "0.17.1"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   ClipboardPlus:

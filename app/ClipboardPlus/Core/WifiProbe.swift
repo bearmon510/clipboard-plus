@@ -255,6 +255,7 @@ struct WifiProbeTimeline: Equatable {
     var receivedAt: Date?
     var restoreStartedAt: Date?
     var restoredAt: Date?
+    var receiveCallCount: Int? = nil
 
     var joinDuration: TimeInterval? { delta(from: joinPromptedAt, to: joinedAt) }
     var connectDuration: TimeInterval? { delta(from: joinedAt, to: connectedAt) }
@@ -277,8 +278,12 @@ struct WifiProbeTimeline: Equatable {
         let uploadDetail = uploadDuration.map {
             "\(WifiProbeMetrics.formatDuration($0)) · \(WifiProbeMetrics.formatSpeed(uploadSpeedMBps))"
         }
-        let downloadDetail = downloadDuration.map {
-            "\(WifiProbeMetrics.formatDuration($0)) · \(WifiProbeMetrics.formatSpeed(downloadSpeedMBps))"
+        let downloadDetail = downloadDuration.map { duration in
+            let summary = "\(WifiProbeMetrics.formatDuration(duration)) · \(WifiProbeMetrics.formatSpeed(downloadSpeedMBps))"
+            if let receiveCallCount {
+                return "\(summary) · 受け取り回数 \(receiveCallCount) 回"
+            }
+            return summary
         }
         let restoreDetail: String?
         if restoredAt != nil {

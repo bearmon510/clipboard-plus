@@ -165,6 +165,23 @@ final class KeyboardExtensionTests: XCTestCase {
         XCTAssertEqual(groups.last?.id, "")
     }
 
+    func testTemplateGroupingCombinesNfcAndNfdTagsIntoSingleNfcGroup() throws {
+        let nfc = "\u{304C}"
+        let nfd = "\u{304B}\u{3099}"
+        let entries = [
+            makeEntry(1, isTemplate: true, tag: nfd, templateOrder: 1),
+            makeEntry(2, isTemplate: true, tag: " \(nfc) ", templateOrder: 0),
+        ]
+
+        let groups = KeyboardTemplateGrouping.make(entries)
+        XCTAssertEqual(groups.count, 1)
+        let group = try XCTUnwrap(groups.first)
+        XCTAssertEqual(group.entries.map(\.id), [2, 1])
+        XCTAssertEqual(group.tag.map { Array($0.utf8) }, Array(nfc.utf8))
+        XCTAssertEqual(Array(group.title.utf8), Array(nfc.utf8))
+        XCTAssertEqual(Array(group.id.utf8), Array(nfc.utf8))
+    }
+
     // MARK: - Text Insertion & Alphanumeric Keypad
 
     @MainActor
