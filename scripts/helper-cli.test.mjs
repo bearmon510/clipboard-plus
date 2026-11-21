@@ -78,10 +78,10 @@ test('Gemini passes extra directories when given', () => {
 });
 
 test('only Gemini models that think enough are allowed', () => {
-  for (const model of ['gemini-4-hydrogen-xhigh', 'gemini-4-hydrogen-high', 'gemini-4-carbon-high', 'gemini-4-argon-high', 'gemini-pro-orchestrator']) {
+  for (const model of ['gemini-4-neon-xhigh', 'gemini-4-neon-high', 'gemini-pro-orchestrator-neon', 'gemini-4-hydrogen-xhigh', 'gemini-4-hydrogen-high', 'gemini-4-carbon-high', 'gemini-4-argon-high', 'gemini-pro-orchestrator']) {
     assert.ok(isAllowedGeminiModel(model), model);
   }
-  for (const model of ['gemini-4-hydrogen-medium', 'gemini-4-carbon-low', 'gemini-3.8-flash-high']) {
+  for (const model of ['gemini-4-neon-medium', 'gemini-4-hydrogen-medium', 'gemini-4-carbon-low', 'gemini-3.8-flash-high']) {
     assert.ok(!isAllowedGeminiModel(model), model);
   }
   assert.ok(isAllowedGeminiModel(DEFAULT_MODELS.gemini));

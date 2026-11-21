@@ -9,10 +9,10 @@ import path from 'node:path';
 // back as a patch that Claude reviews and applies, so it never writes to the real tree.
 
 export const TOOLS = ['gemini', 'copilot'];
-// Hydrogen is the model agy's Orchestrator hands execution to; Carbon and Argon plan.
-// Hydrogen is not accurate enough below its highest thinking level, so the lower
-// variants are refused (see isAllowedGeminiModel).
-export const DEFAULT_MODELS = { gemini: 'gemini-4-hydrogen-xhigh', copilot: 'auto' };
+// Neon (Carbon-level reasoning, faster and more efficient) is the default worker.
+// Hydrogen is the fast executor for well-specified tasks; it is not accurate enough
+// below its highest thinking level, so lower variants are refused (isAllowedGeminiModel).
+export const DEFAULT_MODELS = { gemini: 'gemini-4-neon-xhigh', copilot: 'auto' };
 
 /** Lower thinking levels and the older Flash model are not accurate enough. */
 export function isAllowedGeminiModel(model) {

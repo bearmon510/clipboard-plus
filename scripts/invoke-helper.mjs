@@ -66,7 +66,7 @@ if (values.model !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(values.mo
 if (values.tool === 'gemini' && values.model !== undefined && !isAllowedGeminiModel(values.model)) {
   throw new Error(
     `${values.model} thinks too little to be accurate. ` +
-    'Use gemini-4-hydrogen-xhigh, gemini-4-carbon-high or gemini-4-argon-high.',
+    'Use gemini-4-neon-xhigh, gemini-4-neon-high, gemini-4-hydrogen-xhigh, gemini-4-carbon-high or gemini-4-argon-high.',
   );
 }
 if (values.effort !== undefined && !EFFORTS[values.tool].includes(values.effort)) {
