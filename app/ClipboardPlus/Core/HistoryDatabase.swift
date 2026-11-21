@@ -21,6 +21,11 @@ struct TemplateSyncRowState: Equatable {
     let dirty: Bool
 }
 
+struct TemplateUpdateResult: Equatable {
+    let entry: HistoryEntry
+    let conflictCopy: HistoryEntry?
+}
+
 struct LocalTemplateSyncSnapshot: Equatable {
     let snapshot: TemplateSyncSnapshot
     let dirtyIDs: Set<UUID>
@@ -29,6 +34,27 @@ struct LocalTemplateSyncSnapshot: Equatable {
     let skippedOverflowIDs: Set<UUID>
     let skippedOversizedCount: Int
     let skippedOverflowCount: Int
+    let pushedEditRevByID: [UUID: Int64]
+
+    init(
+        snapshot: TemplateSyncSnapshot,
+        dirtyIDs: Set<UUID>,
+        dirtyTombstoneIDs: Set<UUID>,
+        skippedOversizedIDs: Set<UUID>,
+        skippedOverflowIDs: Set<UUID>,
+        skippedOversizedCount: Int,
+        skippedOverflowCount: Int,
+        pushedEditRevByID: [UUID: Int64] = [:]
+    ) {
+        self.snapshot = snapshot
+        self.dirtyIDs = dirtyIDs
+        self.dirtyTombstoneIDs = dirtyTombstoneIDs
+        self.skippedOversizedIDs = skippedOversizedIDs
+        self.skippedOverflowIDs = skippedOverflowIDs
+        self.skippedOversizedCount = skippedOversizedCount
+        self.skippedOverflowCount = skippedOverflowCount
+        self.pushedEditRevByID = pushedEditRevByID
+    }
 
     var excludedIDs: Set<UUID> {
         skippedOversizedIDs.union(skippedOverflowIDs)
@@ -83,12 +109,12 @@ struct TemplateSyncOutcome: Equatable {
 }
 
 final class HistoryDatabase: HistoryPersistence {
-    static let schemaVersion = 6
+    static let schemaVersion = 7
     static let undoInterval: TimeInterval = 5
     private var connection: OpaquePointer?
     private let now: () -> Date
     private let columns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source, image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type, file_hash, file_name, original_filename, file_bytes, file_type, title, pin_order, tag"
-    private let syncColumns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source, image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type, file_hash, file_name, original_filename, file_bytes, file_type, title, pin_order, tag, template_sync_id, template_updated_at, template_base_hash, template_dirty"
+    private let syncColumns = "id, kind, text, saved_at, collected_at, collection_count, pinned, source, image_hash, image_file, thumbnail_file, image_bytes, pixel_width, pixel_height, image_type, file_hash, file_name, original_filename, file_bytes, file_type, title, pin_order, tag, template_sync_id, template_updated_at, template_base_hash, template_dirty, template_edit_rev, template_pushed_hash, template_pc_diverged"
     private let historyLimit: Int
     private let imageByteLimit: Int
     private var removals: [HistoryEntry] = []
@@ -219,6 +245,15 @@ final class HistoryDatabase: HistoryPersistence {
                     try execute("PRAGMA user_version = 6")
                 }
             }
+            if version < 7 {
+                try transaction {
+                    try execute("ALTER TABLE history ADD COLUMN template_edit_rev INTEGER NOT NULL DEFAULT 0")
+                    try execute("ALTER TABLE history ADD COLUMN template_pushed_hash TEXT")
+                    try execute("ALTER TABLE history ADD COLUMN template_pc_diverged INTEGER NOT NULL DEFAULT 0")
+                    try execute("ALTER TABLE template_tombstones ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0")
+                    try execute("PRAGMA user_version = 7")
+                }
+            }
             try purgeExpired()
         } catch {
             sqlite3_close(connection)
@@ -334,90 +369,166 @@ final class HistoryDatabase: HistoryPersistence {
             let isTextTemplate = entry.kind == .text || entry.kind == .url
             let normalizedText = isTextTemplate ? TemplateSyncMerge.normalizeLineEndings(entry.text) : entry.text
             if isTextTemplate {
-                let normalizedMatch = try activeTemplateText(normalizedText) != nil
-                var originalMatch = false
-                if !normalizedText.utf8.elementsEqual(entry.text.utf8) {
-                    originalMatch = try activeTemplateText(entry.text) != nil
-                }
-                if normalizedMatch || originalMatch {
+                let hasDuplicate = try activeTemplateText(normalizedText) != nil
+                if hasDuplicate {
                     throw HistoryEditError.duplicate
                 }
-            } else if try equalTemplate(to: entry) != nil {
-                throw HistoryEditError.duplicate
+            } else {
+                let hasEqual = try equalTemplate(to: entry) != nil
+                if hasEqual {
+                    throw HistoryEditError.duplicate
+                }
             }
-            let syncRow = try templateSyncMetadata(id: id)
+            let syncRow = try templateSyncRow(id: id)
             let syncId = syncRow?.syncId?.uuidString ?? UUID().uuidString
             let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: nowMillis(), existingUpdatedAt: syncRow?.updatedAt)
+            let nextOrder = try nextTemplateOrder(tag: nil)
             if isTextTemplate {
                 try execute("""
                     UPDATE history SET kind = ?, text = ?, pinned = 1, tag = NULL, pin_order = ?,
-                        template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL, template_dirty = 1
+                        template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL,
+                        template_pushed_hash = NULL, template_pc_diverged = 0, template_dirty = 1,
+                        template_edit_rev = template_edit_rev + 1
                     WHERE id = ?
                     """, [.text(HistoryKind.classify(normalizedText).rawValue), .text(normalizedText),
-                          .integer(try nextTemplateOrder(tag: nil)), .text(syncId), .int64(updatedAt), .integer(id)])
+                          .integer(nextOrder), .text(syncId), .int64(updatedAt), .integer(id)])
             } else {
                 try execute("""
                     UPDATE history SET pinned = 1, tag = NULL, pin_order = ?,
-                        template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL, template_dirty = 1
+                        template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL,
+                        template_pushed_hash = NULL, template_pc_diverged = 0, template_dirty = 1,
+                        template_edit_rev = template_edit_rev + 1
                     WHERE id = ?
-                    """, [.integer(try nextTemplateOrder(tag: nil)), .text(syncId), .int64(updatedAt), .integer(id)])
+                    """, [.integer(nextOrder), .text(syncId), .int64(updatedAt), .integer(id)])
             }
             return try activeEntry(id)
         }
     }
 
     func createTemplate(text: String, title: String?, tag: String? = nil) throws -> HistoryEntry {
+        try transaction {
+            try createTemplateInTransaction(text: text, title: title, tag: tag)
+        }
+    }
+
+    private func createTemplateInTransaction(text: String, title: String?, tag: String?) throws -> HistoryEntry {
         let normalizedText = TemplateSyncMerge.normalizeLineEndings(text)
         guard !normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
-        return try transaction {
-            if try activeTemplateText(normalizedText) != nil { throw HistoryEditError.duplicate }
-            let tag = HistoryEntry.normalizedTag(tag)
-            let date = now().timeIntervalSince1970
-            let updatedAt = Self.millis(from: date)
-            try execute("""
-                INSERT INTO history(kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order, tag,
-                    template_sync_id, template_updated_at, template_base_hash, template_dirty)
-                VALUES (?, ?, ?, ?, 1, 1, 'written', ?, ?, ?, ?, ?, NULL, 1)
-                """, [.text(HistoryKind.classify(normalizedText).rawValue), .text(normalizedText), .real(date), .real(date),
-                      titleValue(title), .integer(try nextTemplateOrder(tag: tag)), tagValue(tag),
-                      .text(UUID().uuidString), .int64(updatedAt)])
-            return try activeEntry(Int(sqlite3_last_insert_rowid(connection)))
-        }
+        let existingDuplicate = try activeTemplateText(normalizedText)
+        if existingDuplicate != nil { throw HistoryEditError.duplicate }
+        let tag = HistoryEntry.normalizedTag(tag)
+        let date = now().timeIntervalSince1970
+        let updatedAt = Self.millis(from: date)
+        let order = try nextTemplateOrder(tag: tag)
+        try execute("""
+            INSERT INTO history(kind, text, saved_at, collected_at, collection_count, pinned, source, title, pin_order, tag,
+                template_sync_id, template_updated_at, template_base_hash, template_dirty, template_edit_rev)
+            VALUES (?, ?, ?, ?, 1, 1, 'written', ?, ?, ?, ?, ?, NULL, 1, 0)
+            """, [.text(HistoryKind.classify(normalizedText).rawValue), .text(normalizedText), .real(date), .real(date),
+                  titleValue(title), .integer(order), tagValue(tag),
+                  .text(UUID().uuidString), .int64(updatedAt)])
+        return try activeEntry(Int(sqlite3_last_insert_rowid(connection)))
     }
 
     func updateTemplate(id: Int, text: String?, title: String?, tag: String?) throws -> HistoryEntry {
         try transaction {
-            let entry = try activeEntry(id)
-            guard entry.isTemplate else { throw HistoryEditError.unsupportedKind }
-            let normalizedInputText = text.map { TemplateSyncMerge.normalizeLineEndings($0) }
-            if let normalizedInputText {
-                guard entry.kind == .text || entry.kind == .url else { throw HistoryEditError.unsupportedKind }
-                guard !normalizedInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
-                if let duplicate = try activeTemplateText(normalizedInputText), duplicate.id != id { throw HistoryEditError.duplicate }
+            try updateTemplateInTransaction(id: id, text: text, title: title, tag: tag)
+        }
+    }
+
+    func updateTemplate(id: Int, text: String?, title: String?, tag: String?, expectedOriginal: HistoryEntry) throws -> TemplateUpdateResult {
+        try transaction {
+            let current = try activeEntry(id)
+            guard current.isTemplate else { throw HistoryEditError.unsupportedKind }
+            let plan = TemplateEditSavePlan.resolve(
+                original: expectedOriginal,
+                latest: current,
+                editsText: text != nil,
+                inputText: text ?? expectedOriginal.text,
+                inputTitle: title,
+                inputTag: tag
+            )
+            let updated = try updateTemplateInTransaction(
+                id: id,
+                text: plan.updateText,
+                title: plan.updateTitle,
+                tag: plan.updateTag
+            )
+            let conflictCopy: HistoryEntry?
+            if let conflictText = plan.conflictCopyText {
+                let existingConflict = try activeTemplateText(conflictText)
+                if existingConflict == nil {
+                    conflictCopy = try createTemplateInTransaction(
+                        text: conflictText,
+                        title: plan.conflictCopyTitle,
+                        tag: nil
+                    )
+                } else {
+                    conflictCopy = nil
+                }
+            } else {
+                conflictCopy = nil
             }
-            let newText = normalizedInputText ?? entry.text
-            let newKind = normalizedInputText.map { HistoryKind.classify($0) } ?? entry.kind
-            let normTitle = HistoryEntry.normalizedTitle(title)
-            let newTag = HistoryEntry.normalizedTag(tag)
-            let order: Int?
-            if Self.utf8Key(newTag) == Self.utf8Key(entry.tag) { order = entry.templateOrder }
-            else { order = try nextTemplateOrder(tag: newTag) }
-            let changed = !newText.utf8.elementsEqual(entry.text.utf8) || newKind != entry.kind ||
-                Self.utf8Key(normTitle) != Self.utf8Key(entry.title) ||
-                Self.utf8Key(newTag) != Self.utf8Key(entry.tag) || order != entry.templateOrder
-            guard changed else { return entry }
-            let syncRow = try templateSyncMetadata(id: id)
-            let syncId = syncRow?.syncId?.uuidString ?? UUID().uuidString
-            let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: nowMillis(), existingUpdatedAt: syncRow?.updatedAt)
+            return TemplateUpdateResult(entry: updated, conflictCopy: conflictCopy)
+        }
+    }
+
+    private func updateTemplateInTransaction(id: Int, text: String?, title: String?, tag: String?) throws -> HistoryEntry {
+        let entry = try activeEntry(id)
+        guard entry.isTemplate else { throw HistoryEditError.unsupportedKind }
+        let normalizedInputText = text.map { TemplateSyncMerge.normalizeLineEndings($0) }
+        if let normalizedInputText {
+            guard entry.kind == .text || entry.kind == .url else { throw HistoryEditError.unsupportedKind }
+            guard !normalizedInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HistoryEditError.empty }
+            let duplicate = try activeTemplateText(normalizedInputText, excludingID: id)
+            if duplicate != nil { throw HistoryEditError.duplicate }
+        }
+        let newText = normalizedInputText ?? entry.text
+        let newKind = normalizedInputText.map { HistoryKind.classify($0) } ?? entry.kind
+        let normTitle = HistoryEntry.normalizedTitle(title)
+        let newTag = HistoryEntry.normalizedTag(tag)
+        let order: Int?
+        if Self.utf8Key(newTag) == Self.utf8Key(entry.tag) { order = entry.templateOrder }
+        else { order = try nextTemplateOrder(tag: newTag) }
+        let changed = !newText.utf8.elementsEqual(entry.text.utf8) || newKind != entry.kind ||
+            Self.utf8Key(normTitle) != Self.utf8Key(entry.title) ||
+            Self.utf8Key(newTag) != Self.utf8Key(entry.tag) || order != entry.templateOrder
+        guard changed else { return entry }
+        let syncRow = try templateSyncRow(id: id)
+        let syncId = syncRow?.syncId?.uuidString ?? UUID().uuidString
+        let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: nowMillis(), existingUpdatedAt: syncRow?.updatedAt)
+        var clearsDivergedBaseHash = false
+        if let syncRow, syncRow.pcDiverged, let baseHash = syncRow.baseHash, (newKind == .text || newKind == .url) {
+            let newHash = TemplateSyncMerge.contentHash(
+                kind: newKind == .url ? .url : .text,
+                text: newText,
+                title: Self.sanitizedTitleForSync(normTitle),
+                tag: Self.sanitizedTagForSync(newTag)
+            )
+            if newHash == baseHash {
+                clearsDivergedBaseHash = true
+            }
+        }
+        if clearsDivergedBaseHash {
             try execute("""
                 UPDATE history SET text = ?, kind = ?, title = ?, tag = ?, pin_order = ?,
-                    template_sync_id = ?, template_updated_at = ?, template_dirty = 1
+                    template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL,
+                    template_pc_diverged = 0, template_dirty = 1, template_edit_rev = template_edit_rev + 1
                 WHERE id = ?
                 """, [.text(newText), .text(newKind.rawValue),
                       titleValue(title), tagValue(newTag), order.map { .integer($0) } ?? .null,
                       .text(syncId), .int64(updatedAt), .integer(id)])
-            return try activeEntry(id)
+        } else {
+            try execute("""
+                UPDATE history SET text = ?, kind = ?, title = ?, tag = ?, pin_order = ?,
+                    template_sync_id = ?, template_updated_at = ?, template_dirty = 1,
+                    template_edit_rev = template_edit_rev + 1
+                WHERE id = ?
+                """, [.text(newText), .text(newKind.rawValue),
+                      titleValue(title), tagValue(newTag), order.map { .integer($0) } ?? .null,
+                      .text(syncId), .int64(updatedAt), .integer(id)])
         }
+        return try activeEntry(id)
     }
 
     func reorderTemplates(_ orderedIDs: [Int]) throws {
@@ -434,9 +545,9 @@ final class HistoryDatabase: HistoryPersistence {
             let arranged = group.map { entry in (seen.contains(entry.id) ? reordered.next() : nil) ?? entry }
             let currentMillis = nowMillis()
             for (offset, entry) in arranged.enumerated() where entry.templateOrder != offset {
-                let syncRow = try templateSyncMetadata(id: entry.id)
+                let syncRow = try templateSyncRow(id: entry.id)
                 let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: currentMillis, existingUpdatedAt: syncRow?.updatedAt)
-                try execute("UPDATE history SET pin_order = ?, template_updated_at = ?, template_dirty = 1 WHERE id = ?",
+                try execute("UPDATE history SET pin_order = ?, template_updated_at = ?, template_dirty = 1, template_edit_rev = template_edit_rev + 1 WHERE id = ?",
                             [.integer(offset), .int64(updatedAt), .integer(entry.id)])
             }
         }
@@ -451,10 +562,31 @@ final class HistoryDatabase: HistoryPersistence {
             let currentMillis = nowMillis()
             for entry in moved {
                 let order = try nextTemplateOrder(tag: newTag)
-                let syncRow = try templateSyncMetadata(id: entry.id)
+                let syncRow = try templateSyncRow(id: entry.id)
                 let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: currentMillis, existingUpdatedAt: syncRow?.updatedAt)
-                try execute("UPDATE history SET tag = ?, pin_order = ?, template_updated_at = ?, template_dirty = 1 WHERE id = ?",
-                            [tagValue(newTag), .integer(order), .int64(updatedAt), .integer(entry.id)])
+                var clearsDivergedBaseHash = false
+                if let syncRow, syncRow.pcDiverged, let baseHash = syncRow.baseHash, (entry.kind == .text || entry.kind == .url) {
+                    let newHash = TemplateSyncMerge.contentHash(
+                        kind: entry.kind == .url ? .url : .text,
+                        text: entry.text,
+                        title: Self.sanitizedTitleForSync(entry.title),
+                        tag: Self.sanitizedTagForSync(newTag)
+                    )
+                    if newHash == baseHash {
+                        clearsDivergedBaseHash = true
+                    }
+                }
+                if clearsDivergedBaseHash {
+                    try execute("""
+                        UPDATE history SET tag = ?, pin_order = ?, template_updated_at = ?,
+                            template_base_hash = NULL, template_pc_diverged = 0, template_dirty = 1,
+                            template_edit_rev = template_edit_rev + 1
+                        WHERE id = ?
+                        """, [tagValue(newTag), .integer(order), .int64(updatedAt), .integer(entry.id)])
+                } else {
+                    try execute("UPDATE history SET tag = ?, pin_order = ?, template_updated_at = ?, template_dirty = 1, template_edit_rev = template_edit_rev + 1 WHERE id = ?",
+                                [tagValue(newTag), .integer(order), .int64(updatedAt), .integer(entry.id)])
+                }
             }
         }
     }
@@ -466,8 +598,19 @@ final class HistoryDatabase: HistoryPersistence {
         return entry
     }
 
-    private func activeTemplateText(_ text: String) throws -> HistoryEntry? {
-        try rows("SELECT \(columns) FROM history WHERE kind IN ('text', 'url') AND text = ? AND pinned = 1 AND deletion_id IS NULL", [.text(text)]).first
+    private func activeTemplateText(_ text: String, excludingID: Int? = nil) throws -> HistoryEntry? {
+        let normalized = TemplateSyncMerge.normalizeLineEndings(text)
+        let matchExpr = "(text = ? OR REPLACE(REPLACE(text, char(13) || char(10), char(10)), char(13), char(10)) = ?)"
+        if let excludingID {
+            return try rows(
+                "SELECT \(columns) FROM history WHERE kind IN ('text', 'url') AND pinned = 1 AND deletion_id IS NULL AND id != ? AND \(matchExpr)",
+                [.integer(excludingID), .text(normalized), .text(normalized)]
+            ).first
+        }
+        return try rows(
+            "SELECT \(columns) FROM history WHERE kind IN ('text', 'url') AND pinned = 1 AND deletion_id IS NULL AND \(matchExpr)",
+            [.text(normalized), .text(normalized)]
+        ).first
     }
 
     private func equalTemplate(to entry: HistoryEntry) throws -> HistoryEntry? {
@@ -515,23 +658,36 @@ final class HistoryDatabase: HistoryPersistence {
             guard !deleted.isEmpty else { return false }
             let currentMillis = nowMillis()
             for old in deleted {
-                let oldSync = old.isTemplate ? try templateSyncMetadata(id: old.id) : nil
-                let predicate = old.kind == .image ? "kind = 'image' AND image_hash = ?"
-                    : old.kind == .file ? "kind = 'file' AND file_hash = ?" : "kind NOT IN ('image', 'file') AND text = ?"
-                let key = old.image?.hash ?? old.file?.hash ?? old.text
-                let active = try rows("SELECT \(columns) FROM history WHERE \(predicate) AND pinned = ? AND deletion_id IS NULL", [.text(key), .integer(old.isTemplate ? 1 : 0)]).first
+                let oldSync: SyncTemplateRow?
+                if old.isTemplate {
+                    oldSync = try templateSyncRow(id: old.id)
+                } else {
+                    oldSync = nil
+                }
+                let active: HistoryEntry?
+                if old.isTemplate && (old.kind == .text || old.kind == .url) {
+                    active = try activeTemplateText(old.text)
+                } else {
+                    let predicate = old.kind == .image ? "kind = 'image' AND image_hash = ?"
+                        : old.kind == .file ? "kind = 'file' AND file_hash = ?" : "kind NOT IN ('image', 'file') AND text = ?"
+                    let key = old.image?.hash ?? old.file?.hash ?? old.text
+                    active = try rows("SELECT \(columns) FROM history WHERE \(predicate) AND pinned = ? AND deletion_id IS NULL", [.text(key), .integer(old.isTemplate ? 1 : 0)]).first
+                }
                 if let active {
-                    if old.isTemplate, let activeSync = try templateSyncMetadata(id: active.id),
-                       let activeSyncId = activeSync.syncId, activeSyncId != oldSync?.syncId,
-                       let activeBaseHash = activeSync.baseHash {
-                        try execute("""
-                            INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
-                            VALUES (?, ?, ?, 0)
-                            ON CONFLICT(sync_id) DO UPDATE SET
-                                deleted_at = excluded.deleted_at,
-                                base_hash = excluded.base_hash,
-                                synced = 0
-                            """, [.text(activeSyncId.uuidString), .int64(currentMillis), .text(activeBaseHash)])
+                    if old.isTemplate {
+                        let activeSync = try templateSyncRow(id: active.id)
+                        if let activeSync, let activeSyncId = activeSync.syncId, activeSyncId != oldSync?.syncId,
+                           let activeBaseHash = activeSync.pushedHash ?? activeSync.baseHash {
+                            try execute("""
+                                INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced, pushed)
+                                VALUES (?, ?, ?, 0, 0)
+                                ON CONFLICT(sync_id) DO UPDATE SET
+                                    deleted_at = excluded.deleted_at,
+                                    base_hash = excluded.base_hash,
+                                    synced = 0,
+                                    pushed = 0
+                                """, [.text(activeSyncId.uuidString), .int64(currentMillis), .text(activeBaseHash)])
+                        }
                     }
                     // A fresh collection during the undo window must survive restoration.
                     let latest = active.lastCollectedAt >= old.lastCollectedAt ? active : old
@@ -549,33 +705,39 @@ final class HistoryDatabase: HistoryPersistence {
                     let previousSyncId = oldSync?.syncId
                     var syncId = previousSyncId ?? UUID()
                     var clearsBaseHash = false
-                    let tombstoneWasSynced: Bool
+                    let tombstoneWasSyncedOrPushed: Bool
                     if let previousSyncId {
-                        tombstoneWasSynced = try isTombstoneSynced(forSyncID: previousSyncId)
+                        tombstoneWasSyncedOrPushed = try isTombstoneSyncedOrPushed(forSyncID: previousSyncId)
                     } else {
-                        tombstoneWasSynced = false
+                        tombstoneWasSyncedOrPushed = false
                     }
-                    if tombstoneWasSynced {
+                    if tombstoneWasSyncedOrPushed {
                         syncId = UUID()
                         clearsBaseHash = true
-                    } else if let existingId = try activeID(forSyncID: syncId), existingId != old.id {
-                        syncId = UUID()
-                        clearsBaseHash = true
+                    } else {
+                        let existingId = try activeID(forSyncID: syncId)
+                        if let existingId, existingId != old.id {
+                            syncId = UUID()
+                            clearsBaseHash = true
+                        }
                     }
-                    if !tombstoneWasSynced {
-                        try execute("DELETE FROM template_tombstones WHERE sync_id = ?", [.text(syncId.uuidString)])
+                    if !tombstoneWasSyncedOrPushed, !clearsBaseHash, let previousSyncId {
+                        try execute("DELETE FROM template_tombstones WHERE sync_id = ?", [.text(previousSyncId.uuidString)])
                     }
                     let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: currentMillis, existingUpdatedAt: oldSync?.updatedAt)
                     if clearsBaseHash {
                         try execute("""
                             UPDATE history SET deletion_id = NULL, delete_after = NULL,
-                                template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL, template_dirty = 1
+                                template_sync_id = ?, template_updated_at = ?, template_base_hash = NULL,
+                                template_pushed_hash = NULL, template_pc_diverged = 0, template_dirty = 1,
+                                template_edit_rev = template_edit_rev + 1
                             WHERE id = ?
                             """, [.text(syncId.uuidString), .int64(updatedAt), .integer(old.id)])
                     } else {
                         try execute("""
                             UPDATE history SET deletion_id = NULL, delete_after = NULL,
-                                template_sync_id = ?, template_updated_at = ?, template_dirty = 1
+                                template_sync_id = ?, template_updated_at = ?, template_dirty = 1,
+                                template_edit_rev = template_edit_rev + 1
                             WHERE id = ?
                             """, [.text(syncId.uuidString), .int64(updatedAt), .integer(old.id)])
                     }
@@ -655,12 +817,12 @@ final class HistoryDatabase: HistoryPersistence {
             for entry in plan.writes {
                 if existingIDs.contains(entry.id) {
                     if entry.isTemplate {
-                        let syncRow = try templateSyncMetadata(id: entry.id)
+                        let syncRow = try templateSyncRow(id: entry.id)
                         let syncId = syncRow?.syncId?.uuidString ?? UUID().uuidString
                         let updatedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: currentMillis, existingUpdatedAt: syncRow?.updatedAt)
                         try execute("""
                             UPDATE history SET saved_at = ?, collected_at = ?, collection_count = ?, pinned = ?, source = ?, title = ?, pin_order = ?, tag = ?,
-                                template_sync_id = ?, template_updated_at = ?, template_dirty = 1
+                                template_sync_id = ?, template_updated_at = ?, template_dirty = 1, template_edit_rev = template_edit_rev + 1
                             WHERE id = ?
                             """, [.real(entry.savedAt.timeIntervalSince1970), .real(entry.lastCollectedAt.timeIntervalSince1970),
                                   .integer(entry.collectionCount), .integer(1),
@@ -730,14 +892,15 @@ final class HistoryDatabase: HistoryPersistence {
             let currentMillis = nowMillis()
             let doomedTemplates = try templateSyncRows("SELECT \(syncColumns) FROM history WHERE deletion_id IS NULL AND pinned = 1 AND (\(predicate))", bindings)
             for row in doomedTemplates {
-                if let syncId = row.syncId, let baseHash = row.baseHash {
+                if let syncId = row.syncId, let baseHash = row.pushedHash ?? row.baseHash {
                     try execute("""
-                        INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
-                        VALUES (?, ?, ?, 0)
+                        INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced, pushed)
+                        VALUES (?, ?, ?, 0, 0)
                         ON CONFLICT(sync_id) DO UPDATE SET
                             deleted_at = excluded.deleted_at,
                             base_hash = excluded.base_hash,
-                            synced = 0
+                            synced = 0,
+                            pushed = 0
                         """, [.text(syncId.uuidString), .int64(currentMillis), .text(baseHash)])
                 }
             }
@@ -773,7 +936,7 @@ final class HistoryDatabase: HistoryPersistence {
     func resetTemplateSyncState() throws {
         try transaction {
             try execute("DELETE FROM template_tombstones")
-            try execute("UPDATE history SET template_base_hash = NULL, template_dirty = 0")
+            try execute("UPDATE history SET template_base_hash = NULL, template_pushed_hash = NULL, template_pc_diverged = 0, template_dirty = 0")
         }
     }
 
@@ -804,7 +967,10 @@ final class HistoryDatabase: HistoryPersistence {
                 if repaired {
                     try execute("UPDATE history SET template_sync_id = ?, template_updated_at = ? WHERE id = ?",
                                 [.text(syncId.uuidString), .int64(updatedAt), .integer(row.entry.id)])
-                    row = SyncTemplateRow(entry: row.entry, syncId: syncId, updatedAt: updatedAt, baseHash: row.baseHash, dirty: row.dirty)
+                    row = SyncTemplateRow(
+                        entry: row.entry, syncId: syncId, updatedAt: updatedAt, baseHash: row.baseHash,
+                        dirty: row.dirty, editRev: row.editRev, pushedHash: row.pushedHash, pcDiverged: row.pcDiverged
+                    )
                     activeRows[index] = row
                 }
             }
@@ -817,6 +983,7 @@ final class HistoryDatabase: HistoryPersistence {
             var dirtyIDs = Set<UUID>()
             var skippedOversizedIDs = Set<UUID>()
             var orderByTag: [Data?: Int] = [:]
+            var editRevBySyncID: [UUID: Int64] = [:]
 
             for group in groups {
                 for entry in group.entries {
@@ -846,6 +1013,7 @@ final class HistoryDatabase: HistoryPersistence {
                     if validBaseHash == nil || row.dirty || validBaseHash != TemplateSyncMerge.contentHash(item) {
                         dirtyIDs.insert(syncId)
                     }
+                    editRevBySyncID[syncId] = row.editRev
                     items.append(item)
                 }
             }
@@ -856,7 +1024,9 @@ final class HistoryDatabase: HistoryPersistence {
             var tombstones: [TemplateSyncTombstone] = []
             var dirtyTombstoneIDs = Set<UUID>()
             for row in tombRows where !activeSyncIDs.contains(row.id) {
-                tombstones.append(TemplateSyncTombstone(id: row.id, deletedAt: row.deletedAt, baseHash: row.baseHash))
+                let wireDeletedAt = (!row.synced && currentMillis - row.deletedAt > SyncProtocol.templateTombstoneLifetimeMillis)
+                    ? currentMillis : row.deletedAt
+                tombstones.append(TemplateSyncTombstone(id: row.id, deletedAt: wireDeletedAt, baseHash: row.baseHash))
                 if !row.synced {
                     dirtyTombstoneIDs.insert(row.id)
                 }
@@ -865,6 +1035,24 @@ final class HistoryDatabase: HistoryPersistence {
             let prepared = try TemplateSyncMerge.prepareSyncState(
                 templates: items, tombstones: tombstones, nowMillis: currentMillis, sentAtMillis: currentMillis
             )
+            // Persist pushed content hashes and tombstone delivery attempts so a disconnect before
+            // tpl_state still produces accurate tombstones and safe undo behavior on retry.
+            var pushedEditRevByID: [UUID: Int64] = [:]
+            pushedEditRevByID.reserveCapacity(prepared.state.templates.count)
+            for item in prepared.state.templates {
+                let itemHash = TemplateSyncMerge.contentHash(item)
+                try execute(
+                    "UPDATE history SET template_pushed_hash = ? WHERE template_sync_id = ? AND deletion_id IS NULL",
+                    [.text(itemHash), .text(item.id.uuidString)]
+                )
+                if let rev = editRevBySyncID[item.id] {
+                    pushedEditRevByID[item.id] = rev
+                }
+            }
+            for tomb in prepared.state.tombstones {
+                try execute("UPDATE template_tombstones SET pushed = 1 WHERE sync_id = ?", [.text(tomb.id.uuidString)])
+            }
+
             let selectedIDs = Set(prepared.state.templates.map(\.id))
             return LocalTemplateSyncSnapshot(
                 snapshot: TemplateSyncSnapshot(sentAt: currentMillis, templates: prepared.state.templates, tombstones: prepared.state.tombstones),
@@ -873,7 +1061,8 @@ final class HistoryDatabase: HistoryPersistence {
                 skippedOversizedIDs: skippedOversizedIDs,
                 skippedOverflowIDs: candidateIDs.subtracting(selectedIDs),
                 skippedOversizedCount: skippedOversizedIDs.count,
-                skippedOverflowCount: prepared.excludedTemplateCount
+                skippedOverflowCount: prepared.excludedTemplateCount,
+                pushedEditRevByID: pushedEditRevByID
             )
         }
     }
@@ -893,6 +1082,7 @@ final class HistoryDatabase: HistoryPersistence {
                 uniquingKeysWith: { first, _ in first }
             )
             let pushedHashByID: [UUID: String] = pushedByID.mapValues { TemplateSyncMerge.contentHash($0) }
+            let pushedEditRevByID: [UUID: Int64] = pushed?.pushedEditRevByID ?? [:]
             let pushedIDs = Set(pushedByID.keys)
             let pushedTombIDs = pushed?.allTombstoneIDs ?? []
             let excludedIDs = pushed?.excludedIDs ?? []
@@ -961,13 +1151,13 @@ final class HistoryDatabase: HistoryPersistence {
                     if let tomb = midSyncLocalTombByID[raw.id],
                        tomb.baseHash == hash || pushedHashByID[raw.id] == hash {
                         suppressedMidSyncDeletes[raw.id] = TombstoneRow(
-                            id: raw.id, deletedAt: tomb.deletedAt, baseHash: hash, synced: false
+                            id: raw.id, deletedAt: tomb.deletedAt, baseHash: hash, synced: false, pushed: false
                         )
                         return nil
                     }
                     if let pushedHash = pushedHashByID[raw.id], pushedHash == hash {
                         suppressedMidSyncDeletes[raw.id] = TombstoneRow(
-                            id: raw.id, deletedAt: currentMillis, baseHash: hash, synced: false
+                            id: raw.id, deletedAt: currentMillis, baseHash: hash, synced: false, pushed: false
                         )
                         return nil
                     }
@@ -1089,6 +1279,7 @@ final class HistoryDatabase: HistoryPersistence {
                 let incoming: IncomingTemplate
                 let keptMidSyncLocalEdit: Bool
                 let keptBaseHash: String?
+                let setsPcDiverged: Bool
             }
             var matchedUpdates: [MatchedUpdate] = []
             var additions: [IncomingTemplate] = []
@@ -1101,10 +1292,10 @@ final class HistoryDatabase: HistoryPersistence {
                 }
                 let canKeepLocalEdit: Bool
                 let keptBaseHash: String?
+                let setsPcDiverged: Bool
                 let pushedItem = pushedByID[inc.item.id] ?? row.syncId.flatMap { pushedByID[$0] }
                 if let pushedItem,
-                   let rowUpdatedAt = row.updatedAt,
-                   rowUpdatedAt > pushedItem.updatedAt,
+                   Self.wasEditedAfterPush(row: row, pushedItem: pushedItem, pushedEditRevByID: pushedEditRevByID),
                    row.dirty {
                     let rowTextBytes = Data(TemplateSyncMerge.normalizeLineEndings(row.entry.text).utf8)
                     let collidesWithOtherIncoming = incoming.indices.contains { otherIdx in
@@ -1115,20 +1306,40 @@ final class HistoryDatabase: HistoryPersistence {
                         let pushedHash = pushedHashByID[pushedItem.id]
                         if pushedHash == inc.hash {
                             keptBaseHash = inc.hash
+                            setsPcDiverged = false
                         } else {
                             // PC also modified this item concurrently; keep the pre-sync baseHash
-                            // so the next sync detects a 3-way conflict instead of discarding PC's edit.
-                            keptBaseHash = row.syncId == inc.item.id ? pushedItem.baseHash : nil
+                            // only if the local edit still differs from it. If the user wrote back
+                            // to the original text (prevBase == rowHash), clear baseHash so the next
+                            // merge treats this write-back as an independent edit instead of unedited.
+                            let rowHash = TemplateSyncMerge.contentHash(
+                                kind: row.entry.kind == .url ? .url : .text,
+                                text: row.entry.text,
+                                title: Self.sanitizedTitleForSync(row.entry.title),
+                                tag: Self.sanitizedTagForSync(row.entry.tag)
+                            )
+                            if row.syncId == inc.item.id, let prevBase = pushedItem.baseHash, prevBase != rowHash {
+                                keptBaseHash = prevBase
+                                setsPcDiverged = true
+                            } else {
+                                keptBaseHash = nil
+                                setsPcDiverged = false
+                            }
                         }
                     } else {
                         canKeepLocalEdit = false
                         keptBaseHash = nil
+                        setsPcDiverged = false
                     }
                 } else {
                     canKeepLocalEdit = false
                     keptBaseHash = nil
+                    setsPcDiverged = false
                 }
-                matchedUpdates.append(MatchedUpdate(row: row, incoming: inc, keptMidSyncLocalEdit: canKeepLocalEdit, keptBaseHash: keptBaseHash))
+                matchedUpdates.append(MatchedUpdate(
+                    row: row, incoming: inc, keptMidSyncLocalEdit: canKeepLocalEdit,
+                    keptBaseHash: keptBaseHash, setsPcDiverged: setsPcDiverged
+                ))
             }
 
             var writtenIncomingTextSet = Set<Data>()
@@ -1151,7 +1362,7 @@ final class HistoryDatabase: HistoryPersistence {
                     guard !writtenIncomingTextSet.contains(rawTextBytes),
                           !writtenIncomingTextSet.contains(normTextBytes) else { continue }
                     if let sid = row.syncId, let pushedItem = pushedByID[sid],
-                       let rowUpdatedAt = row.updatedAt, rowUpdatedAt > pushedItem.updatedAt {
+                       Self.wasEditedAfterPush(row: row, pushedItem: pushedItem, pushedEditRevByID: pushedEditRevByID) {
                         // Edited mid-sync while PC deleted it; preserve locally instead of dropping the edit.
                         let pcTombHasNilHash = snapshotTombstoneByID[sid] != nil && snapshotTombstoneByID[sid]?.baseHash == nil
                         let finalSyncId = pcTombHasNilHash ? UUID() : sid
@@ -1226,7 +1437,7 @@ final class HistoryDatabase: HistoryPersistence {
 
             // 1. Reassign sync_id on any undo-pending rows whose sync_id becomes active.
             for undoRow in try fetchUndoPendingTemplateSyncRows() where undoRow.syncId.map({ keptActiveSyncIDs.contains($0) }) == true {
-                try execute("UPDATE history SET template_sync_id = ?, template_base_hash = NULL WHERE id = ?",
+                try execute("UPDATE history SET template_sync_id = ?, template_base_hash = NULL, template_pushed_hash = NULL, template_pc_diverged = 0 WHERE id = ?",
                             [.text(UUID().uuidString), .integer(undoRow.id)])
             }
 
@@ -1261,12 +1472,17 @@ final class HistoryDatabase: HistoryPersistence {
                 let inc = update.incoming
                 let row = update.row
                 if update.keptMidSyncLocalEdit {
-                    try execute("UPDATE history SET template_sync_id = ?, template_base_hash = ?, template_dirty = 1 WHERE id = ?",
-                                [.text(inc.item.id.uuidString), update.keptBaseHash.map { .text($0) } ?? .null, .integer(row.entry.id)])
+                    try execute("""
+                        UPDATE history SET template_sync_id = ?, template_base_hash = ?,
+                            template_pushed_hash = NULL, template_pc_diverged = ?, template_dirty = 1
+                        WHERE id = ?
+                        """, [.text(inc.item.id.uuidString), update.keptBaseHash.map { .text($0) } ?? .null,
+                              .integer(update.setsPcDiverged ? 1 : 0), .integer(row.entry.id)])
                 } else {
                     try execute("""
                         UPDATE history SET kind = ?, text = ?, title = ?, tag = ?, pin_order = ?,
-                            template_sync_id = ?, template_updated_at = ?, template_base_hash = ?, template_dirty = 0
+                            template_sync_id = ?, template_updated_at = ?, template_base_hash = ?,
+                            template_pushed_hash = NULL, template_pc_diverged = 0, template_dirty = 0
                         WHERE id = ?
                         """, [.text(inc.item.kind.rawValue), .text(inc.item.text),
                               inc.normTitle.map { .text($0) } ?? .null, inc.normTag.map { .text($0) } ?? .null,
@@ -1275,16 +1491,19 @@ final class HistoryDatabase: HistoryPersistence {
                 }
             }
             for preserved in preservedMidSyncEdits {
-                try execute("UPDATE history SET template_sync_id = ?, template_base_hash = NULL, template_dirty = 1 WHERE id = ?",
-                            [.text(preserved.finalSyncId.uuidString), .integer(preserved.row.entry.id)])
+                try execute("""
+                    UPDATE history SET template_sync_id = ?, template_base_hash = NULL,
+                        template_pushed_hash = NULL, template_pc_diverged = 0, template_dirty = 1
+                    WHERE id = ?
+                    """, [.text(preserved.finalSyncId.uuidString), .integer(preserved.row.entry.id)])
             }
 
             let dateReal = currentDate.timeIntervalSince1970
             for inc in additions {
                 try execute("""
                     INSERT INTO history(kind, text, saved_at, collected_at, collection_count, pinned, source,
-                        title, pin_order, tag, template_sync_id, template_updated_at, template_base_hash, template_dirty)
-                    VALUES (?, ?, ?, ?, 1, 1, 'written', ?, ?, ?, ?, ?, ?, 0)
+                        title, pin_order, tag, template_sync_id, template_updated_at, template_base_hash, template_dirty, template_edit_rev)
+                    VALUES (?, ?, ?, ?, 1, 1, 'written', ?, ?, ?, ?, ?, ?, 0, 0)
                     """, [.text(inc.item.kind.rawValue), .text(inc.item.text), .real(dateReal), .real(dateReal),
                           inc.normTitle.map { .text($0) } ?? .null, .integer(inc.normalizedOrder),
                           inc.normTag.map { .text($0) } ?? .null, .text(inc.item.id.uuidString),
@@ -1329,15 +1548,15 @@ final class HistoryDatabase: HistoryPersistence {
                 let adjusted = min(currentMillis, Self.clampedTimestamp(Self.clampedTimestamp(tomb.deletedAt) + clockOffset))
                 let deletedAt = min(adjusted, syncedDeletedAtByID[tomb.id] ?? adjusted)
                 try execute("""
-                    INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
-                    VALUES (?, ?, ?, 1)
+                    INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced, pushed)
+                    VALUES (?, ?, ?, 1, 0)
                     """, [.text(tomb.id.uuidString), .int64(deletedAt),
                           validHash.map { .text($0) } ?? .null])
             }
             for tomb in keptMidSyncTombByID.values {
                 try execute("""
-                    INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
-                    VALUES (?, ?, ?, 0)
+                    INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced, pushed)
+                    VALUES (?, ?, ?, 0, 0)
                     """, [.text(tomb.id.uuidString), .int64(tomb.deletedAt),
                           tomb.baseHash.map { .text($0) } ?? .null])
             }
@@ -1361,6 +1580,7 @@ final class HistoryDatabase: HistoryPersistence {
         let deletedAt: Int64
         let baseHash: String?
         let synced: Bool
+        let pushed: Bool
     }
 
     private struct SyncTemplateRow {
@@ -1369,6 +1589,27 @@ final class HistoryDatabase: HistoryPersistence {
         let updatedAt: Int64?
         let baseHash: String?
         let dirty: Bool
+        let editRev: Int64
+        let pushedHash: String?
+        let pcDiverged: Bool
+    }
+
+    private static func wasEditedAfterPush(
+        row: SyncTemplateRow,
+        pushedItem: TemplateSyncItem,
+        pushedEditRevByID: [UUID: Int64]
+    ) -> Bool {
+        if let pushedRev = pushedEditRevByID[pushedItem.id] {
+            return row.editRev > pushedRev
+        }
+        if let rowUpdatedAt = row.updatedAt {
+            return rowUpdatedAt > pushedItem.updatedAt
+        }
+        return false
+    }
+
+    private func templateSyncRow(id: Int) throws -> SyncTemplateRow? {
+        try templateSyncRows("SELECT \(syncColumns) FROM history WHERE id = ? LIMIT 1", [.integer(id)]).first
     }
 
     private func fetchActiveTemplateSyncRows() throws -> [SyncTemplateRow] {
@@ -1394,11 +1635,11 @@ final class HistoryDatabase: HistoryPersistence {
         return Int(sqlite3_column_int64(statement, 0))
     }
 
-    private func isTombstoneSynced(forSyncID syncId: UUID) throws -> Bool {
-        let statement = try prepare("SELECT synced FROM template_tombstones WHERE sync_id = ? LIMIT 1", [.text(syncId.uuidString)])
+    private func isTombstoneSyncedOrPushed(forSyncID syncId: UUID) throws -> Bool {
+        let statement = try prepare("SELECT synced, pushed FROM template_tombstones WHERE sync_id = ? LIMIT 1", [.text(syncId.uuidString)])
         defer { sqlite3_finalize(statement) }
         guard try step(statement) == SQLITE_ROW else { return false }
-        return sqlite3_column_int(statement, 0) != 0
+        return sqlite3_column_int(statement, 0) != 0 || sqlite3_column_int(statement, 1) != 0
     }
 
     private func templateSyncRows(_ sql: String, _ values: [Value]) throws -> [SyncTemplateRow] {
@@ -1411,13 +1652,19 @@ final class HistoryDatabase: HistoryPersistence {
             let updatedAt: Int64? = sqlite3_column_type(statement, 24) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, 24)
             let baseHash = sqlite3_column_type(statement, 25) == SQLITE_NULL ? nil : string(statement, 25)
             let dirty = sqlite3_column_int(statement, 26) != 0
-            result.append(SyncTemplateRow(entry: entry, syncId: syncId, updatedAt: updatedAt, baseHash: baseHash, dirty: dirty))
+            let editRev = sqlite3_column_int64(statement, 27)
+            let pushedHash = sqlite3_column_type(statement, 28) == SQLITE_NULL ? nil : string(statement, 28)
+            let pcDiverged = sqlite3_column_int(statement, 29) != 0
+            result.append(SyncTemplateRow(
+                entry: entry, syncId: syncId, updatedAt: updatedAt, baseHash: baseHash,
+                dirty: dirty, editRev: editRev, pushedHash: pushedHash, pcDiverged: pcDiverged
+            ))
         }
         return result
     }
 
     private func fetchTombstoneRows() throws -> [TombstoneRow] {
-        let statement = try prepare("SELECT sync_id, deleted_at, base_hash, synced FROM template_tombstones ORDER BY deleted_at ASC, sync_id ASC")
+        let statement = try prepare("SELECT sync_id, deleted_at, base_hash, synced, pushed FROM template_tombstones ORDER BY deleted_at ASC, sync_id ASC")
         defer { sqlite3_finalize(statement) }
         var result: [TombstoneRow] = []
         while try step(statement) == SQLITE_ROW {
@@ -1426,17 +1673,18 @@ final class HistoryDatabase: HistoryPersistence {
             let rawHash = sqlite3_column_type(statement, 2) == SQLITE_NULL ? nil : string(statement, 2)
             let validHash = rawHash.flatMap { SyncProtocol.isLowerHex64($0) ? $0 : nil }
             let synced = sqlite3_column_int(statement, 3) != 0
-            result.append(TombstoneRow(id: id, deletedAt: deletedAt, baseHash: validHash, synced: synced))
+            let pushed = sqlite3_column_int(statement, 4) != 0
+            result.append(TombstoneRow(id: id, deletedAt: deletedAt, baseHash: validHash, synced: synced, pushed: pushed))
         }
         return result
     }
 
     private func pruneTombstones(nowMillis: Int64) throws {
-        try execute("DELETE FROM template_tombstones WHERE (? - deleted_at) > ?",
+        try execute("DELETE FROM template_tombstones WHERE synced != 0 AND (? - deleted_at) > ?",
                     [.int64(nowMillis), .int64(SyncProtocol.templateTombstoneLifetimeMillis)])
         try execute("""
             DELETE FROM template_tombstones WHERE sync_id IN (
-                SELECT sync_id FROM template_tombstones ORDER BY deleted_at DESC, sync_id DESC LIMIT -1 OFFSET ?
+                SELECT sync_id FROM template_tombstones ORDER BY synced ASC, deleted_at DESC, sync_id DESC LIMIT -1 OFFSET ?
             )
             """, [.integer(SyncProtocol.maxTemplateTombstones)])
     }

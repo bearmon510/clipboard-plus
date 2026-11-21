@@ -27,10 +27,15 @@ struct LogLineFormatter {
             event.historyNumber.map { String($0) } ?? "-",
             escape(event.details)
         ]
-        if includeTextPreview, let text = event.text {
+        if includeTextPreview, allowsTextPreview(for: event), let text = event.text {
             fields.append("冒頭20文字=" + escape(String(text.prefix(20))))
         }
         return fields.joined(separator: "\t")
+    }
+
+    private func allowsTextPreview(for event: MeasurementEvent) -> Bool {
+        guard event.kind != "自己コピー" else { return false }
+        return !event.details.contains("取得元=自己コピー後の確認")
     }
 
     func timestamp(_ date: Date) -> String {

@@ -221,18 +221,12 @@ public enum TemplateSyncMerge {
         activeIds: inout Set<UUID>,
         tombstoneIds: Set<UUID>
     ) -> UUID? {
-        var counter = 0
-        while true {
-            let candidate = conflictUuid(originalId: originalId, loserContentHash: loserContentHash, counter: counter)
-            // Suppress recreation if this conflict copy was already deleted (tombstone present).
-            if tombstoneIds.contains(candidate) {
-                return nil
-            }
-            if activeIds.insert(candidate).inserted {
-                return candidate
-            }
-            counter += 1
+        let candidate = conflictUuid(originalId: originalId, loserContentHash: loserContentHash, counter: 0)
+        // Suppress recreation if this conflict copy already exists (even if edited) or was deleted.
+        if tombstoneIds.contains(candidate) || !activeIds.insert(candidate).inserted {
+            return nil
         }
+        return candidate
     }
 
     private static func conflictUuid(originalId: UUID, loserContentHash: String, counter: Int) -> UUID {
@@ -256,6 +250,13 @@ public enum TemplateSyncMerge {
     private struct NormalizedEntry {
         let item: TemplateSyncItem
         let hash: String
+        let isPc: Bool
+
+        init(item: TemplateSyncItem, hash: String, isPc: Bool = false) {
+            self.item = item
+            self.hash = hash
+            self.isPc = isPc
+        }
     }
 
     private struct ConflictCandidate {
@@ -512,7 +513,7 @@ public enum TemplateSyncMerge {
     ) throws -> TemplateSyncMultiMergeResult {
         try SyncProtocol.require(nowMillis >= -SyncProtocol.maxTimestamp && nowMillis <= SyncProtocol.maxTimestamp)
 
-        let (pcItems, pcTombs) = try indexSide(pc, nowMillis: nowMillis, sentAtMillis: nil, knownPcTombs: nil)
+        let (pcItems, pcTombs) = try indexSide(pc, nowMillis: nowMillis, sentAtMillis: nil, knownPcTombs: nil, isPc: true)
 
         var remoteItemsList: [[UUID: NormalizedEntry]] = []
         remoteItemsList.reserveCapacity(remotes.count)
@@ -536,7 +537,8 @@ public enum TemplateSyncMerge {
                 remote.state,
                 nowMillis: nowMillis,
                 sentAtMillis: remote.sentAtMillis,
-                knownPcTombs: pcTombs
+                knownPcTombs: pcTombs,
+                isPc: false
             )
             remoteItemsList.append(rItems)
             remoteTombsList.append(rTombs)
@@ -570,9 +572,10 @@ public enum TemplateSyncMerge {
                 }
             }
 
+            let pcEntryForCheck = pcItems[id]
+            let pcEntryKilledOrAbsent = pcEntryForCheck.map { isDirectlyKilledByTombstones($0, pcTomb: pcTomb, allTombs: tombs) } ?? true
+
             if !tombs.isEmpty {
-                let pcEntryForCheck = pcItems[id]
-                let pcEntryKilledOrAbsent = pcEntryForCheck.map { isDirectlyKilledByTombstones($0, pcTomb: pcTomb, allTombs: tombs) } ?? true
                 let remainingActive = activeEntries.filter {
                     !isKilledByTombstones($0, pcTomb: pcTomb, pcEntryKilledOrAbsent: pcEntryKilledOrAbsent, allTombs: tombs)
                 }
@@ -586,7 +589,20 @@ public enum TemplateSyncMerge {
                     resolveActiveEntries(remainingActive, survivingItems: &survivingItems, conflictCandidates: &conflictCandidates)
                 }
             } else if !activeEntries.isEmpty {
-                resolveActiveEntries(activeEntries, survivingItems: &survivingItems, conflictCandidates: &conflictCandidates)
+                // Even if PC's tombstone expired (>180d) or was evicted (>1000 cap), an unedited
+                // previously-synced remote copy (baseHash == hash) absent on PC must not resurrect.
+                let remainingActive: [NormalizedEntry]
+                if pcEntryKilledOrAbsent {
+                    remainingActive = activeEntries.filter { entry in
+                        guard let itemBaseHash = entry.item.baseHash else { return true }
+                        return itemBaseHash != entry.hash
+                    }
+                } else {
+                    remainingActive = activeEntries
+                }
+                if !remainingActive.isEmpty {
+                    resolveActiveEntries(remainingActive, survivingItems: &survivingItems, conflictCandidates: &conflictCandidates)
+                }
             }
         }
 
@@ -649,7 +665,8 @@ public enum TemplateSyncMerge {
         _ side: TemplateSyncState,
         nowMillis: Int64,
         sentAtMillis: Int64?,
-        knownPcTombs: [UUID: TemplateSyncTombstone]?
+        knownPcTombs: [UUID: TemplateSyncTombstone]?,
+        isPc: Bool
     ) throws -> ([UUID: NormalizedEntry], [UUID: TemplateSyncTombstone]) {
         try SyncProtocol.require(side.templates.count <= SyncProtocol.maxTemplates, .limit)
         var sideIds = Set<UUID>()
@@ -659,7 +676,7 @@ public enum TemplateSyncMerge {
             let normalized = normalizeInputItem(raw)
             try TemplateSyncMessageCodec.validateItem(normalized, allowBaseHash: true)
             try SyncProtocol.require(sideIds.insert(normalized.id).inserted)
-            items[normalized.id] = NormalizedEntry(item: normalized, hash: contentHash(normalized))
+            items[normalized.id] = NormalizedEntry(item: normalized, hash: contentHash(normalized), isPc: isPc)
         }
 
         var tombs: [UUID: TemplateSyncTombstone] = [:]
@@ -773,7 +790,7 @@ public enum TemplateSyncMerge {
             if let baseHash = e.item.baseHash {
                 return baseHash != e.hash
             }
-            return !editedBaseHashes.contains(e.hash)
+            return !e.isPc || !editedBaseHashes.contains(e.hash)
         }
         let pool = edited.isEmpty ? entries : edited
 

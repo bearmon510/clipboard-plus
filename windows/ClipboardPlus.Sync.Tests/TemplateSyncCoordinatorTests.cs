@@ -1234,4 +1234,284 @@ public sealed class TemplateSyncCoordinatorTests : IDisposable
         Assert.Equal("仕事", matching[0].Tag);
         await pad.SendTemplateAsync(new TemplateSyncAck(op));
     }
+
+    [Fact]
+    public async Task Excluded241st64KiBTemplateIsProtectedFromOldVersionReturnedByPeer()
+    {
+        var r = new Rig(this);
+        var pad = await r.ConnectAsync(512);
+        var nowMs = r.Now.ToUnixTimeMilliseconds();
+
+        // Put 241 templates of 64 KiB each on PC: #241 (index 240) is excluded by 80-page budget.
+        var items241 = Enumerable.Range(0, 241).Select(i =>
+        {
+            var prefix = $"PC-{i:D3}-EDITED-";
+            var text = prefix + new string((char)('a' + (i % 26)), SyncProtocol.MaxTemplateTextBytes - prefix.Length);
+            return new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, text, $"題{i}", null, i, nowMs + i);
+        }).ToArray();
+        r.Templates.ApplyMerged(items241, []);
+        var excludedItem = items241[240];
+        var oldVersionOnPad = new TemplateSyncItem(
+            excludedItem.Id,
+            TemplateSyncKind.Text,
+            "iPadに残っていた旧版の本文",
+            "旧題",
+            null,
+            0,
+            nowMs - 10_000,
+            TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "iPadに残っていた旧版の本文", "旧題", null));
+
+        // 1. Peer-initiated sync returns old version of excluded #241 -> PC keeps its 64 KiB edited body
+        //    and does NOT distribute the old version in tpl_state.
+        var peerOp = Guid.NewGuid();
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            peerOp,
+            new TemplateSyncSnapshot(nowMs, [oldVersionOnPad], []),
+            isState: false)));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var peerStates = pad.DrainTemplates().Cast<TemplateSyncStateMessage>().ToArray();
+        var peerAssembler = new TemplateSyncPageAssembler(expectedOp: peerOp, expectedIsState: true);
+        TemplateSyncSnapshot? peerSnapshot = null;
+        foreach (var page in peerStates)
+            peerSnapshot = peerAssembler.Append(page);
+        peerAssembler.Finish();
+        Assert.NotNull(peerSnapshot);
+        Assert.DoesNotContain(peerSnapshot!.Templates, t => t.Id == excludedItem.Id);
+        await pad.SendTemplateAsync(new TemplateSyncAck(peerOp));
+
+        var pcAfterPeerSync = await r.Pc.GetTemplatesAsync();
+        Assert.Equal(241, pcAfterPeerSync.Count);
+        var keptAfterPeer = Assert.Single(pcAfterPeerSync, t => t.Id == excludedItem.Id);
+        Assert.Equal(excludedItem.Text, keptAfterPeer.Text);
+
+        // 2. PC-initiated sync where peer returns old version WITHOUT baseHash also protects #241.
+        var syncTask = r.Pc.SyncTemplatesAsync();
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var pull = Assert.IsType<TemplateSyncPull>(Assert.Single(pad.DrainTemplates()));
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            pull.Op,
+            new TemplateSyncSnapshot(nowMs + 1000, [oldVersionOnPad with { BaseHash = null }], []),
+            isState: false)));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var pcStates = pad.DrainTemplates().Cast<TemplateSyncStateMessage>().ToArray();
+        var pcAssembler = new TemplateSyncPageAssembler(expectedOp: pull.Op, expectedIsState: true);
+        TemplateSyncSnapshot? pcSnapshot = null;
+        foreach (var page in pcStates)
+            pcSnapshot = pcAssembler.Append(page);
+        pcAssembler.Finish();
+        Assert.NotNull(pcSnapshot);
+        Assert.DoesNotContain(pcSnapshot!.Templates, t => t.Id == excludedItem.Id);
+        await pad.SendTemplateAsync(new TemplateSyncAck(pull.Op));
+
+        var runResult = await syncTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(TemplateSyncRunStatus.Completed, runResult.Status);
+        Assert.Equal(1, runResult.ExcludedTemplateCount);
+        var keptAfterPc = Assert.Single(await r.Pc.GetTemplatesAsync(), t => t.Id == excludedItem.Id);
+        Assert.Equal(excludedItem.Text, keptAfterPc.Text);
+    }
+
+    [Fact]
+    public async Task OpenEditorTitleOnlyAndBodyConflictSyncEndToEndPreservesRemoteText()
+    {
+        var r = new Rig(this);
+        var pad = await r.ConnectAsync(512);
+
+        // Create item A on PC and sync to iPad.
+        var created = (await r.Pc.CreateTemplateAsync("本文A", "元題", "仕事")).Item!;
+        var hA = TemplateSyncMerge.ContentHash(created);
+
+        // PC opens editor for A.
+        var openedSnapshot = Assert.Single(await r.Pc.GetTemplatesAsync());
+
+        // While editor is open on PC, iPad edits A -> B and syncs to PC.
+        r.Now = r.Now.AddSeconds(5);
+        var op1 = Guid.NewGuid();
+        var padEditedB = new TemplateSyncItem(created.Id, TemplateSyncKind.Text, "本文B", "元題", "仕事", 0, r.Now.ToUnixTimeMilliseconds(), hA);
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op1, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [padEditedB], []), isState: false)));
+        var state1 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        Assert.Equal("本文B", Assert.Single(state1.Page.Templates).Text);
+        await pad.SendTemplateAsync(new TemplateSyncAck(op1));
+
+        // User on PC changes ONLY title (body box still holds "本文A") and saves with openedSnapshot.
+        r.Now = r.Now.AddSeconds(5);
+        var savedTitleOnly = await r.Pc.UpdateTemplateAsync(created.Id, "本文A", "PCで名前だけ変更", "仕事", openedSnapshot);
+        Assert.True(savedTitleOnly.Succeeded);
+        Assert.Equal("本文B", savedTitleOnly.Item!.Text);
+        Assert.Equal("PCで名前だけ変更", savedTitleOnly.Item.Title);
+
+        // Next sync with iPad (which holds unedited B) keeps B with the new title on both sides!
+        r.Now = r.Now.AddSeconds(5);
+        var op2 = Guid.NewGuid();
+        var syncedB = state1.Page.Templates[0];
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op2, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [syncedB with { BaseHash = TemplateSyncMerge.ContentHash(syncedB) }], []), isState: false)));
+        var state2 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        var finalItem = Assert.Single(state2.Page.Templates);
+        Assert.Equal("本文B", finalItem.Text);
+        Assert.Equal("PCで名前だけ変更", finalItem.Title);
+        await pad.SendTemplateAsync(new TemplateSyncAck(op2));
+
+        // Now PC opens editor at B; iPad edits B -> C and syncs; PC edits body B -> B_PC and saves -> both survive!
+        var openedAtB = Assert.Single(await r.Pc.GetTemplatesAsync());
+        r.Now = r.Now.AddSeconds(5);
+        var op3 = Guid.NewGuid();
+        var padEditedC = new TemplateSyncItem(created.Id, TemplateSyncKind.Text, "本文C", finalItem.Title, "仕事", 0, r.Now.ToUnixTimeMilliseconds(), TemplateSyncMerge.ContentHash(finalItem));
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op3, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [padEditedC], []), isState: false)));
+        var state3 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        await pad.SendTemplateAsync(new TemplateSyncAck(op3));
+
+        r.Now = r.Now.AddSeconds(5);
+        var savedConflict = await r.Pc.UpdateTemplateAsync(created.Id, "本文B_PC", finalItem.Title, "仕事", openedAtB);
+        Assert.True(savedConflict.Succeeded);
+        Assert.NotNull(savedConflict.ConflictCopy);
+        Assert.Equal("本文C", savedConflict.ConflictCopy!.Text);
+        Assert.Null(savedConflict.ConflictCopy.Tag);
+
+        r.Now = r.Now.AddSeconds(5);
+        var op4 = Guid.NewGuid();
+        var syncedC = state3.Page.Templates[0];
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op4, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [syncedC with { BaseHash = TemplateSyncMerge.ContentHash(syncedC) }], []), isState: false)));
+        var state4 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        Assert.Equal(2, state4.Page.Templates.Count);
+        Assert.Contains(state4.Page.Templates, t => t.Id == created.Id && t.Text == "本文B_PC" && t.Tag == "仕事");
+        Assert.Contains(state4.Page.Templates, t => t.Text == "本文C" && t.Tag is null);
+        await pad.SendTemplateAsync(new TemplateSyncAck(op4));
+    }
+
+    [Fact]
+    public async Task DeletedItemDoesNotResurrectAfter181DaysOr1000TombstonesOverCoordinatorSync()
+    {
+        var r = new Rig(this);
+        var pad = await r.ConnectAsync(512);
+
+        // 1. Sync item T1 to iPad, delete T1 on PC, advance 181 days so tombstone expires, then sync unedited iPad.
+        var t1 = (await r.Pc.CreateTemplateAsync("181日後に復活してはいけない本文", "題1", "仕事")).Item!;
+        var padT1 = t1 with { BaseHash = TemplateSyncMerge.ContentHash(t1) };
+        Assert.True((await r.Pc.DeleteTemplateAsync(t1.Id)).Succeeded);
+
+        r.Now = r.Now.AddDays(181);
+        await r.Pc.TickAsync(r.Now);
+        Assert.Equal(0, r.Templates.TombstoneCount);
+
+        var op1 = Guid.NewGuid();
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op1, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [padT1], []), isState: false)));
+        var state1 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        Assert.Empty(state1.Page.Templates);
+        Assert.Empty(await r.Pc.GetTemplatesAsync());
+        await pad.SendTemplateAsync(new TemplateSyncAck(op1));
+
+        // 2. Sync item T2, delete T2, then evict T2's tombstone with 1,001 newer deletions -> unedited iPad still does NOT resurrect T2.
+        var t2 = (await r.Pc.CreateTemplateAsync("1000墓標超過で復活してはいけない本文", "題2", null)).Item!;
+        var padT2 = t2 with { BaseHash = TemplateSyncMerge.ContentHash(t2) };
+        Assert.True((await r.Pc.DeleteTemplateAsync(t2.Id)).Succeeded);
+
+        var nowMs = r.Now.ToUnixTimeMilliseconds();
+        var newer1000Tombs = Enumerable.Range(1, SyncProtocol.MaxTemplateTombstones)
+            .Select(i => new TemplateSyncTombstone(Guid.NewGuid(), nowMs + i))
+            .ToArray();
+        r.Templates.ApplyMerged([], newer1000Tombs);
+        Assert.DoesNotContain(r.Templates.GetState().Tombstones, t => t.Id == t2.Id);
+
+        var op2 = Guid.NewGuid();
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op2, new TemplateSyncSnapshot(nowMs + 2000, [padT2], []), isState: false)));
+        var state2 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        Assert.Empty(state2.Page.Templates);
+        Assert.Empty(await r.Pc.GetTemplatesAsync());
+        await pad.SendTemplateAsync(new TemplateSyncAck(op2));
+    }
+
+    [Fact]
+    public async Task LateTemplatePushAfterPcInitiatedTimeoutIsIgnoredAndDoesNotUpdatePc()
+    {
+        var r = new Rig(this);
+        var pad = await r.ConnectAsync(512);
+        var changedCount = 0;
+        r.Pc.TemplatesChanged += () => changedCount++;
+
+        // Start PC-initiated sync and let it time out after 31s.
+        var syncTask = r.Pc.SyncTemplatesAsync();
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+        var pull = Assert.IsType<TemplateSyncPull>(Assert.Single(pad.DrainTemplates()));
+
+        r.Now = r.Now.AddSeconds(31);
+        await r.Pc.TickAsync(r.Now);
+        var timedOutResult = await syncTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(TemplateSyncRunStatus.TimedOut, timedOutResult.Status);
+        Assert.False(pad.Peer.Rejected);
+
+        // Late tpl_push carrying the same timed-out pull.Op must be discarded without saving or replying!
+        var lateItem = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "遅れて届いた項目", null, null, 0, r.Now.ToUnixTimeMilliseconds());
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            pull.Op, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [lateItem], []), isState: false)));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        Assert.False(pad.Peer.Rejected);
+        Assert.Empty(await r.Pc.GetTemplatesAsync());
+        Assert.Equal(0, changedCount);
+        Assert.Empty(pad.DrainTemplates());
+
+        // A genuinely new peer-initiated op on the same connection still works cleanly.
+        var freshOp = Guid.NewGuid();
+        var freshItem = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "新しい端末起点同期", null, null, 0, r.Now.ToUnixTimeMilliseconds());
+        await pad.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            freshOp, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [freshItem], []), isState: false)));
+        await r.Pc.WaitForOutgoingAsync(pad.Peer);
+
+        var freshState = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad.DrainTemplates()));
+        Assert.Equal("新しい端末起点同期", Assert.Single(freshState.Page.Templates).Text);
+        Assert.Equal("新しい端末起点同期", Assert.Single(await r.Pc.GetTemplatesAsync()).Text);
+        Assert.Equal(1, changedCount);
+        await pad.SendTemplateAsync(new TemplateSyncAck(freshOp));
+    }
+
+    [Fact]
+    public async Task EditedConflictCopyAfterDisconnectIsNotDuplicatedWhenPeerResends()
+    {
+        var r = new Rig(this);
+        var pad1 = await r.ConnectAsync(512);
+        var nowMs = r.Now.ToUnixTimeMilliseconds();
+
+        var sharedId = Guid.NewGuid();
+        var hA = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "A", "題", "仕事");
+        r.Templates.ApplyMerged([
+            new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "C", "題", "仕事", 0, nowMs),
+        ], []);
+
+        var padItemB = new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "B", "題", "仕事", 0, nowMs - 5_000, hA);
+        var op1 = Guid.NewGuid();
+        await pad1.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op1, new TemplateSyncSnapshot(nowMs, [padItemB], []), isState: false)));
+        await r.Pc.WaitForOutgoingAsync(pad1.Peer);
+        pad1.DrainTemplates();
+
+        // Simulate disconnect before iPad receives tpl_state.
+        await r.Pc.DisconnectAsync(pad1.Peer);
+
+        // On PC, edit conflict copy B -> B2.
+        var copy = Assert.Single(await r.Pc.GetTemplatesAsync(), t => t.Id != sharedId);
+        Assert.Equal("B", copy.Text);
+        r.Now = r.Now.AddSeconds(10);
+        Assert.True((await r.Pc.UpdateTemplateAsync(copy.Id, "B2", copy.Title, copy.Tag)).Succeeded);
+
+        // iPad reconnects and resends B -> PC must keep C and B2 without creating a duplicate B!
+        var pad2 = await r.ConnectAsync(512);
+        var op2 = Guid.NewGuid();
+        await pad2.SendTemplateAsync(Assert.Single(TemplateSyncMessageCodec.SplitPages(
+            op2, new TemplateSyncSnapshot(r.Now.ToUnixTimeMilliseconds(), [padItemB], []), isState: false)));
+        await r.Pc.WaitForOutgoingAsync(pad2.Peer);
+
+        var state2 = Assert.IsType<TemplateSyncStateMessage>(Assert.Single(pad2.DrainTemplates()));
+        Assert.Equal(2, state2.Page.Templates.Count);
+        Assert.Contains(state2.Page.Templates, t => t.Id == sharedId && t.Text == "C");
+        Assert.Contains(state2.Page.Templates, t => t.Id == copy.Id && t.Text == "B2");
+        Assert.DoesNotContain(state2.Page.Templates, t => t.Text == "B");
+        await pad2.SendTemplateAsync(new TemplateSyncAck(op2));
+    }
 }

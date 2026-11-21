@@ -2898,4 +2898,102 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.status, .searching)
         XCTAssertFalse(f.link.rejected.isEmpty)
     }
+
+    @MainActor
+    func testDisconnectBeforeTemplateStatePersistsPushedHashesSoDeleteDoesNotResurrectOnResync() async throws {
+        let f = try Fixture(test: self)
+        let pairing = try pair(f)
+
+        // 1. Create and complete initial sync for baseEntry ("旧本文").
+        var baseEntry: HistoryEntry?
+        let createBase = expectation(description: "create base template")
+        f.monitor.createTemplate(text: "旧本文", title: "同期済", tag: "仕事") {
+            if case .success(let entry) = $0 { baseEntry = entry }
+            createBase.fulfill()
+        }
+        await fulfillment(of: [createBase], timeout: 5)
+        await drain(f)
+        let syncedEntry = try XCTUnwrap(baseEntry)
+
+        try f.link.connect(pairing, limit: 512)
+        let initSyncDone = expectation(description: "initial sync")
+        f.controller.syncTemplates { _ in initSyncDone.fulfill() }
+        await drain(f)
+        let initPush = try XCTUnwrap(f.link.templatePushes.last)
+        let nowMs1 = Int64(f.clock.date.timeIntervalSince1970 * 1000)
+        try f.link.send(.state(
+            op: initPush.op, part: 0, total: 1,
+            page: TemplateSyncPage(version: 1, sentAt: nowMs1, templates: initPush.page.templates, tombstones: [])
+        ))
+        await fulfillment(of: [initSyncDone], timeout: 5)
+        await drain(f)
+
+        // 2. Edit syncedEntry ("旧本文" -> "編集済本文") and create a brand-new template ("新規本文").
+        let editDone = expectation(description: "edit template")
+        f.monitor.updateTemplate(syncedEntry, text: "編集済本文", title: "同期済", tag: "仕事") { _ in editDone.fulfill() }
+        await fulfillment(of: [editDone], timeout: 5)
+        var newEntry: HistoryEntry?
+        let createNew = expectation(description: "create new template")
+        f.monitor.createTemplate(text: "新規本文", title: "新規", tag: nil) {
+            if case .success(let entry) = $0 { newEntry = entry }
+            createNew.fulfill()
+        }
+        await fulfillment(of: [createNew], timeout: 5)
+        await drain(f)
+        let createdNew = try XCTUnwrap(newEntry)
+
+        // 3. Push both to PC; PC merges and saves them, then BLE disconnects BEFORE tpl_state arrives.
+        var pushResult: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let disconnectExp = expectation(description: "sync fails on disconnect")
+        f.controller.syncTemplates { pushResult = $0; disconnectExp.fulfill() }
+        await drain(f)
+        let droppedPush = try XCTUnwrap(f.link.templatePushes.last)
+        let pcSavedAfterDrop = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: initPush.page.templates, tombstones: []),
+            remote: TemplateSyncState(templates: droppedPush.page.templates, tombstones: droppedPush.page.tombstones),
+            nowMillis: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+            remoteSentAtMillis: droppedPush.page.sentAt
+        )
+        XCTAssertEqual(pcSavedAfterDrop.templates.count, 2)
+        f.link.disconnect()
+        await fulfillment(of: [disconnectExp], timeout: 5)
+        XCTAssertEqual(pushResult, .failure(.disconnected))
+
+        // 4. Delete both templates on iOS while disconnected, then reconnect and sync again.
+        let latestEdited = try XCTUnwrap(f.monitor.entries.first { $0.id == syncedEntry.id })
+        let del1 = expectation(description: "delete edited")
+        f.monitor.delete(latestEdited) { _ in del1.fulfill() }
+        await fulfillment(of: [del1], timeout: 5)
+        let del2 = expectation(description: "delete new")
+        f.monitor.delete(createdNew) { _ in del2.fulfill() }
+        await fulfillment(of: [del2], timeout: 5)
+        await drain(f)
+
+        try f.link.connect(pairing, limit: 512)
+        let resyncDone = expectation(description: "resync completes")
+        f.controller.syncTemplates { _ in resyncDone.fulfill() }
+        await drain(f)
+        let resyncPush = try XCTUnwrap(f.link.templatePushes.last)
+        let mergedAfterDelete = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: pcSavedAfterDrop.templates, tombstones: pcSavedAfterDrop.tombstones),
+            remote: TemplateSyncState(templates: resyncPush.page.templates, tombstones: resyncPush.page.tombstones),
+            nowMillis: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+            remoteSentAtMillis: resyncPush.page.sentAt
+        )
+        XCTAssertTrue(mergedAfterDelete.templates.isEmpty)
+        XCTAssertEqual(mergedAfterDelete.tombstones.count, 2)
+
+        try f.link.send(.state(
+            op: resyncPush.op, part: 0, total: 1,
+            page: TemplateSyncPage(
+                version: 1,
+                sentAt: Int64(f.clock.date.timeIntervalSince1970 * 1000),
+                templates: mergedAfterDelete.templates,
+                tombstones: mergedAfterDelete.tombstones
+            )
+        ))
+        await fulfillment(of: [resyncDone], timeout: 5)
+        await drain(f)
+        XCTAssertTrue(f.monitor.entries.filter(\.isTemplate).isEmpty)
+    }
 }

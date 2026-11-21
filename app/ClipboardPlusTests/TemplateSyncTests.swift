@@ -385,4 +385,122 @@ final class TemplateSyncTests: XCTestCase {
         XCTAssertEqual(merged.templates.first?.tag, "仕事")
         XCTAssertEqual(merged.subsumedDuplicateCount, 1)
     }
+
+    func testThreeDeviceMergePreservesIndependentRemoteWriteBackWithConcurrentEdit() throws {
+        let now: Int64 = 1_794_873_600_000
+        let sharedId = UUID()
+        let hA = TemplateSyncMerge.contentHash(kind: .text, text: "A", title: "題", tag: "仕事")
+
+        let pcState = TemplateSyncState(
+            templates: [TemplateSyncItem(id: sharedId, kind: .text, text: "C", title: "題", tag: "仕事", order: 0, updatedAt: now - 2_000)],
+            tombstones: []
+        )
+        let iPadWriteBack = TemplateSyncRemoteState(
+            state: TemplateSyncState(
+                templates: [TemplateSyncItem(id: sharedId, kind: .text, text: "A", title: "題", tag: "仕事", order: 0, updatedAt: now - 1_000, baseHash: nil)],
+                tombstones: []
+            ),
+            sentAtMillis: now
+        )
+        let iPhoneEdit = TemplateSyncRemoteState(
+            state: TemplateSyncState(
+                templates: [TemplateSyncItem(id: sharedId, kind: .text, text: "B", title: "題", tag: "仕事", order: 0, updatedAt: now - 3_000, baseHash: hA)],
+                tombstones: []
+            ),
+            sentAtMillis: now
+        )
+
+        for order in [[iPadWriteBack, iPhoneEdit], [iPhoneEdit, iPadWriteBack]] {
+            let merged = try TemplateSyncMerge.mergeAll(pc: pcState, remotes: order, nowMillis: now)
+            XCTAssertEqual(merged.conflictCopyCount, 2)
+            XCTAssertEqual(merged.templates.count, 3)
+            XCTAssertTrue(merged.templates.contains { $0.id == sharedId && $0.text == "A" })
+            XCTAssertTrue(merged.templates.contains { $0.text == "C" && $0.tag == nil })
+            XCTAssertTrue(merged.templates.contains { $0.text == "B" && $0.tag == nil })
+        }
+    }
+
+    func testDeletedItemDoesNotResurrectAfter181DaysOr1000TombstoneCapForUneditedDeviceButKeepsEdit() throws {
+        let now: Int64 = 1_794_873_600_000
+        let day: Int64 = 86_400_000
+        let uneditedId = UUID()
+        let editedId = UUID()
+        let hUnedited = TemplateSyncMerge.contentHash(kind: .text, text: "消した定型文", title: "旧", tag: "仕事")
+        let hOrigEdited = TemplateSyncMerge.contentHash(kind: .text, text: "元の文", title: "題", tag: "仕事")
+
+        // 1. After 181 days, PC's tombstone expired; unedited remote copy must not resurrect, offline edit survives.
+        let expiredResult = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(
+                templates: [],
+                tombstones: [
+                    TemplateSyncTombstone(id: uneditedId, deletedAt: now - 181 * day, baseHash: hUnedited),
+                    TemplateSyncTombstone(id: editedId, deletedAt: now - 181 * day, baseHash: hOrigEdited)
+                ]
+            ),
+            remote: TemplateSyncState(
+                templates: [
+                    TemplateSyncItem(id: uneditedId, kind: .text, text: "消した定型文", title: "旧", tag: "仕事", order: 0, updatedAt: now - 200 * day, baseHash: hUnedited),
+                    TemplateSyncItem(id: editedId, kind: .text, text: "オフラインで書き直した文", title: "題", tag: "仕事", order: 1, updatedAt: now - 10 * day, baseHash: hOrigEdited)
+                ],
+                tombstones: []
+            ),
+            nowMillis: now,
+            remoteSentAtMillis: now
+        )
+        XCTAssertEqual(expiredResult.templates.map(\.id), [editedId])
+        XCTAssertEqual(expiredResult.templates.map(\.text), ["オフラインで書き直した文"])
+        XCTAssertEqual(expiredResult.remoteChanges.deleted, 1)
+
+        // 2. After >1000 tombstones evicted the original tombstone from PC, unedited remote still does not resurrect.
+        let pcTombs = (0..<SyncProtocol.maxTemplateTombstones).map { i in
+            TemplateSyncTombstone(id: UUID(), deletedAt: now - 10_000 + Int64(i))
+        }
+        let evictedResult = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [], tombstones: pcTombs),
+            remote: TemplateSyncState(
+                templates: [
+                    TemplateSyncItem(id: uneditedId, kind: .text, text: "消した定型文", title: "旧", tag: "仕事", order: 0, updatedAt: now - 20_000, baseHash: hUnedited)
+                ],
+                tombstones: []
+            ),
+            nowMillis: now,
+            remoteSentAtMillis: now
+        )
+        XCTAssertTrue(evictedResult.templates.isEmpty)
+        XCTAssertEqual(evictedResult.remoteChanges.deleted, 1)
+    }
+
+    func testEditedConflictCopyIsNotDuplicatedWhenRemoteResendsLoser() throws {
+        let now: Int64 = 1_794_873_600_000
+        let sharedId = UUID()
+        let hA = TemplateSyncMerge.contentHash(kind: .text, text: "A", title: "題", tag: "仕事")
+        let pcItem = TemplateSyncItem(id: sharedId, kind: .text, text: "C", title: "題", tag: "仕事", order: 0, updatedAt: now - 1_000)
+        let remoteLoser = TemplateSyncItem(id: sharedId, kind: .text, text: "B", title: "題", tag: "仕事", order: 0, updatedAt: now - 2_000, baseHash: hA)
+
+        // First merge produces conflict copy for B, then simulate disconnect before remote receives tpl_state.
+        let first = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [pcItem], tombstones: []),
+            remote: TemplateSyncState(templates: [remoteLoser], tombstones: []),
+            nowMillis: now,
+            remoteSentAtMillis: now
+        )
+        XCTAssertEqual(first.conflictCopyCount, 1)
+        let copyB = try XCTUnwrap(first.templates.first { $0.text == "B" })
+
+        // PC edits the conflict copy B -> B2 while remote still holds B with baseHash H(A) and resends it.
+        let editedCopyB2 = TemplateSyncItem(
+            id: copyB.id, kind: .text, text: "B2", title: copyB.title, tag: copyB.tag, order: copyB.order, updatedAt: now + 5_000
+        )
+        let second = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [pcItem, editedCopyB2], tombstones: first.tombstones),
+            remote: TemplateSyncState(templates: [remoteLoser], tombstones: []),
+            nowMillis: now + 10_000,
+            remoteSentAtMillis: now + 10_000
+        )
+        XCTAssertEqual(second.conflictCopyCount, 0)
+        XCTAssertEqual(second.templates.count, 2)
+        XCTAssertTrue(second.templates.contains { $0.id == sharedId && $0.text == "C" })
+        XCTAssertTrue(second.templates.contains { $0.id == copyB.id && $0.text == "B2" })
+        XCTAssertFalse(second.templates.contains { $0.text == "B" })
+    }
 }

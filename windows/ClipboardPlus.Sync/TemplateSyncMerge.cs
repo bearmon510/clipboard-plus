@@ -158,13 +158,11 @@ public static class TemplateSyncMerge
         ISet<Guid> activeIds,
         IReadOnlySet<Guid> tombstoneIds)
     {
-        for (var counter = 0; ; counter++)
-        {
-            var candidate = ConflictUuid(originalId, loserContentHash, counter);
-            // Suppress recreation if this conflict copy was already deleted (tombstone present).
-            if (tombstoneIds.Contains(candidate)) return null;
-            if (activeIds.Add(candidate)) return candidate;
-        }
+        var candidate = ConflictUuid(originalId, loserContentHash, 0);
+        // Suppress recreation if this conflict copy already exists (even if edited) or was already deleted.
+        if (tombstoneIds.Contains(candidate) || !activeIds.Add(candidate))
+            return null;
+        return candidate;
     }
 
     private static Guid ConflictUuid(Guid originalId, string loserContentHash, int counter)
@@ -180,7 +178,7 @@ public static class TemplateSyncMerge
         return new Guid(uuid, bigEndian: true);
     }
 
-    private sealed record NormalizedEntry(TemplateSyncItem Item, string Hash);
+    private sealed record NormalizedEntry(TemplateSyncItem Item, string Hash, bool IsPc = false);
     private sealed record ConflictCandidate(Guid OriginalId, TemplateSyncItem Loser, string LoserHash);
 
     private readonly record struct PagePackerState(int FlushedPages, int FlushedTotalBytes, int CurrentPageBytes, bool CurrentHasItems)
@@ -414,7 +412,7 @@ public static class TemplateSyncMerge
         SyncProtocol.Require(pc is not null && remotes is not null);
         SyncProtocol.Require(nowMillis is >= -SyncProtocol.MaxTimestamp and <= SyncProtocol.MaxTimestamp);
 
-        var (pcItems, pcTombs) = IndexSide(pc, nowMillis, sentAtMillis: null, knownPcTombs: null);
+        var (pcItems, pcTombs) = IndexSide(pc, nowMillis, sentAtMillis: null, knownPcTombs: null, isPc: true);
 
         var remoteItemsList = new List<Dictionary<Guid, NormalizedEntry>>(remotes.Count);
         var remoteTombsList = new List<Dictionary<Guid, TemplateSyncTombstone>>(remotes.Count);
@@ -428,7 +426,7 @@ public static class TemplateSyncMerge
             SyncProtocol.Require(remote is not null && remote.State is not null);
             long? skew = remote.SentAtMillis is long sentAt ? ClockSkewSeconds(sentAt, nowMillis) : null;
             remoteClockSkews.Add(skew);
-            var (rItems, rTombs) = IndexSide(remote.State, nowMillis, remote.SentAtMillis, pcTombs);
+            var (rItems, rTombs) = IndexSide(remote.State, nowMillis, remote.SentAtMillis, pcTombs, isPc: false);
             remoteItemsList.Add(rItems);
             remoteTombsList.Add(rTombs);
             allIds.UnionWith(rItems.Keys);
@@ -460,10 +458,11 @@ public static class TemplateSyncMerge
                     tombs.Add(rTomb);
             }
 
+            var pcHasEntry = pcItems.TryGetValue(id, out var pcEntryForCheck);
+            var pcEntryKilledOrAbsent = !pcHasEntry || (tombs.Count > 0 && IsDirectlyKilledByTombstones(pcEntryForCheck!, pcTomb, tombs));
+
             if (tombs.Count > 0)
             {
-                var pcHasEntry = pcItems.TryGetValue(id, out var pcEntryForCheck);
-                var pcEntryKilledOrAbsent = !pcHasEntry || IsDirectlyKilledByTombstones(pcEntryForCheck!, pcTomb, tombs);
                 var remainingActive = activeEntries
                     .Where(e => !IsKilledByTombstones(e, pcTomb, pcEntryKilledOrAbsent, tombs))
                     .ToList();
@@ -481,7 +480,13 @@ public static class TemplateSyncMerge
             }
             else if (activeEntries.Count > 0)
             {
-                ResolveActiveEntries(activeEntries, survivingItems, conflictCandidates);
+                // An unedited previously-synced remote item (BaseHash == Hash) absent from PC
+                // was deleted on PC even if its tombstone expired (>180d) or was evicted (>1,000).
+                var remainingActive = pcEntryKilledOrAbsent
+                    ? activeEntries.Where(e => !(e.Item.BaseHash is not null && e.Item.BaseHash == e.Hash)).ToList()
+                    : activeEntries;
+                if (remainingActive.Count > 0)
+                    ResolveActiveEntries(remainingActive, survivingItems, conflictCandidates);
             }
         }
 
@@ -536,7 +541,8 @@ public static class TemplateSyncMerge
         TemplateSyncState side,
         long nowMillis,
         long? sentAtMillis,
-        IReadOnlyDictionary<Guid, TemplateSyncTombstone>? knownPcTombs)
+        IReadOnlyDictionary<Guid, TemplateSyncTombstone>? knownPcTombs,
+        bool isPc)
     {
         SyncProtocol.Require(side.Templates is not null && side.Tombstones is not null);
         SyncProtocol.Require(side.Templates.Count <= SyncProtocol.MaxTemplates, SyncError.Limit);
@@ -547,7 +553,7 @@ public static class TemplateSyncMerge
             var normalized = NormalizeInputItem(raw);
             TemplateSyncMessageCodec.ValidateItem(normalized, allowBaseHash: true);
             SyncProtocol.Require(sideIds.Add(normalized.Id));
-            items[normalized.Id] = new NormalizedEntry(normalized, ContentHash(normalized));
+            items[normalized.Id] = new NormalizedEntry(normalized, ContentHash(normalized), isPc);
         }
 
         var tombs = new Dictionary<Guid, TemplateSyncTombstone>();
@@ -651,7 +657,7 @@ public static class TemplateSyncMerge
         var edited = entries.Where(e =>
             e.Item.BaseHash is not null
                 ? e.Item.BaseHash != e.Hash
-                : !editedBaseHashes.Contains(e.Hash)).ToList();
+                : !e.IsPc || !editedBaseHashes.Contains(e.Hash)).ToList();
         var pool = edited.Count > 0 ? edited : entries;
 
         var byHash = pool

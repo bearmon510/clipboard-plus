@@ -144,6 +144,79 @@ extension HistoryEntry {
     }
 }
 
+struct TemplateEditSavePlan: Equatable {
+    let updateText: String?
+    let updateTitle: String?
+    let updateTag: String?
+    let conflictCopyText: String?
+    let conflictCopyTitle: String?
+
+    static func resolve(
+        original: HistoryEntry,
+        latest: HistoryEntry?,
+        editsText: Bool,
+        inputText: String,
+        inputTitle: String?,
+        inputTag: String?
+    ) -> TemplateEditSavePlan {
+        let normOriginalText = TemplateSyncMerge.normalizeLineEndings(original.text)
+        let normInputText = TemplateSyncMerge.normalizeLineEndings(inputText)
+        let userEditedText = editsText && !normInputText.utf8.elementsEqual(normOriginalText.utf8)
+
+        let normOriginalTitle = HistoryEntry.normalizedTitle(original.title)
+        let normInputTitle = HistoryEntry.normalizedTitle(inputTitle)
+        let userEditedTitle = !utf8OptionalEquals(normInputTitle, normOriginalTitle)
+
+        let normOriginalTag = HistoryEntry.normalizedTag(original.tag)
+        let normInputTag = HistoryEntry.normalizedTag(inputTag)
+        let userEditedTag = !utf8OptionalEquals(normInputTag, normOriginalTag)
+
+        let resolvedTitle = userEditedTitle ? inputTitle : (latest?.title ?? inputTitle)
+        let resolvedTag = userEditedTag ? inputTag : (latest?.tag ?? inputTag)
+
+        guard userEditedText else {
+            return TemplateEditSavePlan(
+                updateText: nil,
+                updateTitle: resolvedTitle,
+                updateTag: resolvedTag,
+                conflictCopyText: nil,
+                conflictCopyTitle: nil
+            )
+        }
+
+        if let latest {
+            let normLatestText = TemplateSyncMerge.normalizeLineEndings(latest.text)
+            let changedRemotely = !normLatestText.utf8.elementsEqual(normOriginalText.utf8)
+            let differsFromUserEdit = !normLatestText.utf8.elementsEqual(normInputText.utf8)
+            if changedRemotely && differsFromUserEdit {
+                return TemplateEditSavePlan(
+                    updateText: inputText,
+                    updateTitle: resolvedTitle,
+                    updateTag: resolvedTag,
+                    conflictCopyText: normLatestText,
+                    conflictCopyTitle: TemplateSyncMerge.makeConflictTitle(latest.title)
+                )
+            }
+        }
+
+        return TemplateEditSavePlan(
+            updateText: inputText,
+            updateTitle: resolvedTitle,
+            updateTag: resolvedTag,
+            conflictCopyText: nil,
+            conflictCopyTitle: nil
+        )
+    }
+
+    private static func utf8OptionalEquals(_ lhs: String?, _ rhs: String?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case let (a?, b?): return a.utf8.elementsEqual(b.utf8)
+        default: return false
+        }
+    }
+}
+
 struct HistoryExport: Codable {
     let formatVersion: Int
     let exportedAt: Date

@@ -166,8 +166,38 @@ struct EntryEditorView: View {
                 finish(result, message: "テンプレートに追加しました")
             }
         case .edit(let entry):
-            monitor.updateTemplate(entry, text: editsText ? text : nil, title: name, tag: group) { result in
-                finish(result, message: "保存しました")
+            let latest = monitor.entries.first { $0.id == entry.id && $0.isTemplate }
+            let plan = TemplateEditSavePlan.resolve(
+                original: entry,
+                latest: latest,
+                editsText: editsText,
+                inputText: text,
+                inputTitle: name,
+                inputTag: group
+            )
+            let target = latest ?? entry
+            monitor.updateTemplate(target, text: plan.updateText, title: plan.updateTitle, tag: plan.updateTag) { result in
+                switch result {
+                case .failure(let failure):
+                    isSaving = false
+                    error = failure.message
+                case .success:
+                    guard let conflictText = plan.conflictCopyText else {
+                        finish(result, message: "保存しました")
+                        return
+                    }
+                    monitor.createTemplate(text: conflictText, title: plan.conflictCopyTitle, tag: nil) { copyResult in
+                        switch copyResult {
+                        case .success:
+                            finish(result, message: "保存しました。同期で更新された本文は「その他」に残しました")
+                        case .failure(.duplicate):
+                            finish(result, message: "保存しました")
+                        case .failure(let failure):
+                            isSaving = false
+                            error = failure.message
+                        }
+                    }
+                }
             }
         }
     }

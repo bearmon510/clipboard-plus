@@ -5,11 +5,13 @@ import XCTest
 
 @MainActor
 private final class TemplateTestPasteboard: ClipboardPasteboard {
-    let changeCount = 0
+    var changeCount = 0
     let hasImages = false
-    let hasStrings = false
-    let types: [String] = []
-    var string: String?
+    var hasStrings: Bool { string != nil }
+    var types: [String] { string == nil ? [] : ["public.utf8-plain-text"] }
+    var string: String? {
+        didSet { changeCount += 1 }
+    }
     let image: UIImage? = nil
     func data(forPasteboardType pasteboardType: String) -> Data? { nil }
     func setData(_ data: Data, forPasteboardType pasteboardType: String) {}
@@ -165,5 +167,57 @@ final class TemplateMonitorTests: XCTestCase {
         XCTAssertFalse(logs.contains("private-body"))
         XCTAssertFalse(logs.contains("private-edit"))
         XCTAssertFalse(logs.contains("編集後"))
+    }
+
+    @MainActor
+    func testCopyingPCSyncedTemplateDoesNotLogTextPreviewEvenWhenEnabled() throws {
+        let monitor = try fixture()
+        monitor.log.includeTextPreview = true
+
+        let syncedSecret = "PC由来テンプレートの秘密本文12345"
+        let applied = expectation(description: "pc template synced")
+        monitor.applySyncedTemplates(
+            TemplateSyncSnapshot(
+                sentAt: 1_794_873_600_000,
+                templates: [
+                    TemplateSyncItem(id: UUID(), kind: .text, text: syncedSecret, title: "PC秘密題", tag: "仕事", order: 0, updatedAt: 1_794_873_600_000)
+                ],
+                tombstones: []
+            ),
+            pushed: nil
+        ) { result in
+            if case .failure(let error) = result { XCTFail("\(error)") }
+            applied.fulfill()
+        }
+        wait(for: [applied], timeout: 5)
+        drain(monitor)
+
+        let syncedEntry = try XCTUnwrap(monitor.entries.first { $0.isTemplate && $0.text == syncedSecret })
+        // 1. Copy while not recording (self-copy event only).
+        let copiedIdle = expectation(description: "copied while idle")
+        monitor.copy(syncedEntry) { ok in
+            XCTAssertTrue(ok)
+            copiedIdle.fulfill()
+        }
+        wait(for: [copiedIdle], timeout: 5)
+
+        // 2. Copy while recording (self-copy event + self-copy readback path).
+        monitor.start()
+        defer { monitor.stop() }
+        let copiedRecording = expectation(description: "copied while recording")
+        monitor.copy(syncedEntry) { ok in
+            XCTAssertTrue(ok)
+            copiedRecording.fulfill()
+        }
+        wait(for: [copiedRecording], timeout: 5)
+        drain(monitor)
+
+        let allLines = monitor.log.lines.map(\.fileLine)
+        XCTAssertTrue(allLines.contains { $0.contains("自己コピー") })
+        for line in allLines {
+            XCTAssertFalse(line.contains(syncedSecret))
+            XCTAssertFalse(line.contains("PC由来テンプレート"))
+            XCTAssertFalse(line.contains("PC秘密題"))
+        }
     }
 }

@@ -27,7 +27,10 @@ struct HistoryRestorePlan {
     init(existing: [HistoryEntry], incoming: [HistoryEntry], lastID: Int,
          historyLimit: Int, imageByteLimit: Int, retentionCutoff: Date? = nil) throws {
         var counts = RestoreCounts()
-        let existingByKey = Dictionary(uniqueKeysWithValues: existing.map { (Self.key($0), $0) })
+        let existingByKey = Dictionary(
+            existing.map { (Self.key($0), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         var byKey = existingByKey
         var nextID = lastID
         for entry in incoming {
@@ -45,7 +48,10 @@ struct HistoryRestorePlan {
             } else {
                 guard nextID < Int.max else { throw BackupError.unavailable }
                 nextID += 1
-                byKey[key] = HistoryEntry(id: nextID, kind: entry.kind, text: entry.text, savedAt: entry.savedAt,
+                let normalizedText = entry.isTemplate && (entry.kind == .text || entry.kind == .url)
+                    ? TemplateSyncMerge.normalizeLineEndings(entry.text)
+                    : entry.text
+                byKey[key] = HistoryEntry(id: nextID, kind: entry.kind, text: normalizedText, savedAt: entry.savedAt,
                                          lastCollectedAt: entry.lastCollectedAt,
                                          collectionCount: HistoryCollectionCount.clamped(entry.collectionCount),
                                          isTemplate: entry.isTemplate, source: entry.source, image: entry.image, file: entry.file,
@@ -65,12 +71,14 @@ struct HistoryRestorePlan {
         let existingTemplates = HistoryEntry.orderedTemplates(existing.filter(\.isTemplate))
         for group in TemplateGroups.make(Array(byKey.values), search: "") {
             var seen = Set<Data>()
-            let device = existingTemplates.filter { $0.tag == group.tag && byKey[Self.key($0)]?.tag == group.tag }
+            let device = existingTemplates.filter {
+                TemplateGroups.tagsEqual($0.tag, group.tag) && TemplateGroups.tagsEqual(byKey[Self.key($0)]?.tag, group.tag)
+            }
             let candidates = device + incomingTemplates + existingTemplates
             var order = 0
             for candidate in candidates {
                 let key = Self.key(candidate)
-                guard let value = byKey[key], value.tag == group.tag, seen.insert(key).inserted else { continue }
+                guard let value = byKey[key], TemplateGroups.tagsEqual(value.tag, group.tag), seen.insert(key).inserted else { continue }
                 byKey[key] = HistoryEntry(id: value.id, kind: value.kind, text: value.text, savedAt: value.savedAt,
                                          lastCollectedAt: value.lastCollectedAt, collectionCount: value.collectionCount,
                                          isTemplate: true, source: value.source, image: value.image, file: value.file,
@@ -121,7 +129,9 @@ struct HistoryRestorePlan {
         // Swift String equality normalizes Unicode; SQLite BINARY equality does not.
         let domain = entry.isTemplate ? "template:" : "history:"
         if let file = entry.file { return Data("\(domain)file:\(file.hash)".utf8) }
-        return Data((domain + (entry.kind == .image ? "image:\(entry.image!.hash)" : "text:\(entry.text)")).utf8)
+        if entry.kind == .image { return Data("\(domain)image:\(entry.image!.hash)".utf8) }
+        let text = entry.isTemplate ? TemplateSyncMerge.normalizeLineEndings(entry.text) : entry.text
+        return Data((domain + "text:" + text).utf8)
     }
 }
 

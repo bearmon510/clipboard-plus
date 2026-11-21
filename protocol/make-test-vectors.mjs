@@ -216,14 +216,10 @@ function deterministicConflictId(originalId, loserHash, usedIds) {
 }
 
 function resolveConflictId(originalId, loserHash, activeIds, tombstoneIds) {
-  for (let counter = 0; ; counter++) {
-    const candidate = conflictUuid(originalId, loserHash, counter);
-    if (tombstoneIds.has(candidate)) return undefined;
-    if (!activeIds.has(candidate)) {
-      activeIds.add(candidate);
-      return candidate;
-    }
-  }
+  const candidate = conflictUuid(originalId, loserHash, 0);
+  if (tombstoneIds.has(candidate) || activeIds.has(candidate)) return undefined;
+  activeIds.add(candidate);
+  return candidate;
 }
 
 function compareScalars(a, b) {
@@ -432,12 +428,12 @@ function mergeTemplates(pc, remote, nowMillis, remoteSentAtMillis = undefined) {
 }
 
 function mergeTemplatesAll(pc, remotes, nowMillis) {
-  const indexSide = (side, sentAtMillis, knownPcTombs) => {
+  const indexSide = (side, sentAtMillis, knownPcTombs, isPc) => {
     const items = new Map();
     const tombs = new Map();
     for (const raw of side.templates) {
       const item = { ...cleanItem(raw), baseHash: raw.baseHash };
-      items.set(item.id, { item, hash: contentHash(item) });
+      items.set(item.id, { item, hash: contentHash(item), isPc });
     }
     for (const rawTomb of side.tombstones) {
       const t = cleanTombstone(rawTomb);
@@ -459,7 +455,7 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
     return { items, tombs };
   };
 
-  const pcIdx = indexSide(pc, undefined, undefined);
+  const pcIdx = indexSide(pc, undefined, undefined, true);
   const remoteIndices = [];
   const remoteClockSkewSeconds = [];
   const allIds = new Set([...pcIdx.items.keys(), ...pcIdx.tombs.keys()]);
@@ -469,7 +465,7 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
       ? Math.trunc(Math.abs(r.sentAtMillis - nowMillis) / 1000)
       : undefined;
     remoteClockSkewSeconds.push(skew);
-    const rIdx = indexSide(r.state, r.sentAtMillis, pcIdx.tombs);
+    const rIdx = indexSide(r.state, r.sentAtMillis, pcIdx.tombs, false);
     remoteIndices.push(rIdx);
     for (const k of rIdx.items.keys()) allIds.add(k);
     for (const k of rIdx.tombs.keys()) allIds.add(k);
@@ -531,7 +527,7 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
       if (e.item.baseHash !== undefined && e.item.baseHash !== e.hash) editedBaseHashes.add(e.item.baseHash);
     }
     const edited = entries.filter(e =>
-      e.item.baseHash !== undefined ? e.item.baseHash !== e.hash : !editedBaseHashes.has(e.hash)
+      e.item.baseHash !== undefined ? e.item.baseHash !== e.hash : (!e.isPc || !editedBaseHashes.has(e.hash))
     );
     const pool = edited.length > 0 ? edited : entries;
     const byHashMap = new Map();
@@ -567,9 +563,9 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
     for (const rIdx of remoteIndices) {
       if (rIdx.tombs.has(itemId)) tombs.push(rIdx.tombs.get(itemId));
     }
+    const pcEntry = pcIdx.items.get(itemId);
+    const pcEntryKilledOrAbsent = pcEntry === undefined || (tombs.length > 0 && isDirectlyKilled(pcEntry, pcTomb, tombs));
     if (tombs.length > 0) {
-      const pcEntry = pcIdx.items.get(itemId);
-      const pcEntryKilledOrAbsent = pcEntry === undefined || isDirectlyKilled(pcEntry, pcTomb, tombs);
       const remainingActive = activeEntries.filter(e => !isKilled(e, pcTomb, pcEntryKilledOrAbsent, tombs));
       if (remainingActive.length === 0) {
         let merged = tombs[0];
@@ -579,7 +575,12 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
         resolveActive(remainingActive);
       }
     } else if (activeEntries.length > 0) {
-      resolveActive(activeEntries);
+      const remainingActive = pcEntryKilledOrAbsent
+        ? activeEntries.filter(e => !(e.item.baseHash !== undefined && e.item.baseHash === e.hash))
+        : activeEntries;
+      if (remainingActive.length > 0) {
+        resolveActive(remainingActive);
+      }
     }
   }
 
@@ -1085,16 +1086,18 @@ const templateMergeCases = [
     ],
   }, { alsoCheckIdempotent: true }),
 
-  makeMergeCase('expiredTombstoneAllowsResurrection', baseNow, {
+  makeMergeCase('expiredTombstoneDoesNotResurrectUneditedAndKeepsEdited', baseNow, {
     templates: [],
     tombstones: [
       { id: tplId1, deletedAt: baseNow - tombstoneLifetimeMillis - 1, baseHash: h1Init },
       { id: tplId2, deletedAt: baseNow - tombstoneLifetimeMillis, baseHash: h2Init },
+      { id: tplId3, deletedAt: baseNow - tombstoneLifetimeMillis - 1, baseHash: h3Del },
     ],
   }, {
     templates: [
       { id: tplId1, kind: 'text', text: '初期1', order: 0, updatedAt: 1000, baseHash: h1Init },
       { id: tplId2, kind: 'text', text: '旧文2', order: 1, updatedAt: 1000, baseHash: h2Init },
+      { id: tplId3, kind: 'text', text: '期限後に端末で編集', order: 2, updatedAt: baseNow - 1000, baseHash: h3Del },
     ],
     tombstones: [],
   }),
@@ -1171,6 +1174,24 @@ const templateMergeCases = [
     ],
     tombstones: [],
   }, { alsoCheckIdempotent: true }),
+
+  (() => {
+    const hOrig = contentHash({ kind: 'text', text: 'A', title: '題', tag: '仕事' });
+    const loserHash = contentHash({ kind: 'text', text: 'B', title: '題', tag: '仕事' });
+    const conflictCopyId = conflictUuid(tplId1, loserHash, 0);
+    return makeMergeCase('editedConflictCopyNotDuplicatedOnResend', baseNow, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'C', title: '題', tag: '仕事', order: 0, updatedAt: baseNow - 10_000 },
+        { id: conflictCopyId, kind: 'text', text: 'B2', title: makeConflictTitle('題'), order: 0, updatedAt: baseNow - 5_000 },
+      ],
+      tombstones: [],
+    }, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'B', title: '題', tag: '仕事', order: 0, updatedAt: baseNow - 20_000, baseHash: hOrig },
+      ],
+      tombstones: [],
+    }, { alsoCheckIdempotent: true });
+  })(),
 ];
 
 // --- Multi-Device Merge Test Cases (Item 7) ---
@@ -1314,6 +1335,35 @@ const templateMultiMergeCases = [
         state: {
           templates: [
             { id: tplId1, kind: 'text', text: 'v3-edited', order: 0, updatedAt: baseNow - 20_000, baseHash: hV1 },
+          ],
+          tombstones: [],
+        },
+        sentAtMillis: baseNow,
+      },
+    ], { alsoCheckAllPermutations: true });
+  })(),
+
+  (() => {
+    const hA = contentHash({ kind: 'text', text: 'A', tag: '仕事' });
+    return makeMultiMergeCase('multiDeviceIndependentRemoteWriteBackPreservedWithConcurrentEdit', baseNow, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'C', tag: '仕事', order: 0, updatedAt: baseNow - 20_000 },
+      ],
+      tombstones: [],
+    }, [
+      {
+        state: {
+          templates: [
+            { id: tplId1, kind: 'text', text: 'A', tag: '仕事', order: 0, updatedAt: baseNow - 10_000 },
+          ],
+          tombstones: [],
+        },
+        sentAtMillis: baseNow,
+      },
+      {
+        state: {
+          templates: [
+            { id: tplId1, kind: 'text', text: 'D', tag: '仕事', order: 0, updatedAt: baseNow - 15_000, baseHash: hA },
           ],
           tombstones: [],
         },

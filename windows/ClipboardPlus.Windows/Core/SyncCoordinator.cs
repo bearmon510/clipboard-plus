@@ -51,7 +51,17 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public Guid? IncomingTemplatePushOp;
         public DateTimeOffset? IncomingTemplatePushLastActivity;
         public readonly Dictionary<Guid, DateTimeOffset> AwaitingPeerTemplateAcks = [];
+        public readonly HashSet<Guid> PcInitiatedTemplateOps = [];
+        public readonly Queue<Guid> PcInitiatedTemplateOpOrder = new();
         public bool SendingTemplateMessage;
+
+        public void RecordPcInitiatedTemplateOp(Guid op)
+        {
+            if (!PcInitiatedTemplateOps.Add(op)) return;
+            PcInitiatedTemplateOpOrder.Enqueue(op);
+            while (PcInitiatedTemplateOpOrder.Count > 256)
+                PcInitiatedTemplateOps.Remove(PcInitiatedTemplateOpOrder.Dequeue());
+        }
         public readonly CancellationTokenSource Stop = new();
         public readonly SemaphoreSlim HandoffGate = new(1, 1);
         public readonly object HandoffStateGate = new();
@@ -258,13 +268,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         finally { gate.Release(); }
     }
 
-    public async Task<TemplateEditResult> UpdateTemplateAsync(Guid id, string text, string? title, string? tag)
+    public async Task<TemplateEditResult> UpdateTemplateAsync(Guid id, string text, string? title, string? tag, TemplateSyncItem? expectedOriginal = null)
     {
         await gate.WaitAsync();
         try
         {
             if (stopped) return new(false, TemplateEditError.Stopped);
-            var result = templateStore.Update(id, text, title, tag, Now().ToUnixTimeMilliseconds());
+            var result = templateStore.Update(id, text, title, tag, Now().ToUnixTimeMilliseconds(), expectedOriginal);
             if (result.Succeeded)
             {
                 log($"template updated count={templateStore.Count}");
@@ -418,6 +428,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             var pull = new TemplateSyncPull(op);
             foreach (var c in stage2)
             {
+                c.RecordPcInitiatedTemplateOp(op);
                 EnqueueTemplateMessage(c, pull);
                 StartSending(c);
             }
@@ -1254,7 +1265,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             c.FinalChunkSentAttachments.Clear();
         }
         c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.Sent.Clear();
-        c.TemplateMessages.Clear(); c.AwaitingPeerTemplateAcks.Clear(); c.SendingTemplateMessage = false;
+        c.TemplateMessages.Clear(); c.AwaitingPeerTemplateAcks.Clear(); c.PcInitiatedTemplateOps.Clear(); c.PcInitiatedTemplateOpOrder.Clear(); c.SendingTemplateMessage = false;
         ClearIncomingTemplatePush(c, "disconnect");
         c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
         c.OfferedThisConnection.Clear(); c.Progress = null;
@@ -1323,6 +1334,36 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
     private void HandleTemplatePush(Connection c, TemplateSyncPush push)
     {
+        var active = activeTemplateSync;
+        var isActiveSessionOp = active is not null && push.Op == active.Op;
+        if (!isActiveSessionOp && c.PcInitiatedTemplateOps.Contains(push.Op))
+        {
+            if (c.IncomingTemplatePushOp == push.Op)
+                ClearIncomingTemplatePush(c, "late-pc-op");
+            log("template sync late push ignored");
+            return;
+        }
+        if (isActiveSessionOp)
+        {
+            var participant = active!.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+            if (participant is { State: ParticipantState.TimedOut or ParticipantState.Dropped })
+            {
+                if (c.IncomingTemplatePushOp == push.Op)
+                    ClearIncomingTemplatePush(c, "late-pc-op");
+                log("template sync late push ignored");
+                return;
+            }
+            if (participant is { State: ParticipantState.PushReceived or ParticipantState.AwaitingAck or ParticipantState.AckReceived })
+                throw new SyncProtocolException(SyncError.State);
+            if (active.Phase != TemplateSyncPhase.Collecting || participant is not { State: ParticipantState.AwaitingPush })
+            {
+                if (c.IncomingTemplatePushOp == push.Op)
+                    ClearIncomingTemplatePush(c, "late-pc-op");
+                log("template sync late push ignored");
+                return;
+            }
+        }
+
         if (c.IncomingTemplatePush is not null && push.Part == 0 && c.IncomingTemplatePushOp != push.Op)
             ClearIncomingTemplatePush(c, "superseded");
         if (c.IncomingTemplatePush is null)
@@ -1351,10 +1392,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         c.IncomingTemplatePushOp = null;
         c.IncomingTemplatePushLastActivity = null;
 
-        if (activeTemplateSync is { } active && push.Op == active.Op)
+        if (activeTemplateSync is { } currentActive && push.Op == currentActive.Op)
         {
-            var participant = active.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
-            if (active.Phase == TemplateSyncPhase.Collecting && participant is { State: ParticipantState.AwaitingPush })
+            var participant = currentActive.Participants.FirstOrDefault(x => ReferenceEquals(x.Connection, c));
+            if (currentActive.Phase == TemplateSyncPhase.Collecting && participant is { State: ParticipantState.AwaitingPush })
             {
                 participant.PushSnapshot = snapshot;
                 participant.State = ParticipantState.PushReceived;
@@ -1365,6 +1406,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             if (participant is { State: ParticipantState.PushReceived or ParticipantState.AwaitingAck or ParticipantState.AckReceived })
                 throw new SyncProtocolException(SyncError.State);
 
+            log("template sync late push ignored");
+            return;
+        }
+
+        if (c.PcInitiatedTemplateOps.Contains(push.Op))
+        {
             log("template sync late push ignored");
             return;
         }
@@ -1381,6 +1428,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         var pcRaw = templateStore.GetState();
         var preparedPc = TemplateSyncMerge.PrepareSyncState(pcRaw.Templates, pcRaw.Tombstones, nowMillis, nowMillis);
         TemplateSyncItem[] excludedLocal;
+        IReadOnlyList<TemplateSyncRemoteState> effectiveRemotes = remotes;
         if (preparedPc.ExcludedTemplateCount == 0)
         {
             excludedLocal = [];
@@ -1389,9 +1437,66 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         {
             var includedIds = preparedPc.State.Templates.Select(t => t.Id).ToHashSet();
             excludedLocal = pcRaw.Templates.Where(t => !includedIds.Contains(t.Id)).ToArray();
+
+            // Protect locally excluded PC template IDs before MergeAll so peers cannot overwrite
+            // them with stale versions or cause PC to deliver stale versions in tpl_state.
+            var excludedById = excludedLocal.ToDictionary(t => t.Id);
+            var excludedTexts = excludedLocal
+                .Select(t => TemplateSyncMerge.NormalizeLineEndings(t.Text))
+                .ToHashSet(StringComparer.Ordinal);
+            var knownTombIds = pcRaw.Tombstones.Select(t => t.Id).ToHashSet();
+            foreach (var r in remotes)
+            {
+                foreach (var tomb in r.State.Tombstones)
+                    knownTombIds.Add(tomb.Id);
+            }
+            var filteredRemotes = new List<TemplateSyncRemoteState>(remotes.Count);
+            foreach (var remote in remotes)
+            {
+                var usedIds = remote.State.Templates.Select(t => t.Id).ToHashSet();
+                usedIds.UnionWith(pcRaw.Templates.Select(t => t.Id));
+                var keptItems = new List<TemplateSyncItem>(remote.State.Templates.Count);
+                foreach (var item in remote.State.Templates)
+                {
+                    var normText = TemplateSyncMerge.NormalizeLineEndings(item.Text);
+                    if (excludedById.ContainsKey(item.Id))
+                    {
+                        var itemHash = TemplateSyncMerge.ContentHash(item);
+                        if (item.BaseHash is not null &&
+                            !string.Equals(item.BaseHash, itemHash, StringComparison.Ordinal) &&
+                            !excludedTexts.Contains(normText))
+                        {
+                            var candidateId = TemplateSyncMerge.DeterministicConflictId(item.Id, itemHash, new HashSet<Guid>());
+                            if (!knownTombIds.Contains(candidateId) && usedIds.Add(candidateId))
+                            {
+                                keptItems.Add(item with
+                                {
+                                    Id = candidateId,
+                                    Text = normText,
+                                    Title = TemplateSyncMerge.MakeConflictTitle(item.Title),
+                                    Tag = null,
+                                    Order = TemplateSyncMessageCodec.MaxOrder,
+                                    BaseHash = null,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    if (excludedTexts.Contains(normText))
+                        continue;
+                    keptItems.Add(item);
+                }
+                var keptTombs = remote.State.Tombstones
+                    .Where(t => !excludedById.ContainsKey(t.Id))
+                    .ToArray();
+                filteredRemotes.Add(new TemplateSyncRemoteState(
+                    new TemplateSyncState(keptItems, keptTombs),
+                    remote.SentAtMillis));
+            }
+            effectiveRemotes = filteredRemotes;
         }
 
-        var merged = TemplateSyncMerge.MergeAll(preparedPc.State, remotes, nowMillis);
+        var merged = TemplateSyncMerge.MergeAll(preparedPc.State, effectiveRemotes, nowMillis);
         var stateMessages = TemplateSyncMessageCodec.SplitPages(
             op,
             new TemplateSyncSnapshot(nowMillis, merged.Templates, merged.Tombstones),
@@ -1402,8 +1507,16 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             ? merged.PcChanges
             : ComputeTemplateChanges(pcRaw.Templates, savedTemplates);
         var remoteChangesTotal = 0;
-        foreach (var rc in merged.RemoteChanges)
-            remoteChangesTotal += rc.Total;
+        if (excludedLocal.Length == 0)
+        {
+            foreach (var rc in merged.RemoteChanges)
+                remoteChangesTotal += rc.Total;
+        }
+        else
+        {
+            foreach (var rawRemote in remotes)
+                remoteChangesTotal += ComputeTemplateChanges(rawRemote.State.Templates, merged.Templates).Total;
+        }
 
         long? maxSkew = null;
         foreach (var s in merged.RemoteClockSkewSeconds)

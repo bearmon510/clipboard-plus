@@ -1535,17 +1535,17 @@
         },
         "remoteChanges": {
           "added": 0,
-          "deleted": 1,
-          "updated": 0
+          "deleted": 2,
+          "updated": 1
         },
         "subsumedDuplicateCount": 0,
         "templates": [
           {
-            "id": "44444444-5555-4666-8777-888888888881",
+            "id": "44444444-5555-4666-8777-888888888883",
             "kind": "text",
             "order": 0,
-            "text": "初期1",
-            "updatedAt": 1000
+            "text": "期限後に端末で編集",
+            "updatedAt": 1794873599000
           }
         ],
         "tombstones": [
@@ -1556,7 +1556,7 @@
           }
         ]
       },
-      "name": "expiredTombstoneAllowsResurrection",
+      "name": "expiredTombstoneDoesNotResurrectUneditedAndKeepsEdited",
       "nowMillis": 1794873600000,
       "pc": {
         "templates": [],
@@ -1570,6 +1570,11 @@
             "baseHash": "b0aa3124029403ca18a98446ad1ec21fb78edc84ddfd4ce27257da6263b843e1",
             "deletedAt": 1779321600000,
             "id": "44444444-5555-4666-8777-888888888882"
+          },
+          {
+            "baseHash": "1d39c3bbe715d75db7b9d605622e9b5db13db611fca4cc751c88d6222b87a44e",
+            "deletedAt": 1779321599999,
+            "id": "44444444-5555-4666-8777-888888888883"
           }
         ]
       },
@@ -1590,6 +1595,14 @@
             "order": 1,
             "text": "旧文2",
             "updatedAt": 1000
+          },
+          {
+            "baseHash": "1d39c3bbe715d75db7b9d605622e9b5db13db611fca4cc751c88d6222b87a44e",
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 2,
+            "text": "期限後に端末で編集",
+            "updatedAt": 1794873599000
           }
         ],
         "tombstones": []
@@ -1938,6 +1951,82 @@
             "order": 1,
             "text": "改行のみ編集\n後",
             "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": []
+      }
+    },
+    {
+      "alsoCheckIdempotent": true,
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 0
+        },
+        "remoteChanges": {
+          "added": 1,
+          "deleted": 0,
+          "updated": 1
+        },
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "C",
+            "title": "題",
+            "updatedAt": 1794873590000
+          },
+          {
+            "id": "861B73EE-85EF-42E6-B487-F4BBFF669E6E",
+            "kind": "text",
+            "order": 0,
+            "text": "B2",
+            "title": "題（別の端末の編集）",
+            "updatedAt": 1794873595000
+          }
+        ],
+        "tombstones": []
+      },
+      "name": "editedConflictCopyNotDuplicatedOnResend",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "C",
+            "title": "題",
+            "updatedAt": 1794873590000
+          },
+          {
+            "id": "861B73EE-85EF-42E6-B487-F4BBFF669E6E",
+            "kind": "text",
+            "order": 0,
+            "text": "B2",
+            "title": "題（別の端末の編集）",
+            "updatedAt": 1794873595000
+          }
+        ],
+        "tombstones": []
+      },
+      "remote": {
+        "templates": [
+          {
+            "baseHash": "55dce0c98ec88b37035600f4e16ec5e32536167882fcf25ebf955ac5b1fc52b8",
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "B",
+            "title": "題",
+            "updatedAt": 1794873580000
           }
         ],
         "tombstones": []
@@ -2354,6 +2443,111 @@
                 "order": 0,
                 "text": "v3-edited",
                 "updatedAt": 1794873580000
+              }
+            ],
+            "tombstones": []
+          }
+        }
+      ]
+    },
+    {
+      "alsoCheckAllPermutations": true,
+      "expected": {
+        "conflictCopyCount": 2,
+        "pcChanges": {
+          "added": 2,
+          "deleted": 0,
+          "updated": 1
+        },
+        "remoteChanges": [
+          {
+            "added": 2,
+            "deleted": 0,
+            "updated": 0
+          },
+          {
+            "added": 2,
+            "deleted": 0,
+            "updated": 1
+          }
+        ],
+        "remoteClockSkewSeconds": [
+          null,
+          null
+        ],
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "A",
+            "updatedAt": 1794873590000
+          },
+          {
+            "id": "9EA211C7-B319-4E33-B9AF-A1711B270FD0",
+            "kind": "text",
+            "order": 0,
+            "text": "C",
+            "title": "別の端末の編集",
+            "updatedAt": 1794873580000
+          },
+          {
+            "id": "4F3A807D-EBE4-4AC5-A637-F699E45B82DC",
+            "kind": "text",
+            "order": 1,
+            "text": "D",
+            "title": "別の端末の編集",
+            "updatedAt": 1794873585000
+          }
+        ],
+        "tombstones": []
+      },
+      "name": "multiDeviceIndependentRemoteWriteBackPreservedWithConcurrentEdit",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "C",
+            "updatedAt": 1794873580000
+          }
+        ],
+        "tombstones": []
+      },
+      "remotes": [
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "tag": "仕事",
+                "text": "A",
+                "updatedAt": 1794873590000
+              }
+            ],
+            "tombstones": []
+          }
+        },
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "baseHash": "d99bf975fe8ae7faa6444f9140bb8636cdb89476c3c7c7e92661d54be14c426f",
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "tag": "仕事",
+                "text": "D",
+                "updatedAt": 1794873585000
               }
             ],
             "tombstones": []

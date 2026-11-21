@@ -234,6 +234,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     private TemplateSyncItem? pendingUndoTemplate;
     private EditorMode editorMode = EditorMode.None;
     private Guid? editingTemplateId;
+    private TemplateSyncItem? editingOriginalTemplate;
     private string? renamingOldTag;
 
     public HistoryWindow(Action<string> log, Func<bool> pasteOnSelect,
@@ -864,6 +865,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         {
             editorMode = EditorMode.CreateTemplate;
             editingTemplateId = null;
+            editingOriginalTemplate = null;
             EditorTitleText.Text = "テンプレートを追加";
             TemplateNameBox.Text = "";
             TemplateTagBox.Text = presetTag ?? "";
@@ -873,6 +875,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         {
             editorMode = EditorMode.EditTemplate;
             editingTemplateId = existing.Id;
+            editingOriginalTemplate = existing;
             EditorTitleText.Text = "テンプレートを編集";
             TemplateNameBox.Text = existing.Title ?? "";
             TemplateTagBox.Text = existing.Tag ?? "";
@@ -891,6 +894,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
         ClearEditorError();
         editorMode = EditorMode.RenameTag;
         editingTemplateId = null;
+        editingOriginalTemplate = null;
         renamingOldTag = currentTag;
         EditorTitleText.Text = currentTag is null ? "タグを付ける" : "タグ名を変更";
         RenameTagBox.Text = currentTag ?? "";
@@ -906,6 +910,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
     {
         editorMode = EditorMode.None;
         editingTemplateId = null;
+        editingOriginalTemplate = null;
         renamingOldTag = null;
         savingEditor = false;
         ClearEditorError();
@@ -956,7 +961,7 @@ public partial class HistoryWindow : Window, IHistoryPresenter
             var name = TemplateNameBox.Text;
             var tag = TemplateTagBox.Text;
             var result = editorMode == EditorMode.EditTemplate && editingTemplateId is Guid editId
-                ? await current.UpdateTemplateAsync(editId, body, name, tag)
+                ? await current.UpdateTemplateAsync(editId, body, name, tag, editingOriginalTemplate)
                 : await current.CreateTemplateAsync(body, name, tag);
 
             if (!result.Succeeded)
@@ -970,7 +975,10 @@ public partial class HistoryWindow : Window, IHistoryPresenter
                 EnsureGroupExpanded(saved.Tag);
                 preferredTemplateId = saved.Id;
             }
+            var hadConflictCopy = result.ConflictCopy is not null;
             CloseEditor();
+            if (hadConflictCopy && IsVisible)
+                ShowNotice("別の端末で更新された本文を「その他」に残しました", isWarning: true, showUndo: false, durationMs: 4200);
         }
         catch (Exception ex)
         {

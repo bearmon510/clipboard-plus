@@ -22,7 +22,8 @@ public enum TemplateEditError
 public sealed record TemplateEditResult(
     bool Succeeded,
     TemplateEditError Error = TemplateEditError.None,
-    TemplateSyncItem? Item = null)
+    TemplateSyncItem? Item = null,
+    TemplateSyncItem? ConflictCopy = null)
 {
     public string? ErrorMessage => Error switch
     {
@@ -205,43 +206,93 @@ public sealed class TemplateRepository
         return new TemplateEditResult(true, TemplateEditError.None, Get(created.Id));
     }
 
-    public TemplateEditResult Update(Guid id, string text, string? title, string? tag, long nowMillis)
+    public TemplateEditResult Update(Guid id, string text, string? title, string? tag, long nowMillis, TemplateSyncItem? expectedOriginal = null)
     {
         var index = state.Templates.FindIndex(t => t.Id == id);
         if (index < 0)
             return new TemplateEditResult(false, TemplateEditError.NotFound);
 
-        var normalizedText = text is null ? "" : TemplateSyncMerge.NormalizeLineEndings(text);
-        var validationError = ValidateWritableText(normalizedText);
+        var normalizedInputText = text is null ? "" : TemplateSyncMerge.NormalizeLineEndings(text);
+        var validationError = ValidateWritableText(normalizedInputText);
         if (validationError != TemplateEditError.None)
             return new TemplateEditResult(false, validationError);
 
-        if (state.Templates.Any(t => t.Id != id && string.Equals(TemplateSyncMerge.NormalizeLineEndings(t.Text), normalizedText, StringComparison.Ordinal)))
+        var existing = state.Templates[index];
+        var existingNormText = TemplateSyncMerge.NormalizeLineEndings(existing.Text);
+        var inputTitle = SanitizeTitle(title);
+        var inputTag = SanitizeTag(tag);
+
+        string finalText;
+        string? finalTitle;
+        string? finalTag;
+        TemplateSyncItem? displacedConflict = null;
+
+        if (expectedOriginal is not null && expectedOriginal.Id == id)
+        {
+            var origNormText = TemplateSyncMerge.NormalizeLineEndings(expectedOriginal.Text);
+            var origTitle = SanitizeTitle(expectedOriginal.Title);
+            var origTag = SanitizeTag(expectedOriginal.Tag);
+
+            var userEditedText = !string.Equals(normalizedInputText, origNormText, StringComparison.Ordinal);
+            var userEditedTitle = !string.Equals(inputTitle, origTitle, StringComparison.Ordinal);
+            var userEditedTag = !string.Equals(inputTag, origTag, StringComparison.Ordinal);
+            var concurrentTextChanged = !string.Equals(existingNormText, origNormText, StringComparison.Ordinal);
+
+            if (!userEditedText)
+            {
+                // Title/tag-only save from an open editor must preserve the latest synced body.
+                finalText = existingNormText;
+            }
+            else
+            {
+                finalText = normalizedInputText;
+                if (concurrentTextChanged && !string.Equals(normalizedInputText, existingNormText, StringComparison.Ordinal))
+                {
+                    // Both sides edited the body concurrently: keep this edit in place and save
+                    // the displaced synced body as a separate copy in 「その他」.
+                    if (state.Templates.Count >= SyncProtocol.MaxTemplates)
+                        return new TemplateEditResult(false, TemplateEditError.LimitExceeded);
+                    displacedConflict = existing;
+                }
+            }
+            finalTitle = userEditedTitle ? inputTitle : existing.Title;
+            finalTag = userEditedTag ? inputTag : existing.Tag;
+        }
+        else
+        {
+            finalText = normalizedInputText;
+            finalTitle = inputTitle;
+            finalTag = inputTag;
+        }
+
+        var finalValidationError = ValidateWritableText(finalText);
+        if (finalValidationError != TemplateEditError.None)
+            return new TemplateEditResult(false, finalValidationError);
+
+        if (state.Templates.Any(t => t.Id != id && string.Equals(TemplateSyncMerge.NormalizeLineEndings(t.Text), finalText, StringComparison.Ordinal)))
             return new TemplateEditResult(false, TemplateEditError.Duplicate);
 
-        var existing = state.Templates[index];
-        var normTitle = SanitizeTitle(title);
-        var normTag = SanitizeTag(tag);
-        var newKind = ClassifyKind(normalizedText);
+        var newKind = ClassifyKind(finalText);
 
-        if (existing.Kind == newKind &&
-            string.Equals(existing.Text, normalizedText, StringComparison.Ordinal) &&
-            string.Equals(existing.Title, normTitle, StringComparison.Ordinal) &&
-            string.Equals(existing.Tag, normTag, StringComparison.Ordinal))
+        if (displacedConflict is null &&
+            existing.Kind == newKind &&
+            string.Equals(existing.Text, finalText, StringComparison.Ordinal) &&
+            string.Equals(existing.Title, finalTitle, StringComparison.Ordinal) &&
+            string.Equals(existing.Tag, finalTag, StringComparison.Ordinal))
         {
             return new TemplateEditResult(true, TemplateEditError.None, existing);
         }
 
         var updatedAt = TemplateSyncMerge.NextUpdatedAt(nowMillis, existing.UpdatedAt);
-        var tagChanged = !string.Equals(existing.Tag, normTag, StringComparison.Ordinal);
-        var newOrder = tagChanged ? GetGroupOrdered(normTag).Count : existing.Order;
+        var tagChanged = !string.Equals(existing.Tag, finalTag, StringComparison.Ordinal);
+        var newOrder = tagChanged ? GetGroupOrdered(finalTag).Count : existing.Order;
 
         var updated = existing with
         {
             Kind = newKind,
-            Text = normalizedText,
-            Title = normTitle,
-            Tag = normTag,
+            Text = finalText,
+            Title = finalTitle,
+            Tag = finalTag,
             Order = newOrder,
             UpdatedAt = updatedAt,
             BaseHash = null,
@@ -251,10 +302,28 @@ public sealed class TemplateRepository
         if (tagChanged)
         {
             RenumberGroup(existing.Tag);
-            RenumberGroup(normTag);
+            RenumberGroup(finalTag);
         }
+
+        TemplateSyncItem? createdCopy = null;
+        if (displacedConflict is not null)
+        {
+            var copyText = TemplateSyncMerge.NormalizeLineEndings(displacedConflict.Text);
+            var copy = new TemplateSyncItem(
+                Guid.NewGuid(),
+                ClassifyKind(copyText),
+                copyText,
+                TemplateSyncMerge.MakeConflictTitle(displacedConflict.Title),
+                null,
+                GetGroupOrdered(null).Count,
+                displacedConflict.UpdatedAt);
+            state.Templates.Add(copy);
+            RenumberGroup(null);
+            createdCopy = Get(copy.Id);
+        }
+
         Save();
-        return new TemplateEditResult(true, TemplateEditError.None, Get(id));
+        return new TemplateEditResult(true, TemplateEditError.None, Get(id), createdCopy);
     }
 
     public TemplateDeleteResult Delete(Guid id, long nowMillis)
@@ -410,6 +479,7 @@ public sealed class TemplateRepository
         if (tombstones.Count > SyncProtocol.MaxTemplateTombstones) throw new SyncProtocolException(SyncError.Limit);
 
         var nextTemplates = new List<TemplateSyncItem>(templates.Count + preservedLocal.Count);
+        var protectedIds = preservedLocal.Select(p => p.Id).ToHashSet();
         var activeIds = new HashSet<Guid>();
         var activeTexts = new HashSet<string>(StringComparer.Ordinal);
         var untaggedNextOrder = 0;
@@ -417,6 +487,8 @@ public sealed class TemplateRepository
 
         foreach (var item in templates)
         {
+            if (protectedIds.Contains(item.Id))
+                continue;
             var clean = item with
             {
                 Title = SanitizeTitle(item.Title),
@@ -426,7 +498,7 @@ public sealed class TemplateRepository
             TemplateSyncMessageCodec.ValidateItem(clean, allowBaseHash: false);
             nextTemplates.Add(clean);
             activeIds.Add(clean.Id);
-            activeTexts.Add(clean.Text);
+            activeTexts.Add(TemplateSyncMerge.NormalizeLineEndings(clean.Text));
             if (clean.Tag is null)
             {
                 if (clean.Order >= untaggedNextOrder)
@@ -446,7 +518,8 @@ public sealed class TemplateRepository
             {
                 var cleanTitle = SanitizeTitle(item.Title);
                 var cleanTag = SanitizeTag(item.Tag);
-                if (activeIds.Contains(item.Id) || activeTexts.Contains(item.Text))
+                var normText = TemplateSyncMerge.NormalizeLineEndings(item.Text);
+                if (activeIds.Contains(item.Id) || activeTexts.Contains(normText))
                     continue;
                 if (nextTemplates.Count >= SyncProtocol.MaxTemplates)
                     throw new SyncProtocolException(SyncError.Limit);
@@ -472,7 +545,7 @@ public sealed class TemplateRepository
                 TemplateSyncMessageCodec.ValidateItem(clean, allowBaseHash: false);
                 nextTemplates.Add(clean);
                 activeIds.Add(clean.Id);
-                activeTexts.Add(clean.Text);
+                activeTexts.Add(normText);
             }
         }
 

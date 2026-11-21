@@ -397,4 +397,74 @@ public sealed class TemplateRepositoryTests : IDisposable
         Assert.True(restored.Succeeded);
         Assert.Equal("復元1\n復元2", restored.Item!.Text);
     }
+
+    [Fact]
+    public void ApplyMergedProtectsPreservedLocalIdFromStaleIncomingOverwrite()
+    {
+        const long t0 = 1_794_873_600_000;
+        var repo = new TemplateRepository(root);
+
+        var sharedId = Guid.NewGuid();
+        var preservedLocal = new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "PC編集済みの対象外本文", "PC題", "仕事", 0, t0 + 50);
+        var staleIncoming = new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "iPadから返った旧版本文", "旧題", "仕事", 0, t0);
+        var normalIncoming = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "通常項目", null, null, 0, t0 + 10);
+
+        var saved = repo.ApplyMerged([staleIncoming, normalIncoming], [], [preservedLocal]);
+        Assert.Equal(2, saved.Count);
+        var kept = Assert.Single(saved, t => t.Id == sharedId);
+        Assert.Equal("PC編集済みの対象外本文", kept.Text);
+        Assert.Equal("PC題", kept.Title);
+        Assert.Equal("PC編集済みの対象外本文", repo.Get(sharedId)!.Text);
+    }
+
+    [Fact]
+    public void UpdateWithExpectedOriginalPreservesConcurrentBodyOnTitleOnlyEditAndKeepsBothOnBodyConflict()
+    {
+        const long t0 = 1_794_873_600_000;
+        var repo = new TemplateRepository(root);
+
+        var initial = repo.Create("本文A", "旧題", "仕事", t0).Item!;
+        var openedAtA = repo.Get(initial.Id)!;
+
+        // Peer sync updates the template body from A to B while the editor is open.
+        repo.ApplyMerged([initial with { Text = "本文B", UpdatedAt = t0 + 100 }], []);
+
+        // 1. Title-only save from stale editor keeps latest synced body B.
+        var titleOnly = repo.Update(initial.Id, "本文A", "新しい名前", "仕事", t0 + 200, expectedOriginal: openedAtA);
+        Assert.True(titleOnly.Succeeded);
+        Assert.Null(titleOnly.ConflictCopy);
+        Assert.Equal("本文B", titleOnly.Item!.Text);
+        Assert.Equal("新しい名前", titleOnly.Item.Title);
+        Assert.Equal("仕事", titleOnly.Item.Tag);
+        Assert.Equal(1, repo.Count);
+
+        // 2. Body edit from stale editor when peer also changed body B -> C keeps both (PC edit in original tag, peer C in その他).
+        var openedAtB = repo.Get(initial.Id)!;
+        repo.ApplyMerged([openedAtB with { Text = "本文C", UpdatedAt = t0 + 300 }], []);
+
+        var bodyConflict = repo.Update(initial.Id, "本文B_PC編集", "PC側の題", "仕事", t0 + 400, expectedOriginal: openedAtB);
+        Assert.True(bodyConflict.Succeeded);
+        Assert.Equal("本文B_PC編集", bodyConflict.Item!.Text);
+        Assert.Equal("PC側の題", bodyConflict.Item.Title);
+        Assert.Equal("仕事", bodyConflict.Item.Tag);
+        Assert.NotNull(bodyConflict.ConflictCopy);
+        Assert.Equal("本文C", bodyConflict.ConflictCopy!.Text);
+        Assert.Null(bodyConflict.ConflictCopy.Tag);
+        Assert.Equal(2, repo.Count);
+
+        // 3. Body conflict at the 300-template limit refuses save instead of silently dropping peer's body.
+        for (var i = 2; i < SyncProtocol.MaxTemplates; i++)
+            Assert.True(repo.Create($"filler-{i}", null, null, t0 + 500 + i).Succeeded);
+        Assert.Equal(SyncProtocol.MaxTemplates, repo.Count);
+
+        var openedAtFull = repo.Get(initial.Id)!;
+        var allCurrent = repo.GetState().Templates.Select(t =>
+            t.Id == initial.Id ? t with { Text = "本文D_相手更新", UpdatedAt = t0 + 2000 } : t).ToArray();
+        repo.ApplyMerged(allCurrent, []);
+
+        var fullConflict = repo.Update(initial.Id, "本文D_PC編集", "PC側の題", "仕事", t0 + 2100, expectedOriginal: openedAtFull);
+        Assert.False(fullConflict.Succeeded);
+        Assert.Equal(TemplateEditError.LimitExceeded, fullConflict.Error);
+        Assert.Equal("本文D_相手更新", repo.Get(initial.Id)!.Text);
+    }
 }

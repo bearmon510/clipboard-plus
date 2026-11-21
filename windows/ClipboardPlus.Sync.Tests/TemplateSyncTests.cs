@@ -339,4 +339,111 @@ public sealed class TemplateSyncTests
         Assert.Equal("仕事", kept.Tag);
         Assert.Equal(1, merged.SubsumedDuplicateCount);
     }
+
+    [Fact]
+    public void ThreeDeviceMergePreservesIndependentRemoteVersionEvenWhenOtherDeviceEditedSameBaseHash()
+    {
+        const long now = 1_794_873_600_000;
+        var sharedId = Guid.NewGuid();
+        var hA = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "A", null, "仕事");
+
+        // PC edited A -> C; iPad wrote back to A mid-sync (independent version with BaseHash = null);
+        // iPhone concurrently edited A -> D (BaseHash = H(A)). All three texts must survive.
+        var pcState = new TemplateSyncState([
+            new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "C", null, "仕事", 0, now - 20_000),
+        ], []);
+        var iPadIndependent = new TemplateSyncRemoteState(
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "A", null, "仕事", 0, now - 10_000, null)], []),
+            now);
+        var iPhoneEdited = new TemplateSyncRemoteState(
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "D", null, "仕事", 0, now - 15_000, hA)], []),
+            now);
+
+        foreach (var order in new[] { new[] { iPadIndependent, iPhoneEdited }, new[] { iPhoneEdited, iPadIndependent } })
+        {
+            var merged = TemplateSyncMerge.MergeAll(pcState, order, now);
+            Assert.Equal(3, merged.Templates.Count);
+            Assert.Contains(merged.Templates, t => t.Id == sharedId && t.Text == "A" && t.Tag == "仕事");
+            Assert.Contains(merged.Templates, t => t.Text == "C" && t.Tag is null);
+            Assert.Contains(merged.Templates, t => t.Text == "D" && t.Tag is null);
+        }
+    }
+
+    [Fact]
+    public void DeletedItemDoesNotResurrectAfter181DaysOr1000TombstoneCapForUneditedDeviceButKeepsEdit()
+    {
+        const long now = 1_794_873_600_000;
+        var idUnedited = Guid.NewGuid();
+        var idEdited = Guid.NewGuid();
+        var hUnedited = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "削除済みの未編集項目", null, null);
+        var hOriginal = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "削除済みの元項目", null, null);
+
+        // 1. After 181 days, PC's tombstones expired and were pruned; unedited item must NOT resurrect,
+        //    while an offline-edited item MUST survive.
+        var pcAfter181Days = new TemplateSyncState([], [
+            new TemplateSyncTombstone(idUnedited, now - SyncProtocol.TemplateTombstoneLifetimeMillis - 86_400_000, hUnedited),
+            new TemplateSyncTombstone(idEdited, now - SyncProtocol.TemplateTombstoneLifetimeMillis - 86_400_000, hOriginal),
+        ]);
+        var remoteAfter181Days = new TemplateSyncState([
+            new TemplateSyncItem(idUnedited, TemplateSyncKind.Text, "削除済みの未編集項目", null, null, 0, now - 200L * 86_400_000, hUnedited),
+            new TemplateSyncItem(idEdited, TemplateSyncKind.Text, "オフラインで書き換えた本文", null, null, 1, now - 10_000, hOriginal),
+        ], []);
+
+        var merged181 = TemplateSyncMerge.Merge(pcAfter181Days, remoteAfter181Days, now, now);
+        var survivor = Assert.Single(merged181.Templates);
+        Assert.Equal(idEdited, survivor.Id);
+        Assert.Equal("オフラインで書き換えた本文", survivor.Text);
+        Assert.Equal(1, merged181.RemoteChanges.Deleted);
+
+        // 2. After 1,000 newer tombstones evict idUnedited's tombstone from PC, unedited item still must NOT resurrect.
+        var newer1000Tombs = Enumerable.Range(0, SyncProtocol.MaxTemplateTombstones)
+            .Select(i => new TemplateSyncTombstone(Guid.NewGuid(), now - 10_000 + i))
+            .ToArray();
+        var mergedEvicted = TemplateSyncMerge.Merge(
+            new TemplateSyncState([], newer1000Tombs),
+            new TemplateSyncState([
+                new TemplateSyncItem(idUnedited, TemplateSyncKind.Text, "削除済みの未編集項目", null, null, 0, now - 50_000, hUnedited),
+            ], []),
+            now,
+            now);
+        Assert.Empty(mergedEvicted.Templates);
+        Assert.Equal(1, mergedEvicted.RemoteChanges.Deleted);
+    }
+
+    [Fact]
+    public void EditedConflictCopyIsNotDuplicatedWhenRemoteResendsLoser()
+    {
+        const long now = 1_794_873_600_000;
+        var sharedId = Guid.NewGuid();
+        var hA = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "A", "題", "仕事");
+
+        // 1. Initial conflict: PC has C, remote has B (baseHash = H(A)).
+        var first = TemplateSyncMerge.Merge(
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "C", "題", "仕事", 0, now - 10_000)], []),
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "B", "題", "仕事", 0, now - 20_000, hA)], []),
+            now,
+            now);
+        Assert.Equal(1, first.ConflictCopyCount);
+        var copy = Assert.Single(first.Templates, t => t.Id != sharedId);
+        Assert.Equal("B", copy.Text);
+
+        // 2. Disconnect before remote receives reply; PC edits conflict copy B -> B2.
+        var editedCopy = copy with { Text = "B2", UpdatedAt = now + 5_000 };
+        var pcAfterEdit = new TemplateSyncState([
+            first.Templates.Single(t => t.Id == sharedId),
+            editedCopy,
+        ], first.Tombstones);
+
+        // 3. Remote resends B (baseHash = H(A)) -> B2 stays, NO second copy of B is created!
+        var second = TemplateSyncMerge.Merge(
+            pcAfterEdit,
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "B", "題", "仕事", 0, now - 20_000, hA)], []),
+            now + 10_000,
+            now + 10_000);
+        Assert.Equal(0, second.ConflictCopyCount);
+        Assert.Equal(2, second.Templates.Count);
+        Assert.Contains(second.Templates, t => t.Id == sharedId && t.Text == "C");
+        Assert.Contains(second.Templates, t => t.Id == copy.Id && t.Text == "B2");
+        Assert.DoesNotContain(second.Templates, t => t.Text == "B");
+    }
 }

@@ -101,4 +101,46 @@ final class LogLineFormatterTests: XCTestCase {
         XCTAssertFalse(LogLineFormatter(timeZone: fixedZone).format(value, sessionID: "session\tID", eventNumber: 1)
             .contains("session\tID"))
     }
+
+    func testPreviewIsOmittedForSelfCopyAndSelfCopyReadbackEvents() {
+        let selfCopy = MeasurementEvent(
+            timestamp: Date(timeIntervalSince1970: 0.123),
+            kind: "自己コピー",
+            changeCount: 10,
+            scene: "active",
+            characterCount: 12,
+            historyNumber: 3,
+            details: "読み書き前changeCount=9; 書き込み後changeCount=10",
+            text: "PC同期テンプレートの秘密本文"
+        )
+        let selfCopyLine = format(selfCopy, preview: true)
+        XCTAssertFalse(selfCopyLine.contains("PC同期テンプレート"))
+        XCTAssertFalse(selfCopyLine.contains("冒頭20文字="))
+        XCTAssertEqual(selfCopyLine.components(separatedBy: "\t").count, 9)
+
+        let readback = MeasurementEvent(
+            timestamp: Date(timeIntervalSince1970: 0.124),
+            kind: "読み取り成功",
+            changeCount: 10,
+            scene: "active",
+            characterCount: 12,
+            details: "取得元=自己コピー後の確認; 読み取り前changeCount=10; 読み取り後changeCount=10",
+            text: "PC同期テンプレートの秘密本文"
+        )
+        let readbackLine = format(readback, preview: true)
+        XCTAssertFalse(readbackLine.contains("PC同期テンプレート"))
+        XCTAssertFalse(readbackLine.contains("冒頭20文字="))
+        XCTAssertEqual(readbackLine.components(separatedBy: "\t").count, 9)
+
+        let skippedReadback = MeasurementEvent(
+            timestamp: Date(timeIntervalSince1970: 0.124),
+            kind: "追加の見送り",
+            changeCount: 10,
+            scene: "active",
+            characterCount: 12,
+            details: "取得元=自己コピー後の確認; 理由=アプリ内の自己コピー",
+            text: "PC同期テンプレートの秘密本文"
+        )
+        XCTAssertFalse(format(skippedReadback, preview: true).contains("PC同期テンプレート"))
+    }
 }
