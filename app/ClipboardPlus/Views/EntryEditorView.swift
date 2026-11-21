@@ -88,7 +88,7 @@ struct EntryEditorView: View {
                             }
                         if !tags.isEmpty || !tag.isEmpty {
                             Menu {
-                                ForEach(tags, id: \.self) { value in
+                                ForEach(Array(tags.enumerated()), id: \.offset) { _, value in
                                     Button(value) { tag = value }
                                 }
                                 if !tag.isEmpty {

@@ -306,4 +306,83 @@ final class TemplateSyncTests: XCTestCase {
         XCTAssertTrue(preparedDirty.state.tombstones.isEmpty)
         XCTAssertEqual(preparedDirty.excludedTemplateCount, 2)
     }
+
+    func testThreeDeviceMergeAllDeleteDoesNotResurrectStaleUneditedVersionAndKeepsConcurrentEdit() throws {
+        let now: Int64 = 1_794_873_600_000
+        let sharedId = UUID()
+        let hV1 = TemplateSyncMerge.contentHash(kind: .text, text: "v1", title: "題", tag: "仕事")
+        let hV2 = TemplateSyncMerge.contentHash(kind: .text, text: "v2", title: "題", tag: "仕事")
+
+        let pcState = TemplateSyncState(
+            templates: [TemplateSyncItem(id: sharedId, kind: .text, text: "v2", title: "題", tag: "仕事", order: 0, updatedAt: now - 10_000)],
+            tombstones: []
+        )
+        let iPadDelete = TemplateSyncRemoteState(
+            state: TemplateSyncState(templates: [], tombstones: [TemplateSyncTombstone(id: sharedId, deletedAt: now - 5_000, baseHash: hV2)]),
+            sentAtMillis: now
+        )
+        let iPhoneStale = TemplateSyncRemoteState(
+            state: TemplateSyncState(
+                templates: [TemplateSyncItem(id: sharedId, kind: .text, text: "v1", title: "題", tag: "仕事", order: 0, updatedAt: now - 20_000, baseHash: hV1)],
+                tombstones: []
+            ),
+            sentAtMillis: now
+        )
+
+        for order in [[iPadDelete, iPhoneStale], [iPhoneStale, iPadDelete]] {
+            let merged = try TemplateSyncMerge.mergeAll(pc: pcState, remotes: order, nowMillis: now)
+            XCTAssertTrue(merged.templates.isEmpty)
+            XCTAssertEqual(merged.tombstones.map(\.id), [sharedId])
+            XCTAssertEqual(merged.pcChanges.deleted, 1)
+        }
+
+        let iPhoneEdited = TemplateSyncRemoteState(
+            state: TemplateSyncState(
+                templates: [TemplateSyncItem(id: sharedId, kind: .text, text: "v3-edited", title: "題", tag: "仕事", order: 0, updatedAt: now - 3_000, baseHash: hV1)],
+                tombstones: []
+            ),
+            sentAtMillis: now
+        )
+        for order in [[iPadDelete, iPhoneEdited], [iPhoneEdited, iPadDelete]] {
+            let merged = try TemplateSyncMerge.mergeAll(pc: pcState, remotes: order, nowMillis: now)
+            XCTAssertEqual(merged.templates.count, 1)
+            XCTAssertEqual(merged.templates.first?.id, sharedId)
+            XCTAssertEqual(merged.templates.first?.text, "v3-edited")
+            XCTAssertTrue(merged.tombstones.isEmpty)
+        }
+    }
+
+    func testLineEndingsNormalizeCrlfAndCrToLfPreservingUnicodeForms() throws {
+        let now: Int64 = 1_794_873_600_000
+        XCTAssertEqual(TemplateSyncMerge.normalizeLineEndings("a\r\nb\rc\r\n"), "a\nb\nc\n")
+        XCTAssertEqual(TemplateSyncMerge.normalizeLineEndings("plain"), "plain")
+        // Preserve distinct NFC / NFD UTF-8 byte sequences while normalizing CRLF -> LF.
+        let nfdCrlf = "cafe\u{0301}\r\nline2"
+        let nfdLf = TemplateSyncMerge.normalizeLineEndings(nfdCrlf)
+        XCTAssertEqual(Array(nfdLf.utf8), Array("cafe\u{0301}\nline2".utf8))
+        XCTAssertEqual(
+            TemplateSyncMerge.contentHash(kind: .text, text: "line1\nline2\nline3", title: "題", tag: "仕事"),
+            TemplateSyncMerge.contentHash(kind: .text, text: "line1\r\nline2\rline3", title: "題", tag: "仕事")
+        )
+
+        let pcId = UUID()
+        let iosId = UUID()
+        let merged = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(
+                templates: [TemplateSyncItem(id: pcId, kind: .text, text: "line1\r\nline2", title: "PC題", tag: nil, order: 0, updatedAt: now - 1_000)],
+                tombstones: []
+            ),
+            remote: TemplateSyncState(
+                templates: [TemplateSyncItem(id: iosId, kind: .text, text: "line1\nline2", title: nil, tag: "仕事", order: 0, updatedAt: now)],
+                tombstones: []
+            ),
+            nowMillis: now
+        )
+        XCTAssertEqual(merged.templates.count, 1)
+        XCTAssertEqual(merged.templates.first?.id, iosId)
+        XCTAssertEqual(merged.templates.first?.text, "line1\nline2")
+        XCTAssertEqual(merged.templates.first?.title, "PC題")
+        XCTAssertEqual(merged.templates.first?.tag, "仕事")
+        XCTAssertEqual(merged.subsumedDuplicateCount, 1)
+    }
 }

@@ -194,5 +194,25 @@ public sealed class TemplateWindowLogicTests
             ExcludedTemplateCount: 4));
         Assert.True(excludedNotice.IsWarning);
         Assert.Contains("4件は対象外", excludedNotice.Message);
+
+        var mixedCompleted = Notice(new TemplateSyncRunResult(
+            TemplateSyncRunStatus.Completed,
+            TargetDevices: 1,
+            SucceededDevices: 1,
+            RequiresPeerUpdate: true));
+        Assert.True(mixedCompleted.IsWarning);
+        Assert.Contains("更新が必要な端末があります", mixedCompleted.Message);
+
+        var mixedDisconnected = Notice(new TemplateSyncRunResult(
+            TemplateSyncRunStatus.Disconnected,
+            RequiresPeerUpdate: true));
+        Assert.True(mixedDisconnected.IsWarning);
+        Assert.Contains("更新が必要な端末があります", mixedDisconnected.Message);
+
+        var mixedTimedOut = Notice(new TemplateSyncRunResult(
+            TemplateSyncRunStatus.TimedOut,
+            RequiresPeerUpdate: true));
+        Assert.True(mixedTimedOut.IsWarning);
+        Assert.Contains("更新が必要な端末があります", mixedTimedOut.Message);
     }
 }

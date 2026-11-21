@@ -1161,7 +1161,7 @@ final class PCSyncController: ObservableObject {
                 entry.deadline = updated
             }
         }
-        if var active = activeTemplateSync, !active.isApplying {
+        if var active = activeTemplateSync, !active.isApplying, !active.awaitingSendCompletion {
             let tplCandidate = now.addingTimeInterval(Self.templateSyncTimeout)
             if active.reply.activeFrameToken != frameToken {
                 active.reply.baselineDeadline = active.reply.deadline
@@ -1232,7 +1232,9 @@ final class PCSyncController: ObservableObject {
         } else if sentAt.values.contains(where: { date > $0.deadline }) ||
                   (activeAttachment?.chunks.contains(where: { chunk in chunk.reply.map { date > $0.deadline } ?? false }) ?? false) {
             fail(reject: false, reason: "ack期限")
-        } else if let active = activeTemplateSync, !active.isApplying, date > active.reply.deadline {
+        } else if let active = activeTemplateSync, !active.isApplying,
+                  !(active.pushed != nil && active.awaitingSendCompletion),
+                  date > active.reply.deadline {
             let hasRemainingPages = templateOutgoing.contains { msg in
                 if case let .push(op, _, _, _) = msg { return op == active.op }
                 return false
@@ -1243,7 +1245,7 @@ final class PCSyncController: ObservableObject {
             activeTemplateSync = nil
             isSyncingTemplates = false
             if templateReception?.op == active.op { templateReception = nil }
-            if startedSendingThisOp && hasRemainingPages {
+            if output?.templatePushOp == active.op || (startedSendingThisOp && hasRemainingPages) {
                 fail(reject: false, reason: "テンプレート同期期限")
                 active.completion(.failure(.timedOut))
             } else {

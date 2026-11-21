@@ -373,4 +373,30 @@ final class HistoryBackupTests: XCTestCase {
             XCTAssertEqual(admission.receive(header + "payload"), .skip(reason: "このアプリが書き出した内容"))
         }
     }
+
+    func testBackupWriteAndValidateAcceptDivergedTextAndUrlKinds() throws {
+        let root = try ImageTestSupport.directory(self)
+        let dbURL = root.appendingPathComponent("diverged.sqlite")
+        let database = try HistoryDatabase(url: dbURL)
+        let base = try database.createTemplate(text: "https://example.com\n", title: "改行URL", tag: nil)
+        // Simulate an already-diverged row stored as kind='url' by an older PC sync.
+        try ImageTestSupport.sql("UPDATE history SET kind = 'url' WHERE id = \(base.id)", at: dbURL)
+        let entries = try database.fetchAll()
+        XCTAssertEqual(entries.first?.kind, .url)
+        XCTAssertEqual(HistoryKind.classify(try XCTUnwrap(entries.first?.text)), .text)
+
+        let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
+        let url = try write(entries, files: files, root: root)
+        let validated = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+        XCTAssertEqual(validated.entries.count, 1)
+        XCTAssertEqual(validated.entries.first?.kind, .url)
+        XCTAssertEqual(validated.entries.first?.text, "https://example.com\n")
+
+        let restoredDB = try HistoryDatabase(url: root.appendingPathComponent("restored.sqlite"))
+        let restoredFiles = HistoryImageFiles(directory: root.appendingPathComponent("restored-images"))
+        let counts = try HistoryRestore.apply(validated, database: restoredDB, files: restoredFiles, cancellation: BackupCancellation())
+        XCTAssertEqual(counts, RestoreCounts(added: 1))
+        XCTAssertEqual(try restoredDB.fetchAll().first?.text, "https://example.com\n")
+        waitForBackupCleanup()
+    }
 }

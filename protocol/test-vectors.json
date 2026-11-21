@@ -1857,6 +1857,91 @@
         ]
       },
       "remoteSentAtMillis": 1779235200000
+    },
+    {
+      "alsoCheckIdempotent": true,
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 1
+        },
+        "remoteChanges": {
+          "added": 1,
+          "deleted": 1,
+          "updated": 1
+        },
+        "subsumedDuplicateCount": 1,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "1行目\n2行目\n3行目",
+            "title": "PC複数行",
+            "updatedAt": 1794873580000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 0,
+            "text": "改行のみ編集\n後",
+            "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": [
+          {
+            "baseHash": "658b3cfcc00853d9f33144f828aa8efe69091b5b08cf54dc2d3c2b3eaf76c1e0",
+            "deletedAt": 1794873600000,
+            "id": "44444444-5555-4666-8777-888888888882"
+          }
+        ]
+      },
+      "name": "lineEndingCrlfAndCrNormalizedToLfAndDeduplicated",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "tag": "仕事",
+            "text": "1行目\r\n2行目\r3行目",
+            "title": "PC複数行",
+            "updatedAt": 1794873580000
+          },
+          {
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 1,
+            "text": "改行のみ編集\r\n後",
+            "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": []
+      },
+      "remote": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888882",
+            "kind": "text",
+            "order": 0,
+            "text": "1行目\n2行目\n3行目",
+            "updatedAt": 1794873570000
+          },
+          {
+            "baseHash": "c232e596facaaa4a67716e2c03b159da8100a891e24cbd571652753f87864bd9",
+            "id": "44444444-5555-4666-8777-888888888883",
+            "kind": "text",
+            "order": 1,
+            "text": "改行のみ編集\n後",
+            "updatedAt": 1794873590000
+          }
+        ],
+        "tombstones": []
+      }
     }
   ],
   "templateMultiMergeCases": [
@@ -2111,6 +2196,170 @@
         "tombstones": []
       },
       "remotes": []
+    },
+    {
+      "alsoCheckAllPermutations": true,
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 1,
+          "updated": 0
+        },
+        "remoteChanges": [
+          {
+            "added": 0,
+            "deleted": 0,
+            "updated": 0
+          },
+          {
+            "added": 0,
+            "deleted": 1,
+            "updated": 0
+          }
+        ],
+        "remoteClockSkewSeconds": [
+          null,
+          null
+        ],
+        "subsumedDuplicateCount": 0,
+        "templates": [],
+        "tombstones": [
+          {
+            "baseHash": "b21891189abfd903496cdeb869cd108d61d7ab13945894204b1a119620c68a14",
+            "deletedAt": 1794873590000,
+            "id": "44444444-5555-4666-8777-888888888881"
+          }
+        ]
+      },
+      "name": "multiDeviceThreeWayDeleteDoesNotResurrectStaleUneditedVersion",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "v2",
+            "updatedAt": 1794873550000
+          }
+        ],
+        "tombstones": []
+      },
+      "remotes": [
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [],
+            "tombstones": [
+              {
+                "baseHash": "b21891189abfd903496cdeb869cd108d61d7ab13945894204b1a119620c68a14",
+                "deletedAt": 1794873590000,
+                "id": "44444444-5555-4666-8777-888888888881"
+              }
+            ]
+          }
+        },
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "baseHash": "515bb4d9dba24e8cf7e9c42756996ef1d528e730346d3ab3a7c283df2b701b10",
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "text": "v1",
+                "updatedAt": 1794873500000
+              }
+            ],
+            "tombstones": []
+          }
+        }
+      ]
+    },
+    {
+      "alsoCheckAllPermutations": true,
+      "expected": {
+        "conflictCopyCount": 0,
+        "pcChanges": {
+          "added": 0,
+          "deleted": 0,
+          "updated": 1
+        },
+        "remoteChanges": [
+          {
+            "added": 1,
+            "deleted": 0,
+            "updated": 0
+          },
+          {
+            "added": 0,
+            "deleted": 0,
+            "updated": 0
+          }
+        ],
+        "remoteClockSkewSeconds": [
+          null,
+          null
+        ],
+        "subsumedDuplicateCount": 0,
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "v3-edited",
+            "updatedAt": 1794873580000
+          }
+        ],
+        "tombstones": []
+      },
+      "name": "multiDeviceThreeWayDeletePreservesConcurrentEditOnThirdDevice",
+      "nowMillis": 1794873600000,
+      "pc": {
+        "templates": [
+          {
+            "id": "44444444-5555-4666-8777-888888888881",
+            "kind": "text",
+            "order": 0,
+            "text": "v2",
+            "updatedAt": 1794873550000
+          }
+        ],
+        "tombstones": []
+      },
+      "remotes": [
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [],
+            "tombstones": [
+              {
+                "baseHash": "b21891189abfd903496cdeb869cd108d61d7ab13945894204b1a119620c68a14",
+                "deletedAt": 1794873590000,
+                "id": "44444444-5555-4666-8777-888888888881"
+              }
+            ]
+          }
+        },
+        {
+          "sentAtMillis": 1794873600000,
+          "state": {
+            "templates": [
+              {
+                "baseHash": "515bb4d9dba24e8cf7e9c42756996ef1d528e730346d3ab3a7c283df2b701b10",
+                "id": "44444444-5555-4666-8777-888888888881",
+                "kind": "text",
+                "order": 0,
+                "text": "v3-edited",
+                "updatedAt": 1794873580000
+              }
+            ],
+            "tombstones": []
+          }
+        }
+      ]
     }
   ],
   "templatePageSplitCases": [

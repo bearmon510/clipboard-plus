@@ -75,15 +75,37 @@ public static class TemplateSyncMerge
         return sb.ToString();
     }
 
+    public static string NormalizeLineEndings(string text)
+    {
+        SyncProtocol.Require(text is not null);
+        if (!text.Contains('\r')) return text;
+        var sb = new StringBuilder(text.Length);
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (c == '\r')
+            {
+                sb.Append('\n');
+                if (i + 1 < text.Length && text[i + 1] == '\n') i++;
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
+    }
+
     public static string ContentHash(TemplateSyncItem item) =>
         ContentHash(item.Kind, item.Text, item.Title, item.Tag);
 
     public static string ContentHash(TemplateSyncKind kind, string text, string? title, string? tag)
     {
         SyncProtocol.Require(text is not null);
+        var normText = NormalizeLineEndings(text);
         var normTitle = NormalizedTitle(title);
         var normTag = NormalizedTag(tag);
-        var bytes = TemplateCanonicalJson.SerializeContentHashInput(kind, text, normTitle, normTag);
+        var bytes = TemplateCanonicalJson.SerializeContentHashInput(kind, normText, normTitle, normTag);
         return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 
@@ -440,8 +462,10 @@ public static class TemplateSyncMerge
 
             if (tombs.Count > 0)
             {
+                var pcHasEntry = pcItems.TryGetValue(id, out var pcEntryForCheck);
+                var pcEntryKilledOrAbsent = !pcHasEntry || IsDirectlyKilledByTombstones(pcEntryForCheck!, pcTomb, tombs);
                 var remainingActive = activeEntries
-                    .Where(e => !IsKilledByTombstones(e, pcTomb, tombs))
+                    .Where(e => !IsKilledByTombstones(e, pcTomb, pcEntryKilledOrAbsent, tombs))
                     .ToList();
                 if (remainingActive.Count == 0)
                 {
@@ -556,15 +580,16 @@ public static class TemplateSyncMerge
     private static TemplateSyncItem NormalizeInputItem(TemplateSyncItem raw)
     {
         SyncProtocol.Require(raw is not null);
+        var text = NormalizeLineEndings(raw.Text);
         var title = NormalizedTitle(raw.Title);
         var tag = NormalizedTag(raw.Tag);
-        return raw with { Title = title, Tag = tag };
+        return raw with { Text = text, Title = title, Tag = tag };
     }
 
     private static bool IsExpiredTombstone(long deletedAt, long nowMillis) =>
         nowMillis - deletedAt > SyncProtocol.TemplateTombstoneLifetimeMillis;
 
-    private static bool IsKilledByTombstones(
+    private static bool IsDirectlyKilledByTombstones(
         NormalizedEntry entry,
         TemplateSyncTombstone? pcTomb,
         List<TemplateSyncTombstone> allTombs)
@@ -582,6 +607,19 @@ public static class TemplateSyncMerge
                 if (tomb.BaseHash is null) return true;
             }
         }
+        return false;
+    }
+
+    private static bool IsKilledByTombstones(
+        NormalizedEntry entry,
+        TemplateSyncTombstone? pcTomb,
+        bool pcEntryKilledOrAbsent,
+        List<TemplateSyncTombstone> allTombs)
+    {
+        if (IsDirectlyKilledByTombstones(entry, pcTomb, allTombs))
+            return true;
+        if (entry.Item.BaseHash is not null && entry.Item.BaseHash == entry.Hash && pcEntryKilledOrAbsent)
+            return true;
         return false;
     }
 

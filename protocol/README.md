@@ -8,7 +8,7 @@
 node protocol/make-test-vectors.mjs
 ```
 
-`test-vectors.json` はQR、版3のHELLO/WELCOME/AUTH、PC ID入り版違い応答（同一PC・版2／別PC・版2／旧全ゼロID）、両IDを含むHMAC（先頭バイト `0x03`）、方向別の鍵（`clipboardplus v3`）、12個の平文例、7個の暗号フレーム、20/182/512バイト分割、改ざん・巻き戻し・Cc制御文字名等の失敗例を持つ。さらに第3版としてテンプレート同期の7個の平文例（`tpl_pull` / `tpl_push` 単一・複数ページ・`order` 上限 `2147483647` / `tpl_state` / `tpl_ack`、日本語・改行・絵文字・`U+200D`・墓標入り）、6個の暗号フレーム、3段階パケット分割、各種失敗例（`order: 2147483648` 拒否を含む）、14個の2者間マージ例（`templateMergeCases`）、3個の複数端末一括マージ例（`templateMultiMergeCases`）、3個のページ分割境界例（`templatePageSplitCases`）、3個の同期対象選別例（`templatePrepareCases`）を持つ。大きい境界例（4MiB境界・64KiB本文・300件・1,000墓標・256KiBページ境界・240件実効上限など）は長さとパターンからテスト内で生成する。
+`test-vectors.json` はQR、版3のHELLO/WELCOME/AUTH、PC ID入り版違い応答（同一PC・版2／別PC・版2／旧全ゼロID）、両IDを含むHMAC（先頭バイト `0x03`）、方向別の鍵（`clipboardplus v3`）、12個の平文例、7個の暗号フレーム、20/182/512バイト分割、改ざん・巻き戻し・Cc制御文字名等の失敗例を持つ。さらに第3版としてテンプレート同期の7個の平文例（`tpl_pull` / `tpl_push` 単一・複数ページ・`order` 上限 `2147483647` / `tpl_state` / `tpl_ack`、日本語・改行・絵文字・`U+200D`・墓標入り）、6個の暗号フレーム、3段階パケット分割、各種失敗例（`order: 2147483648` 拒否を含む）、15個の2者間マージ例（`templateMergeCases`）、5個の複数端末一括マージ例（`templateMultiMergeCases`）、3個のページ分割境界例（`templatePageSplitCases`）、3個の同期対象選別例（`templatePrepareCases`）を持つ。大きい境界例（4MiB境界・64KiB本文・300件・1,000墓標・256KiBページ境界・240件実効上限など）は長さとパターンからテスト内で生成する。
 
 Swift/C#は同じJSONからQR、認証、版違い応答、HMAC、鍵、平文、暗号文、タグ、パケット、テンプレートメッセージとマージ結果の一致を検証する。期待値を製品実装自身から計算しない。失敗後の再利用禁止、厳格な構文（標準8-4-4-4-12 UUID表記を含む）、4MiBちょうどの境界も検証する。
 
@@ -31,7 +31,7 @@ Swiftのプロトコル型はFoundation/CryptoKitで動作する。状態を持�
 | TemplateSyncMessage | pull(op:)、push(op:part:total:page:)、state(op:part:total:page:)、ack(op:)（C#は `TemplateSyncPull` / `TemplateSyncPush` / `TemplateSyncStateMessage` / `TemplateSyncAck`）。見出しはASCII JSON、本体はUTF-8 JSON |
 | TemplateSyncMessageCodec | encode / decode、splitPages、`maxOrder = 2,147,483,647`。300件、墓標1,000件、本文64KiB、名前100文字/400B、タグ30文字/120B（`Cc`・改行不可）、`order` 上限2,147,483,647、ページ256KiB（継続空JSON 32B、バイト上限付き書き出し）・最大80ページ・合計20MiBを検証 |
 | TemplateSyncPageAssembler | append / finish。`tpl_push` / `tpl_state` の複数ページを連結し重複IDと合計上限を検証 |
-| TemplateSyncMerge | merge / mergeAll / prepareSyncState / contentHash / normalizedTitle / normalizedTag / nextUpdatedAt / clockSkewSeconds / makeConflictTitle。UTF-8バイト一致・`syncId`・`updatedAt`・`baseHash`・180日墓標（`sentAt` 換算と再送延長抑止）・削除済み衝突写しの再生成抑止・同一本文統合・複数端末一括マージ・実効上限超過項目の除外カウントを両言語共通で実装 |
+| TemplateSyncMerge | merge / mergeAll / prepareSyncState / contentHash / normalizeLineEndings / normalizedTitle / normalizedTag / nextUpdatedAt / clockSkewSeconds / makeConflictTitle。UTF-8バイト一致・改行LF正規化・`syncId`・`updatedAt`・`baseHash`・180日墓標（`sentAt` 換算と再送延長抑止）・削除済み衝突写しの再生成抑止・同一本文統合・複数端末一括マージ・実効上限超過項目の除外カウントを両言語共通で実装 |
 | SyncProtocol | version=3、maxItemBytes=10MiB、chunkBytes=32KiB、maxPending=100、pendingLifetime=24時間、テンプレート同期上限一式（300件、墓標1,000件/180日、本文64KiB、名前100文字/400B、タグ30文字/120B、ページ256KiB/80頁/20MiB）。既存フレーム・見出し・ack・時刻上限も維持 |
 | SyncProtocolError | format / limit / packet / state / authentication / identity / sequence / version |
 

@@ -32,10 +32,11 @@ public sealed record TemplateSyncRunResult(
     int RemoteChangesTotal = 0,
     int ConflictCopyCount = 0,
     long? ClockSkewSeconds = null,
-    int ExcludedTemplateCount = 0)
+    int ExcludedTemplateCount = 0,
+    bool RequiresPeerUpdate = false)
 {
     public static TemplateSyncRunResult NoConnectedDevicesResult() => new(TemplateSyncRunStatus.NoConnectedDevices);
-    public static TemplateSyncRunResult PeerUpdateRequiredResult() => new(TemplateSyncRunStatus.PeerUpdateRequired);
+    public static TemplateSyncRunResult PeerUpdateRequiredResult() => new(TemplateSyncRunStatus.PeerUpdateRequired, RequiresPeerUpdate: true);
     public static TemplateSyncRunResult AlreadyInProgressResult() => new(TemplateSyncRunStatus.AlreadyInProgress);
     public static TemplateSyncRunResult StoppedResult() => new(TemplateSyncRunStatus.Stopped);
     public static TemplateSyncRunResult LimitExceededResult() => new(TemplateSyncRunStatus.LimitExceeded);
@@ -213,17 +214,21 @@ public static class TemplateWindowLogic
             case TemplateSyncRunStatus.LimitExceeded:
                 return new TemplateSyncNotice("テンプレートが300件の上限を超えるため同期できませんでした", IsWarning: true);
             case TemplateSyncRunStatus.Disconnected:
-                return new TemplateSyncNotice(
-                    result.PcSaved
+                {
+                    var text = result.PcSaved
                         ? "PCへ保存しましたが、端末との接続が途中で切れました"
-                        : "端末との接続が途中で切れました",
-                    IsWarning: true);
+                        : "端末との接続が途中で切れました";
+                    if (result.RequiresPeerUpdate) text += "　更新が必要な端末があります";
+                    return new TemplateSyncNotice(text, IsWarning: true);
+                }
             case TemplateSyncRunStatus.TimedOut:
-                return new TemplateSyncNotice(
-                    result.PcSaved
+                {
+                    var text = result.PcSaved
                         ? "PCへ保存しましたが、端末からの応答が時間切れになりました"
-                        : "端末からの応答が時間切れになりました",
-                    IsWarning: true);
+                        : "端末からの応答が時間切れになりました";
+                    if (result.RequiresPeerUpdate) text += "　更新が必要な端末があります";
+                    return new TemplateSyncNotice(text, IsWarning: true);
+                }
             case TemplateSyncRunStatus.Completed:
                 break;
             default:
@@ -258,13 +263,15 @@ public static class TemplateWindowLogic
             suffixes.Add($"上限超 {result.ExcludedTemplateCount}件は対象外");
         if (result.FailedDevices > 0)
             suffixes.Add($"（{result.SucceededDevices}台完了・{result.FailedDevices}台は未完了）");
+        if (result.RequiresPeerUpdate)
+            suffixes.Add("更新が必要な端末があります");
         if (result.ClockSkewSeconds is not null)
             suffixes.Add("※端末の時計がずれています");
 
         var message = suffixes.Count == 0
             ? main
             : $"{main}　{string.Join("　", suffixes)}";
-        var isWarning = result.FailedDevices > 0 || result.ClockSkewSeconds is not null || result.ExcludedTemplateCount > 0;
+        var isWarning = result.FailedDevices > 0 || result.ClockSkewSeconds is not null || result.ExcludedTemplateCount > 0 || result.RequiresPeerUpdate;
         return new TemplateSyncNotice(message, isWarning);
     }
 }

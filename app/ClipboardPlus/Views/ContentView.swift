@@ -14,11 +14,11 @@ struct ContentView: View {
     @State private var confirmHistoryClear = false
     @State private var searchText: String
     @State private var pane: Pane
-    /// Template groups the user opened, by group id.
-    @State private var openTags: Set<String> = []
+    /// Template groups the user opened, by UTF-8 tag bytes (empty Data for "その他").
+    @State private var openTags: Set<Data> = []
     /// Groups the user closed while they would otherwise show open: a lone group, or any group
     /// during a search.
-    @State private var closedTags: Set<String> = []
+    @State private var closedTags: Set<Data> = []
     @State private var reorderGroup: TemplateGroup?
     @State private var renamingGroup: TemplateGroup?
     @State private var tagDraft = ""
@@ -62,7 +62,7 @@ struct ContentView: View {
         _screenshots = StateObject(wrappedValue: ScreenshotWatcher(log: log))
         _searchText = State(initialValue: initialSearch)
         _pane = State(initialValue: initialPane)
-        _openTags = State(initialValue: initialOpenTags)
+        _openTags = State(initialValue: Set(initialOpenTags.map { Data($0.utf8) }))
     }
 
     private var device: DeviceKind { deviceOverride ?? .current }
@@ -463,7 +463,7 @@ struct ContentView: View {
             templateEmptyState
         } else {
             LazyVStack(alignment: .leading, spacing: 10) {
-                ForEach(groups) { group in
+                ForEach(groups, id: \.tagKey) { group in
                     let open = isOpen(group, groupCount: groups.count)
                     templateHeader(group, isOpen: open, groupCount: groups.count)
                     if open {
@@ -536,15 +536,21 @@ struct ContentView: View {
     /// Either way, tapping the header opens or closes it.
     private func startsOpen(groupCount: Int) -> Bool { groupCount == 1 || !query.isEmpty }
 
+    private func groupKey(_ group: TemplateGroup) -> Data {
+        group.tagKey ?? Data()
+    }
+
     private func isOpen(_ group: TemplateGroup, groupCount: Int) -> Bool {
-        startsOpen(groupCount: groupCount) ? !closedTags.contains(group.id) : openTags.contains(group.id)
+        let key = groupKey(group)
+        return startsOpen(groupCount: groupCount) ? !closedTags.contains(key) : openTags.contains(key)
     }
 
     private func toggle(_ group: TemplateGroup, groupCount: Int) {
+        let key = groupKey(group)
         if startsOpen(groupCount: groupCount) {
-            if closedTags.contains(group.id) { closedTags.remove(group.id) } else { closedTags.insert(group.id) }
+            if closedTags.contains(key) { closedTags.remove(key) } else { closedTags.insert(key) }
         } else {
-            if openTags.contains(group.id) { openTags.remove(group.id) } else { openTags.insert(group.id) }
+            if openTags.contains(key) { openTags.remove(key) } else { openTags.insert(key) }
         }
     }
 
@@ -584,7 +590,7 @@ struct ContentView: View {
                 Button("このタグで書く", systemImage: "square.and.pencil") { editor = .create(tag: group.tag) }
                 // The whole group, even while a search hides part of it.
                 let whole = query.isEmpty ? group
-                    : TemplateGroups.make(monitor.entries, search: "").first(where: { $0.id == group.id }) ?? group
+                    : TemplateGroups.make(monitor.entries, search: "").first(where: { $0.tagKey == group.tagKey }) ?? group
                 if whole.entries.count > 1 {
                     Button("並べ替え", systemImage: "arrow.up.arrow.down") { reorderGroup = whole }
                 }
@@ -611,10 +617,11 @@ struct ContentView: View {
     private func renameTag(_ group: TemplateGroup) {
         let newTag = HistoryEntry.normalizedTag(tagDraft)
         monitor.renameTag(group.tag, to: newTag)
-        // Keeps the renamed group open or closed as it was. The id matches TemplateGroup.id.
-        let newID = newTag ?? ""
-        if openTags.remove(group.id) != nil { openTags.insert(newID) }
-        if closedTags.remove(group.id) != nil { closedTags.insert(newID) }
+        // Keeps the renamed group open or closed as it was.
+        let oldKey = groupKey(group)
+        let newKey = TemplateGroups.tagKey(newTag) ?? Data()
+        if openTags.remove(oldKey) != nil { openTags.insert(newKey) }
+        if closedTags.remove(oldKey) != nil { closedTags.insert(newKey) }
         renamingGroup = nil
     }
 

@@ -156,4 +156,25 @@ public sealed class HistoryTextTests
         var prefix = "/" + new string('a', HistoryText.MaxLinkRemainderLength - 2);
         Assert.Equal(prefix + "…", HistoryText.TruncateWithEllipsis(prefix + "😀😀", HistoryText.MaxLinkRemainderLength));
     }
+
+    [Fact]
+    public void IsLinkTextDoesNotTrimWhitespaceAndRejectsControlsAndBackslash()
+    {
+        Assert.True(HistoryText.IsLinkText("https://example.com"));
+        Assert.True(HistoryText.IsLinkText("http://localhost:8080/path?q=1#frag"));
+
+        Assert.False(HistoryText.IsLinkText(null));
+        Assert.False(HistoryText.IsLinkText(""));
+        Assert.False(HistoryText.IsLinkText("https://example.com\n"));
+        Assert.False(HistoryText.IsLinkText("https://example.com\r\n"));
+        Assert.False(HistoryText.IsLinkText("  https://example.com  "));
+        Assert.False(HistoryText.IsLinkText("\thttps://example.com"));
+        Assert.False(HistoryText.IsLinkText("https://example.com/a b"));
+        Assert.False(HistoryText.IsLinkText("https://example.com\\path"));
+        Assert.False(HistoryText.IsLinkText("https://example.com/\u0007"));
+        Assert.False(HistoryText.IsLinkText("ftp://example.com"));
+
+        // Display flavor for history cards still trims surrounding whitespace as before.
+        Assert.Equal(HistoryDisplayFlavor.Link, HistoryText.DetectFlavor(Item("text", "  https://example.com\n")));
+    }
 }

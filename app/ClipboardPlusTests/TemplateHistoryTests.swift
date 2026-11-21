@@ -797,4 +797,328 @@ final class TemplateHistoryTests: XCTestCase {
         XCTAssertTrue(exported.entries.contains { $0.isTemplate && $0.text == "キーボード反映" && $0.title == "最新" })
         XCTAssertFalse(exported.entries.contains { $0.text == "will-delete" })
     }
+
+    func testSyncedWhitespaceUrlEntryCanBeBackedUpAndRestored() throws {
+        let root = try ImageTestSupport.directory(self)
+        let db = try HistoryDatabase(url: root.appendingPathComponent("url-backup.sqlite"))
+        let snap = TemplateSyncSnapshot(
+            sentAt: 10_000,
+            templates: [
+                TemplateSyncItem(id: UUID(), kind: .url, text: "https://example.com\n", title: "改行URL", tag: nil, order: 0, updatedAt: 10_000)
+            ],
+            tombstones: []
+        )
+        _ = try db.applySyncedTemplates(snap)
+        let entries = try db.fetchAll()
+        XCTAssertEqual(entries.first?.kind, .url)
+        let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
+        let archiveURL = root.appendingPathComponent("synced-url.clipboardplus")
+        _ = try HistoryBackup.write(entries: entries, files: files, to: archiveURL, cancellation: BackupCancellation())
+        let validated = try HistoryBackup.validate(at: archiveURL, temporaryRoot: root, cancellation: BackupCancellation())
+        defer { validated.discard() }
+        XCTAssertEqual(validated.entries.count, 1)
+        XCTAssertEqual(validated.entries.first?.text, "https://example.com\n")
+    }
+
+    func testMidSyncEditWhilePCEditedPreservesBaseHashAndNextMergeKeepsBoth() throws {
+        var now = Date(timeIntervalSince1970: 1_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("midsync-p1.sqlite"), now: { now })
+
+        // Establish synced baseline for two items: T1 (PC will edit) and T2 (PC leaves unchanged).
+        let t1 = try db.createTemplate(text: "A", title: "題1", tag: "仕事")
+        let t2 = try db.createTemplate(text: "B", title: "題2", tag: "仕事")
+        let initialPush = try db.readTemplateSyncSnapshot()
+        let item1 = try XCTUnwrap(initialPush.snapshot.templates.first { $0.text == "A" })
+        let item2 = try XCTUnwrap(initialPush.snapshot.templates.first { $0.text == "B" })
+        _ = try db.applySyncedTemplates(initialPush.snapshot, pushed: initialPush)
+        let baseHash1 = try XCTUnwrap(try db.templateSyncMetadata(id: t1.id)?.baseHash)
+
+        // Start sync: capture tpl_push ("A", "B").
+        now = Date(timeIntervalSince1970: 1_100)
+        let pushed = try db.readTemplateSyncSnapshot()
+
+        // Mid-sync before tpl_state arrives: iOS edits both T1 -> "A_iOS" and T2 -> "B_iOS".
+        now = Date(timeIntervalSince1970: 1_110)
+        _ = try db.updateTemplate(id: t1.id, text: "A_iOS", title: "題1", tag: "仕事")
+        _ = try db.updateTemplate(id: t2.id, text: "B_iOS", title: "題2", tag: "仕事")
+
+        // PC concurrently edited T1 -> "A_PC" and left T2 as "B".
+        let pcEdited1 = TemplateSyncItem(id: item1.id, kind: .text, text: "A_PC", title: "題1", tag: "仕事", order: 0, updatedAt: 1_105_000)
+        let pcReply = TemplateSyncSnapshot(sentAt: 1_115_000, templates: [pcEdited1, item2], tombstones: [])
+        _ = try db.applySyncedTemplates(pcReply, pushed: pushed)
+
+        let meta1 = try XCTUnwrap(try db.templateSyncMetadata(id: t1.id))
+        let meta2 = try XCTUnwrap(try db.templateSyncMetadata(id: t2.id))
+        XCTAssertEqual(try db.fetchAll().first { $0.id == t1.id }?.text, "A_iOS")
+        XCTAssertEqual(meta1.baseHash, baseHash1) // NOT overwritten to H("A_PC")
+        XCTAssertTrue(meta1.dirty)
+        XCTAssertEqual(meta2.baseHash, TemplateSyncMerge.contentHash(item2)) // PC unchanged -> stays synced baseHash
+        XCTAssertTrue(meta2.dirty)
+
+        // Next sync merges iOS's snapshot against PC's state: T1 produces conflict copy preserving BOTH "A_iOS" and "A_PC";
+        // T2 fast-forwards cleanly to "B_iOS" with no bogus conflict copy.
+        now = Date(timeIntervalSince1970: 1_120)
+        let nextPush = try db.readTemplateSyncSnapshot()
+        let merged = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [pcEdited1, item2], tombstones: []),
+            remote: TemplateSyncState(templates: nextPush.snapshot.templates, tombstones: nextPush.snapshot.tombstones),
+            nowMillis: 1_120_000
+        )
+        XCTAssertEqual(merged.conflictCopyCount, 1)
+        XCTAssertTrue(merged.templates.contains { $0.id == item1.id && $0.text == "A_iOS" })
+        XCTAssertTrue(merged.templates.contains { $0.text == "A_PC" && $0.tag == nil })
+        XCTAssertTrue(merged.templates.contains { $0.id == item2.id && $0.text == "B_iOS" })
+    }
+
+    func testMidSyncEditAndUndoWhilePCDeletedPreserveLocalTemplate() throws {
+        var now = Date(timeIntervalSince1970: 2_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("midsync-p2.sqlite"), now: { now })
+
+        // Path 2a: PC deleted T1 while iOS edits T1 mid-sync.
+        let t1 = try db.createTemplate(text: "元の文", title: "題", tag: "仕事")
+        let initPush = try db.readTemplateSyncSnapshot()
+        let item1 = try XCTUnwrap(initPush.snapshot.templates.first)
+        _ = try db.applySyncedTemplates(initPush.snapshot, pushed: initPush)
+
+        now = Date(timeIntervalSince1970: 2_010)
+        let push1 = try db.readTemplateSyncSnapshot()
+        now = Date(timeIntervalSince1970: 2_012)
+        _ = try db.updateTemplate(id: t1.id, text: "同期中に書き直した文", title: "題", tag: "仕事")
+
+        let pcTomb1 = TemplateSyncTombstone(id: item1.id, deletedAt: 2_005_000, baseHash: TemplateSyncMerge.contentHash(item1))
+        let outcome1 = try db.applySyncedTemplates(
+            TemplateSyncSnapshot(sentAt: 2_015_000, templates: [], tombstones: [pcTomb1]),
+            pushed: push1
+        )
+        XCTAssertEqual(outcome1.deleted, 0)
+        let kept1 = try XCTUnwrap(try db.fetchAll().first { $0.id == t1.id })
+        XCTAssertEqual(kept1.text, "同期中に書き直した文")
+        let keptMeta1 = try XCTUnwrap(try db.templateSyncMetadata(id: t1.id))
+        XCTAssertNil(keptMeta1.baseHash)
+        XCTAssertTrue(keptMeta1.dirty)
+        XCTAssertFalse(try db.templateTombstones().contains { $0.id == item1.id })
+
+        // Next sync against PC (which holds pcTomb1) preserves "同期中に書き直した文".
+        now = Date(timeIntervalSince1970: 2_020)
+        let push2 = try db.readTemplateSyncSnapshot()
+        let merged1 = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [], tombstones: [pcTomb1]),
+            remote: TemplateSyncState(templates: push2.snapshot.templates, tombstones: push2.snapshot.tombstones),
+            nowMillis: 2_020_000
+        )
+        XCTAssertEqual(merged1.templates.map(\.text), ["同期中に書き直した文"])
+
+        // Path 2b: iOS deleted T2, pushed tombstone, then user tapped Undo mid-sync before tpl_state returned.
+        let t2 = try db.createTemplate(text: "同期中Undo", title: nil, tag: nil)
+        let syncT2 = try db.readTemplateSyncSnapshot()
+        let item2 = try XCTUnwrap(syncT2.snapshot.templates.first { $0.text == "同期中Undo" })
+        _ = try db.applySyncedTemplates(syncT2.snapshot, pushed: syncT2)
+
+        now = Date(timeIntervalSince1970: 2_100)
+        let del2 = try XCTUnwrap(try db.delete(id: t2.id))
+        let pushWithTomb = try db.readTemplateSyncSnapshot()
+        XCTAssertTrue(pushWithTomb.allTombstoneIDs.contains(item2.id))
+
+        now = Date(timeIntervalSince1970: 2_102)
+        XCTAssertTrue(try db.undo(del2))
+
+        let pcTomb2 = TemplateSyncTombstone(id: item2.id, deletedAt: 2_100_000, baseHash: TemplateSyncMerge.contentHash(item2))
+        let pcRemaining = syncT2.snapshot.templates.filter { $0.id != item2.id }
+        _ = try db.applySyncedTemplates(
+            TemplateSyncSnapshot(sentAt: 2_103_000, templates: pcRemaining, tombstones: [pcTomb2]),
+            pushed: pushWithTomb
+        )
+        let restored2 = try XCTUnwrap(try db.fetchAll().first { $0.id == t2.id })
+        XCTAssertEqual(restored2.text, "同期中Undo")
+        let meta2 = try XCTUnwrap(try db.templateSyncMetadata(id: t2.id))
+        XCTAssertNotEqual(meta2.syncId, item2.id)
+        XCTAssertNil(meta2.baseHash)
+        XCTAssertTrue(try db.templateTombstones().contains { $0.id == item2.id })
+
+        now = Date(timeIntervalSince1970: 2_110)
+        let pushAfterUndo = try db.readTemplateSyncSnapshot()
+        let merged2 = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: pcRemaining, tombstones: [pcTomb2]),
+            remote: TemplateSyncState(templates: pushAfterUndo.snapshot.templates, tombstones: pushAfterUndo.snapshot.tombstones),
+            nowMillis: 2_110_000
+        )
+        XCTAssertTrue(merged2.templates.contains { $0.text == "同期中Undo" })
+    }
+
+    func testMidSyncDeletePreventsResurrectionUnlessPCEdited() throws {
+        var now = Date(timeIntervalSince1970: 3_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("midsync-p3.sqlite"), now: { now })
+
+        let tUnchanged = try db.createTemplate(text: "未編集削除", title: nil, tag: nil)
+        let tEditedThenDel = try db.createTemplate(text: "編集前", title: nil, tag: nil)
+        let tPcEdited = try db.createTemplate(text: "PCが編集", title: nil, tag: nil)
+        let basePush = try db.readTemplateSyncSnapshot()
+        _ = try db.applySyncedTemplates(basePush.snapshot, pushed: basePush)
+
+        // Edit tEditedThenDel before pushing, and create brand-new unsynced tNew.
+        now = Date(timeIntervalSince1970: 3_010)
+        _ = try db.updateTemplate(id: tEditedThenDel.id, text: "編集後", title: nil, tag: nil)
+        let tNew = try db.createTemplate(text: "新規直後削除", title: nil, tag: nil)
+
+        now = Date(timeIntervalSince1970: 3_020)
+        let pushed = try db.readTemplateSyncSnapshot()
+        let itemUnchanged = try XCTUnwrap(pushed.snapshot.templates.first { $0.text == "未編集削除" })
+        let itemEdited = try XCTUnwrap(pushed.snapshot.templates.first { $0.text == "編集後" })
+        let itemPcEdited = try XCTUnwrap(pushed.snapshot.templates.first { $0.text == "PCが編集" })
+        let itemNew = try XCTUnwrap(pushed.snapshot.templates.first { $0.text == "新規直後削除" })
+
+        // Delete all 4 locally while sync is in flight.
+        now = Date(timeIntervalSince1970: 3_021)
+        _ = try db.delete(id: tUnchanged.id)
+        _ = try db.delete(id: tEditedThenDel.id)
+        _ = try db.delete(id: tPcEdited.id)
+        _ = try db.delete(id: tNew.id)
+
+        // PC returns unchanged versions for 3 items, and a concurrent edit "PC側で書き換え" for tPcEdited.
+        let pcEditedVersion = TemplateSyncItem(id: itemPcEdited.id, kind: .text, text: "PC側で書き換え", title: nil, tag: nil, order: 2, updatedAt: 3_022_000)
+        let pcReply = TemplateSyncSnapshot(
+            sentAt: 3_023_000,
+            templates: [itemUnchanged, itemEdited, pcEditedVersion, itemNew],
+            tombstones: []
+        )
+        _ = try db.applySyncedTemplates(pcReply, pushed: pushed)
+
+        // Only PC's unseen edit survives; the 3 unchanged mid-sync deletes do NOT resurrect.
+        let remaining = try db.fetchAll().filter(\.isTemplate)
+        XCTAssertEqual(remaining.map(\.text), ["PC側で書き換え"])
+        let tombs = try db.templateTombstones()
+        XCTAssertTrue(tombs.contains { $0.id == itemUnchanged.id && $0.baseHash == TemplateSyncMerge.contentHash(itemUnchanged) })
+        XCTAssertTrue(tombs.contains { $0.id == itemEdited.id && $0.baseHash == TemplateSyncMerge.contentHash(itemEdited) })
+        XCTAssertTrue(tombs.contains { $0.id == itemNew.id && $0.baseHash == TemplateSyncMerge.contentHash(itemNew) })
+        XCTAssertFalse(tombs.contains { $0.id == itemPcEdited.id })
+
+        // Next sync propagates all 3 deletions to PC.
+        now = Date(timeIntervalSince1970: 3_030)
+        let nextPush = try db.readTemplateSyncSnapshot()
+        let nextMerge = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: pcReply.templates, tombstones: []),
+            remote: TemplateSyncState(templates: nextPush.snapshot.templates, tombstones: nextPush.snapshot.tombstones),
+            nowMillis: 3_030_000
+        )
+        XCTAssertEqual(nextMerge.templates.map(\.text), ["PC側で書き換え"])
+    }
+
+    func testUndoAfterSyncedDeletionAssignsNewUUIDAndSurvivesNextMerge() throws {
+        var now = Date(timeIntervalSince1970: 4_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("undo-postsync.sqlite"), now: { now })
+        let entry = try db.createTemplate(text: "5秒以内Undo", title: "大事", tag: "仕事")
+        let initPush = try db.readTemplateSyncSnapshot()
+        let syncedItem = try XCTUnwrap(initPush.snapshot.templates.first)
+        _ = try db.applySyncedTemplates(initPush.snapshot, pushed: initPush)
+
+        // Delete at t=4001 -> sync at t=4002 (PC stores synced tombstone) -> Undo at t=4003 (within 5s).
+        now = Date(timeIntervalSince1970: 4_001)
+        let deletion = try XCTUnwrap(try db.delete(id: entry.id))
+        now = Date(timeIntervalSince1970: 4_002)
+        let pushDel = try db.readTemplateSyncSnapshot()
+        let pcTomb = TemplateSyncTombstone(id: syncedItem.id, deletedAt: 4_001_000, baseHash: TemplateSyncMerge.contentHash(syncedItem))
+        _ = try db.applySyncedTemplates(TemplateSyncSnapshot(sentAt: 4_002_000, templates: [], tombstones: [pcTomb]), pushed: pushDel)
+
+        now = Date(timeIntervalSince1970: 4_003)
+        XCTAssertTrue(try db.undo(deletion))
+        let restored = try XCTUnwrap(try db.fetchAll().first { $0.id == entry.id })
+        XCTAssertEqual(restored.text, "5秒以内Undo")
+        let meta = try XCTUnwrap(try db.templateSyncMetadata(id: entry.id))
+        XCTAssertNotEqual(meta.syncId, syncedItem.id)
+        XCTAssertNil(meta.baseHash)
+        XCTAssertTrue(meta.dirty)
+        XCTAssertTrue(try db.templateTombstones().contains { $0.id == syncedItem.id })
+
+        // Next sync against PC (holding pcTomb) must keep the restored template alive!
+        now = Date(timeIntervalSince1970: 4_010)
+        let nextPush = try db.readTemplateSyncSnapshot()
+        let merged = try TemplateSyncMerge.merge(
+            pc: TemplateSyncState(templates: [], tombstones: [pcTomb]),
+            remote: TemplateSyncState(templates: nextPush.snapshot.templates, tombstones: nextPush.snapshot.tombstones),
+            nowMillis: 4_010_000
+        )
+        XCTAssertEqual(merged.templates.count, 1)
+        XCTAssertEqual(merged.templates.first?.id, meta.syncId)
+        XCTAssertEqual(merged.templates.first?.text, "5秒以内Undo")
+    }
+
+    func testNfcAndNfdTagsStayDistinctInGroupsRenameReorderAndUpdate() throws {
+        let (db, _) = try fixture()
+        let nfc = "\u{00E9}"
+        let nfd = "e\u{0301}"
+        let nfc1 = try db.createTemplate(text: "nfc-1", title: nil, tag: nfc)
+        let nfc2 = try db.createTemplate(text: "nfc-2", title: nil, tag: nfc)
+        let nfd1 = try db.createTemplate(text: "nfd-1", title: nil, tag: nfd)
+
+        let all = try db.fetchAll()
+        let tags = TemplateGroups.tags(all)
+        XCTAssertEqual(tags.count, 2)
+        XCTAssertEqual(Set(tags.map { Data($0.utf8) }), Set([Data(nfc.utf8), Data(nfd.utf8)]))
+
+        let groups = TemplateGroups.make(all, search: "")
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertNotEqual(groups[0], groups[1])
+        XCTAssertNotEqual(groups[0].tagKey, groups[1].tagKey)
+        let nfcGroup = try XCTUnwrap(groups.first { $0.tagKey == Data(nfc.utf8) })
+        let nfdGroup = try XCTUnwrap(groups.first { $0.tagKey == Data(nfd.utf8) })
+        XCTAssertEqual(nfcGroup.entries.map(\.id), [nfc1.id, nfc2.id])
+        XCTAssertEqual(nfdGroup.entries.map(\.id), [nfd1.id])
+
+        // Reordering across NFC/NFD must be ignored; reordering within NFC works.
+        try db.reorderTemplates([nfd1.id, nfc1.id])
+        XCTAssertEqual(try db.fetchAll().first { $0.id == nfc1.id }?.templateOrder, 0)
+        try db.reorderTemplates([nfc2.id, nfc1.id])
+        XCTAssertEqual(try db.fetchAll().first { $0.id == nfc2.id }?.templateOrder, 0)
+        XCTAssertEqual(try db.fetchAll().first { $0.id == nfc1.id }?.templateOrder, 1)
+
+        // Updating nfd1's tag to nfc appends it after existing NFC entries.
+        let movedToNfc = try db.updateTemplate(id: nfd1.id, text: nil, title: nil, tag: nfc)
+        XCTAssertEqual(movedToNfc.tag.map { Data($0.utf8) }, Data(nfc.utf8))
+        XCTAssertEqual(movedToNfc.templateOrder, 2)
+
+        // Move nfd1 back to nfd, then rename only nfc -> nfd stays untouched.
+        _ = try db.updateTemplate(id: nfd1.id, text: nil, title: nil, tag: nfd)
+        try db.renameTag(nfc, to: "改名済み")
+        let afterRename = try db.fetchAll()
+        XCTAssertEqual(afterRename.first { $0.id == nfc1.id }?.tag, "改名済み")
+        XCTAssertEqual(afterRename.first { $0.id == nfc2.id }?.tag, "改名済み")
+        XCTAssertEqual(afterRename.first { $0.id == nfd1.id }?.tag.map { Data($0.utf8) }, Data(nfd.utf8))
+    }
+
+    func testTemplateLineEndingsNormalizeToLfWhileHistoryPreservesRawAndLegacyRowKeepsIdOnSync() throws {
+        let root = try ImageTestSupport.directory(self)
+        let dbURL = root.appendingPathComponent("lf.sqlite")
+        let db = try HistoryDatabase(url: dbURL)
+
+        // History keeps raw CRLF; moving to templates normalizes to LF.
+        let hist = try db.collect("行1\r\n行2", source: .automatic)
+        XCTAssertEqual(hist.text, "行1\r\n行2")
+        let moved = try db.moveToTemplates(id: hist.id)
+        XCTAssertEqual(moved.text, "行1\n行2")
+
+        // createTemplate and updateTemplate normalize CRLF and CR to LF and reject LF/CRLF duplicates.
+        XCTAssertThrowsError(try db.createTemplate(text: "行1\r\n行2", title: nil, tag: nil)) {
+            XCTAssertEqual($0 as? HistoryEditError, .duplicate)
+        }
+        let created = try db.createTemplate(text: "A\r\nB\rC", title: nil, tag: nil)
+        XCTAssertEqual(created.text, "A\nB\nC")
+        let updated = try db.updateTemplate(id: created.id, text: "X\r\nY\rZ", title: nil, tag: nil)
+        XCTAssertEqual(updated.text, "X\nY\nZ")
+
+        // Legacy CRLF template row already in SQLite stays readable, exports as LF, and keeps its integer ID on sync.
+        let legacy = try db.createTemplate(text: "legacy-placeholder", title: nil, tag: nil)
+        try ImageTestSupport.sql("UPDATE history SET text = '旧1' || char(13) || char(10) || '旧2' WHERE id = \(legacy.id)", at: dbURL)
+        let snap = try db.readTemplateSyncSnapshot()
+        XCTAssertTrue(snap.snapshot.templates.contains { $0.text == "旧1\n旧2" })
+
+        let pcSyncID = UUID()
+        _ = try db.applySyncedTemplates(TemplateSyncSnapshot(
+            sentAt: snap.snapshot.sentAt,
+            templates: [TemplateSyncItem(id: pcSyncID, kind: .text, text: "旧1\n旧2", title: "統合済み", tag: nil, order: 0, updatedAt: snap.snapshot.sentAt)],
+            tombstones: []
+        ))
+        let afterSync = try XCTUnwrap(try db.fetchAll().first { $0.id == legacy.id })
+        XCTAssertEqual(afterSync.text, "旧1\n旧2")
+        XCTAssertEqual(afterSync.title, "統合済み")
+    }
 }

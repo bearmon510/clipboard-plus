@@ -268,4 +268,75 @@ public sealed class TemplateSyncTests
         Assert.Empty(preparedDirty.State.Tombstones);
         Assert.Equal(2, preparedDirty.ExcludedTemplateCount);
     }
+
+    [Fact]
+    public void ThreeDeviceMergeAllDeleteDoesNotResurrectStaleUneditedVersionAndKeepsConcurrentEdit()
+    {
+        const long now = 1_794_873_600_000;
+        var sharedId = Guid.NewGuid();
+        var hV1 = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "v1", "題", "仕事");
+        var hV2 = TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "v2", "題", "仕事");
+
+        // 1. PC has v2, iPad deleted v2 (baseHash = H(v2)), iPhone is stale unedited v1 (baseHash = H(v1)).
+        //    In both remote orderings, T must be deleted and NOT resurrected as v1.
+        var pcState = new TemplateSyncState([
+            new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "v2", "題", "仕事", 0, now - 10_000)
+        ], []);
+        var iPadDelete = new TemplateSyncRemoteState(
+            new TemplateSyncState([], [new TemplateSyncTombstone(sharedId, now - 5_000, hV2)]),
+            now);
+        var iPhoneStale = new TemplateSyncRemoteState(
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "v1", "題", "仕事", 0, now - 20_000, hV1)], []),
+            now);
+
+        foreach (var order in new[] { new[] { iPadDelete, iPhoneStale }, new[] { iPhoneStale, iPadDelete } })
+        {
+            var merged = TemplateSyncMerge.MergeAll(pcState, order, now);
+            Assert.Empty(merged.Templates);
+            Assert.Single(merged.Tombstones, t => t.Id == sharedId);
+            Assert.Equal(1, merged.PcChanges.Deleted);
+        }
+
+        // 2. If iPhone actually edited v1 -> v3 concurrently (hash != baseHash), v3 MUST survive.
+        var iPhoneEdited = new TemplateSyncRemoteState(
+            new TemplateSyncState([new TemplateSyncItem(sharedId, TemplateSyncKind.Text, "v3-edited", "題", "仕事", 0, now - 3_000, hV1)], []),
+            now);
+        foreach (var order in new[] { new[] { iPadDelete, iPhoneEdited }, new[] { iPhoneEdited, iPadDelete } })
+        {
+            var merged = TemplateSyncMerge.MergeAll(pcState, order, now);
+            var survivor = Assert.Single(merged.Templates);
+            Assert.Equal(sharedId, survivor.Id);
+            Assert.Equal("v3-edited", survivor.Text);
+            Assert.Empty(merged.Tombstones);
+        }
+    }
+
+    [Fact]
+    public void LineEndingsNormalizeCrlfAndCrToLfInHashPrepareAndMerge()
+    {
+        const long now = 1_794_873_600_000;
+        Assert.Equal("a\nb\nc\n", TemplateSyncMerge.NormalizeLineEndings("a\r\nb\rc\r\n"));
+        Assert.Equal("plain", TemplateSyncMerge.NormalizeLineEndings("plain"));
+        Assert.Equal(
+            TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "line1\nline2\nline3", "題", "仕事"),
+            TemplateSyncMerge.ContentHash(TemplateSyncKind.Text, "line1\r\nline2\rline3", "題", "仕事"));
+
+        var pcId = Guid.NewGuid();
+        var iosId = Guid.NewGuid();
+        var prepared = TemplateSyncMerge.PrepareSyncState([
+            new TemplateSyncItem(pcId, TemplateSyncKind.Text, "one\r\ntwo\rthree", "題", null, 0, now),
+        ], [], now);
+        Assert.Equal("one\ntwo\nthree", Assert.Single(prepared.State.Templates).Text);
+
+        var merged = TemplateSyncMerge.Merge(
+            new TemplateSyncState([new TemplateSyncItem(pcId, TemplateSyncKind.Text, "line1\r\nline2", "PC題", null, 0, now - 1_000)], []),
+            new TemplateSyncState([new TemplateSyncItem(iosId, TemplateSyncKind.Text, "line1\nline2", null, "仕事", 0, now)], []),
+            now);
+        var kept = Assert.Single(merged.Templates);
+        Assert.Equal(iosId, kept.Id);
+        Assert.Equal("line1\nline2", kept.Text);
+        Assert.Equal("PC題", kept.Title);
+        Assert.Equal("仕事", kept.Tag);
+        Assert.Equal(1, merged.SubsumedDuplicateCount);
+    }
 }

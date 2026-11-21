@@ -177,11 +177,12 @@ function normalizeLabel(value, maxChars, maxBytes) {
 }
 const normalizeTitle = v => normalizeLabel(v, maxTemplateTitleChars, maxTemplateTitleBytes);
 const normalizeTag = v => normalizeLabel(v, maxTemplateTagChars, maxTemplateTagBytes);
+const normalizeLineEndings = text => text.replace(/\r\n?/g, '\n');
 
 function contentHash(item) {
   const t = normalizeTitle(item.title) ?? null;
   const g = normalizeTag(item.tag) ?? null;
-  return sha256Hex(Buffer.from(JSON.stringify([item.kind, item.text, t, g])));
+  return sha256Hex(Buffer.from(JSON.stringify([item.kind, normalizeLineEndings(item.text), t, g])));
 }
 
 function makeConflictTitle(originalTitle) {
@@ -246,7 +247,7 @@ function cleanItem(item) {
     kind: item.kind,
     order: item.order,
     tag: normalizeTag(item.tag),
-    text: item.text,
+    text: normalizeLineEndings(item.text),
     title: normalizeTitle(item.title),
     updatedAt: item.updatedAt,
   });
@@ -485,13 +486,21 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
     return cleanTombstone({ id: a.id, deletedAt: a.deletedAt, baseHash: bh });
   };
 
-  const isKilled = (entry, pcTomb, allTombs) => {
+  const isDirectlyKilled = (entry, pcTomb, allTombs) => {
     for (const t of allTombs) {
       if (t.baseHash !== undefined && t.baseHash === entry.hash) return true;
     }
     if (entry.item.baseHash !== undefined && entry.item.baseHash === entry.hash) {
       if (pcTomb !== undefined) return true;
       if (allTombs.some(t => t.baseHash === undefined)) return true;
+    }
+    return false;
+  };
+
+  const isKilled = (entry, pcTomb, pcEntryKilledOrAbsent, allTombs) => {
+    if (isDirectlyKilled(entry, pcTomb, allTombs)) return true;
+    if (entry.item.baseHash !== undefined && entry.item.baseHash === entry.hash && pcEntryKilledOrAbsent) {
+      return true;
     }
     return false;
   };
@@ -559,7 +568,9 @@ function mergeTemplatesAll(pc, remotes, nowMillis) {
       if (rIdx.tombs.has(itemId)) tombs.push(rIdx.tombs.get(itemId));
     }
     if (tombs.length > 0) {
-      const remainingActive = activeEntries.filter(e => !isKilled(e, pcTomb, tombs));
+      const pcEntry = pcIdx.items.get(itemId);
+      const pcEntryKilledOrAbsent = pcEntry === undefined || isDirectlyKilled(pcEntry, pcTomb, tombs);
+      const remainingActive = activeEntries.filter(e => !isKilled(e, pcTomb, pcEntryKilledOrAbsent, tombs));
       if (remainingActive.length === 0) {
         let merged = tombs[0];
         for (let i = 1; i < tombs.length; i++) merged = mergeTomb(merged, tombs[i]);
@@ -1146,6 +1157,20 @@ const templateMergeCases = [
       { id: tombId1, deletedAt: baseNow - 10 * dayMillis, baseHash: h1Init },
     ],
   }, { remoteSentAtMillis: baseNow - 181 * dayMillis, alsoCheckIdempotent: true }),
+
+  makeMergeCase('lineEndingCrlfAndCrNormalizedToLfAndDeduplicated', baseNow, {
+    templates: [
+      { id: tplId1, kind: 'text', text: '1行目\r\n2行目\r3行目', title: 'PC複数行', tag: '仕事', order: 0, updatedAt: baseNow - 20_000 },
+      { id: tplId3, kind: 'text', text: '改行のみ編集\r\n後', order: 1, updatedAt: baseNow - 10_000 },
+    ],
+    tombstones: [],
+  }, {
+    templates: [
+      { id: tplId2, kind: 'text', text: '1行目\n2行目\n3行目', order: 0, updatedAt: baseNow - 30_000 },
+      { id: tplId3, kind: 'text', text: '改行のみ編集\n後', order: 1, updatedAt: baseNow - 10_000, baseHash: contentHash({ kind: 'text', text: '改行のみ編集\r\n後' }) },
+    ],
+    tombstones: [],
+  }, { alsoCheckIdempotent: true }),
 ];
 
 // --- Multi-Device Merge Test Cases (Item 7) ---
@@ -1236,6 +1261,66 @@ const templateMultiMergeCases = [
     ],
     tombstones: [],
   }, []),
+
+  (() => {
+    const hV1 = contentHash({ kind: 'text', text: 'v1' });
+    const hV2 = contentHash({ kind: 'text', text: 'v2' });
+    return makeMultiMergeCase('multiDeviceThreeWayDeleteDoesNotResurrectStaleUneditedVersion', baseNow, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'v2', order: 0, updatedAt: baseNow - 50_000 },
+      ],
+      tombstones: [],
+    }, [
+      {
+        state: {
+          templates: [],
+          tombstones: [
+            { id: tplId1, deletedAt: baseNow - 10_000, baseHash: hV2 },
+          ],
+        },
+        sentAtMillis: baseNow,
+      },
+      {
+        state: {
+          templates: [
+            { id: tplId1, kind: 'text', text: 'v1', order: 0, updatedAt: baseNow - 100_000, baseHash: hV1 },
+          ],
+          tombstones: [],
+        },
+        sentAtMillis: baseNow,
+      },
+    ], { alsoCheckAllPermutations: true });
+  })(),
+
+  (() => {
+    const hV1 = contentHash({ kind: 'text', text: 'v1' });
+    const hV2 = contentHash({ kind: 'text', text: 'v2' });
+    return makeMultiMergeCase('multiDeviceThreeWayDeletePreservesConcurrentEditOnThirdDevice', baseNow, {
+      templates: [
+        { id: tplId1, kind: 'text', text: 'v2', order: 0, updatedAt: baseNow - 50_000 },
+      ],
+      tombstones: [],
+    }, [
+      {
+        state: {
+          templates: [],
+          tombstones: [
+            { id: tplId1, deletedAt: baseNow - 10_000, baseHash: hV2 },
+          ],
+        },
+        sentAtMillis: baseNow,
+      },
+      {
+        state: {
+          templates: [
+            { id: tplId1, kind: 'text', text: 'v3-edited', order: 0, updatedAt: baseNow - 20_000, baseHash: hV1 },
+          ],
+          tombstones: [],
+        },
+        sentAtMillis: baseNow,
+      },
+    ], { alsoCheckAllPermutations: true });
+  })(),
 ];
 
 // --- Page Split Boundary Cases (Item 4) ---

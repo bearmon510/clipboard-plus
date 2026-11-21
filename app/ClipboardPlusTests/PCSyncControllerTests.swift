@@ -2778,4 +2778,124 @@ final class PCSyncControllerTests: XCTestCase {
         let metaAfterUnpair = try XCTUnwrap(try db.templateSyncMetadata(id: remain.id))
         XCTAssertNil(metaAfterUnpair.baseHash)
     }
+
+    @MainActor
+    func testTemplateSyncLargePushExceeding30SecondsDoesNotTimeoutWhileSending() async throws {
+        let f = try Fixture(test: self)
+        let pairing = try pair(f)
+
+        // 1. Single-page large push over 20B MTU taking >30s must NOT time out while actively sending.
+        let created1 = expectation(description: "single-page large template")
+        f.monitor.createTemplate(text: String(repeating: "送", count: 400), title: "長文", tag: nil) { _ in created1.fulfill() }
+        await fulfillment(of: [created1], timeout: 5)
+        await drain(f)
+
+        try f.link.connect(pairing, limit: 20)
+        f.link.stopAfterPackets = 1
+        var res1: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp1 = expectation(description: "slow single-page push succeeds")
+        f.controller.syncTemplates { res1 = $0; exp1.fulfill() }
+        await drain(f)
+        XCTAssertFalse(f.link.canSend)
+        XCTAssertTrue(f.link.templatePushes.isEmpty)
+
+        // Advance past 30s (40s total) while making steady BLE packet progress.
+        for _ in 0..<4 {
+            f.clock.date.addTimeInterval(10)
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+            XCTAssertTrue(f.controller.isSyncingTemplates)
+            XCTAssertNil(res1)
+            f.link.stopAfterPackets = 10
+            f.link.canSend = true
+            f.link.onEvent?(.writable)
+        }
+        XCTAssertTrue(f.link.templatePushes.isEmpty)
+        XCTAssertTrue(f.link.rejected.isEmpty)
+
+        // Finish sending and receive tpl_state after >40s since sync start.
+        f.link.resume()
+        let push1 = try XCTUnwrap(f.link.templatePushes.last)
+        let pushedItem1 = try XCTUnwrap(push1.page.templates.first)
+        f.clock.date.addTimeInterval(10)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertTrue(f.controller.isSyncingTemplates)
+        let nowMs1 = Int64(f.clock.date.timeIntervalSince1970 * 1000)
+        try f.link.send(.state(
+            op: push1.op, part: 0, total: 1,
+            page: TemplateSyncPage(
+                version: 1, sentAt: nowMs1,
+                templates: [TemplateSyncItem(id: pushedItem1.id, kind: .text, text: "PC返答", title: "長文", tag: nil, order: 0, updatedAt: nowMs1)],
+                tombstones: []
+            )
+        ))
+        await fulfillment(of: [exp1], timeout: 5)
+        XCTAssertEqual(try XCTUnwrap(res1).get().updated, 1)
+        XCTAssertTrue(f.link.templateAckOps.contains(push1.op))
+
+        // 2. Multi-page push taking >30s also succeeds without disconnecting or dropping result.
+        for idx in 0..<5 {
+            let done = expectation(description: "multi-page template \(idx)")
+            let prefix = "M\(idx)-"
+            f.monitor.createTemplate(text: prefix + String(repeating: "B", count: 60_000 - prefix.utf8.count), title: nil, tag: nil) { _ in done.fulfill() }
+            await fulfillment(of: [done], timeout: 5)
+        }
+        await drain(f)
+
+        try f.link.connect(pairing, limit: 512)
+        let pushesBefore2 = f.link.templatePushes.count
+        f.link.stopAfterPackets = 1
+        var res2: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp2 = expectation(description: "slow multi-page push succeeds")
+        f.controller.syncTemplates { res2 = $0; exp2.fulfill() }
+        await drain(f)
+        for _ in 0..<4 {
+            f.clock.date.addTimeInterval(10)
+            f.controller.checkTimeouts()
+            XCTAssertEqual(f.controller.status, .connected)
+            XCTAssertTrue(f.controller.isSyncingTemplates)
+            f.link.stopAfterPackets = 20
+            f.link.canSend = true
+            f.link.onEvent?(.writable)
+        }
+        f.link.resume()
+        let pushes2 = Array(f.link.templatePushes.dropFirst(pushesBefore2))
+        XCTAssertGreaterThanOrEqual(pushes2.count, 2)
+        let op2 = try XCTUnwrap(pushes2.first?.op)
+        let nowMs2 = Int64(f.clock.date.timeIntervalSince1970 * 1000)
+        try f.link.send(.state(
+            op: op2, part: 0, total: 1,
+            page: TemplateSyncPage(version: 1, sentAt: nowMs2, templates: [TemplateSyncItem(id: pushedItem1.id, kind: .text, text: "複数頁完了", title: nil, tag: nil, order: 0, updatedAt: nowMs2)], tombstones: [])
+        ))
+        await fulfillment(of: [exp2], timeout: 5)
+        XCTAssertEqual(try XCTUnwrap(res2).get().updated, 1)
+        XCTAssertTrue(f.link.templateAckOps.contains(op2))
+
+        // 3. Post-send 30s timeout still fires once all push packets were handed off.
+        var res3: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp3 = expectation(description: "post-send timeout")
+        f.controller.syncTemplates { res3 = $0; exp3.fulfill() }
+        await drain(f)
+        f.clock.date.addTimeInterval(31)
+        f.controller.checkTimeouts()
+        await fulfillment(of: [exp3], timeout: 5)
+        XCTAssertEqual(res3, .failure(.timedOut))
+        XCTAssertEqual(f.controller.status, .connected)
+
+        // 4. Genuine 60s BLE send stall mid-frame disconnects cleanly instead of leaking partial output.
+        try f.link.connect(pairing, limit: 20)
+        f.link.stopAfterPackets = 1
+        var res4: Result<TemplateSyncOutcome, TemplateSyncError>?
+        let exp4 = expectation(description: "60s send stall disconnects")
+        f.controller.syncTemplates { res4 = $0; exp4.fulfill() }
+        await drain(f)
+        XCTAssertFalse(f.link.canSend)
+        f.clock.date.addTimeInterval(61)
+        f.controller.checkTimeouts()
+        await fulfillment(of: [exp4], timeout: 5)
+        XCTAssertEqual(res4, .failure(.disconnected))
+        XCTAssertEqual(f.controller.status, .searching)
+        XCTAssertFalse(f.link.rejected.isEmpty)
+    }
 }

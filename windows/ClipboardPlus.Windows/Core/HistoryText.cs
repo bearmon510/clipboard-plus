@@ -119,8 +119,12 @@ public static partial class HistoryText
         return HistoryDisplayFlavor.Text;
     }
 
-    public static bool IsLinkText(string? text) =>
-        TrySplitLink((text ?? "").Trim(), out _);
+    public static bool IsLinkText(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        if (text.Any(c => char.IsWhiteSpace(c) || char.IsControl(c) || c == '\\')) return false;
+        return TrySplitLink(text, out _);
+    }
 
     public static string FlavorGlyph(HistoryDisplayFlavor flavor) => flavor switch
     {

@@ -315,4 +315,86 @@ public sealed class TemplateRepositoryTests : IDisposable
         Assert.Equal(3, repo.Count);
         Assert.Equal(3, new TemplateRepository(root).Count);
     }
+
+    [Fact]
+    public void WhitespaceOrNewlineWrappedUrlIsClassifiedAsText()
+    {
+        const long t0 = 1_794_873_600_000;
+        var repo = new TemplateRepository(root);
+
+        var trailingNewline = repo.Create("https://example.com\n", null, null, t0);
+        Assert.True(trailingNewline.Succeeded);
+        Assert.Equal(TemplateSyncKind.Text, trailingNewline.Item!.Kind);
+        Assert.Equal("https://example.com\n", trailingNewline.Item.Text);
+
+        var surroundedSpaces = repo.Create("  https://example.com/page  ", null, null, t0 + 1);
+        Assert.True(surroundedSpaces.Succeeded);
+        Assert.Equal(TemplateSyncKind.Text, surroundedSpaces.Item!.Kind);
+
+        var cleanUrl = repo.Update(surroundedSpaces.Item.Id, "https://example.com/page", null, null, t0 + 2);
+        Assert.True(cleanUrl.Succeeded);
+        Assert.Equal(TemplateSyncKind.Url, cleanUrl.Item!.Kind);
+
+        var backToSpaced = repo.Update(surroundedSpaces.Item.Id, "https://example.com/page\r\n", null, null, t0 + 3);
+        Assert.True(backToSpaced.Succeeded);
+        Assert.Equal(TemplateSyncKind.Text, backToSpaced.Item!.Kind);
+        Assert.Equal("https://example.com/page\n", backToSpaced.Item.Text);
+    }
+
+    [Fact]
+    public void RestoreAfterSyncAssignsNewIdAndPreservesSyncedTombstone()
+    {
+        const long t0 = 1_794_873_600_000;
+        var repo = new TemplateRepository(root);
+        var original = repo.Create("削除して元に戻す本文", "題", "仕事", t0).Item!;
+
+        // 1. Delete -> Restore BEFORE sync reuses the original ID and removes the unsynced tombstone.
+        var delBeforeSync = repo.Delete(original.Id, t0 + 10);
+        Assert.True(delBeforeSync.Succeeded);
+        var restoredBeforeSync = repo.Restore(delBeforeSync.Deleted!, t0 + 20);
+        Assert.True(restoredBeforeSync.Succeeded);
+        Assert.Equal(original.Id, restoredBeforeSync.Item!.Id);
+        Assert.Equal(0, repo.TombstoneCount);
+
+        // 2. Delete -> ApplyMerged (sync) -> Restore AFTER sync assigns a new ID and keeps the synced tombstone.
+        var delAfterSync = repo.Delete(original.Id, t0 + 30);
+        Assert.True(delAfterSync.Succeeded);
+        var tombstoneAfterDel = Assert.Single(repo.GetState().Tombstones);
+        repo.ApplyMerged([], [tombstoneAfterDel]);
+
+        var restoredAfterSync = repo.Restore(delAfterSync.Deleted!, t0 + 40);
+        Assert.True(restoredAfterSync.Succeeded);
+        Assert.NotEqual(original.Id, restoredAfterSync.Item!.Id);
+        Assert.Equal(original.Text, restoredAfterSync.Item.Text);
+        Assert.Equal(original.Title, restoredAfterSync.Item.Title);
+        Assert.Equal(original.Tag, restoredAfterSync.Item.Tag);
+        var remainingTomb = Assert.Single(repo.GetState().Tombstones);
+        Assert.Equal(original.Id, remainingTomb.Id);
+    }
+
+    [Fact]
+    public void LineEndingsAreNormalizedToLfOnCreateUpdateRestoreAndDeduplicated()
+    {
+        const long t0 = 1_794_873_600_000;
+        var repo = new TemplateRepository(root);
+
+        var created = repo.Create("一行目\r\n二行目\r三行目", "改行テスト", "仕事", t0);
+        Assert.True(created.Succeeded);
+        Assert.Equal("一行目\n二行目\n三行目", created.Item!.Text);
+
+        // LF equivalent is rejected as duplicate.
+        Assert.Equal(TemplateEditError.Duplicate, repo.Create("一行目\n二行目\n三行目", null, null, t0 + 1).Error);
+
+        var other = repo.Create("別項目", null, null, t0 + 2).Item!;
+        Assert.Equal(TemplateEditError.Duplicate, repo.Update(other.Id, "一行目\r\n二行目\r\n三行目", null, null, t0 + 3).Error);
+
+        var updated = repo.Update(other.Id, "更新1\r\n更新2\r更新3", null, null, t0 + 4);
+        Assert.True(updated.Succeeded);
+        Assert.Equal("更新1\n更新2\n更新3", updated.Item!.Text);
+
+        var legacyDeleted = new TemplateSyncItem(Guid.NewGuid(), TemplateSyncKind.Text, "復元1\r\n復元2", null, null, 0, t0 + 5);
+        var restored = repo.Restore(legacyDeleted, t0 + 6);
+        Assert.True(restored.Succeeded);
+        Assert.Equal("復元1\n復元2", restored.Item!.Text);
+    }
 }

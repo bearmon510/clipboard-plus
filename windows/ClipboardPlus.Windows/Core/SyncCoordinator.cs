@@ -48,6 +48,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly Queue<SyncMessage> Replies = new();
         public readonly Queue<TemplateSyncMessage> TemplateMessages = new();
         public TemplateSyncPageAssembler? IncomingTemplatePush;
+        public Guid? IncomingTemplatePushOp;
+        public DateTimeOffset? IncomingTemplatePushLastActivity;
         public readonly Dictionary<Guid, DateTimeOffset> AwaitingPeerTemplateAcks = [];
         public bool SendingTemplateMessage;
         public readonly CancellationTokenSource Stop = new();
@@ -880,6 +882,14 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     foreach (var id in expired) c.Sent.Remove(id);
                     foreach (var expiredAck in c.AwaitingPeerTemplateAcks.Where(p => now > p.Value).Select(p => p.Key).ToArray())
                         c.AwaitingPeerTemplateAcks.Remove(expiredAck);
+                    if (c.IncomingTemplatePush is not null && c.IncomingTemplatePushLastActivity is DateTimeOffset lastPushAt)
+                    {
+                        var trackedByActiveSession = activeTemplateSync is { Phase: TemplateSyncPhase.Collecting } activeSession &&
+                            c.IncomingTemplatePushOp == activeSession.Op &&
+                            activeSession.Participants.Any(p => ReferenceEquals(p.Connection, c) && p.State == ParticipantState.AwaitingPush);
+                        if (!trackedByActiveSession && !c.Assembler.HasPartialFrame && now - lastPushAt > TemplateSyncTimeout)
+                            ClearIncomingTemplatePush(c, "timeout");
+                    }
                     var incomingPacketActive = c.ActiveIncomingAttachments.Count > 0 &&
                         c.Assembler.HasPartialFrame &&
                         now - c.LastPacket < HighThroughputIdleGrace;
@@ -1245,12 +1255,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         }
         c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.Sent.Clear();
         c.TemplateMessages.Clear(); c.AwaitingPeerTemplateAcks.Clear(); c.SendingTemplateMessage = false;
-        if (c.IncomingTemplatePush is { } pushAssembler)
-        {
-            c.IncomingTemplatePush = null;
-            try { pushAssembler.Finish(); }
-            catch (SyncProtocolException e) { log($"template push ended error={e.Code}"); }
-        }
+        ClearIncomingTemplatePush(c, "disconnect");
         c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
         c.OfferedThisConnection.Clear(); c.Progress = null;
         if (c.HighThroughputRequested) { c.HighThroughputRequested = false; c.Peer.SetHighThroughput(false); }
@@ -1301,9 +1306,31 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         c.TemplateMessages.Enqueue(message);
     }
 
+    private void ClearIncomingTemplatePush(Connection c, string reason)
+    {
+        if (c.IncomingTemplatePush is not { } pushAssembler)
+        {
+            c.IncomingTemplatePushOp = null;
+            c.IncomingTemplatePushLastActivity = null;
+            return;
+        }
+        c.IncomingTemplatePush = null;
+        c.IncomingTemplatePushOp = null;
+        c.IncomingTemplatePushLastActivity = null;
+        try { pushAssembler.Finish(); }
+        catch (SyncProtocolException e) { log($"template push cleared reason={reason} error={e.Code}"); }
+    }
+
     private void HandleTemplatePush(Connection c, TemplateSyncPush push)
     {
-        c.IncomingTemplatePush ??= new TemplateSyncPageAssembler(expectedOp: push.Op, expectedIsState: false);
+        if (c.IncomingTemplatePush is not null && push.Part == 0 && c.IncomingTemplatePushOp != push.Op)
+            ClearIncomingTemplatePush(c, "superseded");
+        if (c.IncomingTemplatePush is null)
+        {
+            c.IncomingTemplatePush = new TemplateSyncPageAssembler(expectedOp: push.Op, expectedIsState: false);
+            c.IncomingTemplatePushOp = push.Op;
+        }
+        c.IncomingTemplatePushLastActivity = c.LastPacket;
         TemplateSyncSnapshot? snapshot;
         try
         {
@@ -1312,6 +1339,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         catch
         {
             c.IncomingTemplatePush = null;
+            c.IncomingTemplatePushOp = null;
+            c.IncomingTemplatePushLastActivity = null;
             throw;
         }
         if (snapshot is null)
@@ -1319,6 +1348,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
         c.IncomingTemplatePush.Finish();
         c.IncomingTemplatePush = null;
+        c.IncomingTemplatePushOp = null;
+        c.IncomingTemplatePushLastActivity = null;
 
         if (activeTemplateSync is { } active && push.Op == active.Op)
         {
@@ -1498,6 +1529,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 if (p.State == ParticipantState.AwaitingPush && now > p.Deadline)
                 {
                     p.State = ParticipantState.TimedOut;
+                    if (p.Connection.IncomingTemplatePushOp == session.Op)
+                        ClearIncomingTemplatePush(p.Connection, "timeout");
                     changed = true;
                 }
             }
@@ -1540,7 +1573,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 status,
                 TargetDevices: session.Participants.Count,
                 SucceededDevices: 0,
-                FailedDevices: session.Participants.Count));
+                FailedDevices: session.Participants.Count,
+                RequiresPeerUpdate: RequiresPeerUpdate));
             return;
         }
 
@@ -1661,7 +1695,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             RemoteChangesTotal: session.RemoteChangesTotal,
             ConflictCopyCount: session.ConflictCopyCount,
             ClockSkewSeconds: session.ClockSkewSeconds,
-            ExcludedTemplateCount: session.ExcludedTemplateCount));
+            ExcludedTemplateCount: session.ExcludedTemplateCount,
+            RequiresPeerUpdate: RequiresPeerUpdate));
     }
 
     private void ExtendTemplateSyncDeadline(Connection c, ulong frameToken, DateTimeOffset now)
@@ -1734,7 +1769,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 added++;
             }
             else if (beforeItem.Kind != afterItem.Kind ||
-                     !string.Equals(beforeItem.Text, afterItem.Text, StringComparison.Ordinal) ||
+                     !string.Equals(TemplateSyncMerge.NormalizeLineEndings(beforeItem.Text), TemplateSyncMerge.NormalizeLineEndings(afterItem.Text), StringComparison.Ordinal) ||
                      !string.Equals(beforeItem.Title, afterItem.Title, StringComparison.Ordinal) ||
                      !string.Equals(beforeItem.Tag, afterItem.Tag, StringComparison.Ordinal) ||
                      beforeItem.Order != afterItem.Order)

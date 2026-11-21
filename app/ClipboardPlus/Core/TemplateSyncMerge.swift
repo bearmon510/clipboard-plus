@@ -124,14 +124,38 @@ public enum TemplateSyncMerge {
         return result
     }
 
+    public static func normalizeLineEndings(_ text: String) -> String {
+        guard text.utf8.contains(0x0D) else { return text }
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(text.unicodeScalars.count)
+        var iterator = text.unicodeScalars.makeIterator()
+        var current = iterator.next()
+        while let scalar = current {
+            if scalar.value == 0x0D {
+                scalars.append(Unicode.Scalar(0x0A)!)
+                let next = iterator.next()
+                if next?.value == 0x0A {
+                    current = iterator.next()
+                } else {
+                    current = next
+                }
+            } else {
+                scalars.append(scalar)
+                current = iterator.next()
+            }
+        }
+        return String(scalars)
+    }
+
     public static func contentHash(_ item: TemplateSyncItem) -> String {
         contentHash(kind: item.kind, text: item.text, title: item.title, tag: item.tag)
     }
 
     public static func contentHash(kind: TemplateSyncKind, text: String, title: String?, tag: String?) -> String {
+        let normText = normalizeLineEndings(text)
         let normTitle = normalizedTitle(title)
         let normTag = normalizedTag(tag)
-        let data = (try? TemplateCanonicalJson.serializeContentHashInput(kind: kind, text: text, normTitle: normTitle, normTag: normTag)) ?? Data()
+        let data = (try? TemplateCanonicalJson.serializeContentHashInput(kind: kind, text: normText, normTitle: normTitle, normTag: normTag)) ?? Data()
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -547,7 +571,11 @@ public enum TemplateSyncMerge {
             }
 
             if !tombs.isEmpty {
-                let remainingActive = activeEntries.filter { !isKilledByTombstones($0, pcTomb: pcTomb, allTombs: tombs) }
+                let pcEntryForCheck = pcItems[id]
+                let pcEntryKilledOrAbsent = pcEntryForCheck.map { isDirectlyKilledByTombstones($0, pcTomb: pcTomb, allTombs: tombs) } ?? true
+                let remainingActive = activeEntries.filter {
+                    !isKilledByTombstones($0, pcTomb: pcTomb, pcEntryKilledOrAbsent: pcEntryKilledOrAbsent, allTombs: tombs)
+                }
                 if remainingActive.isEmpty {
                     var mergedTomb = tombs[0]
                     for tomb in tombs.dropFirst() {
@@ -661,7 +689,7 @@ public enum TemplateSyncMerge {
         TemplateSyncItem(
             id: raw.id,
             kind: raw.kind,
-            text: raw.text,
+            text: normalizeLineEndings(raw.text),
             title: normalizedTitle(raw.title),
             tag: normalizedTag(raw.tag),
             order: raw.order,
@@ -687,7 +715,7 @@ public enum TemplateSyncMerge {
         nowMillis - deletedAt > SyncProtocol.templateTombstoneLifetimeMillis
     }
 
-    private static func isKilledByTombstones(
+    private static func isDirectlyKilledByTombstones(
         _ entry: NormalizedEntry,
         pcTomb: TemplateSyncTombstone?,
         allTombs: [TemplateSyncTombstone]
@@ -702,6 +730,21 @@ public enum TemplateSyncMerge {
             if allTombs.contains(where: { $0.baseHash == nil }) {
                 return true
             }
+        }
+        return false
+    }
+
+    private static func isKilledByTombstones(
+        _ entry: NormalizedEntry,
+        pcTomb: TemplateSyncTombstone?,
+        pcEntryKilledOrAbsent: Bool,
+        allTombs: [TemplateSyncTombstone]
+    ) -> Bool {
+        if isDirectlyKilledByTombstones(entry, pcTomb: pcTomb, allTombs: allTombs) {
+            return true
+        }
+        if let itemBaseHash = entry.item.baseHash, itemBaseHash == entry.hash, pcEntryKilledOrAbsent {
+            return true
         }
         return false
     }

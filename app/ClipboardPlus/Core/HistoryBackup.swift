@@ -99,7 +99,7 @@ struct BackupManifest: Codable {
                       file.hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
                       fileHashes.insert(domain + file.hash).inserted else { throw BackupError.file }
             } else {
-                guard entry.image == nil, entry.file == nil, HistoryKind.classify(entry.text) == entry.kind,
+                guard (entry.kind == .text || entry.kind == .url), entry.image == nil, entry.file == nil,
                       texts.insert(Data((domain + entry.text).utf8)).inserted else { throw BackupError.manifest }
             }
         }

@@ -88,12 +88,14 @@ public sealed class TemplateRepository
     {
         public List<TemplateSyncItem> Templates { get; set; } = [];
         public List<TemplateSyncTombstone> Tombstones { get; set; } = [];
+        public HashSet<Guid> UnsyncedDeletedIds { get; set; } = [];
     }
 
     private readonly string filePath;
     private readonly Action<string>? log;
     private RepositoryState state;
     private byte[] durable;
+    private HashSet<Guid> durableUnsyncedDeletedIds = [];
 
     public TemplateRepository(string root, Action<string>? log = null)
     {
@@ -170,19 +172,20 @@ public sealed class TemplateRepository
 
     public TemplateEditResult Create(string text, string? title, string? tag, long nowMillis)
     {
-        var validationError = ValidateWritableText(text);
+        var normalizedText = text is null ? "" : TemplateSyncMerge.NormalizeLineEndings(text);
+        var validationError = ValidateWritableText(normalizedText);
         if (validationError != TemplateEditError.None)
             return new TemplateEditResult(false, validationError);
 
         if (state.Templates.Count >= SyncProtocol.MaxTemplates)
             return new TemplateEditResult(false, TemplateEditError.LimitExceeded);
 
-        if (state.Templates.Any(t => string.Equals(t.Text, text, StringComparison.Ordinal)))
+        if (state.Templates.Any(t => string.Equals(TemplateSyncMerge.NormalizeLineEndings(t.Text), normalizedText, StringComparison.Ordinal)))
             return new TemplateEditResult(false, TemplateEditError.Duplicate);
 
         var normTitle = SanitizeTitle(title);
         var normTag = SanitizeTag(tag);
-        var kind = ClassifyKind(text);
+        var kind = ClassifyKind(normalizedText);
         var updatedAt = TemplateSyncMerge.NextUpdatedAt(nowMillis, null);
 
         var groupItems = GetGroupOrdered(normTag);
@@ -190,7 +193,7 @@ public sealed class TemplateRepository
         var created = new TemplateSyncItem(
             Guid.NewGuid(),
             kind,
-            text,
+            normalizedText,
             normTitle,
             normTag,
             nextOrder,
@@ -208,20 +211,21 @@ public sealed class TemplateRepository
         if (index < 0)
             return new TemplateEditResult(false, TemplateEditError.NotFound);
 
-        var validationError = ValidateWritableText(text);
+        var normalizedText = text is null ? "" : TemplateSyncMerge.NormalizeLineEndings(text);
+        var validationError = ValidateWritableText(normalizedText);
         if (validationError != TemplateEditError.None)
             return new TemplateEditResult(false, validationError);
 
-        if (state.Templates.Any(t => t.Id != id && string.Equals(t.Text, text, StringComparison.Ordinal)))
+        if (state.Templates.Any(t => t.Id != id && string.Equals(TemplateSyncMerge.NormalizeLineEndings(t.Text), normalizedText, StringComparison.Ordinal)))
             return new TemplateEditResult(false, TemplateEditError.Duplicate);
 
         var existing = state.Templates[index];
         var normTitle = SanitizeTitle(title);
         var normTag = SanitizeTag(tag);
-        var newKind = ClassifyKind(text);
+        var newKind = ClassifyKind(normalizedText);
 
         if (existing.Kind == newKind &&
-            string.Equals(existing.Text, text, StringComparison.Ordinal) &&
+            string.Equals(existing.Text, normalizedText, StringComparison.Ordinal) &&
             string.Equals(existing.Title, normTitle, StringComparison.Ordinal) &&
             string.Equals(existing.Tag, normTag, StringComparison.Ordinal))
         {
@@ -235,7 +239,7 @@ public sealed class TemplateRepository
         var updated = existing with
         {
             Kind = newKind,
-            Text = text,
+            Text = normalizedText,
             Title = normTitle,
             Tag = normTag,
             Order = newOrder,
@@ -267,6 +271,7 @@ public sealed class TemplateRepository
         var hash = TemplateSyncMerge.ContentHash(existing);
         state.Tombstones.RemoveAll(t => t.Id == existing.Id);
         state.Tombstones.Add(new TemplateSyncTombstone(existing.Id, clampedNow, hash));
+        state.UnsyncedDeletedIds.Add(existing.Id);
         PruneTombstonesInMemory(clampedNow);
         Save();
         return new TemplateDeleteResult(true, existing);
@@ -276,14 +281,18 @@ public sealed class TemplateRepository
     {
         ArgumentNullException.ThrowIfNull(deletedItem);
 
-        var validationError = ValidateWritableText(deletedItem.Text);
+        var normalizedText = TemplateSyncMerge.NormalizeLineEndings(deletedItem.Text);
+        var validationError = ValidateWritableText(normalizedText);
         if (validationError != TemplateEditError.None)
             return new TemplateEditResult(false, validationError);
 
         if (state.Templates.Count >= SyncProtocol.MaxTemplates)
             return new TemplateEditResult(false, TemplateEditError.LimitExceeded);
 
-        if (state.Templates.Any(t => t.Id == deletedItem.Id || string.Equals(t.Text, deletedItem.Text, StringComparison.Ordinal)))
+        var canReuseId = state.UnsyncedDeletedIds.Contains(deletedItem.Id);
+        var restoredId = canReuseId ? deletedItem.Id : Guid.NewGuid();
+
+        if (state.Templates.Any(t => t.Id == restoredId || string.Equals(TemplateSyncMerge.NormalizeLineEndings(t.Text), normalizedText, StringComparison.Ordinal)))
             return new TemplateEditResult(false, TemplateEditError.Duplicate);
 
         var tomb = state.Tombstones.FirstOrDefault(t => t.Id == deletedItem.Id);
@@ -298,9 +307,9 @@ public sealed class TemplateRepository
         var group = GetGroupOrdered(normTag);
         var insertAt = Math.Clamp(deletedItem.Order, 0, group.Count);
         var restored = new TemplateSyncItem(
-            deletedItem.Id,
-            ClassifyKind(deletedItem.Text),
-            deletedItem.Text,
+            restoredId,
+            ClassifyKind(normalizedText),
+            normalizedText,
             normTitle,
             normTag,
             insertAt,
@@ -313,7 +322,11 @@ public sealed class TemplateRepository
                 group[i] = group[i] with { Order = i };
         }
         ReplaceGroupItems(normTag, group);
-        state.Tombstones.RemoveAll(t => t.Id == deletedItem.Id);
+        if (canReuseId)
+        {
+            state.Tombstones.RemoveAll(t => t.Id == deletedItem.Id);
+            state.UnsyncedDeletedIds.Remove(deletedItem.Id);
+        }
         Save();
         return new TemplateEditResult(true, TemplateEditError.None, Get(restored.Id));
     }
@@ -491,7 +504,12 @@ public sealed class TemplateRepository
 
     public void ClearTombstones()
     {
-        if (state.Tombstones.Count == 0) return;
+        state.UnsyncedDeletedIds.Clear();
+        if (state.Tombstones.Count == 0)
+        {
+            durableUnsyncedDeletedIds.Clear();
+            return;
+        }
         state.Tombstones.Clear();
         Save();
     }
@@ -820,10 +838,12 @@ public sealed class TemplateRepository
             var bytes = SerializeState(state);
             AtomicWrite(filePath, bytes);
             durable = bytes;
+            durableUnsyncedDeletedIds = [.. state.UnsyncedDeletedIds];
         }
         catch
         {
             state = DeserializeDurable(durable);
+            state.UnsyncedDeletedIds = [.. durableUnsyncedDeletedIds];
             throw;
         }
     }
