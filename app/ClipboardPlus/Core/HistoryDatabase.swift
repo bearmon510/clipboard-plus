@@ -30,8 +30,8 @@ struct LocalTemplateSyncSnapshot: Equatable {
     let skippedOversizedCount: Int
     let skippedOverflowCount: Int
 
-    var allEligibleIDs: Set<UUID> {
-        Set(snapshot.templates.map(\.id)).union(skippedOverflowIDs)
+    var excludedIDs: Set<UUID> {
+        skippedOversizedIDs.union(skippedOverflowIDs)
     }
 
     var allTombstoneIDs: Set<UUID> {
@@ -72,7 +72,7 @@ struct TemplateSyncOutcome: Equatable {
             extras.append("64KB超 \(skippedOversizedCount)件は対象外")
         }
         if skippedOverflowCount > 0 {
-            extras.append("300件超 \(skippedOverflowCount)件は対象外")
+            extras.append("同期上限により \(skippedOverflowCount)件は対象外")
         }
         if clockSkewSeconds != nil {
             extras.append("\(device.name)の時計がずれています")
@@ -378,8 +378,9 @@ final class HistoryDatabase: HistoryPersistence {
             let order: Int?
             if newTag == entry.tag { order = entry.templateOrder }
             else { order = try nextTemplateOrder(tag: newTag) }
-            let changed = !Data(newText.utf8).elementsEqual(Data(entry.text.utf8)) ||
-                newKind != entry.kind || normTitle != entry.title || newTag != entry.tag || order != entry.templateOrder
+            let changed = !newText.utf8.elementsEqual(entry.text.utf8) || newKind != entry.kind ||
+                Self.utf8Key(normTitle) != Self.utf8Key(entry.title) ||
+                Self.utf8Key(newTag) != Self.utf8Key(entry.tag) || order != entry.templateOrder
             guard changed else { return entry }
             let syncRow = try templateSyncMetadata(id: id)
             let syncId = syncRow?.syncId?.uuidString ?? UUID().uuidString
@@ -421,7 +422,7 @@ final class HistoryDatabase: HistoryPersistence {
         try transaction {
             let oldTag = HistoryEntry.normalizedTag(tag)
             let newTag = HistoryEntry.normalizedTag(newTag)
-            guard oldTag != newTag else { return }
+            guard Self.utf8Key(oldTag) != Self.utf8Key(newTag) else { return }
             let moved = HistoryEntry.orderedTemplates(try fetchAll().filter { $0.isTemplate && $0.tag == oldTag })
             let currentMillis = nowMillis()
             for entry in moved {
@@ -499,7 +500,6 @@ final class HistoryDatabase: HistoryPersistence {
                     if old.isTemplate, let activeSync = try templateSyncMetadata(id: active.id),
                        let activeSyncId = activeSync.syncId, activeSyncId != oldSync?.syncId,
                        let activeBaseHash = activeSync.baseHash {
-                        let deletedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: currentMillis, existingUpdatedAt: activeSync.updatedAt)
                         try execute("""
                             INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
                             VALUES (?, ?, ?, 0)
@@ -507,7 +507,7 @@ final class HistoryDatabase: HistoryPersistence {
                                 deleted_at = excluded.deleted_at,
                                 base_hash = excluded.base_hash,
                                 synced = 0
-                            """, [.text(activeSyncId.uuidString), .int64(deletedAt), .text(activeBaseHash)])
+                            """, [.text(activeSyncId.uuidString), .int64(currentMillis), .text(activeBaseHash)])
                     }
                     // A fresh collection during the undo window must survive restoration.
                     let latest = active.lastCollectedAt >= old.lastCollectedAt ? active : old
@@ -695,7 +695,6 @@ final class HistoryDatabase: HistoryPersistence {
             let doomedTemplates = try templateSyncRows("SELECT \(syncColumns) FROM history WHERE deletion_id IS NULL AND pinned = 1 AND (\(predicate))", bindings)
             for row in doomedTemplates {
                 if let syncId = row.syncId, let baseHash = row.baseHash {
-                    let deletedAt = TemplateSyncMerge.nextUpdatedAt(nowMillis: currentMillis, existingUpdatedAt: row.updatedAt)
                     try execute("""
                         INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
                         VALUES (?, ?, ?, 0)
@@ -703,7 +702,7 @@ final class HistoryDatabase: HistoryPersistence {
                             deleted_at = excluded.deleted_at,
                             base_hash = excluded.base_hash,
                             synced = 0
-                        """, [.text(syncId.uuidString), .int64(deletedAt), .text(baseHash)])
+                        """, [.text(syncId.uuidString), .int64(currentMillis), .text(baseHash)])
                 }
             }
             let id = UUID().uuidString
@@ -781,28 +780,20 @@ final class HistoryDatabase: HistoryPersistence {
             var items: [TemplateSyncItem] = []
             var dirtyIDs = Set<UUID>()
             var skippedOversizedIDs = Set<UUID>()
-            var skippedOverflowIDs = Set<UUID>()
-            var skippedOversizedCount = 0
-            var skippedOverflowCount = 0
-            var orderByTag: [String?: Int] = [:]
+            var orderByTag: [Data?: Int] = [:]
 
             for group in groups {
                 for entry in group.entries {
                     guard let row = rowByID[entry.id], let syncId = row.syncId, let rowUpdatedAt = row.updatedAt else { continue }
                     if entry.text.utf8.count > SyncProtocol.maxTemplateTextBytes {
                         skippedOversizedIDs.insert(syncId)
-                        skippedOversizedCount += 1
-                        continue
-                    }
-                    if items.count >= SyncProtocol.maxTemplates {
-                        skippedOverflowIDs.insert(syncId)
-                        skippedOverflowCount += 1
                         continue
                     }
                     let title = Self.sanitizedTitleForSync(entry.title)
                     let tag = Self.sanitizedTagForSync(entry.tag)
-                    let order = orderByTag[tag, default: 0]
-                    orderByTag[tag] = order + 1
+                    let tagKey = Self.utf8Key(tag)
+                    let order = orderByTag[tagKey, default: 0]
+                    orderByTag[tagKey] = order + 1
                     let updatedAt = Self.clampedTimestamp(rowUpdatedAt)
                     let validBaseHash = row.baseHash.flatMap { SyncProtocol.isLowerHex64($0) ? $0 : nil }
                     let item = TemplateSyncItem(
@@ -815,15 +806,15 @@ final class HistoryDatabase: HistoryPersistence {
                         updatedAt: updatedAt,
                         baseHash: validBaseHash
                     )
-                    let hash = TemplateSyncMerge.contentHash(item)
-                    if validBaseHash == nil || row.dirty || validBaseHash != hash {
+                    if validBaseHash == nil || row.dirty || validBaseHash != TemplateSyncMerge.contentHash(item) {
                         dirtyIDs.insert(syncId)
                     }
                     items.append(item)
                 }
             }
 
-            let activeSyncIDs = Set(items.map(\.id)).union(skippedOversizedIDs).union(skippedOverflowIDs)
+            let candidateIDs = Set(items.map(\.id))
+            let activeSyncIDs = candidateIDs.union(skippedOversizedIDs)
             let tombRows = try fetchTombstoneRows()
             var tombstones: [TemplateSyncTombstone] = []
             var dirtyTombstoneIDs = Set<UUID>()
@@ -834,14 +825,18 @@ final class HistoryDatabase: HistoryPersistence {
                 }
             }
 
+            let prepared = try TemplateSyncMerge.prepareSyncState(
+                templates: items, tombstones: tombstones, nowMillis: currentMillis, sentAtMillis: currentMillis
+            )
+            let selectedIDs = Set(prepared.state.templates.map(\.id))
             return LocalTemplateSyncSnapshot(
-                snapshot: TemplateSyncSnapshot(sentAt: currentMillis, templates: items, tombstones: tombstones),
-                dirtyIDs: dirtyIDs,
-                dirtyTombstoneIDs: dirtyTombstoneIDs,
+                snapshot: TemplateSyncSnapshot(sentAt: currentMillis, templates: prepared.state.templates, tombstones: prepared.state.tombstones),
+                dirtyIDs: dirtyIDs.intersection(selectedIDs),
+                dirtyTombstoneIDs: dirtyTombstoneIDs.intersection(prepared.state.tombstones.map(\.id)),
                 skippedOversizedIDs: skippedOversizedIDs,
-                skippedOverflowIDs: skippedOverflowIDs,
-                skippedOversizedCount: skippedOversizedCount,
-                skippedOverflowCount: skippedOverflowCount
+                skippedOverflowIDs: candidateIDs.subtracting(selectedIDs),
+                skippedOversizedCount: skippedOversizedIDs.count,
+                skippedOverflowCount: prepared.excludedTemplateCount
             )
         }
     }
@@ -855,33 +850,31 @@ final class HistoryDatabase: HistoryPersistence {
 
             let activeRows = try fetchActiveTemplateSyncRows()
             let existingTombstones = try fetchTombstoneRows()
+            let pushedIDs = Set((pushed?.snapshot.templates ?? []).map(\.id))
+            let excludedIDs = pushed?.excludedIDs ?? []
 
             var preservedLocal: [SyncTemplateRow] = []
             var syncManaged: [SyncTemplateRow] = []
+            var protectedIDs = Set<UUID>()
+            var protectedTexts = Set<Data>()
+            var oversizedCount = 0
             for row in activeRows {
                 if row.entry.kind == .image || row.entry.kind == .file {
                     preservedLocal.append(row)
-                } else if row.entry.text.utf8.count > SyncProtocol.maxTemplateTextBytes {
+                    continue
+                }
+                let oversized = row.entry.text.utf8.count > SyncProtocol.maxTemplateTextBytes
+                if oversized { oversizedCount += 1 }
+                if oversized || row.syncId.map(excludedIDs.contains) == true {
                     preservedLocal.append(row)
-                } else if let pushed {
-                    if let sid = row.syncId, pushed.skippedOverflowIDs.contains(sid) {
-                        preservedLocal.append(row)
-                    } else if let sid = row.syncId, (pushed.allEligibleIDs.contains(sid) || pushed.skippedOversizedIDs.contains(sid)) {
-                        syncManaged.append(row)
-                    } else if row.baseHash == nil {
-                        preservedLocal.append(row)
-                    } else {
-                        syncManaged.append(row)
-                    }
+                    if let id = row.syncId { protectedIDs.insert(id) }
+                    protectedTexts.insert(Data(row.entry.text.utf8))
+                } else if pushed != nil && row.baseHash == nil && row.syncId.map(pushedIDs.contains) != true {
+                    preservedLocal.append(row)
                 } else {
                     syncManaged.append(row)
                 }
             }
-
-            let skippedOversizedCount = activeRows.filter {
-                ($0.entry.kind == .text || $0.entry.kind == .url) && $0.entry.text.utf8.count > SyncProtocol.maxTemplateTextBytes
-            }.count
-            let skippedOverflowCount = pushed?.skippedOverflowCount ?? 0
 
             struct IncomingTemplate {
                 let item: TemplateSyncItem
@@ -890,7 +883,9 @@ final class HistoryDatabase: HistoryPersistence {
                 let hash: String
                 let normalizedOrder: Int
             }
-            var rawIncoming: [(item: TemplateSyncItem, normTitle: String?, normTag: String?, hash: String)] = snapshot.templates.map { raw in
+            // A peer may still have an older version of a locally excluded template.
+            let rawIncoming: [(item: TemplateSyncItem, normTitle: String?, normTag: String?, hash: String)] = snapshot.templates.compactMap { raw in
+                guard !protectedIDs.contains(raw.id), !protectedTexts.contains(Data(raw.text.utf8)) else { return nil }
                 let normTitle = TemplateSyncMerge.normalizedTitle(raw.title)
                 let normTag = TemplateSyncMerge.normalizedTag(raw.tag)
                 let normalized = TemplateSyncItem(
@@ -905,11 +900,11 @@ final class HistoryDatabase: HistoryPersistence {
                 )
                 return (normalized, normTitle, normTag, TemplateSyncMerge.contentHash(normalized))
             }
-            var incomingOrderByTag: [String?: Int] = [:]
+            var incomingOrderByTag: [Data?: Int] = [:]
             var incoming: [IncomingTemplate] = []
             incoming.reserveCapacity(rawIncoming.count)
             // Group incoming orders densely per tag so SQLite pin_order stays contiguous from 0.
-            let groupedIndices = Dictionary(grouping: rawIncoming.indices, by: { rawIncoming[$0].normTag })
+            let groupedIndices = Dictionary(grouping: rawIncoming.indices, by: { Self.utf8Key(rawIncoming[$0].normTag) })
             var assignedOrder = Array(repeating: 0, count: rawIncoming.count)
             for indices in groupedIndices.values {
                 let sorted = indices.sorted { lhs, rhs in
@@ -925,7 +920,8 @@ final class HistoryDatabase: HistoryPersistence {
             for index in rawIncoming.indices {
                 let raw = rawIncoming[index]
                 let ord = assignedOrder[index]
-                incomingOrderByTag[raw.normTag] = max(incomingOrderByTag[raw.normTag, default: 0], ord + 1)
+                let tagKey = Self.utf8Key(raw.normTag)
+                incomingOrderByTag[tagKey] = max(incomingOrderByTag[tagKey, default: 0], ord + 1)
                 let itemWithOrder = TemplateSyncItem(
                     id: raw.item.id, kind: raw.item.kind, text: raw.item.text,
                     title: raw.normTitle, tag: raw.normTag, order: ord, updatedAt: raw.item.updatedAt, baseHash: nil
@@ -940,14 +936,15 @@ final class HistoryDatabase: HistoryPersistence {
             }
             var beforeByRowID: [Int: BeforeInfo] = [:]
             let syncManagedByID = Dictionary(uniqueKeysWithValues: syncManaged.map { ($0.entry.id, $0) })
-            var beforeOrderByTag: [String?: Int] = [:]
+            var beforeOrderByTag: [Data?: Int] = [:]
             for group in TemplateGroups.make(syncManaged.map(\.entry), search: "") {
                 for entry in group.entries {
                     guard let row = syncManagedByID[entry.id] else { continue }
                     let title = Self.sanitizedTitleForSync(entry.title)
                     let tag = Self.sanitizedTagForSync(entry.tag)
-                    let order = beforeOrderByTag[tag, default: 0]
-                    beforeOrderByTag[tag] = order + 1
+                    let tagKey = Self.utf8Key(tag)
+                    let order = beforeOrderByTag[tagKey, default: 0]
+                    beforeOrderByTag[tagKey] = order + 1
                     let item = TemplateSyncItem(
                         id: row.syncId ?? UUID(),
                         kind: entry.kind == .url ? .url : .text,
@@ -1041,18 +1038,18 @@ final class HistoryDatabase: HistoryPersistence {
                 let row = update.row
                 if let before = beforeByRowID[row.entry.id] {
                     if before.item.kind != inc.item.kind ||
-                        !Data(before.item.text.utf8).elementsEqual(Data(inc.item.text.utf8)) ||
-                        before.item.title != inc.normTitle ||
-                        before.item.tag != inc.normTag ||
+                        !before.item.text.utf8.elementsEqual(inc.item.text.utf8) ||
+                        Self.utf8Key(before.item.title) != Self.utf8Key(inc.normTitle) ||
+                        Self.utf8Key(before.item.tag) != Self.utf8Key(inc.normTag) ||
                         before.item.order != inc.normalizedOrder {
                         updatedCount += 1
                     }
                 } else {
                     let kind = row.entry.kind == .url ? TemplateSyncKind.url : .text
                     if kind != inc.item.kind ||
-                        !Data(row.entry.text.utf8).elementsEqual(Data(inc.item.text.utf8)) ||
-                        Self.sanitizedTitleForSync(row.entry.title) != inc.normTitle ||
-                        Self.sanitizedTagForSync(row.entry.tag) != inc.normTag ||
+                        !row.entry.text.utf8.elementsEqual(inc.item.text.utf8) ||
+                        Self.utf8Key(Self.sanitizedTitleForSync(row.entry.title)) != Self.utf8Key(inc.normTitle) ||
+                        Self.utf8Key(Self.sanitizedTagForSync(row.entry.tag)) != Self.utf8Key(inc.normTag) ||
                         row.entry.templateOrder != inc.normalizedOrder {
                         updatedCount += 1
                     }
@@ -1098,7 +1095,7 @@ final class HistoryDatabase: HistoryPersistence {
             for update in matchedUpdates where !update.keptMidSyncLocalEdit {
                 let inc = update.incoming
                 let row = update.row
-                let textChanged = !Data(row.entry.text.utf8).elementsEqual(Data(inc.item.text.utf8))
+                let textChanged = !row.entry.text.utf8.elementsEqual(inc.item.text.utf8)
                 let idChanged = row.syncId != inc.item.id
                 if textChanged || idChanged {
                     try execute("UPDATE history SET text = ?, template_sync_id = NULL WHERE id = ?",
@@ -1151,8 +1148,9 @@ final class HistoryDatabase: HistoryPersistence {
                 var nextOrderByTag = incomingOrderByTag
                 for group in TemplateGroups.make(remainingPreserved.map(\.entry), search: "") {
                     for entry in group.entries {
-                        let nextOrder = nextOrderByTag[entry.tag, default: 0]
-                        nextOrderByTag[entry.tag] = nextOrder + 1
+                        let tagKey = Self.utf8Key(entry.tag)
+                        let nextOrder = nextOrderByTag[tagKey, default: 0]
+                        nextOrderByTag[tagKey] = nextOrder + 1
                         if entry.templateOrder != nextOrder {
                             try execute("UPDATE history SET pin_order = ? WHERE id = ?",
                                         [.integer(nextOrder), .integer(entry.id)])
@@ -1167,13 +1165,18 @@ final class HistoryDatabase: HistoryPersistence {
                 !$0.synced && !pushedTombIDs.contains($0.id) && !incomingActiveIDs.contains($0.id)
             }
             let keptMidSyncTombIDs = Set(keptMidSyncTombstones.map(\.id))
+            let syncedDeletedAtByID = Dictionary(uniqueKeysWithValues: existingTombstones.filter(\.synced).map { ($0.id, $0.deletedAt) })
+            let clockOffset = currentMillis - Self.clampedTimestamp(snapshot.sentAt)
             try execute("DELETE FROM template_tombstones")
             for tomb in snapshot.tombstones where !incomingActiveIDs.contains(tomb.id) && !keptMidSyncTombIDs.contains(tomb.id) {
                 let validHash = tomb.baseHash.flatMap { SyncProtocol.isLowerHex64($0) ? $0 : nil }
+                // Store PC tombstones in the same clock as locally created tombstones and sentAt.
+                let adjusted = min(currentMillis, Self.clampedTimestamp(Self.clampedTimestamp(tomb.deletedAt) + clockOffset))
+                let deletedAt = min(adjusted, syncedDeletedAtByID[tomb.id] ?? adjusted)
                 try execute("""
                     INSERT INTO template_tombstones(sync_id, deleted_at, base_hash, synced)
                     VALUES (?, ?, ?, 1)
-                    """, [.text(tomb.id.uuidString), .int64(Self.clampedTimestamp(tomb.deletedAt)),
+                    """, [.text(tomb.id.uuidString), .int64(deletedAt),
                           validHash.map { .text($0) } ?? .null])
             }
             for tomb in keptMidSyncTombstones {
@@ -1191,8 +1194,8 @@ final class HistoryDatabase: HistoryPersistence {
                 deleted: deletedCount,
                 pushedToPCCount: pushedToPCCount,
                 conflictCopyCount: conflictCopyCount,
-                skippedOversizedCount: skippedOversizedCount,
-                skippedOverflowCount: skippedOverflowCount,
+                skippedOversizedCount: pushed?.skippedOversizedCount ?? oversizedCount,
+                skippedOverflowCount: pushed?.skippedOverflowCount ?? 0,
                 clockSkewSeconds: clockSkewSeconds
             )
         }
@@ -1290,6 +1293,10 @@ final class HistoryDatabase: HistoryPersistence {
 
     private static func clampedTimestamp(_ value: Int64) -> Int64 {
         min(SyncProtocol.maxTimestamp, max(-SyncProtocol.maxTimestamp, value))
+    }
+
+    private static func utf8Key(_ value: String?) -> Data? {
+        value.map { Data($0.utf8) }
     }
 
     private static func sanitizedTitleForSync(_ title: String?) -> String? {

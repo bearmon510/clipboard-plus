@@ -161,9 +161,13 @@ final class PCSyncController: ObservableObject {
     private var activeTemplateSync: ActiveTemplateSync?
     private var templateAckQueue: [UUID] = []
     private var templateOutgoing: [TemplateSyncMessage] = []
-    private var templateAssembler: TemplateSyncPageAssembler?
-    private var templateReceiveStart: Date?
-    private var templateReceiveBytes = 0
+    private struct TemplateReception {
+        let op: UUID
+        let assembler: TemplateSyncPageAssembler
+        let start: Date
+        var bytes = 0
+    }
+    private var templateReception: TemplateReception?
     private var inFlightTemplatePulls: Set<UUID> = []
     private var pendingPushedSnapshots: [(op: UUID, snapshot: LocalTemplateSyncSnapshot)] = []
     private var nextIncomingFrameToken: UInt64 = 0
@@ -449,13 +453,12 @@ final class PCSyncController: ObservableObject {
         if let assembler {
             do { try assembler.finish() } catch { record("受信組み立てを破棄") }
         }
-        if let templateAssembler {
-            do { try templateAssembler.finish() } catch { record("テンプレート受信組み立てを破棄") }
+        if let templateReception {
+            do { try templateReception.assembler.finish() } catch { record("テンプレート受信組み立てを破棄") }
         }
-        assembler = nil; templateAssembler = nil; handshake = nil; sender = nil; receiver = nil; peerId = nil
+        assembler = nil; templateReception = nil; handshake = nil; sender = nil; receiver = nil; peerId = nil
         sessionGeneration = UUID()
         handshakeStart = nil; partialStart = nil; receiveStart = nil; receiveBytes = 0
-        templateReceiveStart = nil; templateReceiveBytes = 0
         nextIncomingFrameToken = 0; currentIncomingFrameToken = nil; incomingFrameBytes = 0
         writeBlockedSince = nil
         lastActivity = nil; pingRequestedAt = nil; pingQueued = false
@@ -832,6 +835,10 @@ final class PCSyncController: ObservableObject {
             switch incoming {
             case .sync(.ping), .sync(.pong):
                 revertReplyExtension(for: frameToken)
+            case .template(.state(let op, _, _, _)) where !isAwaitingTemplateState(op):
+                // An old response must not change the current sync or its deadline.
+                revertReplyExtension(for: frameToken)
+                return
             default:
                 if frameBytes > Self.minExtendableFrameBytes {
                     extendReplyDeadlines(for: frameToken, at: current)
@@ -965,6 +972,13 @@ final class PCSyncController: ObservableObject {
         return pendingPushedSnapshots.remove(at: index).snapshot
     }
 
+    private func isAwaitingTemplateState(_ op: UUID) -> Bool {
+        if let active = activeTemplateSync, active.op == op {
+            return active.pushed != nil && !active.isApplying
+        }
+        return pendingPushedSnapshots.contains { $0.op == op }
+    }
+
     private func handleTemplateMessage(_ message: TemplateSyncMessage, bytes: Int, start: Date, current: Date) throws {
         switch message {
         case .pull(let op):
@@ -994,14 +1008,12 @@ final class PCSyncController: ObservableObject {
                 }
             }
         case .state(let op, _, _, _):
-            if templateAssembler == nil {
-                templateAssembler = TemplateSyncPageAssembler(expectedOp: nil, expectedIsState: true)
-                templateReceiveStart = start
-                templateReceiveBytes = 0
-            }
-            templateReceiveBytes += bytes
-            let assembled = try templateAssembler!.append(message)
-            guard let snapshot = assembled else {
+            var reception = templateReception ?? TemplateReception(
+                op: op, assembler: TemplateSyncPageAssembler(expectedOp: op, expectedIsState: true), start: start
+            )
+            reception.bytes += bytes
+            guard let snapshot = try reception.assembler.append(message) else {
+                templateReception = reception
                 if var active = activeTemplateSync, active.op == op {
                     let candidate = current.addingTimeInterval(Self.templateSyncTimeout)
                     let maxDeadline = active.reply.initialSentAt.addingTimeInterval(Self.templateSyncTimeout + Self.maxReplyExtension)
@@ -1014,12 +1026,8 @@ final class PCSyncController: ObservableObject {
                 }
                 return
             }
-            let totalStart = templateReceiveStart ?? start
-            let totalBytes = templateReceiveBytes
-            templateReceiveStart = nil
-            templateReceiveBytes = 0
-            try templateAssembler?.finish()
-            templateAssembler = nil
+            try reception.assembler.finish()
+            templateReception = nil
 
             let pushed: LocalTemplateSyncSnapshot?
             if var active = activeTemplateSync, active.op == op {
@@ -1032,7 +1040,7 @@ final class PCSyncController: ObservableObject {
 
             let pairingGen = pairingGeneration
             let sessionGen = sessionGeneration
-            monitor.applySyncedTemplates(snapshot, pushed: pushed) { [weak self] result in
+            monitor.applySyncedTemplates(snapshot, pushed: pushed) { [weak self, totalBytes = reception.bytes, totalStart = reception.start] result in
                 guard let self, self.pairingGeneration == pairingGen else { return }
                 let completion: (@MainActor (Result<TemplateSyncOutcome, TemplateSyncError>) -> Void)?
                 if let active = self.activeTemplateSync, active.op == op, self.sessionGeneration == sessionGen {
@@ -1050,7 +1058,8 @@ final class PCSyncController: ObservableObject {
                     }
                     completion?(.failure(.saveFailed))
                 case .success(let outcome):
-                    self.record("テンプレート同期完了; 追加=\(outcome.added); 更新=\(outcome.updated); 削除=\(outcome.deleted); 反映=\(outcome.pushedToPCCount); 競合写し=\(outcome.conflictCopyCount); バイト数=\(totalBytes); 所要ms=\(self.milliseconds(since: totalStart))")
+                    let excludedCount = outcome.skippedOversizedCount + outcome.skippedOverflowCount
+                    self.record("テンプレート同期完了; 追加=\(outcome.added); 更新=\(outcome.updated); 削除=\(outcome.deleted); 反映=\(outcome.pushedToPCCount); 競合写し=\(outcome.conflictCopyCount); 対象外=\(excludedCount); バイト数=\(totalBytes); 所要ms=\(self.milliseconds(since: totalStart))")
                     if let skew = outcome.clockSkewSeconds {
                         self.record("PCとの時刻差を検知; ずれ秒=\(skew)")
                     }
@@ -1233,6 +1242,7 @@ final class PCSyncController: ObservableObject {
                  !templateOutgoing.contains { if case let .push(op, part, _, _) = $0 { return op == active.op && part == 0 }; return false })
             activeTemplateSync = nil
             isSyncingTemplates = false
+            if templateReception?.op == active.op { templateReception = nil }
             if startedSendingThisOp && hasRemainingPages {
                 fail(reject: false, reason: "テンプレート同期期限")
                 active.completion(.failure(.timedOut))

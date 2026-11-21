@@ -2559,8 +2559,9 @@ final class PCSyncControllerTests: XCTestCase {
 
         await drain(f)
         let push = try XCTUnwrap(f.link.templatePushes.last)
-        XCTAssertEqual(push.part, 1)
+        XCTAssertEqual(push.part, 0)
         XCTAssertEqual(push.total, 1)
+        XCTAssertEqual(push.page.version, 1)
         XCTAssertEqual(push.page.templates.count, 2)
         let id1 = try XCTUnwrap(push.page.templates.first { $0.text == "秘密本文アルファ" }?.id)
         let id2 = try XCTUnwrap(push.page.templates.first { $0.text == "削除される本文" }?.id)
@@ -2568,9 +2569,9 @@ final class PCSyncControllerTests: XCTestCase {
         let pcAddedID = UUID()
         let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
         try f.link.send(.state(
-            op: push.op, part: 1, total: 1,
+            op: push.op, part: 0, total: 1,
             page: TemplateSyncPage(
-                version: Int(SyncProtocol.version),
+                version: 1,
                 sentAt: nowMs,
                 templates: [
                     TemplateSyncItem(id: id1, kind: .text, text: "同期後本文", title: "更新済題", tag: "別タグ", order: 0, updatedAt: nowMs + 100),
@@ -2632,8 +2633,8 @@ final class PCSyncControllerTests: XCTestCase {
         let op1 = try XCTUnwrap(f.link.templatePushes.last?.op)
         let partialItem = TemplateSyncItem(id: UUID(), kind: .text, text: "part1", title: nil, tag: nil, order: 0,
                                            updatedAt: Int64(f.clock.date.timeIntervalSince1970 * 1000))
-        try f.link.send(.state(op: op1, part: 1, total: 2,
-                               page: TemplateSyncPage(version: Int(SyncProtocol.version),
+        try f.link.send(.state(op: op1, part: 0, total: 2,
+                               page: TemplateSyncPage(version: 1,
                                                       sentAt: Int64(f.clock.date.timeIntervalSince1970 * 1000),
                                                       templates: [partialItem], tombstones: [])))
         f.link.disconnect()
@@ -2641,10 +2642,12 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(res1, .failure(.disconnected))
         XCTAssertFalse(f.controller.isSyncingTemplates)
 
-        // 2. Reconnect, stale part 2 of op1 is ignored, and 30s timeout triggers .timedOut.
+        // 2. Reconnect, ignore the stale continuation, and time out the next sync after 30s.
         try f.link.connect(pairing, limit: 512)
-        try f.link.send(.state(op: op1, part: 2, total: 2,
+        try f.link.send(.state(op: op1, part: 1, total: 2,
                                page: TemplateSyncPage(templates: [partialItem], tombstones: [])))
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertTrue(f.link.templateAckOps.isEmpty)
         var res2: Result<TemplateSyncOutcome, TemplateSyncError>?
         let exp2 = expectation(description: "timeout")
         f.controller.syncTemplates { res2 = $0; exp2.fulfill() }
@@ -2665,7 +2668,8 @@ final class PCSyncControllerTests: XCTestCase {
         await fulfillment(of: [exp2], timeout: 5)
         XCTAssertEqual(res2, .failure(.timedOut))
         XCTAssertFalse(f.controller.isSyncingTemplates)
-        XCTAssertEqual(f.link.rejected, [false])
+        XCTAssertTrue(f.link.rejected.isEmpty)
+        XCTAssertEqual(f.controller.status, .connected)
 
         // 3. Large incoming tpl_state frame extends deadline beyond 30s so multi-packet delivery succeeds.
         try f.link.connect(pairing, limit: 512)
@@ -2678,8 +2682,8 @@ final class PCSyncControllerTests: XCTestCase {
         let bigText = String(repeating: "延", count: 350)
         let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
         let bigState = try f.link.seal(.state(
-            op: op3, part: 1, total: 1,
-            page: TemplateSyncPage(version: Int(SyncProtocol.version), sentAt: nowMs,
+            op: op3, part: 0, total: 1,
+            page: TemplateSyncPage(version: 1, sentAt: nowMs,
                                    templates: [TemplateSyncItem(id: push3.id, kind: .text, text: bigText, title: nil, tag: nil, order: 0, updatedAt: nowMs)],
                                    tombstones: [])
         ))
@@ -2729,7 +2733,10 @@ final class PCSyncControllerTests: XCTestCase {
         f.link.resume()
         let pushes = f.link.templatePushes.filter { $0.op == pcOp }
         XCTAssertGreaterThanOrEqual(pushes.count, 2)
-        XCTAssertEqual(pushes.map(\.part), Array(1...pushes.count))
+        XCTAssertEqual(pushes.map(\.part), Array(0..<pushes.count))
+        XCTAssertEqual(pushes.first?.page.version, 1)
+        XCTAssertEqual(pushes.first?.page.sentAt, Int64(dbNow.timeIntervalSince1970 * 1000))
+        XCTAssertTrue(pushes.dropFirst().allSatisfy { $0.page.version == nil && $0.page.sentAt == nil })
 
         // All tpl_push pages must precede the queued pending history item.
         let lastPushIdx = try XCTUnwrap(f.link.decryptedLog.lastIndex(of: "tpl_push"))
@@ -2741,14 +2748,14 @@ final class PCSyncControllerTests: XCTestCase {
         let nowMs = Int64(f.clock.date.timeIntervalSince1970 * 1000)
         dbNow = dbNow.addingTimeInterval(10)
         try f.link.send(.state(
-            op: pcOp, part: 1, total: 2,
-            page: TemplateSyncPage(version: Int(SyncProtocol.version), sentAt: nowMs,
+            op: pcOp, part: 0, total: 2,
+            page: TemplateSyncPage(version: 1, sentAt: nowMs,
                                    templates: [TemplateSyncItem(id: kept.id, kind: .text, text: "PC配信結果", title: "共有", tag: nil, order: 0, updatedAt: nowMs)],
                                    tombstones: [])
         ))
         let page2Item = TemplateSyncItem(id: UUID(), kind: .text, text: "PC追加2ページ目", title: nil, tag: nil, order: 1, updatedAt: nowMs)
         try f.link.send(.state(
-            op: pcOp, part: 2, total: 2,
+            op: pcOp, part: 1, total: 2,
             page: TemplateSyncPage(templates: [page2Item], tombstones: [])
         ))
         await drain(f)

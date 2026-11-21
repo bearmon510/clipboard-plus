@@ -524,8 +524,10 @@ final class TemplateHistoryTests: XCTestCase {
         let syncedMeta = try XCTUnwrap(try db.templateSyncMetadata(id: syncedEntry.id))
         let localSnap = try db.readTemplateSyncSnapshot()
         let syncedItem = try XCTUnwrap(localSnap.snapshot.templates.first { $0.id == syncedMeta.syncId })
+        let pcItem = TemplateSyncItem(id: syncedItem.id, kind: syncedItem.kind, text: syncedItem.text,
+                                      title: syncedItem.title, tag: syncedItem.tag, order: syncedItem.order, updatedAt: 1_500_000)
         _ = try db.applySyncedTemplates(
-            TemplateSyncSnapshot(sentAt: 1_000_000, templates: [syncedItem], tombstones: []),
+            TemplateSyncSnapshot(sentAt: 1_500_000, templates: [pcItem], tombstones: []),
             pushed: localSnap
         )
         let freshLocal = try db.createTemplate(text: "完全未同期", title: nil, tag: nil)
@@ -535,7 +537,7 @@ final class TemplateHistoryTests: XCTestCase {
         XCTAssertTrue(try db.templateTombstones().isEmpty)
         XCTAssertTrue(try db.undo(localDel))
 
-        // Delete synced template -> creates tombstone with baseHash; undo deletes tombstone and bumps updatedAt.
+        // The deletion uses the local clock even when the PC's last edit is in the future.
         now = Date(timeIntervalSince1970: 1_100)
         let syncedDel = try XCTUnwrap(try db.delete(id: syncedEntry.id))
         let tombsAfterDel = try db.templateTombstones()
@@ -548,7 +550,7 @@ final class TemplateHistoryTests: XCTestCase {
         XCTAssertTrue(try db.undo(syncedDel))
         XCTAssertTrue(try db.templateTombstones().isEmpty)
         let restoredMeta = try XCTUnwrap(try db.templateSyncMetadata(id: syncedEntry.id))
-        XCTAssertGreaterThan(restoredMeta.updatedAt ?? 0, 1_100_000)
+        XCTAssertGreaterThan(restoredMeta.updatedAt ?? 0, pcItem.updatedAt)
         XCTAssertTrue(restoredMeta.dirty)
 
         // Re-delete and purge after undo interval -> row removed, tombstone retained.
@@ -616,6 +618,88 @@ final class TemplateHistoryTests: XCTestCase {
         let prunedSnap = try db.readTemplateSyncSnapshot()
         XCTAssertEqual(prunedSnap.snapshot.tombstones.count, SyncProtocol.maxTemplateTombstones)
         XCTAssertFalse(prunedSnap.snapshot.tombstones.contains { $0.deletedAt <= staleMs })
+    }
+
+    func testTemplateSyncExcludesEscapedPageOverflowAndKeepsLocalEdit() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("limit.sqlite"), now: { now })
+        let local = try db.createTemplate(text: "以前同期した本文", title: nil)
+        let initial = try db.readTemplateSyncSnapshot()
+        let oldItem = try XCTUnwrap(initial.snapshot.templates.first)
+        _ = try db.applySyncedTemplates(initial.snapshot, pushed: initial)
+
+        let escaped = String(repeating: "\u{0001}", count: SyncProtocol.maxTemplateTextBytes)
+        _ = try db.updateTemplate(id: local.id, text: escaped, title: nil, tag: nil)
+        _ = try db.createTemplate(text: "同期できる本文", title: nil)
+
+        let pushed = try db.readTemplateSyncSnapshot()
+        XCTAssertEqual(pushed.skippedOverflowIDs, Set([oldItem.id]))
+        XCTAssertEqual(pushed.skippedOversizedCount, 0)
+        XCTAssertEqual(pushed.snapshot.templates.map(\.text), ["同期できる本文"])
+        let pages = try TemplateSyncMessageCodec.splitPages(op: UUID(), snapshot: pushed.snapshot, isState: false)
+        XCTAssertEqual(pages.count, 1)
+        _ = try TemplateSyncMessageCodec.encode(try XCTUnwrap(pages.first))
+
+        let reply = TemplateSyncSnapshot(sentAt: pushed.snapshot.sentAt, templates: pushed.snapshot.templates + [oldItem], tombstones: [])
+        let outcome = try db.applySyncedTemplates(reply, pushed: pushed)
+        XCTAssertEqual(outcome.skippedOverflowCount, 1)
+        XCTAssertTrue(outcome.toastMessage(for: .pad).contains("同期上限により 1件は対象外"))
+        let retained = try XCTUnwrap(db.fetchAll().first { $0.id == local.id })
+        XCTAssertTrue(retained.text.utf8.elementsEqual(escaped.utf8))
+        XCTAssertEqual(try db.templateSyncMetadata(id: local.id)?.syncId, oldItem.id)
+        XCTAssertEqual(try db.templateSyncMetadata(id: local.id)?.dirty, true)
+    }
+
+    func testTemplateSyncUsesSentAtForTombstoneAgeWithoutExtendingItOnReplay() throws {
+        var now = Date(timeIntervalSince1970: 40_000_000)
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("tomb-clock.sqlite"), now: { now })
+        let day: Int64 = 86_400_000
+        let localMillis = Int64(now.timeIntervalSince1970 * 1000)
+        let pcMillis = localMillis - 181 * day
+        let age = SyncProtocol.templateTombstoneLifetimeMillis - day
+        let tomb = TemplateSyncTombstone(id: UUID(), deletedAt: pcMillis - age)
+        let reply = TemplateSyncSnapshot(sentAt: pcMillis, templates: [], tombstones: [tomb])
+
+        _ = try db.applySyncedTemplates(reply)
+        let adjusted = TemplateSyncTombstone(id: tomb.id, deletedAt: localMillis - age)
+        let pushed = try db.readTemplateSyncSnapshot()
+        XCTAssertEqual(pushed.snapshot.sentAt, localMillis)
+        XCTAssertEqual(pushed.snapshot.tombstones, [adjusted])
+
+        now.addTimeInterval(86_400)
+        _ = try db.applySyncedTemplates(reply, pushed: pushed)
+        XCTAssertEqual(try db.templateTombstones(), [adjusted])
+        now.addTimeInterval(1)
+        XCTAssertTrue(try db.readTemplateSyncSnapshot().snapshot.tombstones.isEmpty)
+    }
+
+    func testTemplateSyncComparesTitleAndTagBytesAndKeepsSeparateTagOrders() throws {
+        let db = try HistoryDatabase(url: ImageTestSupport.directory(self).appendingPathComponent("unicode.sqlite"))
+        let nfc = "\u{00e9}"
+        let nfd = "e\u{0301}"
+        let first = try db.createTemplate(text: "first", title: nfc, tag: nfc)
+        let second = try db.createTemplate(text: "second", title: nil, tag: nfd)
+        let pushed = try db.readTemplateSyncSnapshot()
+        let firstItem = try XCTUnwrap(pushed.snapshot.templates.first { $0.text == first.text })
+        let secondItem = try XCTUnwrap(pushed.snapshot.templates.first { $0.text == second.text })
+        XCTAssertEqual(firstItem.order, 0)
+        XCTAssertEqual(secondItem.order, 0)
+
+        let reply = TemplateSyncSnapshot(sentAt: pushed.snapshot.sentAt, templates: [
+            TemplateSyncItem(id: firstItem.id, kind: firstItem.kind, text: first.text, title: nfd, tag: nfc,
+                             order: TemplateSyncMessageCodec.maxOrder, updatedAt: firstItem.updatedAt),
+            secondItem
+        ], tombstones: [])
+        XCTAssertEqual(try db.applySyncedTemplates(reply, pushed: pushed).updated, 1)
+        let rows = try db.fetchAll()
+        let updatedFirst = try XCTUnwrap(rows.first { $0.id == first.id })
+        XCTAssertEqual(updatedFirst.title.map { Data($0.utf8) }, Data(nfd.utf8))
+        XCTAssertEqual(updatedFirst.templateOrder, 0)
+        XCTAssertEqual(rows.first { $0.id == second.id }?.templateOrder, 0)
+
+        let edited = try db.updateTemplate(id: second.id, text: nil, title: nil, tag: nfc)
+        XCTAssertEqual(edited.tag.map { Data($0.utf8) }, Data(nfc.utf8))
+        XCTAssertEqual(try db.templateSyncMetadata(id: second.id)?.dirty, true)
     }
 
     func testApplySyncedTemplatesPreservesIDsUnicodeSwapsAndExportsKeyboardHistory() throws {
