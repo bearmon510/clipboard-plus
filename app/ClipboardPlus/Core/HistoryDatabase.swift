@@ -334,8 +334,12 @@ final class HistoryDatabase: HistoryPersistence {
             let isTextTemplate = entry.kind == .text || entry.kind == .url
             let normalizedText = isTextTemplate ? TemplateSyncMerge.normalizeLineEndings(entry.text) : entry.text
             if isTextTemplate {
-                if try activeTemplateText(normalizedText) != nil ||
-                    (!normalizedText.utf8.elementsEqual(entry.text.utf8) && try activeTemplateText(entry.text) != nil) {
+                let normalizedMatch = try activeTemplateText(normalizedText) != nil
+                var originalMatch = false
+                if !normalizedText.utf8.elementsEqual(entry.text.utf8) {
+                    originalMatch = try activeTemplateText(entry.text) != nil
+                }
+                if normalizedMatch || originalMatch {
                     throw HistoryEditError.duplicate
                 }
             } else if try equalTemplate(to: entry) != nil {
