@@ -412,7 +412,7 @@ final class LivePCSyncWifiClient: PCSyncWifiClient {
         timeoutSeconds: TimeInterval,
         initialReadTimeoutSeconds: TimeInterval
     ) async throws -> any PCSyncWifiConnection {
-        guard port >= 1, port <= Int(UInt16.max), let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+        guard port >= 1, port <= Int(UInt16.max), let nwPort = Network.NWEndpoint.Port(rawValue: UInt16(port)) else {
             throw PCSyncWifiClientError.invalidEndpoint
         }
         let deadline = Date().addingTimeInterval(max(0.05, timeoutSeconds))
@@ -445,7 +445,7 @@ final class LivePCSyncWifiClient: PCSyncWifiClient {
 
     private func connectOnce(
         host: String,
-        nwPort: NWEndpoint.Port,
+        nwPort: Network.NWEndpoint.Port,
         timeoutSeconds: TimeInterval,
         initialReadTimeoutSeconds: TimeInterval
     ) async throws -> LiveConnection {
@@ -453,7 +453,7 @@ final class LivePCSyncWifiClient: PCSyncWifiClient {
         tcpOptions.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         parameters.requiredInterfaceType = .wifi
-        let nwConnection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
+        let nwConnection = NWConnection(host: Network.NWEndpoint.Host(host), port: nwPort, using: parameters)
         let queue = DispatchQueue(label: "clipboardplus.wifi-sync.tcp", qos: .userInitiated)
         let attempt = ConnectAttempt(connection: nwConnection, queue: queue)
 
