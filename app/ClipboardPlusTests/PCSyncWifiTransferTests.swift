@@ -2474,4 +2474,156 @@ final class PCSyncWifiTransferTests: XCTestCase {
         XCTAssertEqual(f2.link.wifiRequests.last?.direction, .both)
         XCTAssertEqual(f2.link.wifiRequests.last?.ids, [over10OutID2, over10InOffer2.id])
     }
+
+    @MainActor
+    func testIncomingAndOutgoingBatchIntoUnsentWifiRequestUpToLimitAndDeferAfterSent() async throws {
+        // Part 1: While BLE is not writable, incoming offers followed by an outgoing item batch into one
+        //         .both request; an offer arriving after that request is sent waits for the next request.
+        let f1 = try Fixture(test: self)
+        let p1 = try pair(f1)
+        f1.controller.copiesReceivedToPasteboard = false
+        f1.monitor.updateScene("active")
+        try f1.link.connect(p1, limit: 512)
+
+        f1.link.canSend = false
+        let inData1 = makeDeterministicBytes(count: 520_000, seed: 71)
+        let inOffer1 = makeOffer(from: "pc", data: inData1, name: "batch-in1.bin")
+        let inData2 = makeDeterministicBytes(count: 530_000, seed: 72)
+        let inOffer2 = makeOffer(from: "pc", data: inData2, name: "batch-in2.bin")
+        try f1.link.send(.offer(inOffer1))
+        try f1.link.send(.offer(inOffer2))
+
+        let outData1 = makeDeterministicBytes(count: 540_000, seed: 73)
+        let savedBeforeOut1 = f1.monitor.savedCount
+        f1.monitor.saveManually([try makeFileProvider(in: f1.root, bytes: outData1, name: "batch-out1.bin")], receivedAt: f1.clock.date)
+        await awaitSave(f1, savedCount: savedBeforeOut1 + 1)
+        XCTAssertTrue(f1.link.wifiRequests.isEmpty)
+
+        f1.link.canSend = true
+        f1.link.onEvent?(.writable)
+
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
+        let req1 = try XCTUnwrap(f1.link.wifiRequests.first)
+        XCTAssertEqual(req1.direction, .both)
+        XCTAssertEqual(req1.ids.count, 3)
+        let outID1 = req1.ids[0]
+        XCTAssertEqual(Array(req1.ids.dropFirst()), [inOffer1.id, inOffer2.id])
+
+        // Offer arriving after wifi_request #1 has been sent must not merge into #1 and waits for #2.
+        let inData3 = makeDeterministicBytes(count: 550_000, seed: 74)
+        let inOffer3 = makeOffer(from: "pc", data: inData3, name: "batch-in3.bin")
+        try f1.link.send(.offer(inOffer3))
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
+
+        let ready1 = makeReadyPayload(ssid: "DIRECT-cp-BATCH1")
+        let bleKeys1 = try XCTUnwrap(f1.link.pcSessionKeys)
+        let pcKeys1 = try WifiTransferKeys.derive(bleKeys: bleKeys1, token: ready1.token, session: ready1.session)
+        let pcGuard1 = try WifiSessionReplayGuard()
+        let pcSink1 = InMemoryWifiTransferSink()
+        let pcOutgoing1: [any WifiTransferSource] = [
+            InMemoryWifiTransferSource(offer: inOffer1, payload: inData1),
+            InMemoryWifiTransferSource(offer: inOffer2, payload: inData2),
+        ]
+        let padToPc1 = FakeByteChannel()
+        let pcToPad1 = FakeByteChannel()
+        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 5)
+        let pcEnd1 = FakePcStreamEnd(incoming: padToPc1, outgoing: pcToPad1)
+        await f1.wifiClient.setConnectHandler { _, _, _ in padConn1 }
+        let pcTask1 = Task {
+            try await WifiTransferEngine.runPcSession(
+                stream: pcEnd1,
+                keys: pcKeys1,
+                outgoing: pcOutgoing1,
+                sink: pcSink1,
+                replayGuard: pcGuard1
+            )
+        }
+
+        let savedBeforeRx1 = f1.monitor.savedCount
+        try f1.link.send(.ready(ready1))
+        await awaitSave(f1, savedCount: savedBeforeRx1 + 2)
+        let startedSecond = await waitUntil(timeoutSeconds: 10) {
+            f1.controller.pendingCount == 0 && f1.link.wifiRequests.count == 2 && f1.controller.wifiTransferProgress == nil
+        }
+        XCTAssertTrue(startedSecond)
+        let pcResult1 = try await pcTask1.value
+        XCTAssertEqual(pcResult1.received.count, 1)
+        XCTAssertEqual(pcResult1.sent.count, 2)
+        let pcReceivedOut1 = await pcSink1.completedData(for: outID1)
+        XCTAssertEqual(pcReceivedOut1, outData1)
+        XCTAssertEqual(f1.link.wifiRequests.last?.direction, .receive)
+        XCTAssertEqual(f1.link.wifiRequests.last?.ids, [inOffer3.id])
+
+        let ready2 = makeReadyPayload(ssid: "DIRECT-cp-BATCH2")
+        let pcKeys2 = try WifiTransferKeys.derive(bleKeys: bleKeys1, token: ready2.token, session: ready2.session)
+        let pcGuard2 = try WifiSessionReplayGuard()
+        let padToPc2 = FakeByteChannel()
+        let pcToPad2 = FakeByteChannel()
+        let padConn2 = FakeWifiConnection(incoming: pcToPad2, outgoing: padToPc2, initialReadTimeout: 5)
+        let pcEnd2 = FakePcStreamEnd(incoming: padToPc2, outgoing: pcToPad2)
+        await f1.wifiClient.setConnectHandler { _, _, _ in padConn2 }
+        let pcTask2 = Task {
+            try await WifiTransferEngine.runPcSession(
+                stream: pcEnd2,
+                keys: pcKeys2,
+                outgoing: [InMemoryWifiTransferSource(offer: inOffer3, payload: inData3)],
+                sink: InMemoryWifiTransferSink(),
+                replayGuard: pcGuard2
+            )
+        }
+
+        let savedBeforeRx3 = f1.monitor.savedCount
+        try f1.link.send(.ready(ready2))
+        await awaitSave(f1, savedCount: savedBeforeRx3 + 1)
+        let finished2 = await waitUntil(timeoutSeconds: 10) { f1.controller.wifiTransferProgress == nil }
+        XCTAssertTrue(finished2)
+        let pcResult2 = try await pcTask2.value
+        XCTAssertEqual(pcResult2.sent.count, 1)
+        XCTAssertTrue(f1.link.ackIDs.contains(inOffer1.id))
+        XCTAssertTrue(f1.link.ackIDs.contains(inOffer2.id))
+        XCTAssertTrue(f1.link.ackIDs.contains(inOffer3.id))
+
+        // Part 2: More than 100 unsent offers cap wifi_request at SyncProtocol.maxPending (100)
+        //         and carry the 101st offer over to the next request.
+        let f2 = try Fixture(test: self)
+        let p2 = try pair(f2)
+        f2.controller.copiesReceivedToPasteboard = false
+        f2.monitor.updateScene("active")
+        try f2.link.connect(p2, limit: 512)
+
+        f2.link.canSend = false
+        let over10Size = SyncProtocol.maxItemBytes + 1_024
+        let over10Sha = SyncEchoGuard.hash(makeDeterministicBytes(count: over10Size, seed: 75))
+        let offers101: [SyncOffer] = (0..<(SyncProtocol.maxPending + 1)).map { idx in
+            SyncOffer(
+                id: UUID(),
+                at: 1_795_000_000_123 + Int64(idx),
+                from: "pc",
+                kind: "file",
+                size: over10Size,
+                sha256: over10Sha,
+                name64: Data("cap-\(idx).bin".utf8).base64EncodedString(),
+                type: "public.data"
+            )
+        }
+        for offer in offers101 {
+            try f2.link.sendLargeOffer(offer)
+        }
+        XCTAssertTrue(f2.link.wifiRequests.isEmpty)
+
+        f2.link.canSend = true
+        f2.link.onEvent?(.writable)
+
+        XCTAssertEqual(f2.link.wifiRequests.count, 1)
+        XCTAssertEqual(f2.link.wifiRequests.first?.direction, .receive)
+        XCTAssertEqual(f2.link.wifiRequests.first?.ids, Array(offers101.prefix(SyncProtocol.maxPending).map(\.id)))
+
+        await f2.wifiClient.enqueueJoinStatus(.notForeground)
+        try f2.link.send(.ready(makeReadyPayload(ssid: "DIRECT-cp-CAP101")))
+
+        let sentOverflowReq = await waitUntil { f2.link.wifiRequests.count == 2 }
+        XCTAssertTrue(sentOverflowReq)
+        XCTAssertEqual(f2.link.wifiRequests.last?.direction, .receive)
+        XCTAssertEqual(f2.link.wifiRequests.last?.ids, [offers101[SyncProtocol.maxPending].id])
+    }
 }

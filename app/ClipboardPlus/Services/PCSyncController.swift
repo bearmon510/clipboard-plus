@@ -796,9 +796,6 @@ final class PCSyncController: ObservableObject {
                 if output == nil {
                     if status == .connected {
                         dropOversizedPendingItemsIfWifiUnavailable()
-                        if wifiSession == nil && wifiControlOutgoing.isEmpty {
-                            tryStartWifiTransfer()
-                        }
                     }
                     let frame: Data
                     var id: UUID?
@@ -810,6 +807,9 @@ final class PCSyncController: ObservableObject {
                     if !controlFrames.isEmpty {
                         frame = controlFrames.removeFirst(); isAuth = frame.first == 3
                     } else if status == .connected, let sender {
+                        if ackQueue.isEmpty && wifiSession == nil && wifiControlOutgoing.isEmpty {
+                            tryStartWifiTransfer()
+                        }
                         if !ackQueue.isEmpty {
                             let ids = Array(ackQueue.prefix(SyncProtocol.maxAckIds))
                             ackQueue.removeFirst(ids.count)
@@ -952,7 +952,7 @@ final class PCSyncController: ObservableObject {
             if writeBlockedSince == nil,
                output != nil || !controlFrames.isEmpty || !ackQueue.isEmpty || !replies.isEmpty ||
                 !wifiControlOutgoing.isEmpty || !templateAckQueue.isEmpty || !templateOutgoing.isEmpty ||
-                pingQueued || nextPendingItem() != nil {
+                pingQueued || nextPendingItem() != nil || hasPendingWifiRequest(at: now()) {
                 writeBlockedSince = now()
             }
         } catch { fail(reject: false, countBackoff: handshakeStart != nil && status != .connected, reason: "送信フレーム作成失敗") }
@@ -1478,7 +1478,7 @@ final class PCSyncController: ObservableObject {
                 }
                 if output == nil && controlFrames.isEmpty && ackQueue.isEmpty && replies.isEmpty &&
                     wifiControlOutgoing.isEmpty && templateAckQueue.isEmpty && templateOutgoing.isEmpty &&
-                    !pingQueued && nextPendingItem() == nil {
+                    !pingQueued && nextPendingItem() == nil && !hasPendingWifiRequest(at: date) {
                     writeBlockedSince = nil
                 }
                 record("テンプレート同期期限")
@@ -1517,7 +1517,7 @@ final class PCSyncController: ObservableObject {
             if !wifiBusyRetryPending {
                 wifiBusyRetryCount = 0
             }
-            tryStartWifiTransfer()
+            pump()
         } else if newState == "background" {
             handleEnteredBackground()
         }
@@ -1570,7 +1570,7 @@ final class PCSyncController: ObservableObject {
                 wifiBusyRetryCount = 0
             }
             if status == .connected {
-                tryStartWifiTransfer()
+                pump()
             }
             return
         }
@@ -1675,7 +1675,7 @@ final class PCSyncController: ObservableObject {
             if !pendingWifiIncomingOrder.contains(offer.id) {
                 pendingWifiIncomingOrder.append(offer.id)
             }
-            tryStartWifiTransfer()
+            pump()
             return
         }
 
@@ -1704,13 +1704,33 @@ final class PCSyncController: ObservableObject {
         if status == .connected { queueAck(offer.id) }
     }
 
+    private var canStartWifiTransfer: Bool {
+        wifiAvailableOnSession
+            && usesWifiForLargeItems
+            && wifiSession == nil
+            && isForeground
+            && !wifiRequestHoldActive
+            && !wifiBusyRetryPending
+    }
+
+    private func isIncomingWifiCandidate(_ id: UUID, at current: Date) -> Bool {
+        pendingWifiIncomingOffers[id] != nil
+            && !seen.contains(id)
+            && !receiving.contains(id)
+            && !isInWifiCooldown(id, at: current)
+            && !wifiDeferredUntilForeground.contains(id)
+    }
+
+    private func hasPendingWifiRequest(at current: Date) -> Bool {
+        guard canStartWifiTransfer else { return false }
+        if historyReady && pending.contains(where: { isOutgoingWifiCandidate($0, at: current) }) {
+            return true
+        }
+        return pendingWifiIncomingOrder.contains { isIncomingWifiCandidate($0, at: current) }
+    }
+
     private func tryStartWifiTransfer() {
-        guard wifiAvailableOnSession,
-              usesWifiForLargeItems,
-              wifiSession == nil,
-              isForeground,
-              !wifiRequestHoldActive,
-              !wifiBusyRetryPending else {
+        guard canStartWifiTransfer else {
             return
         }
         let current = now()
@@ -1726,13 +1746,7 @@ final class PCSyncController: ObservableObject {
         pendingWifiIncomingOrder.removeAll { id in
             pendingWifiIncomingOffers[id] == nil || seen.contains(id) || receiving.contains(id)
         }
-        var incomingIDs: [UUID] = []
-        for id in pendingWifiIncomingOrder {
-            guard pendingWifiIncomingOffers[id] != nil,
-                  !isInWifiCooldown(id, at: current),
-                  !wifiDeferredUntilForeground.contains(id) else { continue }
-            incomingIDs.append(id)
-        }
+        let incomingIDs = pendingWifiIncomingOrder.filter { isIncomingWifiCandidate($0, at: current) }
 
         guard !outgoingIDs.isEmpty || !incomingIDs.isEmpty else { return }
 
@@ -1774,7 +1788,7 @@ final class PCSyncController: ObservableObject {
             phase: .awaitingReady(requestedAt: current)
         )
         scheduleWifiReadyTimeout(for: sessionID)
-        queueWifiControl(.request(direction: direction, ids: combinedIDs))
+        queueWifiControl(.request(direction: direction, ids: combinedIDs), pumpNow: false)
         record("Wi-Fi転送要求; 方向=\(direction.rawValue); 送信件数=\(selectedOutgoing.count); 受信件数=\(selectedIncoming.count)")
     }
 
@@ -1856,7 +1870,7 @@ final class PCSyncController: ObservableObject {
             }
             self.clearWifiRequestHold()
             if self.status == .connected {
-                self.tryStartWifiTransfer()
+                self.pump()
             }
         }
     }
@@ -1901,7 +1915,7 @@ final class PCSyncController: ObservableObject {
             self.wifiRetryTask = nil
             self.wifiBusyRetryPending = false
             if self.status == .connected {
-                self.tryStartWifiTransfer()
+                self.pump()
             }
         }
     }
@@ -1976,7 +1990,7 @@ final class PCSyncController: ObservableObject {
                 clearWifiRequestHold()
                 record("Wi-Fi遅延応答を破棄; 理由=\(reason.rawValue)")
                 if status == .connected {
-                    tryStartWifiTransfer()
+                    pump()
                 }
             }
             return
@@ -2032,7 +2046,7 @@ final class PCSyncController: ObservableObject {
                 clearWifiRequestHold()
                 record("Wi-Fi遅延readyを破棄")
                 if status == .connected {
-                    tryStartWifiTransfer()
+                    pump()
                 }
             }
             return
