@@ -106,8 +106,8 @@ final class SyncDiskStore {
         state.seen.removeAll { $0 == id }; state.seen.append(id)
         state.seen = Array(state.seen.suffix(500)); try save()
     }
-    func begin(_ offer: SyncOffer, now: Date) throws -> Int {
-        try offer.validate()
+    func begin(_ offer: SyncOffer, now: Date, maxSize: Int = SyncProtocol.maxItemBytes) throws -> Int {
+        try offer.validate(maxSize: maxSize)
         if let old = state.partials.first(where: { $0.offer.id == offer.id }) {
             try SyncProtocol.require(old.offer == offer)
         } else {

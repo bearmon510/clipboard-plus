@@ -67,6 +67,20 @@ final class PCSyncSettings {
         get { defaults.object(forKey: prefix + "copiesReceivedToPasteboard") as? Bool ?? true }
         set { defaults.set(newValue, forKey: prefix + "copiesReceivedToPasteboard") }
     }
+    var usesWifiForLargeItems: Bool {
+        get { defaults.object(forKey: prefix + "usesWifiForLargeItems") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: prefix + "usesWifiForLargeItems") }
+    }
+    var wifiThreshold: PCSyncWifiThreshold {
+        get {
+            guard let raw = defaults.object(forKey: prefix + "wifiThresholdBytes") as? Int,
+                  let value = PCSyncWifiThreshold(rawValue: raw) else {
+                return .defaultValue
+            }
+            return value
+        }
+        set { defaults.set(newValue.rawValue, forKey: prefix + "wifiThresholdBytes") }
+    }
     var requiresPeerUpdate: Bool {
         get { defaults.bool(forKey: prefix + "requiresPeerUpdate") }
         set { defaults.set(newValue, forKey: prefix + "requiresPeerUpdate") }

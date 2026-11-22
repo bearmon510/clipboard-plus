@@ -279,12 +279,13 @@ final class HistoryStore {
     }
 
     struct SyncBody { let data: Data; let kind: String; let name: String; let type: String; let hash: String }
-    func prepareForPC(_ entry: HistoryEntry, completion: @escaping @MainActor (Result<SyncBody, Error>) -> Void) {
+    func prepareForPC(_ entry: HistoryEntry, maxItemBytes: Int = SyncProtocol.maxItemBytes,
+                      completion: @escaping @MainActor (Result<SyncBody, Error>) -> Void) {
         queue.async {
             let result = Result { () throws -> SyncBody in
                 let data: Data, kind: String, name: String, type: String
                 if let image = entry.image {
-                    guard image.byteCount <= SyncProtocol.maxItemBytes,
+                    guard image.byteCount <= maxItemBytes,
                           image.pixelWidth > 0, image.pixelHeight > 0,
                           Int64(image.pixelWidth) <= SyncProtocol.maxImagePixels / Int64(image.pixelHeight) else {
                         throw SyncProtocolError.limit
@@ -302,11 +303,11 @@ final class HistoryStore {
                         data = png as Data; type = "public.png"
                     }
                 } else if let file = entry.file {
-                    guard file.byteCount <= SyncProtocol.maxItemBytes else { throw SyncProtocolError.limit }
+                    guard file.byteCount <= maxItemBytes else { throw SyncProtocolError.limit }
                     data = try Data(contentsOf: self.fileFiles.url(for: file), options: .mappedIfSafe)
                     kind = "file"; name = file.originalFilename; type = file.typeIdentifier
                 } else { data = Data(entry.text.utf8); kind = "text"; name = ""; type = "public.utf8-plain-text" }
-                try SyncProtocol.require(data.count <= SyncProtocol.maxItemBytes, .limit)
+                try SyncProtocol.require(data.count <= maxItemBytes, .limit)
                 return SyncBody(data: data, kind: kind, name: name, type: type, hash: SyncEchoGuard.hash(data))
             }
             DispatchQueue.main.async { completion(result) }

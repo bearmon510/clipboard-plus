@@ -86,9 +86,19 @@ final class ScreenSnapshotTests: XCTestCase {
             pcName: "DESK-PC", status: .connected, lastSentAt: now, lastReceivedAt: now.addingTimeInterval(-90),
             pendingCount: 3,
             transfer: PCSyncController.TransferProgress(direction: "send", itemID: UUID(), bytes: 1_400_000, totalBytes: 3_600_000))
+        let wifiSending = SyncDisplay(
+            pcName: "DESK-PC", status: .connected, lastSentAt: now, lastReceivedAt: now.addingTimeInterval(-30),
+            pendingCount: 3,
+            wifiTransfer: PCSyncController.WifiTransferProgress(phase: .sending, itemIndex: 1, itemCount: 3, bytes: 1_800_000, totalBytes: 4_000_000))
+        let wifiReceiving = SyncDisplay(
+            pcName: "DESK-PC", status: .connected, lastSentAt: now, lastReceivedAt: now.addingTimeInterval(-30),
+            pendingCount: 0,
+            wifiTransfer: PCSyncController.WifiTransferProgress(phase: .receiving, itemIndex: 2, itemCount: 2, bytes: 3_000_000, totalBytes: 5_000_000))
         let repair = SyncDisplay(pcName: "DESK-PC", status: .unsupported, requiresRepair: true, lastSentAt: now.addingTimeInterval(-86_400))
         let update = SyncDisplay(pcName: "DESK-PC", status: .unsupported, requiresPeerUpdate: true, pendingCount: 12)
         try save(render(syncForm(transferring), size: Self.narrow, style: .light), "sync-transferring-narrow-light")
+        try save(render(syncForm(wifiSending), size: Self.narrow, style: .light), "sync-wifi-transferring-narrow-light")
+        try save(render(syncForm(wifiReceiving, device: .phone), size: Self.phone, style: .dark), "sync-wifi-transferring-phone-dark")
         try save(render(syncForm(repair), size: Self.narrow, style: .dark), "sync-repair-narrow-dark")
         try save(render(syncForm(update, device: .phone), size: Self.phone, style: .light), "sync-update-phone-light")
         try save(render(syncForm(SyncDisplay(), device: .phone), size: Self.phone, style: .dark), "sync-unpaired-phone-dark")
@@ -96,13 +106,22 @@ final class ScreenSnapshotTests: XCTestCase {
         XCTAssertEqual(repair.statusLabel(device: .pad).text, "組み直しが必要です")
         XCTAssertEqual(update.statusLabel(device: .pad).text, "アプリの更新が必要です")
         XCTAssertEqual(SyncDisplay(pcName: "PC", status: .unsupported).statusLabel(device: .phone).text, "このiPhoneでは使えません")
+        XCTAssertEqual(wifiSending.wifiTransfer?.summaryText, "Wi-Fi で送っています（3件のうち1件、45%）")
+        XCTAssertEqual(wifiReceiving.wifiTransfer?.summaryText, "Wi-Fi で受け取っています（2件のうち2件、60%）")
     }
 
     @MainActor
     private func syncForm(_ display: SyncDisplay, device: DeviceKind? = nil) -> some View {
         let actions = SyncSettingsActions(pair: { _ in }, unpair: {}, retryAfterPeerUpdate: {}, retryAfterRepair: {})
         return Form {
-            SyncSettingsContent(display: display, copiesReceivedToPasteboard: .constant(true), actions: actions, deviceOverride: device)
+            SyncSettingsContent(
+                display: display,
+                copiesReceivedToPasteboard: .constant(true),
+                usesWifiForLargeItems: .constant(true),
+                wifiThreshold: .constant(.kb500),
+                actions: actions,
+                deviceOverride: device
+            )
         }
     }
 

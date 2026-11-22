@@ -66,8 +66,9 @@ final class ClipboardMonitor: NSObject, ObservableObject {
     var onHistoryIDsForPC: ((Set<Int>) -> Void)?
     var syncDirectory: URL { imageDirectory.appendingPathComponent("PCSync-v2", isDirectory: true) }
     private let syncEcho: SyncEchoGuard
-    func prepareForPC(_ entry: HistoryEntry, completion: @escaping (Result<HistoryStore.SyncBody, Error>) -> Void) {
-        store.prepareForPC(entry, completion: completion)
+    func prepareForPC(_ entry: HistoryEntry, maxItemBytes: Int = SyncProtocol.maxItemBytes,
+                      completion: @escaping (Result<HistoryStore.SyncBody, Error>) -> Void) {
+        store.prepareForPC(entry, maxItemBytes: maxItemBytes, completion: completion)
     }
     func clearPCFingerprints() { syncEcho.clear() }
     func rememberIncomingPC(kind: String, hash: String) { syncEcho.remember(kind: kind, hash: hash) }

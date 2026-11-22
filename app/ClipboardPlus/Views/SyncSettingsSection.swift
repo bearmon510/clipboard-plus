@@ -11,13 +11,15 @@ struct SyncDisplay: Equatable {
     var lastReceivedAt: Date? = nil
     var pendingCount = 0
     var transfer: PCSyncController.TransferProgress? = nil
+    var wifiTransfer: PCSyncController.WifiTransferProgress? = nil
 }
 
 extension SyncDisplay {
     @MainActor init(_ sync: PCSyncController) {
         self.init(pcName: sync.pcName, status: sync.status, requiresPeerUpdate: sync.requiresPeerUpdate,
                   requiresRepair: sync.requiresRepair, lastSentAt: sync.lastSentAt, lastReceivedAt: sync.lastReceivedAt,
-                  pendingCount: sync.pendingCount, transfer: sync.transferProgress)
+                  pendingCount: sync.pendingCount, transfer: sync.transferProgress,
+                  wifiTransfer: sync.wifiTransferProgress)
     }
 
     /// Both stops are reported as `.unsupported`, so they are checked before the status.
@@ -58,6 +60,8 @@ struct SyncSettingsSection: View {
         SyncSettingsContent(
             display: SyncDisplay(sync),
             copiesReceivedToPasteboard: $sync.copiesReceivedToPasteboard,
+            usesWifiForLargeItems: $sync.usesWifiForLargeItems,
+            wifiThreshold: $sync.wifiThreshold,
             actions: SyncSettingsActions(
                 pair: { try sync.pair(code: $0) },
                 unpair: { sync.unpair() },
@@ -69,6 +73,8 @@ struct SyncSettingsSection: View {
 struct SyncSettingsContent: View {
     let display: SyncDisplay
     @Binding var copiesReceivedToPasteboard: Bool
+    @Binding var usesWifiForLargeItems: Bool
+    @Binding var wifiThreshold: PCSyncWifiThreshold
     let actions: SyncSettingsActions
     /// Snapshots run on an iPad and ask for the iPhone wording with this.
     var deviceOverride: DeviceKind? = nil
@@ -94,7 +100,7 @@ struct SyncSettingsContent: View {
         } header: {
             Text("Windowsと同期")
         } footer: {
-            Text("文章・リンク・画像・ファイルを両方向に受け渡します（1件10MBまで）。\(device.name)から送れるのは、clipboard+が画面に出ている間に取り込んだものと、clipboard+でコピーしたものです。PCでのコピーは、clipboard+が裏にいても受け取ります。")
+            Text("文章・リンク・画像・ファイルを両方向に受け渡します（Bluetoothは1件10MBまで、Wi-Fiは1件50MBまで）。\(device.name)から送れるのは、clipboard+が画面に出ている間に取り込んだものと、clipboard+でコピーしたものです。大きい項目のWi-Fi転送はclipboard+が画面に出ているときだけ行います。")
         }
     }
 
@@ -124,6 +130,33 @@ struct SyncSettingsContent: View {
             Button("Bluetoothを許可する", systemImage: "gear") { openSettings() }
                 .frame(minHeight: 44)
         }
+        if let wifi = display.wifiTransfer {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: "wifi")
+                        .foregroundStyle(Theme.accent)
+                        .accessibilityHidden(true)
+                    Text(wifi.summaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if wifi.totalBytes > 0 {
+                        Text(SyncDisplay.byteProgress(wifi.bytes, of: wifi.totalBytes))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                if wifi.phase == .sending || wifi.phase == .receiving {
+                    ProgressView(
+                        value: Double(min(wifi.bytes, wifi.totalBytes)),
+                        total: Double(max(wifi.totalBytes, 1))
+                    )
+                } else {
+                    ProgressView()
+                }
+            }
+            .padding(.vertical, 4)
+        }
         if let transfer = display.transfer {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -147,6 +180,17 @@ struct SyncSettingsContent: View {
         }
         Toggle("PCのコピーを\(device.name)のクリップボードにも入れる", isOn: $copiesReceivedToPasteboard)
             .frame(minHeight: 44)
+        Toggle("大きいものは Wi-Fi で送る", isOn: $usesWifiForLargeItems)
+            .frame(minHeight: 44)
+        if usesWifiForLargeItems {
+            Picker("Wi-Fi を使う大きさ", selection: $wifiThreshold) {
+                ForEach(PCSyncWifiThreshold.allCases) { option in
+                    Text(option.displayName).tag(option)
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(minHeight: 44)
+        }
         Button("組を解く", role: .destructive) { confirmUnpair = true }
             .frame(minHeight: 44)
             .confirmationDialog("PCとの組を解きますか？", isPresented: $confirmUnpair, titleVisibility: .visible) {

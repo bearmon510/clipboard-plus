@@ -280,6 +280,9 @@ struct ContentView: View {
     private var statusStrip: some View {
         VStack(spacing: 6) {
             if !monitor.isRecording { pausedBanner }
+            if let wifi = sync.wifiTransferProgress {
+                statusRow(wifi.summaryText, symbol: "wifi", tint: Theme.accent)
+            }
             if let error = monitor.storageError {
                 statusRow(error, symbol: "exclamationmark.triangle.fill", tint: Color.red)
             }
