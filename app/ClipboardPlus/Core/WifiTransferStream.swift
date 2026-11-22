@@ -197,8 +197,15 @@ public actor WifiEncryptedStream {
 
     public static func connectAsPad(
         stream: any WifiByteStream,
+        keys: WifiTransferKeys
+    ) async throws -> WifiEncryptedStream {
+        try await connectAsPad(stream: stream, keys: keys, testNonce: nil)
+    }
+
+    static func connectAsPad(
+        stream: any WifiByteStream,
         keys: WifiTransferKeys,
-        testNonce: Data? = nil
+        testNonce: Data?
     ) async throws -> WifiEncryptedStream {
         let handshake = try WifiTcpPadHandshake(transferKeys: keys, testNonce: testNonce)
         let hello = try handshake.createHello()
@@ -223,12 +230,18 @@ public actor WifiEncryptedStream {
     public static func acceptAsPc(
         stream: any WifiByteStream,
         keys: WifiTransferKeys,
-        replayGuard: WifiSessionReplayGuard? = nil,
-        testNonce: Data? = nil
+        replayGuard: WifiSessionReplayGuard
     ) async throws -> WifiEncryptedStream {
-        if let replayGuard {
-            try await replayGuard.requireNotConsumed(keys.session)
-        }
+        try await acceptAsPc(stream: stream, keys: keys, replayGuard: replayGuard, testNonce: nil)
+    }
+
+    static func acceptAsPc(
+        stream: any WifiByteStream,
+        keys: WifiTransferKeys,
+        replayGuard: WifiSessionReplayGuard,
+        testNonce: Data?
+    ) async throws -> WifiEncryptedStream {
+        try await replayGuard.requireNotConsumed(keys.session)
         let handshake = try WifiTcpPcHandshake(transferKeys: keys, testNonce: testNonce)
         var scratch = Data()
         let hello = try await readExact(from: stream, buffer: &scratch, count: SyncProtocol.wifiTcpHelloBytes)
@@ -237,9 +250,7 @@ public actor WifiEncryptedStream {
 
         let auth = try await readExact(from: stream, buffer: &scratch, count: SyncProtocol.wifiTcpAuthBytes)
         let trafficKeys = try handshake.acceptAuth(auth)
-        if let replayGuard {
-            try await replayGuard.consumeOrThrow(keys.session)
-        }
+        try await replayGuard.consumeOrThrow(keys.session)
 
         let channel = try WifiEncryptedStream(
             stream: stream,
@@ -459,8 +470,25 @@ public enum WifiTransferEngine {
         keys: WifiTransferKeys,
         outgoing: [any WifiTransferSource],
         sink: any WifiTransferSink,
+        chunkSize: Int = SyncProtocol.maxWifiChunkBytes
+    ) async throws -> WifiSessionResult {
+        try await runPadSession(
+            stream: stream,
+            keys: keys,
+            outgoing: outgoing,
+            sink: sink,
+            chunkSize: chunkSize,
+            testNonce: nil
+        )
+    }
+
+    static func runPadSession(
+        stream: any WifiByteStream,
+        keys: WifiTransferKeys,
+        outgoing: [any WifiTransferSource],
+        sink: any WifiTransferSink,
         chunkSize: Int = SyncProtocol.maxWifiChunkBytes,
-        testNonce: Data? = nil
+        testNonce: Data?
     ) async throws -> WifiSessionResult {
         let channel = try await WifiEncryptedStream.connectAsPad(stream: stream, keys: keys, testNonce: testNonce)
         let sent = try await sendItems(outgoing, over: channel, chunkSize: chunkSize)
@@ -473,9 +501,28 @@ public enum WifiTransferEngine {
         keys: WifiTransferKeys,
         outgoing: [any WifiTransferSource],
         sink: any WifiTransferSink,
-        replayGuard: WifiSessionReplayGuard? = nil,
+        replayGuard: WifiSessionReplayGuard,
+        chunkSize: Int = SyncProtocol.maxWifiChunkBytes
+    ) async throws -> WifiSessionResult {
+        try await runPcSession(
+            stream: stream,
+            keys: keys,
+            outgoing: outgoing,
+            sink: sink,
+            replayGuard: replayGuard,
+            chunkSize: chunkSize,
+            testNonce: nil
+        )
+    }
+
+    static func runPcSession(
+        stream: any WifiByteStream,
+        keys: WifiTransferKeys,
+        outgoing: [any WifiTransferSource],
+        sink: any WifiTransferSink,
+        replayGuard: WifiSessionReplayGuard,
         chunkSize: Int = SyncProtocol.maxWifiChunkBytes,
-        testNonce: Data? = nil
+        testNonce: Data?
     ) async throws -> WifiSessionResult {
         let channel = try await WifiEncryptedStream.acceptAsPc(
             stream: stream,

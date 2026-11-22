@@ -6,7 +6,7 @@ public enum WifiStreamDirection: UInt8, Equatable, Sendable {
     case pcToPad = 0x02
 }
 
-public struct WifiTrafficKeys: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct WifiTrafficKeys: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public let padToPc: Data
     public let pcToPad: Data
 
@@ -17,12 +17,15 @@ public struct WifiTrafficKeys: Equatable, Sendable, CustomStringConvertible, Cus
 
     public var description: String { "WifiTrafficKeys(redacted: true)" }
     public var debugDescription: String { description }
+    public var customMirror: Mirror {
+        Mirror(self, children: ["redacted": true], displayStyle: .struct)
+    }
 }
 
 /// One-time per-transfer Wi-Fi keys derived from the BLE session's Wi-Fi base key,
 /// the per-transfer 32-byte random token, and the 16-byte session UUID.
 /// BLE traffic keys are never used on TCP.
-public struct WifiTransferKeys: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct WifiTransferKeys: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public let session: UUID
     public let transferKey: Data
     public let authKey: Data
@@ -82,9 +85,12 @@ public struct WifiTransferKeys: Equatable, Sendable, CustomStringConvertible, Cu
 
     public var description: String { "WifiTransferKeys(redacted: true)" }
     public var debugDescription: String { description }
+    public var customMirror: Mirror {
+        Mirror(self, children: ["redacted": true], displayStyle: .struct)
+    }
 }
 
-/// Tracks already-authenticated Wi-Fi transfer sessions so a completed session cannot be replayed.
+/// Tracks already-authenticated Wi-Fi transfer sessions so a session is consumed upon mutual authentication and cannot be replayed.
 public actor WifiSessionReplayGuard {
     private let maxTracked: Int
     private var consumed: Set<UUID> = []
@@ -148,21 +154,33 @@ enum WifiTcpHandshakeWire {
     }
 }
 
-public struct WifiTcpPadAuthentication: Sendable {
+public struct WifiTcpPadAuthentication: Sendable, CustomReflectable {
     public let auth: Data
     public let keys: WifiTrafficKeys
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["keys": keys, "redacted": true], displayStyle: .struct)
+    }
 }
 
-/// Single-use per TCP connection (iOS / client side). Nonce injection is ONLY for test vectors.
-public final class WifiTcpPadHandshake {
+/// Single-use per TCP connection (iOS / client side). Nonce injection is internal and ONLY for test vectors.
+public final class WifiTcpPadHandshake: CustomReflectable {
     private let transferKeys: WifiTransferKeys
     private let padNonce: Data
     private var state = 0
 
-    public init(transferKeys: WifiTransferKeys, testNonce: Data? = nil) throws {
+    public convenience init(transferKeys: WifiTransferKeys) throws {
+        try self.init(transferKeys: transferKeys, testNonce: nil)
+    }
+
+    init(transferKeys: WifiTransferKeys, testNonce: Data?) throws {
         self.transferKeys = transferKeys
         let rawNonce = testNonce ?? WifiTcpHandshakeWire.randomNonce()
         self.padNonce = try SyncProtocol.fixed(rawNonce, 32)
+    }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["state": state, "redacted": true], displayStyle: .class)
     }
 
     public func createHello() throws -> Data {
@@ -206,8 +224,8 @@ public final class WifiTcpPadHandshake {
     }
 }
 
-/// Single-use per TCP connection (PC / server side). Nonce injection is ONLY for test vectors.
-public final class WifiTcpPcHandshake {
+/// Single-use per TCP connection (PC / server side). Nonce injection is internal and ONLY for test vectors.
+public final class WifiTcpPcHandshake: CustomReflectable {
     private let transferKeys: WifiTransferKeys
     private let pcNonce: Data
     private var padNonce: Data?
@@ -215,10 +233,18 @@ public final class WifiTcpPcHandshake {
 
     public var isAuthenticated: Bool { state == 2 }
 
-    public init(transferKeys: WifiTransferKeys, testNonce: Data? = nil) throws {
+    public convenience init(transferKeys: WifiTransferKeys) throws {
+        try self.init(transferKeys: transferKeys, testNonce: nil)
+    }
+
+    init(transferKeys: WifiTransferKeys, testNonce: Data?) throws {
         self.transferKeys = transferKeys
         let rawNonce = testNonce ?? WifiTcpHandshakeWire.randomNonce()
         self.pcNonce = try SyncProtocol.fixed(rawNonce, 32)
+    }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["state": state, "redacted": true], displayStyle: .class)
     }
 
     public func acceptHello(_ input: Data) throws -> Data {

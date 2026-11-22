@@ -93,9 +93,14 @@ private final class SyncTestLink: PCSyncTransport {
     var corruptWelcome = false
     var welcomeVersion: UInt8?
     var welcomePcId: UUID?
+    var rejectHelloWithMismatchVersion: [UInt8: UInt8] = [:]
+    var receivedHelloVersions: [UInt8] = []
+    var negotiatedVersions: [UInt8] = []
     var dropsNotifications = false
     var stopAfterPackets: Int?
     private var pc: SyncPcHandshake?
+    private var currentPairing: SyncPairing?
+    private var versionRejectedThisConnection = false
     private var assembler: SyncPacketAssembler?
     private var sender: SyncFrameSender?
     private var receiver: SyncFrameReceiver?
@@ -158,6 +163,8 @@ private final class SyncTestLink: PCSyncTransport {
     func connect(_ pairing: SyncPairing, limit: Int = 20) throws {
         self.limit = limit
         stopAfterPackets = nil
+        currentPairing = pairing
+        versionRejectedThisConnection = false
         pc = try SyncPcHandshake(pairing: pairing)
         assembler = try SyncPacketAssembler(packetLimit: limit)
         sender = nil; receiver = nil; canSend = true
@@ -182,7 +189,18 @@ private final class SyncTestLink: PCSyncTransport {
         }
         do {
             guard let frame = try assembler?.append(packet), let pc else { return }
+            if versionRejectedThisConnection { return }
             if frame.first == 1 {
+                if frame.count >= 2 {
+                    receivedHelloVersions.append(frame[1])
+                }
+                if frame.count == 50, let advertisedVersion = rejectHelloWithMismatchVersion[frame[1]] {
+                    versionRejectedThisConnection = true
+                    let pcId = welcomePcId ?? currentPairing?.pcId ?? UUID()
+                    let mismatch = Data([2, advertisedVersion]) + SyncProtocol.idBytes(pcId) + Data(repeating: 0, count: 64)
+                    try deliver(mismatch)
+                    return
+                }
                 var welcome = try pc.acceptHello(frame)
                 if let welcomePcId { welcome.replaceSubrange(2..<18, with: SyncProtocol.idBytes(welcomePcId)) }
                 if let welcomeVersion { welcome[1] = welcomeVersion }
@@ -193,6 +211,7 @@ private final class SyncTestLink: PCSyncTransport {
                 sender = try SyncFrameSender(key: keys.pcToPad)
                 receiver = try SyncFrameReceiver(key: keys.padToPc)
                 if let id = pc.authenticatedPadId { acceptedPadIds.append(id) }
+                if let ver = pc.negotiatedVersion { negotiatedVersions.append(ver) }
             } else {
                 let receiver = try XCTUnwrap(receiver, "Data must follow AUTH")
                 let plaintext = try receiver.open(frame)
@@ -1499,6 +1518,109 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.compatibilityMessage, "相手のアプリを更新してください")
         XCTAssertEqual(f.controller.status, .unsupported)
         XCTAssertEqual(f.link.stops, 1)
+    }
+
+    @MainActor
+    func testV4PadFallsBackToV3ForLegacyV3PcAndRetriesV4OnNextConnection() async throws {
+        let f = try Fixture(test: self), pairing = try pair(f)
+        let primaryPeerId = f.link.id
+        f.controller.copiesReceivedToPasteboard = false
+
+        // Simulate an unmodified v3 PC: rejects v4 HELLO with 0x02 | 0x03 | pcId(16) | zeros(64),
+        // and accepts v3 HELLO on reconnect.
+        f.link.rejectHelloWithMismatchVersion = [4: 3]
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4])
+        XCTAssertTrue(f.link.negotiatedVersions.isEmpty)
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+        XCTAssertFalse(f.controller.requiresRepair)
+        XCTAssertEqual(f.controller.status, .searching)
+        XCTAssertEqual(f.link.stops, 0)
+        XCTAssertEqual(f.link.rejected, [false])
+
+        // An unrelated peripheral connecting in between must still be tried at v4 and must not consume the fallback for primaryPeerId.
+        f.link.id = UUID()
+        let strangerPairing = try SyncPairing(pcId: UUID(), key: pairing.key, name: "Other")
+        try f.link.connect(strangerPairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4, 4])
+        XCTAssertEqual(f.link.rejected, [false, true])
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+
+        // Reconnect to the same legacy v3 PC uses protocolVersion: 3 and syncs over BLE without wifi_* messages.
+        f.link.id = primaryPeerId
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4, 4, 3])
+        XCTAssertEqual(f.link.negotiatedVersions, [3])
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+        XCTAssertEqual(f.link.devices.count, 1)
+
+        f.monitor.saveManually(["版3で送る項目"], receivedAt: f.clock.date)
+        await drain(f)
+        XCTAssertEqual(f.link.items.count, 1)
+        let sentId = try itemID(try XCTUnwrap(f.link.items.first))
+        try f.link.send(.ack(ids: [sentId]))
+        XCTAssertEqual(f.controller.pendingCount, 0)
+
+        let pcItemId = UUID()
+        try f.link.send(.item(id: pcItemId, at: Int64(f.clock.date.timeIntervalSince1970 * 1000), from: "pc", text: "PCからの版3項目"))
+        await drain(f)
+        XCTAssertTrue(f.link.ackIDs.contains(pcItemId))
+        XCTAssertTrue(f.monitor.entries.contains { $0.source == .pc && $0.text == "PCからの版3項目" })
+
+        // Next connection starts from v4 again (so when PC is updated to v4, it connects at v4).
+        f.link.disconnect()
+        f.link.rejectHelloWithMismatchVersion = [:]
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4, 4, 3, 4])
+        XCTAssertEqual(f.link.negotiatedVersions, [3, 4])
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+    }
+
+    @MainActor
+    func testV3FallbackStopsForUpdateIfReconnectStillFailsVersionCheckAndIgnoresOtherPcV3Mismatch() async throws {
+        // 1. A v3-shaped mismatch from a DIFFERENT PC ID must be rejected as .identity without triggering fallback or stopping.
+        let fOther = try Fixture(test: self), pairingOther = try pair(fOther)
+        fOther.link.welcomePcId = UUID()
+        fOther.link.rejectHelloWithMismatchVersion = [4: 3]
+        try fOther.link.connect(pairingOther, limit: 512)
+        XCTAssertEqual(fOther.link.receivedHelloVersions, [4])
+        XCTAssertEqual(fOther.link.rejected, [true])
+        XCTAssertFalse(fOther.controller.requiresPeerUpdate)
+        XCTAssertEqual(fOther.link.stops, 0)
+        XCTAssertEqual(fOther.controller.status, .searching)
+
+        // 2. If v4 falls back to v3 and the v3 reconnect ALSO fails version check, pauseForUpdate() stops without looping.
+        let f = try Fixture(test: self), pairing = try pair(f)
+        f.link.rejectHelloWithMismatchVersion = [4: 3, 3: 2]
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4])
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
+        XCTAssertEqual(f.link.stops, 0)
+        XCTAssertEqual(f.controller.status, .searching)
+
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4, 3])
+        XCTAssertTrue(f.controller.requiresPeerUpdate)
+        XCTAssertFalse(f.controller.requiresRepair)
+        XCTAssertEqual(f.controller.compatibilityMessage, "相手のアプリを更新してください")
+        XCTAssertEqual(f.controller.status, .unsupported)
+        XCTAssertEqual(f.link.stops, 1)
+
+        f.clock.date.addTimeInterval(600)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.link.starts, 1)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4, 3])
+
+        // Explicit retry starts from v4 again once PC is updated.
+        f.link.rejectHelloWithMismatchVersion = [:]
+        f.controller.retryAfterPeerUpdate()
+        try f.link.connect(pairing, limit: 512)
+        XCTAssertEqual(f.link.receivedHelloVersions, [4, 3, 4])
+        XCTAssertEqual(f.link.negotiatedVersions, [4])
+        XCTAssertEqual(f.controller.status, .connected)
+        XCTAssertFalse(f.controller.requiresPeerUpdate)
     }
 
     @MainActor

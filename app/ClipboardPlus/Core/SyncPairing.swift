@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-public struct SyncPairing: Equatable {
+public struct SyncPairing: Equatable, CustomReflectable {
     public let pcId: UUID
     public let key: Data
     public let name: String
@@ -11,6 +11,10 @@ public struct SyncPairing: Equatable {
         self.key = try SyncProtocol.fixed(key, 32)
         try SyncProtocol.require((1...255).contains(name.utf8.count) && !name.unicodeScalars.contains { $0.value < 32 || $0.value == 127 })
         self.name = name
+    }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["name": name, "redacted": true], displayStyle: .struct)
     }
     public static func create(name: String) throws -> SyncPairing {
         let key = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }

@@ -554,6 +554,7 @@ public sealed class WifiTransferTests : IDisposable
         var padSink = new InMemoryWifiTransferSink();
 
         // Session 1: cut the pipe mid-transfer after ~300 KB so 1st chunk succeeds and later chunk is truncated.
+        var replayGuard = new WifiSessionReplayGuard();
         var keys1 = MakeSessionKeys();
         var brokenPipe = new InMemoryDuplexPipe(cutPadToPcAfterBytes: 300_000);
         var padTask1 = WifiTransferEngine.RunPadSessionAsync(
@@ -566,11 +567,30 @@ public sealed class WifiTransferTests : IDisposable
             brokenPipe.PcEnd,
             keys1,
             [],
-            pcSink);
+            pcSink,
+            replayGuard: replayGuard);
 
         await ErrorAsync(SyncError.Packet, () => pcTask1);
         brokenPipe.PcEnd.CloseWrite();
         await Assert.ThrowsAnyAsync<Exception>(() => padTask1);
+
+        // Mutual auth succeeded before truncation, so keys1.Session is already consumed and cannot be reused.
+        Assert.True(replayGuard.IsConsumed(keys1.Session));
+        var replayCutPipe = new InMemoryDuplexPipe();
+        var replayCutPad = WifiTransferEngine.RunPadSessionAsync(
+            replayCutPipe.PadEnd,
+            keys1,
+            [new InMemoryWifiTransferSource(offer, payload)],
+            padSink);
+        var replayCutPc = WifiTransferEngine.RunPcSessionAsync(
+            replayCutPipe.PcEnd,
+            keys1,
+            [],
+            pcSink,
+            replayGuard: replayGuard);
+        await ErrorAsync(SyncError.State, () => replayCutPc);
+        replayCutPipe.PcEnd.CloseWrite();
+        await Assert.ThrowsAnyAsync<Exception>(() => replayCutPad);
 
         Assert.True(pcSink.HasPartial(offer.Id));
         var savedBeforeResume = pcSink.PartialLength(offer.Id);
@@ -590,7 +610,8 @@ public sealed class WifiTransferTests : IDisposable
             resumePipe.PcEnd,
             keys2,
             [],
-            pcSink);
+            pcSink,
+            replayGuard: replayGuard);
 
         var results = await Task.WhenAll(padTask2, pcTask2);
         var sentItem = Assert.Single(results[0].Sent);
@@ -622,7 +643,7 @@ public sealed class WifiTransferTests : IDisposable
 
         var pcSink = new InMemoryWifiTransferSink();
         var padSink = new InMemoryWifiTransferSink();
-        var pcTask = WifiTransferEngine.RunPcSessionAsync(pipe.PcEnd, keys, [], pcSink);
+        var pcTask = WifiTransferEngine.RunPcSessionAsync(pipe.PcEnd, keys, [], pcSink, new WifiSessionReplayGuard());
         var padTask = WifiTransferEngine.RunPadSessionAsync(pipe.PadEnd, keys, [new InMemoryWifiTransferSource(offer, payload)], padSink);
 
         await ErrorAsync(SyncError.Authentication, () => pcTask);
@@ -674,7 +695,7 @@ public sealed class WifiTransferTests : IDisposable
             if (writes == 3) return [.. data, .. data];
             return data;
         });
-        var pcTask3 = WifiTransferEngine.RunPcSessionAsync(pipe3.PcEnd, keys3, [], new InMemoryWifiTransferSink());
+        var pcTask3 = WifiTransferEngine.RunPcSessionAsync(pipe3.PcEnd, keys3, [], new InMemoryWifiTransferSink(), guard);
         var padTask3 = WifiTransferEngine.RunPadSessionAsync(pipe3.PadEnd, keys3, [new InMemoryWifiTransferSource(offer, payload)], new InMemoryWifiTransferSink());
         await ErrorAsync(SyncError.Sequence, () => pcTask3);
         pipe3.PcEnd.CloseWrite();
@@ -688,7 +709,7 @@ public sealed class WifiTransferTests : IDisposable
         var pipe = new InMemoryDuplexPipe();
 
         var padConnect = WifiEncryptedStream.ConnectAsPadAsync(pipe.PadEnd, keys);
-        var pcAccept = WifiEncryptedStream.AcceptAsPcAsync(pipe.PcEnd, keys);
+        var pcAccept = WifiEncryptedStream.AcceptAsPcAsync(pipe.PcEnd, keys, new WifiSessionReplayGuard());
         _ = await padConnect;
         var pcChannel = await pcAccept;
 
@@ -723,7 +744,7 @@ public sealed class WifiTransferTests : IDisposable
         var pcSink = new InMemoryWifiTransferSink();
         var padSink = new InMemoryWifiTransferSink();
 
-        var pcTask = WifiTransferEngine.RunPcSessionAsync(pipe.PcEnd, keys, [], pcSink);
+        var pcTask = WifiTransferEngine.RunPcSessionAsync(pipe.PcEnd, keys, [], pcSink, new WifiSessionReplayGuard());
         var padTask = WifiTransferEngine.RunPadSessionAsync(pipe.PadEnd, keys, [new InMemoryWifiTransferSource(badOffer, payload)], padSink);
 
         await ErrorAsync(SyncError.Authentication, () => pcTask);
@@ -752,7 +773,7 @@ public sealed class WifiTransferTests : IDisposable
 
         var keysOver = MakeSessionKeys();
         var pipeOver = new InMemoryDuplexPipe();
-        var pcTaskOver = WifiTransferEngine.RunPcSessionAsync(pipeOver.PcEnd, keysOver, [], new InMemoryWifiTransferSink());
+        var pcTaskOver = WifiTransferEngine.RunPcSessionAsync(pipeOver.PcEnd, keysOver, [], new InMemoryWifiTransferSink(), new WifiSessionReplayGuard());
         var padTaskOver = WifiTransferEngine.RunPadSessionAsync(
             pipeOver.PadEnd,
             keysOver,
@@ -787,7 +808,8 @@ public sealed class WifiTransferTests : IDisposable
             pipe50.PcEnd,
             keys50,
             [],
-            streamingSink);
+            streamingSink,
+            new WifiSessionReplayGuard());
 
         var results = await Task.WhenAll(padTask50, pcTask50);
         Assert.Equal(exact50Bytes, Assert.Single(results[0].Sent).TransferredBytes);
@@ -802,7 +824,7 @@ public sealed class WifiTransferTests : IDisposable
         var pipe = new InMemoryDuplexPipe();
 
         var padConnect = WifiEncryptedStream.ConnectAsPadAsync(pipe.PadEnd, keys);
-        var pcAccept = WifiEncryptedStream.AcceptAsPcAsync(pipe.PcEnd, keys);
+        var pcAccept = WifiEncryptedStream.AcceptAsPcAsync(pipe.PcEnd, keys, new WifiSessionReplayGuard());
         _ = await padConnect;
         var pcChannel = await pcAccept;
 
@@ -839,7 +861,7 @@ public sealed class WifiTransferTests : IDisposable
             return data;
         });
 
-        var pcTask1 = WifiTransferEngine.RunPcSessionAsync(reorderPipe.PcEnd, keysReorder, [], new InMemoryWifiTransferSink());
+        var pcTask1 = WifiTransferEngine.RunPcSessionAsync(reorderPipe.PcEnd, keysReorder, [], new InMemoryWifiTransferSink(), new WifiSessionReplayGuard());
         var padTask1 = WifiTransferEngine.RunPadSessionAsync(
             reorderPipe.PadEnd,
             keysReorder,
@@ -859,7 +881,7 @@ public sealed class WifiTransferTests : IDisposable
             return dropIdx == 4 ? [] : data;
         });
 
-        var pcTask2 = WifiTransferEngine.RunPcSessionAsync(dropPipe.PcEnd, keysDrop, [], new InMemoryWifiTransferSink());
+        var pcTask2 = WifiTransferEngine.RunPcSessionAsync(dropPipe.PcEnd, keysDrop, [], new InMemoryWifiTransferSink(), new WifiSessionReplayGuard());
         var padTask2 = WifiTransferEngine.RunPadSessionAsync(
             dropPipe.PadEnd,
             keysDrop,
@@ -885,7 +907,7 @@ public sealed class WifiTransferTests : IDisposable
 
         var keys1 = MakeSessionKeys();
         var pipe1 = new InMemoryDuplexPipe();
-        var pcTask1 = WifiTransferEngine.RunPcSessionAsync(pipe1.PcEnd, keys1, [], sink1);
+        var pcTask1 = WifiTransferEngine.RunPcSessionAsync(pipe1.PcEnd, keys1, [], sink1, new WifiSessionReplayGuard());
         var padTask1 = WifiTransferEngine.RunPadSessionAsync(pipe1.PadEnd, keys1, [new InMemoryWifiTransferSource(offer, payload)], new InMemoryWifiTransferSink());
         await ErrorAsync(SyncError.Authentication, () => pcTask1);
         pipe1.PcEnd.CloseWrite();
@@ -901,7 +923,7 @@ public sealed class WifiTransferTests : IDisposable
         var keys2 = MakeSessionKeys();
         var pipe2 = new InMemoryDuplexPipe();
         var padTask2 = WifiTransferEngine.RunPadSessionAsync(pipe2.PadEnd, keys2, [new InMemoryWifiTransferSource(offer, payload)], new InMemoryWifiTransferSink());
-        var pcTask2 = WifiTransferEngine.RunPcSessionAsync(pipe2.PcEnd, keys2, [], sink2);
+        var pcTask2 = WifiTransferEngine.RunPcSessionAsync(pipe2.PcEnd, keys2, [], sink2, new WifiSessionReplayGuard());
         var results2 = await Task.WhenAll(padTask2, pcTask2);
         Assert.Equal(0, Assert.Single(results2[0].Sent).TransferredBytes);
         Assert.Equal(payload, sink2.Completed[offer.Id].Data);
@@ -960,6 +982,40 @@ public sealed class WifiTransferTests : IDisposable
         {
             if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task PublicApiHidesTestNonceAndRequiresReplayGuard()
+    {
+        Assert.DoesNotContain(
+            typeof(WifiTcpPadHandshake).GetConstructors().SelectMany(c => c.GetParameters()),
+            p => p.Name == "testNonce");
+        Assert.DoesNotContain(
+            typeof(WifiTcpPcHandshake).GetConstructors().SelectMany(c => c.GetParameters()),
+            p => p.Name == "testNonce");
+        Assert.DoesNotContain(
+            typeof(WifiEncryptedStream).GetMethods().SelectMany(m => m.GetParameters()),
+            p => p.Name == "testNonce");
+        Assert.DoesNotContain(
+            typeof(WifiTransferEngine).GetMethods().SelectMany(m => m.GetParameters()),
+            p => p.Name == "testNonce");
+
+        var acceptParams = Assert.Single(typeof(WifiEncryptedStream).GetMethods(), m => m.Name == nameof(WifiEncryptedStream.AcceptAsPcAsync))
+            .GetParameters();
+        var acceptGuardParam = Assert.Single(acceptParams, p => p.Name == "replayGuard");
+        Assert.False(acceptGuardParam.HasDefaultValue);
+
+        var runPcParams = Assert.Single(typeof(WifiTransferEngine).GetMethods(), m => m.Name == nameof(WifiTransferEngine.RunPcSessionAsync))
+            .GetParameters();
+        var runPcGuardParam = Assert.Single(runPcParams, p => p.Name == "replayGuard");
+        Assert.False(runPcGuardParam.HasDefaultValue);
+
+        var keys = MakeSessionKeys();
+        var pipe = new InMemoryDuplexPipe();
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            WifiEncryptedStream.AcceptAsPcAsync(pipe.PcEnd, keys, replayGuard: null!));
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            WifiTransferEngine.RunPcSessionAsync(pipe.PcEnd, keys, [], new InMemoryWifiTransferSink(), replayGuard: null!));
     }
 
     private sealed class StubClipboard : ClipboardPlus.Windows.Core.IClipboardAccess

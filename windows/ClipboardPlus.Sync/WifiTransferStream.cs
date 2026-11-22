@@ -200,10 +200,16 @@ public sealed class WifiEncryptedStream
         this.receiver = receiver ?? throw new ArgumentNullException(nameof(receiver));
     }
 
-    public static async Task<WifiEncryptedStream> ConnectAsPadAsync(
+    public static Task<WifiEncryptedStream> ConnectAsPadAsync(
         Stream stream,
         WifiTransferKeys keys,
-        byte[]? testNonce = null,
+        CancellationToken cancellationToken = default) =>
+        ConnectAsPadAsync(stream, keys, testNonce: null, cancellationToken);
+
+    internal static async Task<WifiEncryptedStream> ConnectAsPadAsync(
+        Stream stream,
+        WifiTransferKeys keys,
+        byte[]? testNonce,
         CancellationToken cancellationToken = default)
     {
         var handshake = new WifiTcpPadHandshake(keys, testNonce);
@@ -223,14 +229,22 @@ public sealed class WifiEncryptedStream
             new WifiStreamFrameReceiver(auth.Keys.PcToPad, WifiStreamDirection.PcToPad));
     }
 
-    public static async Task<WifiEncryptedStream> AcceptAsPcAsync(
+    public static Task<WifiEncryptedStream> AcceptAsPcAsync(
         Stream stream,
         WifiTransferKeys keys,
-        WifiSessionReplayGuard? replayGuard = null,
-        byte[]? testNonce = null,
+        WifiSessionReplayGuard replayGuard,
+        CancellationToken cancellationToken = default) =>
+        AcceptAsPcAsync(stream, keys, replayGuard, testNonce: null, cancellationToken);
+
+    internal static async Task<WifiEncryptedStream> AcceptAsPcAsync(
+        Stream stream,
+        WifiTransferKeys keys,
+        WifiSessionReplayGuard replayGuard,
+        byte[]? testNonce,
         CancellationToken cancellationToken = default)
     {
-        replayGuard?.RequireNotConsumed(keys.Session);
+        ArgumentNullException.ThrowIfNull(replayGuard);
+        replayGuard.RequireNotConsumed(keys.Session);
         var handshake = new WifiTcpPcHandshake(keys, testNonce);
         var hello = await ReadExactOrThrowAsync(stream, SyncProtocol.WifiTcpHelloBytes, cancellationToken).ConfigureAwait(false);
         var welcome = handshake.AcceptHello(hello);
@@ -240,7 +254,7 @@ public sealed class WifiEncryptedStream
 
         var auth = await ReadExactOrThrowAsync(stream, SyncProtocol.WifiTcpAuthBytes, cancellationToken).ConfigureAwait(false);
         var trafficKeys = handshake.AcceptAuth(auth);
-        replayGuard?.ConsumeOrThrow(keys.Session);
+        replayGuard.ConsumeOrThrow(keys.Session);
 
         return new WifiEncryptedStream(
             stream,
@@ -431,13 +445,22 @@ public static class WifiTransferEngine
         }
     }
 
-    public static async Task<WifiSessionResult> RunPadSessionAsync(
+    public static Task<WifiSessionResult> RunPadSessionAsync(
         Stream stream,
         WifiTransferKeys keys,
         IReadOnlyList<IWifiTransferSource> outgoing,
         IWifiTransferSink sink,
         int chunkSize = SyncProtocol.MaxWifiChunkBytes,
-        byte[]? testNonce = null,
+        CancellationToken cancellationToken = default) =>
+        RunPadSessionAsync(stream, keys, outgoing, sink, testNonce: null, chunkSize, cancellationToken);
+
+    internal static async Task<WifiSessionResult> RunPadSessionAsync(
+        Stream stream,
+        WifiTransferKeys keys,
+        IReadOnlyList<IWifiTransferSource> outgoing,
+        IWifiTransferSink sink,
+        byte[]? testNonce,
+        int chunkSize = SyncProtocol.MaxWifiChunkBytes,
         CancellationToken cancellationToken = default)
     {
         var channel = await WifiEncryptedStream.ConnectAsPadAsync(stream, keys, testNonce, cancellationToken).ConfigureAwait(false);
@@ -446,14 +469,24 @@ public static class WifiTransferEngine
         return new WifiSessionResult(sent, received);
     }
 
-    public static async Task<WifiSessionResult> RunPcSessionAsync(
+    public static Task<WifiSessionResult> RunPcSessionAsync(
         Stream stream,
         WifiTransferKeys keys,
         IReadOnlyList<IWifiTransferSource> outgoing,
         IWifiTransferSink sink,
-        WifiSessionReplayGuard? replayGuard = null,
+        WifiSessionReplayGuard replayGuard,
         int chunkSize = SyncProtocol.MaxWifiChunkBytes,
-        byte[]? testNonce = null,
+        CancellationToken cancellationToken = default) =>
+        RunPcSessionAsync(stream, keys, outgoing, sink, replayGuard, testNonce: null, chunkSize, cancellationToken);
+
+    internal static async Task<WifiSessionResult> RunPcSessionAsync(
+        Stream stream,
+        WifiTransferKeys keys,
+        IReadOnlyList<IWifiTransferSource> outgoing,
+        IWifiTransferSink sink,
+        WifiSessionReplayGuard replayGuard,
+        byte[]? testNonce,
+        int chunkSize = SyncProtocol.MaxWifiChunkBytes,
         CancellationToken cancellationToken = default)
     {
         var channel = await WifiEncryptedStream.AcceptAsPcAsync(stream, keys, replayGuard, testNonce, cancellationToken).ConfigureAwait(false);

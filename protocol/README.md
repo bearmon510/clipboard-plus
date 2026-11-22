@@ -39,7 +39,7 @@ Swift/C#は同じJSONからQR、認証、版3互換・版違い応答、HMAC、�
   - `TCP_WELCOME`（PC→iOS、86B）：`"CPW2" | 0x01 | 0x02 | session(16) | pcNonce(32) | pcHmac(32)`
   - `TCP_AUTH`（iOS→PC、38B）：`"CPW2" | 0x01 | 0x03 | padHmac(32)`
   - `HMAC-SHA256(authKey, "CPW2" | 0x01 | ASCII("pc" または "pad") | session(16) | padNonce(32) | pcNonce(32))`
-  - 認証完了後、`salt = padNonce || pcNonce` で方向別トラフィック鍵 `pad->pc`（`clipboardplus wifi v1 pad->pc`）と `pc->pad`（`clipboardplus wifi v1 pc->pad`）を派生し、完了した `session` は `WifiSessionReplayGuard` で再利用を禁止する。
+  - 相互確認（`TCP_AUTH` 検証）が通った時点で、`salt = padNonce || pcNonce` により方向別トラフィック鍵 `pad->pc`（`clipboardplus wifi v1 pad->pc`）と `pc->pad`（`clipboardplus wifi v1 pc->pad`）を派生し、その `session` を `WifiSessionReplayGuard` で使い済みにして再利用を禁止する（転送途中で切れた場合もその `session` は再開に使えず、BLE の `wifi_ready` からやり直す）。
 
 ### TCP 連続暗号フレームと転送ストリーム
 - **暗号フレーム（上限 256 KiB = 262,144B）**：`0x20 | dir(1B: pad->pc=0x01, pc->pad=0x02) | payloadLen(4B BE) | seq(8B BE) | ciphertext(N) | tag(16B)`。
@@ -67,7 +67,7 @@ Swiftのプロトコル型はFoundation/CryptoKitで動作する。状態を持�
 | SyncMessageCodec | encode / decode。ASCII JSON見出しと本体 |
 | WifiControlMessage / WifiControlMessageCodec | request / ready / unavailable / joinResult / cancel の厳格なエンコード・デコードとローカル IPv4 検証。`ready` 文字列表現は秘匿情報を伏せる |
 | WifiTransferKeys / WifiTrafficKeys | BLE の `wifiBaseKey` + `token` + `session` から HKDF-SHA256 で `transferKey` / `authKey` と TCP 方向別鍵を派生 |
-| WifiTcpPadHandshake / WifiTcpPcHandshake / WifiSessionReplayGuard | `CPW2` 第1版の双方向 HMAC-SHA256 認証と完了済み `session` の再利用禁止 |
+| WifiTcpPadHandshake / WifiTcpPcHandshake / WifiSessionReplayGuard | `CPW2` 第1版の双方向 HMAC-SHA256 認証と相互確認済み `session` の再利用禁止 |
 | WifiStreamFrameSender / WifiStreamFrameReceiver | 256KiB上限・14Bヘッダ・厳密連続通し番号の AES-256-GCM ストリーム枠 |
 | WifiStreamMessage / WifiStreamMessageCodec / WifiEncryptedStream / WifiTransferEngine | `offer`→`resume`→`chunk`→SHA-256検証→`ack`→`done` の OS 非依存ストリーム転送部品（途中再開・双方向一括・50MiB対応） |
 | TemplateSyncMessage | pull(op:)、push(op:part:total:page:)、state(op:part:total:page:)、ack(op:)（C#は `TemplateSyncPull` / `TemplateSyncPush` / `TemplateSyncStateMessage` / `TemplateSyncAck`）。見出しはASCII JSON、本体はUTF-8 JSON |

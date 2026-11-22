@@ -77,7 +77,7 @@ public sealed class WifiTransferKeys
 }
 
 /// <summary>
-/// Tracks already-authenticated Wi-Fi transfer sessions so a completed session cannot be replayed.
+/// Tracks already-authenticated Wi-Fi transfer sessions so a session is consumed upon mutual authentication and cannot be replayed.
 /// </summary>
 public sealed class WifiSessionReplayGuard
 {
@@ -150,7 +150,7 @@ internal static class WifiTcpHandshakeWire
 public sealed record WifiTcpPadAuthentication(byte[] Auth, WifiTrafficKeys Keys);
 
 /// <summary>
-/// Single-use per TCP connection (iOS / client side). Nonce injection is ONLY for test vectors.
+/// Single-use per TCP connection (iOS / client side). Nonce injection is internal and ONLY for test vectors.
 /// </summary>
 public sealed class WifiTcpPadHandshake
 {
@@ -159,7 +159,12 @@ public sealed class WifiTcpPadHandshake
     private readonly byte[] padNonce;
     private int state;
 
-    public WifiTcpPadHandshake(WifiTransferKeys transferKeys, byte[]? testNonce = null)
+    public WifiTcpPadHandshake(WifiTransferKeys transferKeys)
+        : this(transferKeys, testNonce: null)
+    {
+    }
+
+    internal WifiTcpPadHandshake(WifiTransferKeys transferKeys, byte[]? testNonce)
     {
         SyncProtocol.Require(transferKeys is not null);
         this.transferKeys = transferKeys;
@@ -194,7 +199,7 @@ public sealed class WifiTcpPadHandshake
 }
 
 /// <summary>
-/// Single-use per TCP connection (PC / server side). Nonce injection is ONLY for test vectors.
+/// Single-use per TCP connection (PC / server side). Nonce injection is internal and ONLY for test vectors.
 /// </summary>
 public sealed class WifiTcpPcHandshake
 {
@@ -206,7 +211,12 @@ public sealed class WifiTcpPcHandshake
 
     public bool IsAuthenticated => state == 2;
 
-    public WifiTcpPcHandshake(WifiTransferKeys transferKeys, byte[]? testNonce = null)
+    public WifiTcpPcHandshake(WifiTransferKeys transferKeys)
+        : this(transferKeys, testNonce: null)
+    {
+    }
+
+    internal WifiTcpPcHandshake(WifiTransferKeys transferKeys, byte[]? testNonce)
     {
         SyncProtocol.Require(transferKeys is not null);
         this.transferKeys = transferKeys;

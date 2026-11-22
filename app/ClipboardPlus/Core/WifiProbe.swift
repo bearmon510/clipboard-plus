@@ -27,7 +27,7 @@ enum WifiProbeQRError: Error, Equatable {
     }
 }
 
-struct WifiProbeQR: Equatable, Sendable {
+struct WifiProbeQR: Equatable, Sendable, CustomReflectable {
     static let prefix = "clipboardplus-wifi-probe:1:"
     static let pairingPrefix = "clipboardplus-pair:"
     private static let maxQRBytes = 1024
@@ -37,6 +37,10 @@ struct WifiProbeQR: Equatable, Sendable {
     let ip: String
     let port: UInt16
     let token: String
+
+    var customMirror: Mirror {
+        Mirror(self, children: ["port": port, "redacted": true], displayStyle: .struct)
+    }
 
     private struct Payload: Codable {
         let ssid: String

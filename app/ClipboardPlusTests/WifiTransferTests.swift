@@ -324,6 +324,27 @@ final class WifiTransferTests: XCTestCase {
         }
     }
 
+    private func assertRedactedReflection<T>(
+        _ value: T,
+        secrets: [String],
+        expectedLabels: [String]? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        var dumped = ""
+        _ = dump(value, to: &dumped)
+        for secret in secrets where !secret.isEmpty {
+            XCTAssertFalse(dumped.contains(secret), file: file, line: line)
+        }
+        let labels = Mirror(reflecting: value).children.compactMap { $0.label }
+        if let expectedLabels {
+            XCTAssertEqual(labels, expectedLabels, file: file, line: line)
+        }
+        for forbidden in ["transferKey", "authKey", "padToPc", "pcToPad", "wifiBaseKey", "ssid", "passphrase", "ip", "token", "session", "key", "pcId", "padNonce", "pcNonce", "auth"] {
+            XCTAssertFalse(labels.contains(forbidden), file: file, line: line)
+        }
+    }
+
     private func makeOffer(
         id: UUID = UUID(),
         from: String,
@@ -407,6 +428,20 @@ final class WifiTransferTests: XCTestCase {
         XCTAssertEqual(pcKeysV4.wifiBaseKey, expectedWifiBase)
         XCTAssertTrue(authV4.keys.supportsWifiTransfer)
         XCTAssertTrue(pcKeysV4.supportsWifiTransfer)
+        assertRedactedReflection(
+            pairing,
+            secrets: [pairing.pcId.uuidString, WifiControlMessageCodec.lowerHex(pairing.key)],
+            expectedLabels: ["name", "redacted"]
+        )
+        assertRedactedReflection(
+            authV4.keys,
+            secrets: [
+                WifiControlMessageCodec.lowerHex(authV4.keys.padToPc),
+                WifiControlMessageCodec.lowerHex(authV4.keys.pcToPad),
+                WifiControlMessageCodec.lowerHex(expectedWifiBase),
+            ],
+            expectedLabels: ["protocolVersion", "supportsWifiTransfer", "redacted"]
+        )
 
         // Old v3 Pad talking to v4 PC negotiates v3 cleanly without Wi-Fi.
         let legacy = try object(v, "legacyV3Handshake")
@@ -476,6 +511,19 @@ final class WifiTransferTests: XCTestCase {
                 XCTAssertFalse(desc.contains(ready.ip))
                 XCTAssertFalse(desc.contains(WifiControlMessageCodec.lowerHex(ready.token)))
                 XCTAssertFalse(desc.contains(ready.session.uuidString))
+                let secrets = [
+                    ready.ssid,
+                    ready.passphrase,
+                    ready.ip,
+                    WifiControlMessageCodec.lowerHex(ready.token),
+                    ready.session.uuidString,
+                ]
+                assertRedactedReflection(ready, secrets: secrets, expectedLabels: ["port", "ttlSeconds", "redacted"])
+                assertRedactedReflection(decoded, secrets: secrets, expectedLabels: ["ready"])
+            } else if case let .joinResult(joinSession, _) = decoded {
+                assertRedactedReflection(decoded, secrets: [joinSession.uuidString], expectedLabels: ["status"])
+            } else if case let .cancel(cancelSession, _) = decoded {
+                assertRedactedReflection(decoded, secrets: [cancelSession.uuidString], expectedLabels: ["reason"])
             }
         }
 
@@ -537,11 +585,22 @@ final class WifiTransferTests: XCTestCase {
         XCTAssertNotEqual(transferKeys.transferKey, transferKeys.authKey)
         XCTAssertFalse(transferKeys.description.contains(WifiControlMessageCodec.lowerHex(transferKeys.transferKey)))
         XCTAssertFalse(transferKeys.description.contains(WifiControlMessageCodec.lowerHex(transferKeys.authKey)))
+        assertRedactedReflection(
+            transferKeys,
+            secrets: [
+                session.uuidString,
+                WifiControlMessageCodec.lowerHex(transferKeys.transferKey),
+                WifiControlMessageCodec.lowerHex(transferKeys.authKey),
+            ],
+            expectedLabels: ["redacted"]
+        )
 
         let padNonce = try bytes(w, "padNonceHex")
         let pcNonce = try bytes(w, "pcNonceHex")
         let padHs = try WifiTcpPadHandshake(transferKeys: transferKeys, testNonce: padNonce)
         let pcHs = try WifiTcpPcHandshake(transferKeys: transferKeys, testNonce: pcNonce)
+        assertRedactedReflection(padHs, secrets: [session.uuidString], expectedLabels: ["state", "redacted"])
+        assertRedactedReflection(pcHs, secrets: [session.uuidString], expectedLabels: ["state", "redacted"])
 
         let tcpHello = try padHs.createHello()
         let expectedTcpHello = try bytes(w, "tcpHelloHex")
@@ -558,6 +617,14 @@ final class WifiTransferTests: XCTestCase {
         XCTAssertEqual(Data(padAuth.auth.suffix(32)), expectedPadHmac)
         let pcTraffic = try pcHs.acceptAuth(padAuth.auth)
         XCTAssertTrue(pcHs.isAuthenticated)
+        assertRedactedReflection(
+            padAuth,
+            secrets: [
+                WifiControlMessageCodec.lowerHex(padAuth.keys.padToPc),
+                WifiControlMessageCodec.lowerHex(padAuth.keys.pcToPad),
+            ],
+            expectedLabels: ["keys", "redacted"]
+        )
 
         let expectedPadToPc = try bytes(w, "padToPcKeyHex")
         let expectedPcToPad = try bytes(w, "pcToPadKeyHex")
@@ -566,6 +633,14 @@ final class WifiTransferTests: XCTestCase {
             XCTAssertEqual(tk.pcToPad, expectedPcToPad)
             XCTAssertNotEqual(tk.padToPc, tk.pcToPad)
             XCTAssertFalse(tk.description.contains(WifiControlMessageCodec.lowerHex(tk.padToPc)))
+            assertRedactedReflection(
+                tk,
+                secrets: [
+                    WifiControlMessageCodec.lowerHex(tk.padToPc),
+                    WifiControlMessageCodec.lowerHex(tk.pcToPad),
+                ],
+                expectedLabels: ["redacted"]
+            )
         }
 
         expectError(.state) { _ = try padHs.createHello() }
@@ -716,6 +791,7 @@ final class WifiTransferTests: XCTestCase {
         let padSink = InMemoryWifiTransferSink()
 
         // Session 1: cut mid-transfer after 300 KB.
+        let replayGuard = try WifiSessionReplayGuard()
         let keys1 = try makeSessionKeys()
         let brokenPipe = InMemoryDuplexPipe(padToPcFault: .cutAfterBytes(300_000))
         let padTask1 = Task {
@@ -732,13 +808,39 @@ final class WifiTransferTests: XCTestCase {
                 stream: brokenPipe.pcEnd,
                 keys: keys1,
                 outgoing: [],
-                sink: pcSink
+                sink: pcSink,
+                replayGuard: replayGuard
             )
         }
 
         await expectAsyncError(.packet) { _ = try await pcTask1.value }
         await brokenPipe.closeAll()
         do { _ = try await padTask1.value } catch {}
+
+        // Mutual auth succeeded before truncation, so keys1.session is consumed and must be re-negotiated via wifi_ready.
+        let consumedAfterCut = await replayGuard.isConsumed(keys1.session)
+        XCTAssertTrue(consumedAfterCut)
+        let replayCutPipe = InMemoryDuplexPipe()
+        let replayCutPad = Task {
+            try await WifiTransferEngine.runPadSession(
+                stream: replayCutPipe.padEnd,
+                keys: keys1,
+                outgoing: [InMemoryWifiTransferSource(offer: offer, payload: payload)],
+                sink: padSink
+            )
+        }
+        let replayCutPc = Task {
+            try await WifiTransferEngine.runPcSession(
+                stream: replayCutPipe.pcEnd,
+                keys: keys1,
+                outgoing: [],
+                sink: pcSink,
+                replayGuard: replayGuard
+            )
+        }
+        await expectAsyncError(.state) { _ = try await replayCutPc.value }
+        await replayCutPipe.closeAll()
+        do { _ = try await replayCutPad.value } catch {}
 
         let hasPartial = await pcSink.hasPartial(for: offer.id)
         let savedOffset = await pcSink.partialLength(for: offer.id)
@@ -762,7 +864,8 @@ final class WifiTransferTests: XCTestCase {
             stream: resumePipe.pcEnd,
             keys: keys2,
             outgoing: [],
-            sink: pcSink
+            sink: pcSink,
+            replayGuard: replayGuard
         )
         let (padResult2, _) = try await (padRun2, pcRun2)
         XCTAssertEqual(padResult2.sent.count, 1)
@@ -781,6 +884,7 @@ final class WifiTransferTests: XCTestCase {
         _ = try await pcSink.appendChunk(id: offer.id, offset: 0, data: payload)
 
         let keys = try makeSessionKeys()
+        let replayGuard = try WifiSessionReplayGuard()
         let pipe = InMemoryDuplexPipe()
         async let padRun = WifiTransferEngine.runPadSession(
             stream: pipe.padEnd,
@@ -792,7 +896,8 @@ final class WifiTransferTests: XCTestCase {
             stream: pipe.pcEnd,
             keys: keys,
             outgoing: [],
-            sink: pcSink
+            sink: pcSink,
+            replayGuard: replayGuard
         )
         let (padResult, _) = try await (padRun, pcRun)
         XCTAssertEqual(padResult.sent.count, 1)
@@ -805,6 +910,7 @@ final class WifiTransferTests: XCTestCase {
 
     func testInMemoryPipeTamperingOnWireRejectedWithAuthentication() async throws {
         let keys = try makeSessionKeys()
+        let replayGuard = try WifiSessionReplayGuard()
         let payload = makeDeterministicData(length: 10_000, seed: 3)
         let offer = makeOffer(from: "pad", data: payload, name: "tamper.bin")
         // Write #1 = TCP_HELLO, #2 = TCP_AUTH, #3 = offer encrypted frame.
@@ -821,7 +927,7 @@ final class WifiTransferTests: XCTestCase {
             )
         }
         let pcTask = Task {
-            try await WifiTransferEngine.runPcSession(stream: pipe.pcEnd, keys: keys, outgoing: [], sink: pcSink)
+            try await WifiTransferEngine.runPcSession(stream: pipe.pcEnd, keys: keys, outgoing: [], sink: pcSink, replayGuard: replayGuard)
         }
 
         await expectAsyncError(.authentication) { _ = try await pcTask.value }
@@ -872,7 +978,7 @@ final class WifiTransferTests: XCTestCase {
             )
         }
         let pcTask3 = Task {
-            try await WifiTransferEngine.runPcSession(stream: pipe3.pcEnd, keys: keys3, outgoing: [], sink: InMemoryWifiTransferSink())
+            try await WifiTransferEngine.runPcSession(stream: pipe3.pcEnd, keys: keys3, outgoing: [], sink: InMemoryWifiTransferSink(), replayGuard: guard1)
         }
         await expectAsyncError(.sequence) { _ = try await pcTask3.value }
         await pipe3.closeAll()
@@ -893,7 +999,7 @@ final class WifiTransferTests: XCTestCase {
             )
         }
         let pcTask4 = Task {
-            try await WifiTransferEngine.runPcSession(stream: pipe4.pcEnd, keys: keys4, outgoing: [], sink: InMemoryWifiTransferSink())
+            try await WifiTransferEngine.runPcSession(stream: pipe4.pcEnd, keys: keys4, outgoing: [], sink: InMemoryWifiTransferSink(), replayGuard: guard1)
         }
         await expectAsyncError(.sequence) { _ = try await pcTask4.value }
         await pipe4.closeAll()
@@ -912,7 +1018,7 @@ final class WifiTransferTests: XCTestCase {
             )
         }
         let pcTask5 = Task {
-            try await WifiTransferEngine.runPcSession(stream: pipe5.pcEnd, keys: keys5, outgoing: [], sink: InMemoryWifiTransferSink())
+            try await WifiTransferEngine.runPcSession(stream: pipe5.pcEnd, keys: keys5, outgoing: [], sink: InMemoryWifiTransferSink(), replayGuard: guard1)
         }
         await expectAsyncError(.sequence) { _ = try await pcTask5.value }
         await pipe5.closeAll()
@@ -921,9 +1027,10 @@ final class WifiTransferTests: XCTestCase {
 
     func testInMemoryPipeOversizedWireFrameHeaderRejectedWithLimit() async throws {
         let keys = try makeSessionKeys()
+        let replayGuard = try WifiSessionReplayGuard()
         let pipe = InMemoryDuplexPipe()
         async let padConnect = WifiEncryptedStream.connectAsPad(stream: pipe.padEnd, keys: keys)
-        async let pcAccept = WifiEncryptedStream.acceptAsPc(stream: pipe.pcEnd, keys: keys)
+        async let pcAccept = WifiEncryptedStream.acceptAsPc(stream: pipe.pcEnd, keys: keys, replayGuard: replayGuard)
         _ = try await padConnect
         let pcChannel = try await pcAccept
 
@@ -943,6 +1050,7 @@ final class WifiTransferTests: XCTestCase {
 
     func testInMemoryPipeSha256MismatchDiscardsPartialAndRejectsWithoutAck() async throws {
         let keys = try makeSessionKeys()
+        let replayGuard = try WifiSessionReplayGuard()
         let payload = makeDeterministicData(length: 20_000, seed: 7)
         let badOffer = SyncOffer(
             id: UUID(),
@@ -967,7 +1075,7 @@ final class WifiTransferTests: XCTestCase {
             )
         }
         let pcTask = Task {
-            try await WifiTransferEngine.runPcSession(stream: pipe.pcEnd, keys: keys, outgoing: [], sink: pcSink)
+            try await WifiTransferEngine.runPcSession(stream: pipe.pcEnd, keys: keys, outgoing: [], sink: pcSink, replayGuard: replayGuard)
         }
 
         await expectAsyncError(.authentication) { _ = try await pcTask.value }
@@ -994,9 +1102,10 @@ final class WifiTransferTests: XCTestCase {
         expectError(.limit) { _ = try WifiStreamMessageCodec.encode(.offer(over50)) }
 
         let keysOver = try makeSessionKeys()
+        let replayGuardOver = try WifiSessionReplayGuard()
         let pipeOver = InMemoryDuplexPipe()
         let pcTaskOver = Task {
-            try await WifiTransferEngine.runPcSession(stream: pipeOver.pcEnd, keys: keysOver, outgoing: [], sink: InMemoryWifiTransferSink())
+            try await WifiTransferEngine.runPcSession(stream: pipeOver.pcEnd, keys: keysOver, outgoing: [], sink: InMemoryWifiTransferSink(), replayGuard: replayGuardOver)
         }
         let padTaskOver = Task {
             try await WifiTransferEngine.runPadSession(
@@ -1024,6 +1133,7 @@ final class WifiTransferTests: XCTestCase {
             type: "public.data"
         )
         let keys50 = try makeSessionKeys()
+        let replayGuard50 = try WifiSessionReplayGuard()
         let pipe50 = InMemoryDuplexPipe()
         let streamingSink = StreamingHashWifiTransferSink()
 
@@ -1037,7 +1147,8 @@ final class WifiTransferTests: XCTestCase {
             stream: pipe50.pcEnd,
             keys: keys50,
             outgoing: [],
-            sink: streamingSink
+            sink: streamingSink,
+            replayGuard: replayGuard50
         )
         let (padResult50, _) = try await (pad50, pc50)
         XCTAssertEqual(padResult50.sent.count, 1)
@@ -1050,9 +1161,10 @@ final class WifiTransferTests: XCTestCase {
 
     func testInMemoryPipeCleanEofBeforeDoneDetectedAsTruncation() async throws {
         let keys = try makeSessionKeys()
+        let replayGuard = try WifiSessionReplayGuard()
         let pipe = InMemoryDuplexPipe()
         async let padConnect = WifiEncryptedStream.connectAsPad(stream: pipe.padEnd, keys: keys)
-        async let pcAccept = WifiEncryptedStream.acceptAsPc(stream: pipe.pcEnd, keys: keys)
+        async let pcAccept = WifiEncryptedStream.acceptAsPc(stream: pipe.pcEnd, keys: keys, replayGuard: replayGuard)
         _ = try await padConnect
         let pcChannel = try await pcAccept
 

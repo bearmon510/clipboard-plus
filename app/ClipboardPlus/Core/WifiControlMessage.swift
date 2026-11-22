@@ -31,7 +31,7 @@ public enum WifiCancelReason: String, Equatable, Sendable {
     case superseded
 }
 
-public struct WifiReadyPayload: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct WifiReadyPayload: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public let session: UUID
     public let ssid: String
     public let passphrase: String
@@ -56,9 +56,13 @@ public struct WifiReadyPayload: Equatable, Sendable, CustomStringConvertible, Cu
     }
 
     public var debugDescription: String { description }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["port": port, "ttlSeconds": ttlSeconds, "redacted": true], displayStyle: .struct)
+    }
 }
 
-public enum WifiControlMessage: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+public enum WifiControlMessage: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     case request(direction: WifiTransferDirection, ids: [UUID])
     case ready(WifiReadyPayload)
     case unavailable(reason: WifiUnavailableReason)
@@ -81,6 +85,21 @@ public enum WifiControlMessage: Equatable, Sendable, CustomStringConvertible, Cu
     }
 
     public var debugDescription: String { description }
+
+    public var customMirror: Mirror {
+        switch self {
+        case let .request(direction, ids):
+            return Mirror(self, children: ["direction": direction.rawValue, "count": ids.count], displayStyle: .enum)
+        case let .ready(payload):
+            return Mirror(self, children: ["ready": payload], displayStyle: .enum)
+        case let .unavailable(reason):
+            return Mirror(self, children: ["reason": reason.rawValue], displayStyle: .enum)
+        case let .joinResult(_, status):
+            return Mirror(self, children: ["status": status.rawValue], displayStyle: .enum)
+        case let .cancel(_, reason):
+            return Mirror(self, children: ["reason": reason.rawValue], displayStyle: .enum)
+        }
+    }
 }
 
 public enum WifiControlMessageCodec {

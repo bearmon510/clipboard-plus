@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-public struct SyncSessionKeys: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct SyncSessionKeys: Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     public let protocolVersion: UInt8
     public let padToPc: Data
     public let pcToPad: Data
@@ -37,6 +37,18 @@ public struct SyncSessionKeys: Sendable, CustomStringConvertible, CustomDebugStr
     }
 
     public var debugDescription: String { description }
+
+    public var customMirror: Mirror {
+        Mirror(
+            self,
+            children: [
+                "protocolVersion": protocolVersion,
+                "supportsWifiTransfer": supportsWifiTransfer,
+                "redacted": true,
+            ],
+            displayStyle: .struct
+        )
+    }
 }
 
 enum SyncHandshakeWire {

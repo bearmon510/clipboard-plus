@@ -16,6 +16,14 @@ final class WifiProbeTests: XCTestCase {
 
         let parsed = try WifiProbeQR.parse(qrText)
         XCTAssertEqual(parsed, original)
+
+        var dumped = ""
+        _ = dump(original, to: &dumped)
+        XCTAssertFalse(dumped.contains(original.ssid))
+        XCTAssertFalse(dumped.contains(original.passphrase))
+        XCTAssertFalse(dumped.contains(original.ip))
+        XCTAssertFalse(dumped.contains(original.token))
+        XCTAssertEqual(Mirror(reflecting: original).children.compactMap { $0.label }, ["port", "redacted"])
     }
 
     func testQRParserRejectsPairingQRAndInvalidPayloads() {

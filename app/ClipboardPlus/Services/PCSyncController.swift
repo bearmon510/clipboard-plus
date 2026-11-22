@@ -80,6 +80,8 @@ final class PCSyncController: ObservableObject {
     private var pairing: SyncPairing?
     private var transport: PCSyncTransport?
     private var handshake: SyncPadHandshake?
+    private var pendingVersionFallback: (peerId: UUID, version: UInt8)?
+    private var currentAttemptUsedFallback = false
     private var sender: SyncFrameSender?
     private var receiver: SyncFrameReceiver?
     private var assembler: SyncPacketAssembler?
@@ -440,6 +442,7 @@ final class PCSyncController: ObservableObject {
     }
     private func stopPairing() {
         transport?.onEvent = nil; transport?.stop(); transport = nil
+        pendingVersionFallback = nil
         resetSession()
         pairingGeneration = UUID()
         pairing = nil; pcName = nil; status = .unpaired; historyReady = false
@@ -456,7 +459,7 @@ final class PCSyncController: ObservableObject {
         if let templateReception {
             do { try templateReception.assembler.finish() } catch { record("テンプレート受信組み立てを破棄") }
         }
-        assembler = nil; templateReception = nil; handshake = nil; sender = nil; receiver = nil; peerId = nil
+        assembler = nil; templateReception = nil; handshake = nil; currentAttemptUsedFallback = false; sender = nil; receiver = nil; peerId = nil
         sessionGeneration = UUID()
         handshakeStart = nil; partialStart = nil; receiveStart = nil; receiveBytes = 0
         nextIncomingFrameToken = 0; currentIncomingFrameToken = nil; incomingFrameBytes = 0
@@ -484,6 +487,7 @@ final class PCSyncController: ObservableObject {
             if status != .connected { status = value }
             if value == .bluetoothOff || value == .unauthorized || value == .unsupported {
                 nextReconnectAt = nil
+                pendingVersionFallback = nil
             }
         case let .ready(id, limit, receiveLimit):
             resetSession()
@@ -492,7 +496,15 @@ final class PCSyncController: ObservableObject {
                 writeLimit = min(512, limit); peerId = id
                 self.receiveLimit = min(512, receiveLimit)
                 assembler = try SyncPacketAssembler(packetLimit: self.receiveLimit, frameLimit: 82)
-                handshake = try SyncPadHandshake(pairing: pairing, padId: settings.padId)
+                let protocolVersion: UInt8
+                if let fallback = pendingVersionFallback, fallback.peerId == id {
+                    pendingVersionFallback = nil
+                    currentAttemptUsedFallback = true
+                    protocolVersion = fallback.version
+                } else {
+                    protocolVersion = SyncProtocol.version
+                }
+                handshake = try SyncPadHandshake(pairing: pairing, padId: settings.padId, protocolVersion: protocolVersion)
                 handshakeStart = now(); status = .connecting
                 controlFrames.append(try handshake!.createHello())
                 record("接続確認開始; GATT値上限=\(limit)")
@@ -561,17 +573,18 @@ final class PCSyncController: ObservableObject {
         guard pairing != nil else { return }
         requiresPeerUpdate = false; settings.requiresPeerUpdate = false
         if !requiresRepair { compatibilityMessage = nil }
-        authenticationFailures = 0; nextReconnectAt = nil
+        authenticationFailures = 0; nextReconnectAt = nil; pendingVersionFallback = nil
         startTransport()
     }
     func retryAfterRepair() {
         guard pairing != nil else { return }
         requiresRepair = false; settings.requiresRepair = false
         if !requiresPeerUpdate { compatibilityMessage = nil }
-        authenticationFailures = 0; nextReconnectAt = nil
+        authenticationFailures = 0; nextReconnectAt = nil; pendingVersionFallback = nil
         startTransport()
     }
     private func pauseForUpdate() {
+        pendingVersionFallback = nil
         resetSession(); requiresPeerUpdate = true; settings.requiresPeerUpdate = true
         requiresRepair = false; settings.requiresRepair = false
         compatibilityMessage = "相手のアプリを更新してください"
@@ -580,6 +593,7 @@ final class PCSyncController: ObservableObject {
         record("接続停止; 理由=通信の版が不一致")
     }
     private func pauseForRepair() {
+        pendingVersionFallback = nil
         resetSession(); requiresRepair = true; settings.requiresRepair = true
         requiresPeerUpdate = false; settings.requiresPeerUpdate = false
         compatibilityMessage = "PCとの組が一致しません。PCのQRコードを読み直して組み直してください"
@@ -748,7 +762,7 @@ final class PCSyncController: ObservableObject {
                 if finished {
                     if current.isAuth {
                         status = .connected; handshakeStart = nil; handshake = nil
-                        authenticationFailures = 0; nextReconnectAt = nil
+                        authenticationFailures = 0; nextReconnectAt = nil; pendingVersionFallback = nil
                         replies.insert(.device(kind: UIDevice.current.userInterfaceIdiom == .phone ? "phone" : "pad"), at: 0)
                         record("接続確認成功")
                         if let peerId { settings.peripheralId = peerId; transport.authenticated(peerId) }
@@ -946,7 +960,19 @@ final class PCSyncController: ObservableObject {
                     if !pingQueued { pingRequestedAt = nil }
                 }
             }
-        } catch SyncProtocolError.version { pauseForUpdate() }
+        } catch SyncProtocolError.version {
+            if !currentAttemptUsedFallback,
+               let handshake,
+               handshake.requestedVersion > SyncProtocol.minSupportedVersion,
+               handshake.suggestedFallbackVersion == 3,
+               let peerId {
+                pendingVersionFallback = (peerId: peerId, version: 3)
+                fail(reject: false, countBackoff: false, reason: "通信の版3で再接続")
+            } else {
+                pendingVersionFallback = nil
+                pauseForUpdate()
+            }
+        }
         catch SyncProtocolError.identity { fail(reject: true, countBackoff: false, reason: "別のPC") }
         catch SyncProtocolError.authentication where receiver == nil {
             authenticationFailures += 1
