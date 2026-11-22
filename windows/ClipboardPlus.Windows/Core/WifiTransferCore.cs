@@ -46,13 +46,15 @@ public sealed record WifiTransferOptions(
     TimeSpan? PostAuthIdleTimeout = null,
     TimeSpan? PostDoneCloseGrace = null,
     Func<TimeSpan, CancellationToken, Task>? DelayAsync = null,
-    Func<WifiTransferCredentials>? CredentialsFactory = null)
+    Func<WifiTransferCredentials>? CredentialsFactory = null,
+    TimeSpan? StartTimeout = null)
 {
     public static readonly WifiTransferOptions Default = new();
 
     public TimeSpan EffectivePreAuthReadTimeout => PreAuthReadTimeout ?? TimeSpan.FromSeconds(5);
     public TimeSpan EffectivePostAuthIdleTimeout => PostAuthIdleTimeout ?? TimeSpan.FromSeconds(10);
     public TimeSpan EffectivePostDoneCloseGrace => PostDoneCloseGrace ?? TimeSpan.FromSeconds(2);
+    public TimeSpan EffectiveStartTimeout => StartTimeout ?? WifiApStarter.DefaultTotalStartTimeout;
     public Func<TimeSpan, CancellationToken, Task> EffectiveDelayAsync => DelayAsync ?? Task.Delay;
 }
 
@@ -124,13 +126,98 @@ public interface IWifiApBackend
     Task<WifiApAttemptResult> TryStartWifiDirectAsync(WifiTransferCredentials credentials, CancellationToken cancellationToken);
 }
 
+public sealed class WifiStepTimeoutException(string code) : TimeoutException($"Wi-Fi step timed out: {code}")
+{
+    public string Code { get; } = code;
+}
+
+public static class WifiStepTimeout
+{
+    public static async Task<T> RunAsync<T>(
+        Func<CancellationToken, Task<T>> operation,
+        TimeSpan timeout,
+        string timeoutCode,
+        CancellationToken cancellationToken,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (timeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var delay = delayAsync ?? Task.Delay;
+        using var stepCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var timerCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var opTask = operation(stepCts.Token);
+        var delayTask = delay(timeout, timerCts.Token);
+
+        var winner = await Task.WhenAny(opTask, delayTask).ConfigureAwait(false);
+        if (ReferenceEquals(winner, opTask))
+        {
+            timerCts.Cancel();
+            ObserveSilently(delayTask);
+            return await opTask.ConfigureAwait(false);
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            stepCts.Cancel();
+            ObserveSilently(opTask);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        if (opTask.IsCompleted)
+            return await opTask.ConfigureAwait(false);
+
+        stepCts.Cancel();
+        ObserveSilently(opTask);
+        throw new WifiStepTimeoutException(timeoutCode);
+    }
+
+    public static async Task RunAsync(
+        Func<CancellationToken, Task> operation,
+        TimeSpan timeout,
+        string timeoutCode,
+        CancellationToken cancellationToken,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
+    {
+        await RunAsync(
+            async ct =>
+            {
+                await operation(ct).ConfigureAwait(false);
+                return true;
+            },
+            timeout,
+            timeoutCode,
+            cancellationToken,
+            delayAsync).ConfigureAwait(false);
+    }
+
+    internal static void ObserveSilently(Task task)
+    {
+        if (task.IsCompleted)
+        {
+            _ = task.Exception;
+            return;
+        }
+        _ = task.ContinueWith(static t => { _ = t.Exception; },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+}
+
 /// <summary>
 /// Selects the primary Windows AP mode (5GHz Mobile Hotspot when online, Wi-Fi Direct Legacy when offline)
 /// and falls back to the alternate mode after a brief settle delay when the primary fails.
+/// Enforces per-attempt and total startup time budgets so startup finishes within 15 seconds.
 /// </summary>
 public static class WifiApStarter
 {
     public static readonly TimeSpan DefaultFallbackDelay = TimeSpan.FromMilliseconds(800);
+    public static readonly TimeSpan DefaultTotalStartTimeout = TimeSpan.FromSeconds(15);
+    public static readonly TimeSpan DefaultPrimaryAttemptTimeout = TimeSpan.FromSeconds(7);
 
     public static async Task<WifiHostStartResult> StartWithFallbackAsync(
         IWifiApBackend backend,
@@ -138,48 +225,234 @@ public static class WifiApStarter
         Action<string> log,
         TimeSpan? fallbackDelay = null,
         Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        TimeSpan? totalTimeout = null,
+        TimeSpan? primaryTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(credentials);
         ArgumentNullException.ThrowIfNull(log);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var delay = delayAsync ?? Task.Delay;
+        var overallBudget = totalTimeout ?? DefaultTotalStartTimeout;
+        if (overallBudget <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(totalTimeout));
+        var primaryBudget = primaryTimeout ?? DefaultPrimaryAttemptTimeout;
+        if (primaryBudget <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(primaryTimeout));
+        if (primaryBudget > overallBudget)
+            primaryBudget = overallBudget;
 
         var online = backend.HasInternetConnection();
         var primaryName = online ? "hotspot" : "wifiDirect";
         var fallbackName = online ? "wifiDirect" : "hotspot";
 
-        var primary = online
-            ? await backend.TryStartHotspotAsync(credentials, cancellationToken).ConfigureAwait(false)
-            : await backend.TryStartWifiDirectAsync(credentials, cancellationToken).ConfigureAwait(false);
-
-        if (primary.Succeeded && primary.Handle is not null)
-            return WifiHostStartResult.Success(primary.Handle);
-
-        if (primary.TerminalReason is { } terminal)
-            return WifiHostStartResult.Failure(terminal);
-
-        cancellationToken.ThrowIfCancellationRequested();
-        log($"wifi ap primary failed mode={primaryName} reason={primary.ErrorCode ?? "unknown"}");
-
-        var wait = fallbackDelay ?? DefaultFallbackDelay;
-        if (wait > TimeSpan.Zero)
+        using var overallCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var overallTimerCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var overallExpired = 0;
+        var overallTimeoutTask = RunTimeoutSignalAsync(overallBudget, delay, overallTimerCts.Token, () =>
         {
-            var delay = delayAsync ?? Task.Delay;
-            await delay(wait, cancellationToken).ConfigureAwait(false);
+            Volatile.Write(ref overallExpired, 1);
+            try { overallCts.Cancel(); } catch { }
+        });
+
+        try
+        {
+            var primary = await RunAttemptAsync(
+                ct => online
+                    ? backend.TryStartHotspotAsync(credentials, ct)
+                    : backend.TryStartWifiDirectAsync(credentials, ct),
+                primaryBudget,
+                delay,
+                overallCts.Token,
+                overallTimeoutTask,
+                cancellationToken,
+                () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+
+            if (primary.Succeeded && primary.Handle is not null)
+                return WifiHostStartResult.Success(primary.Handle);
+
+            if (primary.TerminalReason is { } terminal)
+            {
+                if (string.Equals(primary.ErrorCode, "total_timeout", StringComparison.Ordinal))
+                    log($"wifi ap primary failed mode={primaryName} reason=total_timeout");
+                return WifiHostStartResult.Failure(terminal);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            log($"wifi ap primary failed mode={primaryName} reason={primary.ErrorCode ?? "unknown"}");
+
+            if (Volatile.Read(ref overallExpired) != 0)
+            {
+                log($"wifi ap fallback failed mode={fallbackName} reason=total_timeout");
+                return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+            }
+
+            var wait = fallbackDelay ?? DefaultFallbackDelay;
+            if (wait > TimeSpan.Zero)
+            {
+                try
+                {
+                    var settleTask = delay(wait, overallCts.Token);
+                    var winner = await Task.WhenAny(settleTask, overallTimeoutTask).ConfigureAwait(false);
+                    if (ReferenceEquals(winner, overallTimeoutTask))
+                    {
+                        WifiStepTimeout.ObserveSilently(settleTask);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        log($"wifi ap fallback failed mode={fallbackName} reason=total_timeout");
+                        return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+                    }
+                    await settleTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && Volatile.Read(ref overallExpired) != 0)
+                {
+                    log($"wifi ap fallback failed mode={fallbackName} reason=total_timeout");
+                    return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+                }
+            }
+
+            if (Volatile.Read(ref overallExpired) != 0)
+            {
+                log($"wifi ap fallback failed mode={fallbackName} reason=total_timeout");
+                return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+            }
+
+            var secondary = await RunAttemptAsync(
+                ct => online
+                    ? backend.TryStartWifiDirectAsync(credentials, ct)
+                    : backend.TryStartHotspotAsync(credentials, ct),
+                attemptBudget: null,
+                delay,
+                overallCts.Token,
+                overallTimeoutTask,
+                cancellationToken,
+                () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+
+            if (secondary.Succeeded && secondary.Handle is not null)
+                return WifiHostStartResult.Success(secondary.Handle);
+
+            if (secondary.TerminalReason is { } secondaryTerminal)
+            {
+                if (string.Equals(secondary.ErrorCode, "total_timeout", StringComparison.Ordinal))
+                    log($"wifi ap fallback failed mode={fallbackName} reason=total_timeout");
+                return WifiHostStartResult.Failure(secondaryTerminal);
+            }
+
+            log($"wifi ap fallback failed mode={fallbackName} reason={secondary.ErrorCode ?? "unknown"}");
+            return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+        }
+        finally
+        {
+            try { overallTimerCts.Cancel(); } catch { }
+            WifiStepTimeout.ObserveSilently(overallTimeoutTask);
+        }
+    }
+
+    private static async Task RunTimeoutSignalAsync(
+        TimeSpan duration,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        CancellationToken ct,
+        Action onExpired)
+    {
+        try
+        {
+            await delay(duration, ct).ConfigureAwait(false);
+            if (!ct.IsCancellationRequested)
+                onExpired();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static async Task<WifiApAttemptResult> RunAttemptAsync(
+        Func<CancellationToken, Task<WifiApAttemptResult>> startAttempt,
+        TimeSpan? attemptBudget,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        CancellationToken overallToken,
+        Task overallTimeoutTask,
+        CancellationToken callerToken,
+        Func<bool> isOverallExpired)
+    {
+        using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(overallToken);
+        using var attemptTimerCts = CancellationTokenSource.CreateLinkedTokenSource(overallToken);
+
+        var attemptTask = startAttempt(attemptCts.Token);
+        Task? attemptTimeoutTask = attemptBudget is { } budget
+            ? delay(budget, attemptTimerCts.Token)
+            : null;
+
+        var winner = attemptTimeoutTask is not null
+            ? await Task.WhenAny(attemptTask, attemptTimeoutTask, overallTimeoutTask).ConfigureAwait(false)
+            : await Task.WhenAny(attemptTask, overallTimeoutTask).ConfigureAwait(false);
+
+        if (ReferenceEquals(winner, attemptTask))
+        {
+            try { attemptTimerCts.Cancel(); } catch { }
+            if (attemptTimeoutTask is not null)
+                WifiStepTimeout.ObserveSilently(attemptTimeoutTask);
+
+            WifiApAttemptResult result;
+            try
+            {
+                result = await attemptTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                return isOverallExpired()
+                    ? WifiApAttemptResult.Failure("total_timeout", WifiUnavailableReason.StartFailed)
+                    : WifiApAttemptResult.Failure("timeout");
+            }
+
+            if (result.Succeeded && result.Handle is not null && (callerToken.IsCancellationRequested || isOverallExpired()))
+            {
+                try { await result.Handle.DisposeAsync().ConfigureAwait(false); } catch { }
+                callerToken.ThrowIfCancellationRequested();
+                return WifiApAttemptResult.Failure("total_timeout", WifiUnavailableReason.StartFailed);
+            }
+
+            return result;
         }
 
-        var secondary = online
-            ? await backend.TryStartWifiDirectAsync(credentials, cancellationToken).ConfigureAwait(false)
-            : await backend.TryStartHotspotAsync(credentials, cancellationToken).ConfigureAwait(false);
+        try { attemptCts.Cancel(); } catch { }
+        try { attemptTimerCts.Cancel(); } catch { }
+        if (attemptTimeoutTask is not null)
+            WifiStepTimeout.ObserveSilently(attemptTimeoutTask);
+        DisposeHandleIfLateSuccess(attemptTask);
 
-        if (secondary.Succeeded && secondary.Handle is not null)
-            return WifiHostStartResult.Success(secondary.Handle);
+        callerToken.ThrowIfCancellationRequested();
+        return isOverallExpired()
+            ? WifiApAttemptResult.Failure("total_timeout", WifiUnavailableReason.StartFailed)
+            : WifiApAttemptResult.Failure("timeout");
+    }
 
-        if (secondary.TerminalReason is { } secondaryTerminal)
-            return WifiHostStartResult.Failure(secondaryTerminal);
-
-        log($"wifi ap fallback failed mode={fallbackName} reason={secondary.ErrorCode ?? "unknown"}");
-        return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+    private static void DisposeHandleIfLateSuccess(Task<WifiApAttemptResult> attemptTask)
+    {
+        _ = attemptTask.ContinueWith(
+            static t =>
+            {
+                if (t.IsFaulted)
+                {
+                    _ = t.Exception;
+                    return;
+                }
+                if (t.IsCompletedSuccessfully && t.Result.Succeeded && t.Result.Handle is { } lateHandle)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try { await lateHandle.DisposeAsync().ConfigureAwait(false); }
+                        catch { }
+                    });
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 }
 

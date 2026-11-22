@@ -20,8 +20,12 @@ internal sealed class WindowsWifiTransferHost(
     HotspotConfigBackupStore? backupStore = null) : IWifiTransferHost, IWifiApBackend
 {
     private const string HardwareLeaseOwner = "production";
-    private static readonly TimeSpan VirtualIpBindTimeout = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan DirectStartTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan HotspotBandQueryTimeout = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan HotspotConfigureTimeout = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan HotspotStartTimeout = TimeSpan.FromSeconds(4);
+    internal static readonly TimeSpan HotspotCleanupOnStartFailureTimeout = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan VirtualIpBindTimeout = TimeSpan.FromSeconds(3);
+    internal static readonly TimeSpan DirectStartTimeout = TimeSpan.FromSeconds(3);
 
     private readonly HotspotConfigBackupStore backups = backupStore ?? new HotspotConfigBackupStore();
     private readonly object activeGate = new();
@@ -110,7 +114,11 @@ internal sealed class WindowsWifiTransferHost(
             var mode = WifiApMode.HotspotAuto;
             if (WindowsWifiApController.IsHotspotBandApiSupported())
             {
-                var supported = await WindowsWifiApController.QuerySupportedHotspotBandsAsync(config, cancellationToken).ConfigureAwait(false);
+                var supported = await WifiStepTimeout.RunAsync(
+                    stepCt => WindowsWifiApController.QuerySupportedHotspotBandsAsync(config, stepCt),
+                    HotspotBandQueryTimeout,
+                    "hotspot_band_timeout",
+                    cancellationToken).ConfigureAwait(false);
                 var useFiveGHz = supported.Contains(WifiProbeBand.FiveGHz);
                 if (useFiveGHz)
                 {
@@ -118,10 +126,18 @@ internal sealed class WindowsWifiTransferHost(
                     {
                         config.Band = WindowsWifiApController.ToWinRtBand(WifiProbeBand.FiveGHz);
                         hotspotState.ConfigModified = true;
-                        await manager.ConfigureAccessPointAsync(config).AsTask(cancellationToken).ConfigureAwait(false);
+                        await WifiStepTimeout.RunAsync(
+                            stepCt => manager.ConfigureAccessPointAsync(config).AsTask(stepCt),
+                            HotspotConfigureTimeout,
+                            "hotspot_config_timeout",
+                            cancellationToken).ConfigureAwait(false);
                         mode = WifiApMode.Hotspot5GHz;
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (WifiStepTimeoutException)
                     {
                         throw;
                     }
@@ -130,7 +146,11 @@ internal sealed class WindowsWifiTransferHost(
                         log($"wifi transfer hotspot5 config error={ex.GetType().Name}");
                         config.Band = WindowsWifiApController.ToWinRtBand(WifiProbeBand.Auto);
                         hotspotState.ConfigModified = true;
-                        await manager.ConfigureAccessPointAsync(config).AsTask(cancellationToken).ConfigureAwait(false);
+                        await WifiStepTimeout.RunAsync(
+                            stepCt => manager.ConfigureAccessPointAsync(config).AsTask(stepCt),
+                            HotspotConfigureTimeout,
+                            "hotspot_config_timeout",
+                            cancellationToken).ConfigureAwait(false);
                         mode = WifiApMode.HotspotAuto;
                     }
                 }
@@ -138,21 +158,37 @@ internal sealed class WindowsWifiTransferHost(
                 {
                     config.Band = WindowsWifiApController.ToWinRtBand(WifiProbeBand.Auto);
                     hotspotState.ConfigModified = true;
-                    await manager.ConfigureAccessPointAsync(config).AsTask(cancellationToken).ConfigureAwait(false);
+                    await WifiStepTimeout.RunAsync(
+                        stepCt => manager.ConfigureAccessPointAsync(config).AsTask(stepCt),
+                        HotspotConfigureTimeout,
+                        "hotspot_config_timeout",
+                        cancellationToken).ConfigureAwait(false);
                     mode = WifiApMode.HotspotAuto;
                 }
             }
             else
             {
                 hotspotState.ConfigModified = true;
-                await manager.ConfigureAccessPointAsync(config).AsTask(cancellationToken).ConfigureAwait(false);
+                await WifiStepTimeout.RunAsync(
+                    stepCt => manager.ConfigureAccessPointAsync(config).AsTask(stepCt),
+                    HotspotConfigureTimeout,
+                    "hotspot_config_timeout",
+                    cancellationToken).ConfigureAwait(false);
             }
 
-            var startResult = await manager.StartTetheringAsync().AsTask(cancellationToken).ConfigureAwait(false);
+            var startResult = await WifiStepTimeout.RunAsync(
+                stepCt => manager.StartTetheringAsync().AsTask(stepCt),
+                HotspotStartTimeout,
+                "hotspot_start_timeout",
+                cancellationToken).ConfigureAwait(false);
             if (startResult.Status != TetheringOperationStatus.Success)
             {
                 var statusName = WifiProbeText.FormatTetheringOperationStatus((int)startResult.Status, startResult.Status.ToString());
-                await WindowsWifiApController.StopHotspotAndRestoreAsync(hotspotState, log, "wifi transfer").ConfigureAwait(false);
+                await WindowsWifiApController.StopHotspotAndRestoreAsync(
+                    hotspotState,
+                    log,
+                    "wifi transfer",
+                    HotspotCleanupOnStartFailureTimeout).ConfigureAwait(false);
                 hotspotState = null;
                 return WifiApAttemptResult.Failure(statusName);
             }
@@ -184,14 +220,33 @@ internal sealed class WindowsWifiTransferHost(
         {
             try { listener?.Stop(); } catch { }
             if (hotspotState is not null)
-                await WindowsWifiApController.StopHotspotAndRestoreAsync(hotspotState, log, "wifi transfer").ConfigureAwait(false);
+                await WindowsWifiApController.StopHotspotAndRestoreAsync(
+                    hotspotState,
+                    log,
+                    "wifi transfer",
+                    HotspotCleanupOnStartFailureTimeout).ConfigureAwait(false);
             throw;
+        }
+        catch (WifiStepTimeoutException ex)
+        {
+            try { listener?.Stop(); } catch { }
+            if (hotspotState is not null)
+                await WindowsWifiApController.StopHotspotAndRestoreAsync(
+                    hotspotState,
+                    log,
+                    "wifi transfer",
+                    HotspotCleanupOnStartFailureTimeout).ConfigureAwait(false);
+            return WifiApAttemptResult.Failure(ex.Code);
         }
         catch (Exception ex)
         {
             try { listener?.Stop(); } catch { }
             if (hotspotState is not null)
-                await WindowsWifiApController.StopHotspotAndRestoreAsync(hotspotState, log, "wifi transfer").ConfigureAwait(false);
+                await WindowsWifiApController.StopHotspotAndRestoreAsync(
+                    hotspotState,
+                    log,
+                    "wifi transfer",
+                    HotspotCleanupOnStartFailureTimeout).ConfigureAwait(false);
             return WifiApAttemptResult.Failure(ex.GetType().Name);
         }
     }
@@ -275,6 +330,12 @@ internal sealed class WindowsWifiTransferHost(
             try { pub?.Stop(); } catch { }
             throw;
         }
+        catch (OperationCanceledException)
+        {
+            try { listener?.Stop(); } catch { }
+            try { pub?.Stop(); } catch { }
+            return WifiApAttemptResult.Failure("direct_start_timeout");
+        }
         catch (Exception ex)
         {
             try { listener?.Stop(); } catch { }
@@ -285,12 +346,15 @@ internal sealed class WindowsWifiTransferHost(
 
     private void ReleaseHandle(WindowsWifiSessionHandle handle)
     {
+        bool owned;
         lock (activeGate)
         {
-            if (ReferenceEquals(activeHandle, handle))
+            owned = ReferenceEquals(activeHandle, handle);
+            if (owned)
                 activeHandle = null;
         }
-        WindowsWifiHardwareLease.Release(HardwareLeaseOwner);
+        if (owned)
+            WindowsWifiHardwareLease.Release(HardwareLeaseOwner);
     }
 
     private sealed class TcpClientOwner(TcpClient client) : IAsyncDisposable

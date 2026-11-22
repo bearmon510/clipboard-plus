@@ -925,25 +925,28 @@ public sealed class SyncCoordinator(
                 {
                     // An attachment whose 60-second reply deadline expires drops the connection so the
                     // next session restarts cleanly from offer; text items may resend on the same link.
-                    var wifiIds = activeWifi is { } currentWifi && ReferenceEquals(currentWifi.Connection, c)
-                        ? currentWifi.RequestedIds
-                        : null;
-                    var expired = c.Sent
-                        .Where(p => p.Key != c.InFlight && (wifiIds is null || !wifiIds.Contains(p.Key)) && now > p.Value.Deadline)
-                        .Select(p => p.Key)
-                        .ToArray();
+                    // While a Wi-Fi session is active on this connection, attachment deadlines are paused
+                    // and refreshed on teardown so an in-flight offer cannot kill BLE and Wi-Fi mid-session.
+                    var wifiActiveOnConnection = activeWifi is { } currentWifi && ReferenceEquals(currentWifi.Connection, c);
                     bool attachmentExpired;
                     Guid? activeAttachmentId;
                     bool outgoingAttachmentActive;
                     lock (c.HandoffStateGate)
                     {
-                        attachmentExpired = c.ActiveAttachment is { } activeForExpiry &&
-                            (wifiIds is null || !wifiIds.Contains(activeForExpiry.Id)) &&
+                        attachmentExpired = !wifiActiveOnConnection &&
+                            c.ActiveAttachment is { } activeForExpiry &&
                             activeForExpiry.Chunks.Any(ch => ch.Reply is { } reply && now > reply.Deadline);
                         activeAttachmentId = c.ActiveAttachment?.Id;
                         outgoingAttachmentActive = c.ActiveAttachment is { } activeAtt &&
                             (c.InFlight == activeAtt.Id || now - activeAtt.LastActivity < HighThroughputIdleGrace);
                     }
+                    var expired = c.Sent
+                        .Where(p => p.Key != c.InFlight && now > p.Value.Deadline &&
+                            (!wifiActiveOnConnection ||
+                             (activeAttachmentId != p.Key &&
+                              store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == p.Key)?.Kind is not ("image" or "file"))))
+                        .Select(p => p.Key)
+                        .ToArray();
                     if (attachmentExpired || expired.Any(id => activeAttachmentId == id ||
                         store.Pending(c.DeviceId).FirstOrDefault(i => i.Id == id)?.Kind is "image" or "file"))
                     {
@@ -1135,15 +1138,18 @@ public sealed class SyncCoordinator(
                     }
                     else
                     {
-                        var wifiIds = activeWifi is { } currentWifi && ReferenceEquals(currentWifi.Connection, c)
-                            ? currentWifi.RequestedIds
-                            : null;
+                        var currentWifi = activeWifi;
+                        var wifiActiveOnConnection = currentWifi is not null && ReferenceEquals(currentWifi.Connection, c);
+                        var wifiIds = wifiActiveOnConnection ? currentWifi!.RequestedIds : null;
                         var pendingList = store.Pending(c.DeviceId);
                         if (c.Stage == 2 && (item = pendingList.FirstOrDefault(i =>
                             i.Kind == "text"
                                 ? !c.Sent.ContainsKey(i.Id)
-                                : (wifiIds is null || !wifiIds.Contains(i.Id)) &&
-                                  (c.ActiveAttachment is null ? !c.Sent.ContainsKey(i.Id) : c.ActiveAttachment.Id == i.Id && c.ActiveAttachment.CanSendChunk))) is not null)
+                                : c.ActiveAttachment is null
+                                    ? !wifiActiveOnConnection && !c.Sent.ContainsKey(i.Id)
+                                    : c.ActiveAttachment.Id == i.Id &&
+                                      (wifiIds is null || !wifiIds.Contains(i.Id)) &&
+                                      c.ActiveAttachment.CanSendChunk)) is not null)
                         {
                             SyncMessage message;
                             var sentNow = Now();
@@ -2173,7 +2179,7 @@ public sealed class SyncCoordinator(
             WifiHostStartResult startResult;
             try
             {
-                startResult = await wifiHost!.StartAsync(credentials, session.SessionCts.Token).ConfigureAwait(false);
+                startResult = await StartWifiHostWithTimeoutAsync(credentials, session.SessionCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -2411,15 +2417,28 @@ public sealed class SyncCoordinator(
                 {
                     var refreshedNow = Now();
                     var refreshedDeadline = refreshedNow + ReplyTimeout;
-                    foreach (var id in session.RequestedIds)
-                    {
-                        if (c.Sent.ContainsKey(id))
-                            c.Sent[id] = new(refreshedNow, refreshedDeadline, refreshedDeadline, null);
-                    }
+                    var pendingAttachments = store.Pending(c.DeviceId)
+                        .Where(i => i.Kind is "image" or "file")
+                        .Select(i => i.Id)
+                        .ToHashSet();
+                    Guid? activeAttachmentId;
                     lock (c.HandoffStateGate)
                     {
-                        if (c.ActiveAttachment is { } att && session.RequestedIds.Contains(att.Id))
+                        activeAttachmentId = c.ActiveAttachment?.Id;
+                        if (c.ActiveAttachment is { } att)
+                        {
                             att.LastActivity = refreshedNow;
+                            for (var i = 0; i < att.Chunks.Count; i++)
+                            {
+                                if (att.Chunks[i].Reply is not null)
+                                    att.Chunks[i] = att.Chunks[i] with { Reply = new(refreshedNow, refreshedDeadline, refreshedDeadline, null) };
+                            }
+                        }
+                    }
+                    foreach (var id in c.Sent.Keys.ToArray())
+                    {
+                        if (session.RequestedIds.Contains(id) || activeAttachmentId == id || pendingAttachments.Contains(id))
+                            c.Sent[id] = new(refreshedNow, refreshedDeadline, refreshedDeadline, null);
                     }
                     StartSending(c);
                 }
@@ -2431,6 +2450,65 @@ public sealed class SyncCoordinator(
             session.PreAuthCts.Dispose();
             session.TtlTimerCts.Dispose();
         }
+    }
+
+    private async Task<WifiHostStartResult> StartWifiHostWithTimeoutAsync(
+        WifiTransferCredentials credentials,
+        CancellationToken sessionToken)
+    {
+        var timeout = wifiConfig.EffectiveStartTimeout;
+        var delay = wifiConfig.EffectiveDelayAsync;
+        using var startCts = CancellationTokenSource.CreateLinkedTokenSource(sessionToken);
+        using var timerCts = CancellationTokenSource.CreateLinkedTokenSource(sessionToken);
+
+        var startTask = wifiHost!.StartAsync(credentials, startCts.Token);
+        var delayTask = delay(timeout, timerCts.Token);
+
+        var winner = await Task.WhenAny(startTask, delayTask).ConfigureAwait(false);
+        if (ReferenceEquals(winner, startTask))
+        {
+            try { timerCts.Cancel(); } catch { }
+            WifiStepTimeout.ObserveSilently(delayTask);
+            return await startTask.ConfigureAwait(false);
+        }
+
+        if (sessionToken.IsCancellationRequested)
+        {
+            try { startCts.Cancel(); } catch { }
+            DisposeHostHandleIfLateSuccess(startTask);
+            sessionToken.ThrowIfCancellationRequested();
+        }
+
+        if (startTask.IsCompleted)
+            return await startTask.ConfigureAwait(false);
+
+        try { startCts.Cancel(); } catch { }
+        DisposeHostHandleIfLateSuccess(startTask);
+        throw new TimeoutException("Wi-Fi host startup timed out.");
+    }
+
+    private static void DisposeHostHandleIfLateSuccess(Task<WifiHostStartResult> startTask)
+    {
+        _ = startTask.ContinueWith(
+            static t =>
+            {
+                if (t.IsFaulted)
+                {
+                    _ = t.Exception;
+                    return;
+                }
+                if (t.IsCompletedSuccessfully && t.Result.Succeeded && t.Result.Handle is { } lateHandle)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try { await lateHandle.DisposeAsync().ConfigureAwait(false); }
+                        catch { }
+                    });
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private async Task RunWifiTtlTimerAsync(ActiveWifiSession session, int ttlSeconds)

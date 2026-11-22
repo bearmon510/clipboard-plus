@@ -442,6 +442,7 @@ private actor FakeWifiClient: PCSyncWifiClient {
     private var defaultJoinStatus: WifiJoinStatus = .joined
     private var connectHandler: (@Sendable (String, Int, TimeInterval) async throws -> any PCSyncWifiConnection)?
     private(set) var joinedSSIDs: [String] = []
+    private(set) var joinTimeouts: [TimeInterval] = []
     private(set) var leftSSIDs: [String] = []
     private(set) var connectRecords: [ConnectRecord] = []
 
@@ -459,6 +460,7 @@ private actor FakeWifiClient: PCSyncWifiClient {
 
     func join(ssid: String, passphrase: String, timeoutSeconds: TimeInterval) async -> WifiJoinStatus {
         joinedSSIDs.append(ssid)
+        joinTimeouts.append(timeoutSeconds)
         if !joinStatuses.isEmpty {
             return joinStatuses.removeFirst()
         }
@@ -483,6 +485,109 @@ private actor FakeWifiClient: PCSyncWifiClient {
     }
 }
 
+private final class ControlledWifiSleeper: @unchecked Sendable {
+    final class PendingSleep: @unchecked Sendable {
+        let duration: TimeInterval
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Error>?
+        private var finished = false
+
+        init(duration: TimeInterval) {
+            self.duration = duration
+        }
+
+        var isFinished: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return finished
+        }
+
+        func install(_ continuation: CheckedContinuation<Void, Error>) -> Bool {
+            lock.lock()
+            if finished {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return false
+            }
+            self.continuation = continuation
+            lock.unlock()
+            return true
+        }
+
+        func fire() {
+            lock.lock()
+            if finished {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let cont = continuation
+            continuation = nil
+            lock.unlock()
+            cont?.resume(returning: ())
+        }
+
+        func cancel() {
+            lock.lock()
+            if finished {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let cont = continuation
+            continuation = nil
+            lock.unlock()
+            cont?.resume(throwing: CancellationError())
+        }
+    }
+
+    private let lock = NSLock()
+    private var waits: [PendingSleep] = []
+    private var waiters: [(duration: TimeInterval, continuation: CheckedContinuation<PendingSleep, Never>)] = []
+
+    func sleep(_ duration: TimeInterval) async throws {
+        try Task.checkCancellation()
+        let pending = PendingSleep(duration: duration)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard pending.install(continuation) else { return }
+                var matchedWaiter: CheckedContinuation<PendingSleep, Never>?
+                self.lock.lock()
+                self.waits.append(pending)
+                if let idx = self.waiters.firstIndex(where: { abs($0.duration - duration) < 0.001 }) {
+                    matchedWaiter = self.waiters.remove(at: idx).continuation
+                }
+                self.lock.unlock()
+                matchedWaiter?.resume(returning: pending)
+            }
+        } onCancel: {
+            pending.cancel()
+        }
+    }
+
+    func waitForSleep(duration: TimeInterval) async -> PendingSleep {
+        await withCheckedContinuation { (continuation: CheckedContinuation<PendingSleep, Never>) in
+            self.lock.lock()
+            if let existing = self.waits.last(where: { !$0.isFinished && abs($0.duration - duration) < 0.001 }) {
+                self.lock.unlock()
+                continuation.resume(returning: existing)
+            } else {
+                self.waiters.append((duration: duration, continuation: continuation))
+                self.lock.unlock()
+            }
+        }
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let pendingList = waits
+        lock.unlock()
+        for pending in pendingList {
+            pending.cancel()
+        }
+    }
+}
+
 final class PCSyncWifiTransferTests: XCTestCase {
     @MainActor
     private final class Fixture {
@@ -493,24 +598,36 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let board = WifiTestPasteboard()
         let link = WifiTestBleLink()
         let wifiClient = FakeWifiClient()
+        let sleeper: ControlledWifiSleeper?
         let monitor: ClipboardMonitor
         let controller: PCSyncController
 
         init(
             test: XCTestCase,
             timeouts: PCSyncController.WifiTransferTimeouts = PCSyncController.WifiTransferTimeouts(
-                readySeconds: 8,
+                readySeconds: 20,
+                joinSeconds: 75,
                 tcpConnectSeconds: 1,
                 preAuthReadSeconds: 0.15,
                 idleSeconds: 0.25,
-                cooldownSeconds: 600
-            )
+                cooldownSeconds: 600,
+                busyRetrySeconds: 5,
+                maxBusyRetries: 6,
+                readyTimeoutHoldSeconds: 2
+            ),
+            sleeper: ControlledWifiSleeper? = nil
         ) throws {
+            self.sleeper = sleeper
             root = try ImageTestSupport.directory(test)
             let suite = UUID().uuidString
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             let defaultsRef = self.defaults
             test.addTeardownBlock { defaultsRef.removePersistentDomain(forName: suite) }
+            if let sleeperRef = sleeper {
+                test.addTeardownBlock {
+                    sleeperRef.cancelAll()
+                }
+            }
             HistoryRetention.never.save(to: defaults)
 
             let dbURL = root.appendingPathComponent("history.sqlite")
@@ -529,6 +646,14 @@ final class PCSyncWifiTransferTests: XCTestCase {
             )
             let clockRef = self.clock
             let linkRef = self.link
+            let sleepClosure: (@Sendable (TimeInterval) async throws -> Void)?
+            if let sleeper {
+                sleepClosure = { duration in
+                    try await sleeper.sleep(duration)
+                }
+            } else {
+                sleepClosure = nil
+            }
             controller = PCSyncController(
                 monitor: monitor,
                 defaults: defaults,
@@ -537,7 +662,8 @@ final class PCSyncWifiTransferTests: XCTestCase {
                 schedulesTimeouts: false,
                 makeTransport: { _ in linkRef },
                 wifiClient: wifiClient,
-                wifiTimeouts: timeouts
+                wifiTimeouts: timeouts,
+                wifiSleep: sleepClosure
             )
         }
     }
@@ -719,9 +845,11 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let f = try Fixture(test: self)
         let pairing = try pair(f)
         f.controller.copiesReceivedToPasteboard = true
-        f.monitor.updateScene("background")
+        f.monitor.updateScene("active")
         try f.link.connect(pairing, limit: 512)
 
+        // Pause BLE writeability briefly so 2 outgoing items and 1 incoming offer batch into one `.both` request.
+        f.link.canSend = false
         let out1 = makeDeterministicBytes(count: 550_000, seed: 11)
         let out2 = makeDeterministicBytes(count: 520_000, seed: 22)
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: out1, name: "secret-out1.bin")], receivedAt: f.clock.date)
@@ -733,13 +861,12 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let inOffer = makeOffer(from: "pc", data: inData, name: "secret-incoming.bin")
         try f.link.send(.offer(inOffer))
 
-        // Still in background: no wifi_request and no BLE offer/resume.
-        XCTAssertTrue(f.link.wifiRequests.isEmpty)
         XCTAssertTrue(f.link.offers.isEmpty)
         XCTAssertTrue(f.link.resumes.isEmpty)
 
-        // Move to foreground: a single combined `.both` wifi_request is sent with all 3 IDs.
-        f.monitor.updateScene("active")
+        // Flush BLE queue: a single combined `.both` wifi_request is sent with all 3 IDs.
+        f.link.canSend = true
+        f.link.onEvent?(.writable)
         XCTAssertEqual(f.link.wifiRequests.count, 1)
         let req = try XCTUnwrap(f.link.wifiRequests.first)
         XCTAssertEqual(req.direction, .both)
@@ -970,8 +1097,18 @@ final class PCSyncWifiTransferTests: XCTestCase {
 
     @MainActor
     func testTimeoutsReadyJoinPreAuthAndIdleFallbackToBle() async throws {
-        // 1. Ready timeout (> 8s)
-        let f1 = try Fixture(test: self)
+        let defaultTimeouts = PCSyncController.WifiTransferTimeouts()
+        XCTAssertEqual(defaultTimeouts.readySeconds, 20)
+        XCTAssertEqual(defaultTimeouts.joinSeconds, 75)
+        XCTAssertEqual(defaultTimeouts.preAuthReadSeconds, 5)
+        XCTAssertEqual(defaultTimeouts.idleSeconds, 10)
+        XCTAssertEqual(defaultTimeouts.busyRetrySeconds, 5)
+        XCTAssertEqual(defaultTimeouts.maxBusyRetries, 6)
+        XCTAssertEqual(defaultTimeouts.readyTimeoutHoldSeconds, 2)
+
+        // 1. Ready timeout (20s) fires on deadline without relying on periodic checkTimeouts().
+        let sleeper1 = ControlledWifiSleeper()
+        let f1 = try Fixture(test: self, sleeper: sleeper1)
         let p1 = try pair(f1)
         f1.monitor.updateScene("active")
         try f1.link.connect(p1, limit: 512)
@@ -980,11 +1117,12 @@ final class PCSyncWifiTransferTests: XCTestCase {
         await awaitSave(f1, savedCount: 1)
         XCTAssertEqual(f1.link.wifiRequests.count, 1)
         XCTAssertTrue(f1.link.offers.isEmpty)
-        f1.clock.date.addTimeInterval(9)
-        f1.controller.checkTimeouts()
-        XCTAssertEqual(f1.link.offers.count, 1)
+        let readyWait = await sleeper1.waitForSleep(duration: 20)
+        readyWait.fire()
+        let fellBack1 = await waitUntil { f1.link.offers.count == 1 }
+        XCTAssertTrue(fellBack1)
 
-        // 2. Join timeout
+        // 2. Join timeout uses 75s (< PC's 90s TTL).
         let f2 = try Fixture(test: self)
         let p2 = try pair(f2)
         f2.monitor.updateScene("active")
@@ -993,10 +1131,12 @@ final class PCSyncWifiTransferTests: XCTestCase {
         f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: d2, name: "t-join.bin")], receivedAt: f2.clock.date)
         await awaitSave(f2, savedCount: 1)
         await f2.wifiClient.enqueueJoinStatus(.timeout)
-        try f2.link.send(.ready(makeReadyPayload()))
+        try f2.link.send(.ready(makeReadyPayload(ttlSeconds: 90)))
         let fellBack2 = await waitUntil { f2.link.offers.count == 1 }
         XCTAssertTrue(fellBack2)
         XCTAssertEqual(f2.link.wifiJoinResults.last?.status, .timeout)
+        let joinTimeouts2 = await f2.wifiClient.joinTimeouts
+        XCTAssertEqual(joinTimeouts2, [75])
 
         // 3. Pre-auth TCP read timeout (stalled TCP_WELCOME)
         let f3 = try Fixture(test: self)
@@ -1240,40 +1380,295 @@ final class PCSyncWifiTransferTests: XCTestCase {
     }
 
     @MainActor
-    func testBackgroundDefersWifiAndNotForegroundReadyRetriesOnForeground() async throws {
-        let f = try Fixture(test: self)
-        let pairing = try pair(f)
-        f.monitor.updateScene("background")
-        try f.link.connect(pairing, limit: 512)
+    func testBackgroundUsesBleFor10MiBAndUnderWithoutLoopAndDefersOnlyOver10MiB() async throws {
+        // 1. Background PC->iOS large (<= 10 MiB) offer replies immediately with BLE resume (no 60s timeout loop)
+        //    and finishes over BLE even after returning to foreground.
+        let f1 = try Fixture(test: self)
+        let p1 = try pair(f1)
+        f1.controller.copiesReceivedToPasteboard = false
+        f1.monitor.updateScene("background")
+        try f1.link.connect(p1, limit: 512)
 
-        // Small text still sends over BLE in background, while large item waits.
-        f.monitor.saveManually(["裏で送る文章"], receivedAt: f.clock.date)
-        await drain(f)
-        XCTAssertEqual(f.link.messages.filter { if case .item = $0 { return true }; return false }.count, 1)
+        let inData = makeDeterministicBytes(count: 600_000, seed: 12)
+        let inOffer = makeOffer(from: "pc", data: inData, name: "bg-in.bin")
+        try f1.link.send(.offer(inOffer))
+        XCTAssertTrue(f1.link.wifiRequests.isEmpty)
+        XCTAssertEqual(f1.link.resumes.count, 1)
+        XCTAssertEqual(f1.link.resumes.first?.id, inOffer.id)
+        XCTAssertEqual(f1.link.resumes.first?.offset, 0)
 
-        let outData = makeDeterministicBytes(count: 550_000, seed: 12)
-        f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: outData, name: "bg-wait.bin")], receivedAt: f.clock.date.addingTimeInterval(1))
-        await awaitSave(f, savedCount: 2)
-        XCTAssertTrue(f.link.wifiRequests.isEmpty)
-        XCTAssertTrue(f.link.offers.isEmpty)
+        // Start receiving over BLE, then move to foreground: must finish over BLE without starting Wi-Fi.
+        let firstEnd = min(inData.count, SyncProtocol.chunkBytes)
+        try f1.link.send(.chunk(id: inOffer.id, offset: 0, data: inData.subdata(in: 0..<firstEnd)))
+        f1.monitor.updateScene("active")
+        XCTAssertTrue(f1.link.wifiRequests.isEmpty)
+
+        var rxOffset = firstEnd
+        while rxOffset < inData.count {
+            let end = min(inData.count, rxOffset + SyncProtocol.chunkBytes)
+            try f1.link.send(.chunk(id: inOffer.id, offset: rxOffset, data: inData.subdata(in: rxOffset..<end)))
+            rxOffset = end
+        }
+        await drain(f1)
+        XCTAssertTrue(f1.link.wifiRequests.isEmpty)
+        XCTAssertTrue(f1.link.ackIDs.contains(inOffer.id))
+        let savedIn = try XCTUnwrap(f1.monitor.entries.first { $0.source == .pc && $0.kind == .file })
+        let savedInFile = try XCTUnwrap(savedIn.file)
+        let savedInBytes = try Data(contentsOf: f1.monitor.fileURL(savedInFile))
+        XCTAssertEqual(savedInBytes, inData)
+
+        // 2. Background iOS->PC large (<= 10 MiB) item sends over BLE and finishes over BLE after returning to foreground.
+        let f2 = try Fixture(test: self)
+        let p2 = try pair(f2)
+        f2.monitor.updateScene("background")
+        try f2.link.connect(p2, limit: 512)
+
+        let outData = makeDeterministicBytes(count: 550_000, seed: 13)
+        f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: outData, name: "bg-out.bin")], receivedAt: f2.clock.date)
+        await awaitSave(f2, savedCount: 1)
+        XCTAssertTrue(f2.link.wifiRequests.isEmpty)
+        XCTAssertEqual(f2.link.offers.count, 1)
+        let bleOutOffer = try XCTUnwrap(f2.link.offers.first)
+
+        try f2.link.send(.resume(id: bleOutOffer.id, offset: 0))
+        f2.monitor.updateScene("active")
+        XCTAssertTrue(f2.link.wifiRequests.isEmpty)
+
+        var txAcked = 0
+        var processedIndex = 0
+        while txAcked < outData.count {
+            let before = processedIndex
+            while processedIndex < f2.link.messages.count {
+                let msg = f2.link.messages[processedIndex]
+                processedIndex += 1
+                if case let .chunk(id, offset, chunkData) = msg, id == bleOutOffer.id {
+                    XCTAssertEqual(offset, txAcked)
+                    txAcked += chunkData.count
+                    if txAcked < outData.count {
+                        try f2.link.send(.resume(id: bleOutOffer.id, offset: txAcked))
+                    }
+                }
+            }
+            if processedIndex == before {
+                XCTFail("Expected BLE chunks to progress")
+                break
+            }
+        }
+        try f2.link.send(.ack(ids: [bleOutOffer.id]))
+        XCTAssertEqual(f2.controller.pendingCount, 0)
+        XCTAssertTrue(f2.link.wifiRequests.isEmpty)
+
+        // 3. Background > 10 MiB waits until foreground; not_foreground ready keeps it waiting and retries on foreground.
+        let f3 = try Fixture(test: self)
+        let p3 = try pair(f3)
+        f3.monitor.updateScene("background")
+        try f3.link.connect(p3, limit: 512)
+
+        let over10Size = SyncProtocol.maxItemBytes + 1_024
+        let over10Out = makeDeterministicBytes(count: over10Size, seed: 14)
+        f3.monitor.saveManually([try makeFileProvider(in: f3.root, bytes: over10Out, name: "bg-over10.bin")], receivedAt: f3.clock.date)
+        await awaitSave(f3, savedCount: 1)
+        XCTAssertEqual(f3.controller.pendingCount, 1)
+        XCTAssertTrue(f3.link.wifiRequests.isEmpty)
+        XCTAssertTrue(f3.link.offers.isEmpty)
 
         // Enter foreground -> wifi_request sent.
-        f.monitor.updateScene("active")
-        XCTAssertEqual(f.link.wifiRequests.count, 1)
+        f3.monitor.updateScene("active")
+        XCTAssertEqual(f3.link.wifiRequests.count, 1)
 
-        // Move back to background BEFORE wifi_ready arrives -> replies not_foreground without cooldown/BLE fallback.
-        f.monitor.updateScene("background")
+        // Move back to background BEFORE wifi_ready arrives -> replies not_foreground without dropping or BLE fallback.
+        f3.monitor.updateScene("background")
         let ready1 = makeReadyPayload()
-        try f.link.send(.ready(ready1))
-        XCTAssertEqual(f.link.wifiJoinResults.last?.session, ready1.session)
-        XCTAssertEqual(f.link.wifiJoinResults.last?.status, .notForeground)
-        XCTAssertTrue(f.link.offers.isEmpty)
-        let joinCountBefore = await f.wifiClient.joinedSSIDs.count
+        try f3.link.send(.ready(ready1))
+        XCTAssertEqual(f3.link.wifiJoinResults.last?.session, ready1.session)
+        XCTAssertEqual(f3.link.wifiJoinResults.last?.status, .notForeground)
+        XCTAssertEqual(f3.controller.pendingCount, 1)
+        XCTAssertTrue(f3.link.offers.isEmpty)
+        let joinCountBefore = await f3.wifiClient.joinedSSIDs.count
         XCTAssertEqual(joinCountBefore, 0)
 
-        // Return to foreground -> immediately sends fresh wifi_request (no 10-minute cooldown applied).
-        f.monitor.updateScene("active")
-        XCTAssertEqual(f.link.wifiRequests.count, 2)
+        // Return to foreground -> immediately sends fresh wifi_request.
+        f3.monitor.updateScene("active")
+        XCTAssertEqual(f3.link.wifiRequests.count, 2)
+    }
+
+    @MainActor
+    func testBusyRetriesUpToSixTimesAfterFiveSecondsWithoutDroppingOver10MiB() async throws {
+        // Part 1: Transient busy does not drop > 10 MiB item; retries after 5s and succeeds.
+        let sleeper1 = ControlledWifiSleeper()
+        let f1 = try Fixture(test: self, sleeper: sleeper1)
+        let p1 = try pair(f1)
+        f1.monitor.updateScene("active")
+        try f1.link.connect(p1, limit: 512)
+
+        let over10Size = SyncProtocol.maxItemBytes + 1_024
+        let over10Data = makeDeterministicBytes(count: over10Size, seed: 21)
+        f1.monitor.saveManually([try makeFileProvider(in: f1.root, bytes: over10Data, name: "busy-over10.bin")], receivedAt: f1.clock.date)
+        await awaitSave(f1, savedCount: 1)
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
+        let over10ID1 = try XCTUnwrap(f1.link.wifiRequests.first?.ids.first)
+
+        try f1.link.send(.unavailable(reason: .busy))
+        XCTAssertEqual(f1.controller.pendingCount, 1)
+        XCTAssertTrue(f1.link.offers.isEmpty)
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
+
+        let retryWait = await sleeper1.waitForSleep(duration: 5)
+        retryWait.fire()
+        let retried = await waitUntil { f1.link.wifiRequests.count == 2 }
+        XCTAssertTrue(retried)
+        XCTAssertEqual(f1.link.wifiRequests.last?.ids, [over10ID1])
+
+        let ready1 = makeReadyPayload()
+        let bleKeys1 = try XCTUnwrap(f1.link.pcSessionKeys)
+        let pcKeys1 = try WifiTransferKeys.derive(bleKeys: bleKeys1, token: ready1.token, session: ready1.session)
+        let pcGuard1 = try WifiSessionReplayGuard()
+        let pcSink1 = InMemoryWifiTransferSink()
+        let padToPc1 = FakeByteChannel()
+        let pcToPad1 = FakeByteChannel()
+        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 0.5)
+        let pcEnd1 = FakePcStreamEnd(incoming: padToPc1, outgoing: pcToPad1)
+        await f1.wifiClient.setConnectHandler { _, _, _ in padConn1 }
+        let pcTask1 = Task {
+            try await WifiTransferEngine.runPcSession(
+                stream: pcEnd1,
+                keys: pcKeys1,
+                outgoing: [],
+                sink: pcSink1,
+                replayGuard: pcGuard1
+            )
+        }
+        try f1.link.send(.ready(ready1))
+        let done1 = await waitUntil(timeoutSeconds: 10) { f1.controller.pendingCount == 0 && f1.controller.wifiTransferProgress == nil }
+        XCTAssertTrue(done1)
+        _ = try await pcTask1.value
+        let pcReceived = await pcSink1.completedData(for: over10ID1)
+        XCTAssertEqual(pcReceived, over10Data)
+
+        // Part 2: 6 consecutive busy retries (7 busy replies total) -> <= 10 MiB falls back to BLE,
+        //         > 10 MiB stays pending (not dropped) and waits until returning to foreground.
+        let sleeper2 = ControlledWifiSleeper()
+        let f2 = try Fixture(test: self, sleeper: sleeper2)
+        let p2 = try pair(f2)
+        f2.monitor.updateScene("active")
+        try f2.link.connect(p2, limit: 512)
+
+        f2.link.canSend = false
+        let bleData = makeDeterministicBytes(count: 550_000, seed: 22)
+        f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: bleData, name: "busy-ble.bin")], receivedAt: f2.clock.date)
+        await awaitSave(f2, savedCount: 1)
+        f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: over10Data, name: "busy-wait-fg.bin")], receivedAt: f2.clock.date.addingTimeInterval(1))
+        await awaitSave(f2, savedCount: 2)
+        f2.link.canSend = true
+        f2.link.onEvent?(.writable)
+
+        XCTAssertEqual(f2.link.wifiRequests.count, 1)
+        let firstReqIDs = try XCTUnwrap(f2.link.wifiRequests.first?.ids)
+        XCTAssertEqual(firstReqIDs.count, 2)
+        let bleID = firstReqIDs[0]
+        let over10ID2 = firstReqIDs[1]
+
+        // Initial busy + 6 retries (5s each).
+        for retryIndex in 1...6 {
+            try f2.link.send(.unavailable(reason: .busy))
+            XCTAssertEqual(f2.controller.pendingCount, 2)
+            XCTAssertTrue(f2.link.offers.isEmpty)
+            let wait5 = await sleeper2.waitForSleep(duration: 5)
+            wait5.fire()
+            let sentRetry = await waitUntil { f2.link.wifiRequests.count == retryIndex + 1 }
+            XCTAssertTrue(sentRetry)
+        }
+
+        // 7th busy reply (after 6 retries) exhausts busy retries.
+        try f2.link.send(.unavailable(reason: .busy))
+        XCTAssertEqual(f2.link.offers.count, 1)
+        XCTAssertEqual(f2.link.offers.first?.id, bleID)
+        XCTAssertEqual(f2.controller.pendingCount, 2)
+
+        // Complete BLE item; > 10 MiB item stays pending and does not retry while still in foreground.
+        try f2.link.send(.ack(ids: [bleID]))
+        XCTAssertEqual(f2.controller.pendingCount, 1)
+        f2.controller.checkTimeouts()
+        XCTAssertEqual(f2.link.wifiRequests.count, 7)
+
+        // Move to background and back to foreground -> retries > 10 MiB item via Wi-Fi.
+        f2.monitor.updateScene("background")
+        XCTAssertEqual(f2.controller.pendingCount, 1)
+        XCTAssertEqual(f2.link.wifiRequests.count, 7)
+        f2.monitor.updateScene("active")
+        XCTAssertEqual(f2.link.wifiRequests.count, 8)
+        XCTAssertEqual(f2.link.wifiRequests.last?.ids, [over10ID2])
+    }
+
+    @MainActor
+    func testLateWifiReadyAfterReadyTimeoutSendsSupersededAndWaitsTwoSecondsOrLateReply() async throws {
+        // Part 1: After 20s ready_timeout, new request holds until late wifi_ready arrives (answered with superseded).
+        let sleeper1 = ControlledWifiSleeper()
+        let f1 = try Fixture(test: self, sleeper: sleeper1)
+        let p1 = try pair(f1)
+        f1.monitor.updateScene("active")
+        try f1.link.connect(p1, limit: 512)
+
+        let dataA = makeDeterministicBytes(count: 520_000, seed: 31)
+        f1.monitor.saveManually([try makeFileProvider(in: f1.root, bytes: dataA, name: "late-a.bin")], receivedAt: f1.clock.date)
+        await awaitSave(f1, savedCount: 1)
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
+
+        let readyTimeout1 = await sleeper1.waitForSleep(duration: 20)
+        readyTimeout1.fire()
+        let aFellBack = await waitUntil { f1.link.offers.count == 1 }
+        XCTAssertTrue(aFellBack)
+        _ = await sleeper1.waitForSleep(duration: 2)
+
+        // New large item B arrives during the 2s post-timeout hold: must NOT send wifi_request #2 yet.
+        let dataB = makeDeterministicBytes(count: 530_000, seed: 32)
+        f1.monitor.saveManually([try makeFileProvider(in: f1.root, bytes: dataB, name: "late-b.bin")], receivedAt: f1.clock.date.addingTimeInterval(1))
+        await awaitSave(f1, savedCount: 2)
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
+        XCTAssertEqual(f1.link.offers.count, 1)
+
+        // Late wifi_ready for request #1 arrives -> replied with wifi_cancel(superseded), never joined, and unlocks request #2.
+        let staleReady = makeReadyPayload()
+        try f1.link.send(.ready(staleReady))
+        XCTAssertEqual(f1.link.wifiCancels.count, 1)
+        XCTAssertEqual(f1.link.wifiCancels.first?.session, staleReady.session)
+        XCTAssertEqual(f1.link.wifiCancels.first?.reason, .superseded)
+        let joinedCount1 = await f1.wifiClient.joinedSSIDs.count
+        XCTAssertEqual(joinedCount1, 0)
+        XCTAssertEqual(f1.link.wifiRequests.count, 2)
+
+        // Part 2: If no late reply arrives, 2s hold expires and then sends wifi_request #2.
+        let sleeper2 = ControlledWifiSleeper()
+        let f2 = try Fixture(test: self, sleeper: sleeper2)
+        let p2 = try pair(f2)
+        f2.monitor.updateScene("active")
+        try f2.link.connect(p2, limit: 512)
+
+        f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: dataA, name: "hold-a.bin")], receivedAt: f2.clock.date)
+        await awaitSave(f2, savedCount: 1)
+        XCTAssertEqual(f2.link.wifiRequests.count, 1)
+
+        let readyTimeout2 = await sleeper2.waitForSleep(duration: 20)
+        readyTimeout2.fire()
+        let aFellBack2 = await waitUntil { f2.link.offers.count == 1 }
+        XCTAssertTrue(aFellBack2)
+        let holdWait2 = await sleeper2.waitForSleep(duration: 2)
+
+        f2.monitor.saveManually([try makeFileProvider(in: f2.root, bytes: dataB, name: "hold-b.bin")], receivedAt: f2.clock.date.addingTimeInterval(1))
+        await awaitSave(f2, savedCount: 2)
+        XCTAssertEqual(f2.link.wifiRequests.count, 1)
+
+        holdWait2.fire()
+        let sentSecond = await waitUntil { f2.link.wifiRequests.count == 2 }
+        XCTAssertTrue(sentSecond)
+        XCTAssertEqual(f2.link.offers.count, 1)
+
+        // An unexpected late wifi_ready when no request is awaiting ready still returns wifi_cancel(superseded).
+        try f2.link.send(.unavailable(reason: .startFailed))
+        let strayReady = makeReadyPayload()
+        try f2.link.send(.ready(strayReady))
+        XCTAssertEqual(f2.link.wifiCancels.last?.session, strayReady.session)
+        XCTAssertEqual(f2.link.wifiCancels.last?.reason, .superseded)
     }
 
     @MainActor

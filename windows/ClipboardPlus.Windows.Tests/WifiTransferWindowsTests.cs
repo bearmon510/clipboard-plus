@@ -79,6 +79,22 @@ public sealed class WifiTransferWindowsTests : IDisposable
     }
 
     [Fact]
+    public void WifiTransferHostStepTimeoutsFitWithin15SecondTotalBudget()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(15), WifiApStarter.DefaultTotalStartTimeout);
+        Assert.True(WindowsWifiTransferHost.HotspotBandQueryTimeout > TimeSpan.Zero);
+        Assert.True(WindowsWifiTransferHost.HotspotConfigureTimeout > TimeSpan.Zero);
+        Assert.True(WindowsWifiTransferHost.HotspotStartTimeout > TimeSpan.Zero);
+        Assert.True(WindowsWifiTransferHost.HotspotCleanupOnStartFailureTimeout > TimeSpan.Zero);
+        Assert.True(WindowsWifiTransferHost.VirtualIpBindTimeout > TimeSpan.Zero);
+        Assert.True(WindowsWifiTransferHost.DirectStartTimeout > TimeSpan.Zero);
+        Assert.True(
+            WifiApStarter.DefaultPrimaryAttemptTimeout +
+            WindowsWifiTransferHost.HotspotCleanupOnStartFailureTimeout +
+            WifiApStarter.DefaultFallbackDelay < WifiApStarter.DefaultTotalStartTimeout);
+    }
+
+    [Fact]
     public void MainWindowWifiTransferCheckboxReflectsAndSavesSetting()
     {
         RunSta(() =>

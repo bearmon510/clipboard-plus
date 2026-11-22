@@ -101,11 +101,37 @@ final class PCSyncController: ObservableObject {
         }
     }
     struct WifiTransferTimeouts: Equatable, Sendable {
-        var readySeconds: TimeInterval = 8
+        var readySeconds: TimeInterval = 20
+        var joinSeconds: TimeInterval = 75
         var tcpConnectSeconds: TimeInterval = 10
         var preAuthReadSeconds: TimeInterval = 5
         var idleSeconds: TimeInterval = 10
         var cooldownSeconds: TimeInterval = 10 * 60
+        var busyRetrySeconds: TimeInterval = 5
+        var maxBusyRetries: Int = 6
+        var readyTimeoutHoldSeconds: TimeInterval = 2
+
+        init(
+            readySeconds: TimeInterval = 20,
+            joinSeconds: TimeInterval = 75,
+            tcpConnectSeconds: TimeInterval = 10,
+            preAuthReadSeconds: TimeInterval = 5,
+            idleSeconds: TimeInterval = 10,
+            cooldownSeconds: TimeInterval = 10 * 60,
+            busyRetrySeconds: TimeInterval = 5,
+            maxBusyRetries: Int = 6,
+            readyTimeoutHoldSeconds: TimeInterval = 2
+        ) {
+            self.readySeconds = readySeconds
+            self.joinSeconds = joinSeconds
+            self.tcpConnectSeconds = tcpConnectSeconds
+            self.preAuthReadSeconds = preAuthReadSeconds
+            self.idleSeconds = idleSeconds
+            self.cooldownSeconds = cooldownSeconds
+            self.busyRetrySeconds = busyRetrySeconds
+            self.maxBusyRetries = maxBusyRetries
+            self.readyTimeoutHoldSeconds = readyTimeoutHoldSeconds
+        }
     }
     @Published private(set) var transferProgress: TransferProgress?
     @Published private(set) var wifiTransferProgress: WifiTransferProgress?
@@ -137,6 +163,7 @@ final class PCSyncController: ObservableObject {
     private let now: () -> Date
     private let wifiClient: any PCSyncWifiClient
     private let wifiTimeouts: WifiTransferTimeouts
+    private let wifiSleep: @Sendable (TimeInterval) async throws -> Void
     private let isForegroundOverride: (@MainActor () -> Bool)?
     private var currentSceneState: String
     private var sceneCancellable: AnyCancellable?
@@ -186,6 +213,15 @@ final class PCSyncController: ObservableObject {
     }
     private var wifiSession: WifiSession?
     private var wifiTransferTask: Task<Void, Never>?
+    private var wifiReadyTimeoutTask: Task<Void, Never>?
+    private var wifiRetryTask: Task<Void, Never>?
+    private var wifiRetryToken: UUID?
+    private var wifiBusyRetryPending = false
+    private var wifiBusyRetryCount = 0
+    private var wifiRequestHoldTask: Task<Void, Never>?
+    private var wifiRequestHoldToken: UUID?
+    private var wifiRequestHoldActive = false
+    private var wifiDeferredUntilForeground: Set<UUID> = []
     private var activeWifiSSID: String?
     private struct PendingChunk {
         let endOffset: Int
@@ -282,7 +318,8 @@ final class PCSyncController: ObservableObject {
          makeTransport: ((@escaping (String) -> Void) -> PCSyncTransport)? = nil,
          wifiClient: (any PCSyncWifiClient)? = nil,
          wifiTimeouts: WifiTransferTimeouts = WifiTransferTimeouts(),
-         isForeground: (@MainActor () -> Bool)? = nil) {
+         isForeground: (@MainActor () -> Bool)? = nil,
+         wifiSleep: (@Sendable (TimeInterval) async throws -> Void)? = nil) {
         self.monitor = monitor
         self.disk = SyncDiskStore(root: monitor.syncDirectory)
         self.settings = PCSyncSettings(defaults: defaults)
@@ -291,6 +328,14 @@ final class PCSyncController: ObservableObject {
         self.makeTransport = makeTransport ?? { PCSyncBluetooth(log: $0) }
         self.wifiClient = wifiClient ?? LivePCSyncWifiClient()
         self.wifiTimeouts = wifiTimeouts
+        if let wifiSleep {
+            self.wifiSleep = wifiSleep
+        } else {
+            self.wifiSleep = { seconds in
+                let clamped = max(0, min(seconds, 86_400))
+                try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
+            }
+        }
         self.isForegroundOverride = isForeground
         self.currentSceneState = monitor.sceneState
         self.wifiReplayGuard = try! WifiSessionReplayGuard(maxTracked: 256)
@@ -552,6 +597,9 @@ final class PCSyncController: ObservableObject {
     }
     private func resetSession() {
         cancelActiveWifiTaskAndLeave()
+        cancelWifiBusyRetry(resetCount: true)
+        clearWifiRequestHold()
+        wifiDeferredUntilForeground.removeAll()
         if let assembler {
             do { try assembler.finish() } catch { record("受信組み立てを破棄") }
         }
@@ -1394,9 +1442,7 @@ final class PCSyncController: ObservableObject {
         if let active = wifiSession,
            case let .awaitingReady(requestedAt) = active.phase,
            date.timeIntervalSince(requestedAt) >= wifiTimeouts.readySeconds {
-            wifiSession = nil
-            record("Wi-Fi転送失敗; 理由=ready_timeout; 送信件数=\(active.outgoingIDs.count); 受信件数=\(active.incomingIDs.count); 所要ms=\(milliseconds(since: requestedAt))")
-            fallbackWifiToBle(outgoingIDs: active.outgoingIDs, incomingIDs: active.incomingIDs, applyCooldown: true)
+            handleWifiReadyTimeout(active)
         }
         if let start = handshakeStart, date.timeIntervalSince(start) > 30 {
             fail(reject: false, countBackoff: true, reason: "接続確認期限")
@@ -1463,19 +1509,47 @@ final class PCSyncController: ObservableObject {
     }
 
     private func handleSceneStateChange(_ newState: String) {
+        let wasForeground = isForeground
         currentSceneState = newState
-        if isForeground && status == .connected {
+        guard status == .connected else { return }
+        if !wasForeground && isForeground {
+            wifiDeferredUntilForeground.removeAll()
+            if !wifiBusyRetryPending {
+                wifiBusyRetryCount = 0
+            }
             tryStartWifiTransfer()
+        } else if newState == "background" {
+            handleEnteredBackground()
         }
+    }
+
+    private func handleEnteredBackground() {
+        cancelWifiBusyRetry(resetCount: true)
+        wifiDeferredUntilForeground.removeAll()
+        guard wifiSession == nil else { return }
+        let waitingIncoming = pendingWifiIncomingOrder
+        fallbackWifiToBleKeepingOversized(
+            outgoingIDs: [],
+            incomingIDs: waitingIncoming,
+            applyCooldownToBle: false,
+            deferOversizedUntilForeground: false
+        )
     }
 
     private func handleWifiSettingChanged() {
         if usesWifiForLargeItems {
+            wifiDeferredUntilForeground.removeAll()
+            if !wifiBusyRetryPending {
+                wifiBusyRetryCount = 0
+            }
             if status == .connected {
                 tryStartWifiTransfer()
             }
             return
         }
+        cancelWifiBusyRetry(resetCount: true)
+        clearWifiRequestHold()
+        wifiDeferredUntilForeground.removeAll()
         if let active = wifiSession {
             let remainingOutgoing = active.outgoingIDs.filter { id in pending.contains { $0.id == id } }
             let remainingIncoming = active.incomingIDs.filter { id in pendingWifiIncomingOffers[id] != nil && !seen.contains(id) }
@@ -1527,10 +1601,11 @@ final class PCSyncController: ObservableObject {
 
     private func isOutgoingWifiCandidate(_ item: SyncPending, at date: Date) -> Bool {
         guard let offer = item.offer else { return false }
-        guard wifiAvailableOnSession && usesWifiForLargeItems else { return false }
+        guard wifiAvailableOnSession && usesWifiForLargeItems && isForeground else { return false }
         guard !sentThisConnection.contains(item.id) else { return false }
         if activeAttachment?.id == item.id { return false }
         if isInWifiCooldown(item.id, at: date) { return false }
+        if wifiDeferredUntilForeground.contains(item.id) { return false }
         return offer.size > SyncProtocol.maxItemBytes || offer.size >= wifiThreshold.rawValue
     }
 
@@ -1563,8 +1638,8 @@ final class PCSyncController: ObservableObject {
         let overBleLimit = offer.size > SyncProtocol.maxItemBytes
         let wantsWifi = wifiAvailableOnSession
             && usesWifiForLargeItems
-            && (overBleLimit || offer.size >= wifiThreshold.rawValue)
             && !isInWifiCooldown(offer.id, at: offerNow)
+            && (overBleLimit || (isForeground && offer.size >= wifiThreshold.rawValue))
 
         if wantsWifi {
             pendingWifiIncomingOffers[offer.id] = offer
@@ -1601,7 +1676,12 @@ final class PCSyncController: ObservableObject {
     }
 
     private func tryStartWifiTransfer() {
-        guard wifiAvailableOnSession, usesWifiForLargeItems, wifiSession == nil, isForeground else {
+        guard wifiAvailableOnSession,
+              usesWifiForLargeItems,
+              wifiSession == nil,
+              isForeground,
+              !wifiRequestHoldActive,
+              !wifiBusyRetryPending else {
             return
         }
         let current = now()
@@ -1619,7 +1699,9 @@ final class PCSyncController: ObservableObject {
         }
         var incomingIDs: [UUID] = []
         for id in pendingWifiIncomingOrder {
-            guard pendingWifiIncomingOffers[id] != nil, !isInWifiCooldown(id, at: current) else { continue }
+            guard pendingWifiIncomingOffers[id] != nil,
+                  !isInWifiCooldown(id, at: current),
+                  !wifiDeferredUntilForeground.contains(id) else { continue }
             incomingIDs.append(id)
         }
 
@@ -1654,15 +1736,175 @@ final class PCSyncController: ObservableObject {
             direction = .receive
         }
 
+        let sessionID = UUID()
         wifiSession = WifiSession(
-            id: UUID(),
+            id: sessionID,
             direction: direction,
             outgoingIDs: selectedOutgoing,
             incomingIDs: selectedIncoming,
             phase: .awaitingReady(requestedAt: current)
         )
+        scheduleWifiReadyTimeout(for: sessionID)
         queueWifiControl(.request(direction: direction, ids: combinedIDs))
         record("Wi-Fi転送要求; 方向=\(direction.rawValue); 送信件数=\(selectedOutgoing.count); 受信件数=\(selectedIncoming.count)")
+    }
+
+    private func scheduleWifiReadyTimeout(for wifiSessionID: UUID) {
+        wifiReadyTimeoutTask?.cancel()
+        wifiReadyTimeoutTask = nil
+        let pairingGen = pairingGeneration
+        let bleSessionGen = sessionGeneration
+        let timeoutSeconds = wifiTimeouts.readySeconds
+        let sleep = wifiSleep
+        wifiReadyTimeoutTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(timeoutSeconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.pairingGeneration == pairingGen,
+                  self.sessionGeneration == bleSessionGen,
+                  let active = self.wifiSession,
+                  active.id == wifiSessionID,
+                  case .awaitingReady = active.phase else {
+                return
+            }
+            self.handleWifiReadyTimeout(active)
+        }
+    }
+
+    private func handleWifiReadyTimeout(_ active: WifiSession) {
+        guard wifiSession?.id == active.id,
+              case let .awaitingReady(requestedAt) = active.phase else { return }
+        wifiReadyTimeoutTask?.cancel()
+        wifiReadyTimeoutTask = nil
+        wifiSession = nil
+        wifiBusyRetryCount = 0
+        startWifiRequestHold()
+        record("Wi-Fi転送失敗; 理由=ready_timeout; 送信件数=\(active.outgoingIDs.count); 受信件数=\(active.incomingIDs.count); 所要ms=\(milliseconds(since: requestedAt))")
+        fallbackWifiToBle(outgoingIDs: active.outgoingIDs, incomingIDs: active.incomingIDs, applyCooldown: true)
+    }
+
+    private func startWifiRequestHold() {
+        wifiRequestHoldTask?.cancel()
+        wifiRequestHoldTask = nil
+        wifiRequestHoldToken = nil
+        guard status == .connected else {
+            wifiRequestHoldActive = false
+            return
+        }
+        wifiRequestHoldActive = true
+        let holdToken = UUID()
+        wifiRequestHoldToken = holdToken
+        let pairingGen = pairingGeneration
+        let bleSessionGen = sessionGeneration
+        let holdSeconds = wifiTimeouts.readyTimeoutHoldSeconds
+        let sleep = wifiSleep
+        wifiRequestHoldTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(holdSeconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.pairingGeneration == pairingGen,
+                  self.sessionGeneration == bleSessionGen,
+                  self.wifiRequestHoldToken == holdToken,
+                  self.wifiRequestHoldActive else {
+                return
+            }
+            self.clearWifiRequestHold()
+            if self.status == .connected {
+                self.tryStartWifiTransfer()
+            }
+        }
+    }
+
+    private func clearWifiRequestHold() {
+        wifiRequestHoldActive = false
+        wifiRequestHoldToken = nil
+        wifiRequestHoldTask?.cancel()
+        wifiRequestHoldTask = nil
+    }
+
+    private func scheduleWifiBusyRetry() {
+        wifiRetryTask?.cancel()
+        wifiRetryTask = nil
+        wifiRetryToken = nil
+        guard status == .connected else {
+            wifiBusyRetryPending = false
+            return
+        }
+        wifiBusyRetryPending = true
+        let retryToken = UUID()
+        wifiRetryToken = retryToken
+        let pairingGen = pairingGeneration
+        let bleSessionGen = sessionGeneration
+        let retrySeconds = wifiTimeouts.busyRetrySeconds
+        let sleep = wifiSleep
+        wifiRetryTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(retrySeconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.pairingGeneration == pairingGen,
+                  self.sessionGeneration == bleSessionGen,
+                  self.wifiRetryToken == retryToken,
+                  self.wifiBusyRetryPending else {
+                return
+            }
+            self.wifiRetryToken = nil
+            self.wifiRetryTask = nil
+            self.wifiBusyRetryPending = false
+            if self.status == .connected {
+                self.tryStartWifiTransfer()
+            }
+        }
+    }
+
+    private func cancelWifiBusyRetry(resetCount: Bool) {
+        wifiBusyRetryPending = false
+        wifiRetryToken = nil
+        wifiRetryTask?.cancel()
+        wifiRetryTask = nil
+        if resetCount {
+            wifiBusyRetryCount = 0
+        }
+    }
+
+    private func handleWifiBusy(outgoingIDs: [UUID], incomingIDs: [UUID]) {
+        if wifiBusyRetryCount < wifiTimeouts.maxBusyRetries {
+            if !isForeground {
+                wifiBusyRetryCount = 0
+                fallbackWifiToBleKeepingOversized(
+                    outgoingIDs: outgoingIDs,
+                    incomingIDs: incomingIDs,
+                    applyCooldownToBle: false,
+                    deferOversizedUntilForeground: false
+                )
+                return
+            }
+            wifiBusyRetryCount += 1
+            let attempt = wifiBusyRetryCount
+            scheduleWifiBusyRetry()
+            record("Wi-Fi再試行待ち; 理由=busy; 回数=\(attempt); 待機秒=\(Int(wifiTimeouts.busyRetrySeconds))")
+            return
+        }
+
+        wifiBusyRetryCount = 0
+        record("Wi-Fi再試行上限; 理由=busy; 送信件数=\(outgoingIDs.count); 受信件数=\(incomingIDs.count)")
+        fallbackWifiToBleKeepingOversized(
+            outgoingIDs: outgoingIDs,
+            incomingIDs: incomingIDs,
+            applyCooldownToBle: true,
+            deferOversizedUntilForeground: true
+        )
     }
 
     private func queueWifiControl(_ message: WifiControlMessage) {
@@ -1689,10 +1931,26 @@ final class PCSyncController: ObservableObject {
     }
 
     private func handleWifiUnavailable(_ reason: WifiUnavailableReason) {
-        guard let active = wifiSession, case .awaitingReady = active.phase else { return }
+        guard let active = wifiSession, case .awaitingReady = active.phase else {
+            if wifiRequestHoldActive {
+                clearWifiRequestHold()
+                record("Wi-Fi遅延応答を破棄; 理由=\(reason.rawValue)")
+                if status == .connected {
+                    tryStartWifiTransfer()
+                }
+            }
+            return
+        }
+        wifiReadyTimeoutTask?.cancel()
+        wifiReadyTimeoutTask = nil
         wifiSession = nil
         wifiTransferProgress = nil
         record("Wi-Fi転送不可; 理由=\(reason.rawValue); 送信件数=\(active.outgoingIDs.count); 受信件数=\(active.incomingIDs.count)")
+        if reason == .busy {
+            handleWifiBusy(outgoingIDs: active.outgoingIDs, incomingIDs: active.incomingIDs)
+            return
+        }
+        wifiBusyRetryCount = 0
         fallbackWifiToBle(outgoingIDs: active.outgoingIDs, incomingIDs: active.incomingIDs, applyCooldown: true)
     }
 
@@ -1721,8 +1979,18 @@ final class PCSyncController: ObservableObject {
     private func handleWifiReady(_ payload: WifiReadyPayload) {
         guard let session = wifiSession, case .awaitingReady = session.phase else {
             queueWifiControl(.cancel(session: payload.session, reason: .superseded))
+            if wifiRequestHoldActive {
+                clearWifiRequestHold()
+                record("Wi-Fi遅延readyを破棄")
+                if status == .connected {
+                    tryStartWifiTransfer()
+                }
+            }
             return
         }
+        wifiReadyTimeoutTask?.cancel()
+        wifiReadyTimeoutTask = nil
+        wifiBusyRetryCount = 0
         guard let sessionKeys, sessionKeys.supportsWifiTransfer else {
             wifiSession = nil
             queueWifiControl(.cancel(session: payload.session, reason: .protocolError))
@@ -1733,6 +2001,12 @@ final class PCSyncController: ObservableObject {
             wifiSession = nil
             queueWifiControl(.joinResult(session: payload.session, status: .notForeground))
             record("Wi-Fi参加; 状態=not_foreground; 所要ms=0")
+            fallbackWifiToBleKeepingOversized(
+                outgoingIDs: session.outgoingIDs,
+                incomingIDs: session.incomingIDs,
+                applyCooldownToBle: false,
+                deferOversizedUntilForeground: false
+            )
             return
         }
 
@@ -1840,7 +2114,7 @@ final class PCSyncController: ObservableObject {
         }
 
         let joinStart = now()
-        let joinTimeout = TimeInterval(max(1, payload.ttlSeconds))
+        let joinTimeout = min(wifiTimeouts.joinSeconds, TimeInterval(max(1, payload.ttlSeconds)))
         let joinStatus = await wifiClient.join(
             ssid: payload.ssid,
             passphrase: payload.passphrase,
@@ -1860,12 +2134,11 @@ final class PCSyncController: ObservableObject {
         record("Wi-Fi参加; 状態=\(joinStatus.rawValue); 所要ms=\(joinMs)")
 
         if joinStatus != .joined {
-            let shouldFallback = (joinStatus != .notForeground)
             finishWifiSessionAfterJoinFailure(
                 wifiSessionID: wifiSessionID,
                 outgoingIDs: outgoingIDs,
                 incomingIDs: incomingIDs,
-                fallbackToBle: shouldFallback
+                joinStatus: joinStatus
             )
             return
         }
@@ -2135,13 +2408,25 @@ final class PCSyncController: ObservableObject {
         wifiSessionID: UUID,
         outgoingIDs: [UUID],
         incomingIDs: [UUID],
-        fallbackToBle: Bool
+        joinStatus: WifiJoinStatus
     ) {
         guard wifiSession?.id == wifiSessionID else { return }
         wifiSession = nil
         wifiTransferTask = nil
         wifiTransferProgress = nil
-        if fallbackToBle {
+        if joinStatus == .notForeground {
+            if isForeground {
+                wifiDeferredUntilForeground.formUnion(outgoingIDs)
+                wifiDeferredUntilForeground.formUnion(incomingIDs)
+            } else {
+                fallbackWifiToBleKeepingOversized(
+                    outgoingIDs: outgoingIDs,
+                    incomingIDs: incomingIDs,
+                    applyCooldownToBle: false,
+                    deferOversizedUntilForeground: false
+                )
+            }
+        } else {
             fallbackWifiToBle(outgoingIDs: outgoingIDs, incomingIDs: incomingIDs, applyCooldown: true)
         }
     }
@@ -2171,6 +2456,8 @@ final class PCSyncController: ObservableObject {
     }
 
     private func cancelActiveWifiTaskAndLeave() {
+        wifiReadyTimeoutTask?.cancel()
+        wifiReadyTimeoutTask = nil
         wifiSession = nil
         wifiTransferTask?.cancel()
         wifiTransferTask = nil
@@ -2181,6 +2468,63 @@ final class PCSyncController: ObservableObject {
             Task {
                 await client.leave(ssid: ssid)
             }
+        }
+    }
+
+    private func fallbackWifiToBleKeepingOversized(
+        outgoingIDs: [UUID],
+        incomingIDs: [UUID],
+        applyCooldownToBle: Bool,
+        deferOversizedUntilForeground: Bool
+    ) {
+        let current = now()
+        var bleCooldownIDs: [UUID] = []
+
+        for id in outgoingIDs {
+            guard let item = pending.first(where: { $0.id == id }),
+                  let offer = item.offer else { continue }
+            if offer.size > SyncProtocol.maxItemBytes {
+                if deferOversizedUntilForeground {
+                    wifiDeferredUntilForeground.insert(id)
+                }
+            } else if applyCooldownToBle {
+                bleCooldownIDs.append(id)
+            }
+        }
+
+        var incomingToBle: [SyncOffer] = []
+        for id in incomingIDs {
+            guard let offer = pendingWifiIncomingOffers[id] else { continue }
+            if seen.contains(id) || receiving.contains(id) {
+                pendingWifiIncomingOffers.removeValue(forKey: id)
+                pendingWifiIncomingOrder.removeAll { $0 == id }
+                continue
+            }
+            if offer.size > SyncProtocol.maxItemBytes {
+                if deferOversizedUntilForeground {
+                    wifiDeferredUntilForeground.insert(id)
+                }
+            } else {
+                pendingWifiIncomingOffers.removeValue(forKey: id)
+                pendingWifiIncomingOrder.removeAll { $0 == id }
+                if applyCooldownToBle {
+                    bleCooldownIDs.append(id)
+                }
+                incomingToBle.append(offer)
+            }
+        }
+
+        if !bleCooldownIDs.isEmpty {
+            markWifiCooldown(bleCooldownIDs, at: current)
+        }
+
+        for offer in incomingToBle where status == .connected {
+            do { try beginBleIncomingOffer(offer, at: current) }
+            catch { fail(reject: false, reason: "BLE受信再開失敗"); return }
+        }
+
+        if status == .connected {
+            pump()
         }
     }
 
@@ -2275,6 +2619,9 @@ final class PCSyncController: ObservableObject {
     }
     deinit {
         wifiTransferTask?.cancel()
+        wifiReadyTimeoutTask?.cancel()
+        wifiRetryTask?.cancel()
+        wifiRequestHoldTask?.cancel()
         sceneCancellable?.cancel()
         timer?.invalidate()
         if let unlockObserver { NotificationCenter.default.removeObserver(unlockObserver) }

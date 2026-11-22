@@ -1281,4 +1281,314 @@ public sealed class WifiCoordinatorTests : IDisposable
         await rig.Pc.WaitForWifiIdleAsync();
         Assert.True(handle.IsDisposed);
     }
+
+    [Fact]
+    public async Task SuppressesNewNonTextBleOffersDuringActiveWifiSessionAndResumesAfterTeardown()
+    {
+        var delay = new ControlledDelay();
+        await using var rig = new Rig(NewRoot(), options: new WifiTransferOptions(
+            PostDoneCloseGrace: TimeSpan.Zero,
+            DelayAsync: delay.DelayAsync));
+        var secondDevice = Guid.NewGuid();
+        rig.Store.Register(secondDevice, "phone", rig.Now);
+
+        var pad1 = await rig.ConnectAsync(deviceId: rig.DeviceId);
+        var pad2 = await rig.ConnectAsync(deviceId: secondDevice);
+
+        var uploadBytes = MakeBytes(600_000, seed: 0x1A);
+        var uploadOffer = MakeOffer(Guid.NewGuid(), "pad", uploadBytes, filename: "up.bin");
+
+        await pad1.SendWifiAsync(new WifiRequest(WifiTransferDirection.Send, [uploadOffer.Id]));
+        var ready = await pad1.WaitForMessageAsync<WifiReady>();
+        var handle = rig.Host.LastHandle!;
+        await handle.AcceptStarted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // While pad1's Wi-Fi session is active, add both a text item and a large attachment on PC.
+        var deferredFileBytes = MakeBytes(620_000, seed: 0x2B);
+        await rig.Pc.AddLocalContentsAsync([
+            new ClipboardContent("text", Text: "text during wifi"),
+            new ClipboardContent("file", Filename: "after-wifi.bin", Data: deferredFileBytes),
+        ]);
+        await rig.Pc.WaitForOutgoingAsync();
+
+        // Pad1 receives text over BLE, but MUST NOT receive the new non-text offer while Wi-Fi is active.
+        var pad1Text = await pad1.WaitForMessageAsync<SyncItem>();
+        Assert.Equal("text during wifi", pad1Text.Text);
+        Assert.DoesNotContain(pad1.DrainAll(), m => m is SyncOffer);
+
+        // Pad2 is a separate connection and still receives both text and the new non-text offer over BLE.
+        var pad2Text = await pad2.WaitForMessageAsync<SyncItem>();
+        Assert.Equal("text during wifi", pad2Text.Text);
+        var pad2Offer = await pad2.WaitForMessageAsync<SyncOffer>();
+        Assert.Equal(deferredFileBytes.Length, pad2Offer.Size);
+
+        // Advance past BLE's 60s ReplyTimeout (still under 90s Wi-Fi TTL): pad1 BLE & Wi-Fi stay alive.
+        rig.Now = rig.Now.AddSeconds(65);
+        await rig.Pc.TickAsync(rig.Now);
+        Assert.False(pad1.Peer.Rejected);
+        Assert.False(handle.IsDisposed);
+        Assert.DoesNotContain(pad1.DrainAll(), m => m is SyncOffer);
+
+        // Finish pad1's Wi-Fi session cleanly.
+        var pipe = new DuplexPipe();
+        handle.ProvideConnection(pipe.PcEnd, pipe.PcEnd.CloseWrite);
+        var keys = WifiTransferKeys.Derive(pad1.Keys, ready.Token, ready.Session);
+        await WifiTransferEngine.RunPadSessionAsync(
+            pipe.PadEnd,
+            keys,
+            outgoing: [new InMemoryWifiTransferSource(uploadOffer, uploadBytes)],
+            sink: new InMemoryWifiTransferSink());
+        pipe.PadEnd.CloseWrite();
+
+        await rig.Pc.WaitForWifiIdleAsync();
+        await rig.Pc.WaitForOutgoingAsync(pad1.Peer);
+        Assert.True(handle.IsDisposed);
+
+        // After Wi-Fi teardown completes, PC automatically sends the deferred non-text offer over BLE.
+        var resumedOffer = await pad1.WaitForMessageAsync<SyncOffer>();
+        Assert.Equal(deferredFileBytes.Length, resumedOffer.Size);
+    }
+
+    [Fact]
+    public async Task InFlightBleOfferBeforeWifiRequestDoesNotExpireDuringWifiSession()
+    {
+        var delay = new ControlledDelay();
+        await using var rig = new Rig(NewRoot(), options: new WifiTransferOptions(
+            PostDoneCloseGrace: TimeSpan.Zero,
+            DelayAsync: delay.DelayAsync));
+
+        var pcBytes = MakeBytes(40_000, seed: 0x3C);
+        await rig.Pc.AddLocalContentsAsync([new ClipboardContent("file", Filename: "inflight.bin", Data: pcBytes)]);
+        var pcItem = Assert.Single(rig.Store.Pending(rig.DeviceId));
+
+        var pad = await rig.ConnectAsync();
+        var bleOffer = await pad.WaitForMessageAsync<SyncOffer>();
+        Assert.Equal(pcItem.Id, bleOffer.Id);
+
+        // iOS concurrently sends wifi_request for its own upload (NOT including pcItem.Id).
+        var padBytes = MakeBytes(520_000, seed: 0x4D);
+        var padOffer = MakeOffer(Guid.NewGuid(), "pad", padBytes, filename: "pad-up.bin");
+        await pad.SendWifiAsync(new WifiRequest(WifiTransferDirection.Send, [padOffer.Id]));
+        var ready = await pad.WaitForMessageAsync<WifiReady>();
+        var handle = rig.Host.LastHandle!;
+        await handle.AcceptStarted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // At +65s (past BLE's 60s ReplyTimeout for pcItem, before 90s Wi-Fi TTL), BLE & Wi-Fi must NOT drop.
+        rig.Now = rig.Now.AddSeconds(65);
+        await rig.Pc.TickAsync(rig.Now);
+        Assert.False(pad.Peer.Rejected);
+        Assert.False(handle.IsDisposed);
+
+        // Complete Wi-Fi transfer.
+        var pipe = new DuplexPipe();
+        handle.ProvideConnection(pipe.PcEnd, pipe.PcEnd.CloseWrite);
+        var keys = WifiTransferKeys.Derive(pad.Keys, ready.Token, ready.Session);
+        await WifiTransferEngine.RunPadSessionAsync(
+            pipe.PadEnd,
+            keys,
+            outgoing: [new InMemoryWifiTransferSource(padOffer, padBytes)],
+            sink: new InMemoryWifiTransferSink());
+        pipe.PadEnd.CloseWrite();
+        await rig.Pc.WaitForWifiIdleAsync();
+
+        // After teardown, pcItem's reply deadline was refreshed (survives +50s more) and BLE resume succeeds.
+        rig.Now = rig.Now.AddSeconds(50);
+        await rig.Pc.TickAsync(rig.Now);
+        Assert.False(pad.Peer.Rejected);
+
+        await pad.SendSyncAsync(new SyncResume(pcItem.Id, 0));
+        var chunk = await pad.WaitForMessageAsync<SyncChunk>();
+        Assert.Equal(pcItem.Id, chunk.Id);
+        Assert.Equal(0, chunk.Offset);
+    }
+
+    private sealed class AsyncFakeApBackend : IWifiApBackend
+    {
+        public bool Online { get; set; }
+        public List<string> Calls { get; } = [];
+        public Func<WifiTransferCredentials, CancellationToken, Task<WifiApAttemptResult>> OnHotspot { get; set; } =
+            (c, _) => Task.FromResult(WifiApAttemptResult.Success(new FakeWifiSessionHandle(WifiApMode.Hotspot5GHz, c.Ssid)));
+        public Func<WifiTransferCredentials, CancellationToken, Task<WifiApAttemptResult>> OnDirect { get; set; } =
+            (c, _) => Task.FromResult(WifiApAttemptResult.Success(new FakeWifiSessionHandle(WifiApMode.WifiDirect, c.Ssid)));
+
+        public bool HasInternetConnection() => Online;
+
+        public Task<WifiApAttemptResult> TryStartHotspotAsync(WifiTransferCredentials credentials, CancellationToken cancellationToken)
+        {
+            Calls.Add("hotspot");
+            return OnHotspot(credentials, cancellationToken);
+        }
+
+        public Task<WifiApAttemptResult> TryStartWifiDirectAsync(WifiTransferCredentials credentials, CancellationToken cancellationToken)
+        {
+            Calls.Add("wifiDirect");
+            return OnDirect(credentials, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task ApStarterPrimaryTimeoutFallsBackToWifiDirectAndDisposesLateHandle()
+    {
+        var delay = new ControlledDelay();
+        var creds = WifiTransferCredentials.CreateRandom();
+        var logs = new List<string>();
+        var hungHotspot = new TaskCompletionSource<WifiApAttemptResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hotspotCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var backend = new AsyncFakeApBackend
+        {
+            Online = true,
+            OnHotspot = (_, ct) =>
+            {
+                ct.Register(() => hotspotCancelled.TrySetResult());
+                return hungHotspot.Task;
+            },
+        };
+
+        var startTask = WifiApStarter.StartWithFallbackAsync(
+            backend,
+            creds,
+            logs.Add,
+            delayAsync: delay.DelayAsync);
+
+        // Primary hotspot times out at DefaultPrimaryAttemptTimeout (7s).
+        var primaryWait = await delay.WaitForRequestedDelayAsync(WifiApStarter.DefaultPrimaryAttemptTimeout).WaitAsync(TimeSpan.FromSeconds(5));
+        primaryWait.Trigger();
+        await hotspotCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Settle delay (800ms) runs before Wi-Fi Direct fallback.
+        var settleWait = await delay.WaitForRequestedDelayAsync(WifiApStarter.DefaultFallbackDelay).WaitAsync(TimeSpan.FromSeconds(5));
+        settleWait.Trigger();
+
+        var result = await startTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(result.Succeeded);
+        Assert.Equal(WifiApMode.WifiDirect, result.Handle!.Mode);
+        Assert.Equal(["hotspot", "wifiDirect"], backend.Calls);
+        Assert.Contains(logs, l => l == "wifi ap primary failed mode=hotspot reason=timeout");
+        await result.Handle.DisposeAsync();
+
+        // If the abandoned hung hotspot later resolves with a handle, it is disposed automatically.
+        var lateHandle = new FakeWifiSessionHandle(WifiApMode.Hotspot5GHz, creds.Ssid);
+        hungHotspot.SetResult(WifiApAttemptResult.Success(lateHandle));
+        await lateHandle.Disposed.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task ApStarterTotalTimeout15SecondsCapsPrimaryFailureAndHungFallback()
+    {
+        var delay = new ControlledDelay();
+        var creds = WifiTransferCredentials.CreateRandom();
+        var logs = new List<string>();
+        var hungDirect = new TaskCompletionSource<WifiApAttemptResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var directStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var directCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var backend = new AsyncFakeApBackend
+        {
+            Online = true,
+            OnHotspot = (_, _) => Task.FromResult(WifiApAttemptResult.Failure("hotspot_start_timeout")),
+            OnDirect = (_, ct) =>
+            {
+                directStarted.TrySetResult();
+                ct.Register(() => directCancelled.TrySetResult());
+                return hungDirect.Task;
+            },
+        };
+
+        var startTask = WifiApStarter.StartWithFallbackAsync(
+            backend,
+            creds,
+            logs.Add,
+            delayAsync: delay.DelayAsync);
+
+        var totalWait = await delay.WaitForRequestedDelayAsync(TimeSpan.FromSeconds(15)).WaitAsync(TimeSpan.FromSeconds(5));
+        var settleWait = await delay.WaitForRequestedDelayAsync(WifiApStarter.DefaultFallbackDelay).WaitAsync(TimeSpan.FromSeconds(5));
+        settleWait.Trigger();
+        await directStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Overall 15-second budget expires while Wi-Fi Direct is still starting.
+        totalWait.Trigger();
+        await directCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var result = await startTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(result.Succeeded);
+        Assert.Null(result.Handle);
+        Assert.Equal(WifiUnavailableReason.StartFailed, result.FailureReason);
+        Assert.Contains(logs, l => l == "wifi ap primary failed mode=hotspot reason=hotspot_start_timeout");
+        Assert.Contains(logs, l => l == "wifi ap fallback failed mode=wifiDirect reason=total_timeout");
+    }
+
+    [Fact]
+    public async Task WifiStepTimeoutAbortsHungStepAndRespectsCallerCancellation()
+    {
+        var delay = new ControlledDelay();
+        var hung = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stepCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var runTask = WifiStepTimeout.RunAsync(
+            ct =>
+            {
+                ct.Register(() => stepCancelled.TrySetResult());
+                return hung.Task;
+            },
+            TimeSpan.FromSeconds(2),
+            "hotspot_band_timeout",
+            CancellationToken.None,
+            delay.DelayAsync);
+
+        var stepWait = await delay.WaitForRequestedDelayAsync(TimeSpan.FromSeconds(2)).WaitAsync(TimeSpan.FromSeconds(5));
+        stepWait.Trigger();
+
+        var ex = await Assert.ThrowsAsync<WifiStepTimeoutException>(() => runTask);
+        Assert.Equal("hotspot_band_timeout", ex.Code);
+        await stepCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Caller cancellation throws OperationCanceledException instead of WifiStepTimeoutException.
+        using var callerCts = new CancellationTokenSource();
+        var hung2 = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelTask = WifiStepTimeout.RunAsync(
+            _ => hung2.Task,
+            TimeSpan.FromSeconds(4),
+            "hotspot_start_timeout",
+            callerCts.Token,
+            delay.DelayAsync);
+        _ = await delay.WaitForRequestedDelayAsync(TimeSpan.FromSeconds(4)).WaitAsync(TimeSpan.FromSeconds(5));
+        callerCts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelTask);
+    }
+
+    [Fact]
+    public async Task CoordinatorEnforces15SecondStartTimeoutWhenWifiHostHangs()
+    {
+        var delay = new ControlledDelay();
+        var hungStart = new TaskCompletionSource<WifiHostStartResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hostCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var host = new FakeWifiHost
+        {
+            CustomStart = (_, ct) =>
+            {
+                ct.Register(() => hostCancelled.TrySetResult());
+                return hungStart.Task;
+            },
+        };
+        await using var rig = new Rig(
+            NewRoot(),
+            host: host,
+            options: new WifiTransferOptions(DelayAsync: delay.DelayAsync));
+        var pad = await rig.ConnectAsync();
+
+        await pad.SendWifiAsync(new WifiRequest(WifiTransferDirection.Send, [Guid.NewGuid()]));
+        var startWait = await delay.WaitForRequestedDelayAsync(TimeSpan.FromSeconds(15)).WaitAsync(TimeSpan.FromSeconds(5));
+        startWait.Trigger();
+
+        await hostCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var unavailable = await pad.WaitForMessageAsync<WifiUnavailable>();
+        Assert.Equal(WifiUnavailableReason.StartFailed, unavailable.Reason);
+        await rig.Pc.WaitForWifiIdleAsync();
+
+        // Late-resolving host handle after timeout is disposed cleanly.
+        var lateHandle = new FakeWifiSessionHandle(WifiApMode.Hotspot5GHz, "DIRECT-cp-LATE0001");
+        hungStart.SetResult(WifiHostStartResult.Success(lateHandle));
+        await lateHandle.Disposed.WaitAsync(TimeSpan.FromSeconds(5));
+    }
 }

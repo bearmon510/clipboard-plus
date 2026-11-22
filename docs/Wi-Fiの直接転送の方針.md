@@ -318,3 +318,45 @@ OS 非依存の共通プロトコルと TCP ストリーム部品（Swift の `a
   - 暗号フレームは上限 **256 KiB（262,144B）** で `0x20 | dir(1B) | payloadLen(4B BE) | seq(8B BE) | ciphertext | tag(16B)`。AAD は先頭14バイト、nonce は `dir(1B) | 0,0,0 | seq(8B BE)`。受信側は `seq` を `0, 1, 2, ...` と厳密連続検証し、入れ替え・欠け・重複・方向違い・256KiB超過・途中切り詰め・改ざんを検知して失効する。
 - **転送の流れと上限**：1件最大 **50 MiB（52,428,800B）**、1チャンク最大 **252 KiB（258,048B）**。`offer` → `resume`（既完了・全保存済みなら `ack`）→ `chunk` 連続送信 → 全バイトの SHA-256 検証（不一致は途中ファイルを破棄し `.authentication` で切断）→ `ack` → 送信終了の認証済み `done`。1接続で iOS→PC の全件のあとに PC→iOS の全件を続けて送受し、`done` より前の EOF を切り詰めとして検知する。
 - **秘匿**：`WifiReady` / `WifiTransferKeys` / `WifiTrafficKeys` の文字列表現では SSID・パスフレーズ・IP・セッション・トークン・鍵を伏せる。
+
+---
+
+## 11. PC と iOS の受け渡しの決まり（段階C・D）
+
+通信の形は [共通部品と試験データ](../protocol/README.md) の Wi-Fi の節と、段階Bの部品（Swift `app/ClipboardPlus/Core/WifiControlMessage.swift`・`WifiTransferCrypto.swift`・`WifiTransferStream.swift`、C# `windows/ClipboardPlus.Sync/WifiControlMessage.cs`・`WifiTransferCrypto.cs`・`WifiTransferStream.cs`）が決めている形をそのまま使い、形は変えない。
+
+1. **使う版**：Wi-Fi を使うのは、版4でつながった BLE の接続のときだけ。版3の接続では今までどおり BLE だけ。
+2. **境目**：中身の大きさが **512,000 バイト以上**の添付（画像・ファイル）を Wi-Fi で送る。iOS は設定で境目を変えられる（既定 512,000）。PC は境目を持たず、iOS の要求に従う。
+3. **始め方と前面・裏の扱い**：
+   - 始めるのはいつも iOS。**Wi-Fi を使うのは clipboard+ が前面にいるときだけ**。
+   - **裏にいるときは、両方の向きとも今までどおり BLE で送る・受ける（10MiB 以下）**。裏で BLE で始めたものは、前面に戻ってもそのまま BLE で終える。**10MiB を超えるものだけは前面に戻るまで待つ**。
+   - **iOS→PC（前面）**：送る待ちの大きい項目があるとき、BLE の `offer` の代わりに `wifi_request`（`direction` に送りを含め、`ids` に送る項目）を送る。
+   - **PC→iOS（前面）**：PC は今までどおり BLE で `offer` を送る。前面にいる iOS は境目以上（または 10MiB 超え）の `offer` を受けたら、BLE の中身を求めずに `wifi_request`（受けを含め、`ids` にその `offer` の id）を送る。送りと受けが両方あれば `both` で1回にまとめる。
+   - **Wi-Fi の session 中の BLE**：PC は、その接続で Wi-Fi の session が動いている間（`wifi_request` を受けて `wifi_ready` を出してから片付けが終わるまで）、**文章以外の新しい `offer` を BLE で出さない**（文章は BLE で送る）。片付けが終わったら続きを出す。
+4. **PC が `wifi_request` を受けたときの動き**：
+   - PC がインターネットにつながっていれば、モバイルホットスポットを 5GHz（5GHz 設定失敗時は自動帯）で作る。つながっていなければ、Wi-Fi Direct（従来機器向け）。始められなければ、少し待ってもう片方を試す。
+   - モバイルホットスポットの各手順（対応帯の問い合わせ・AP 設定・起動）と Wi-Fi Direct の起動・仮想アダプタ IP 待ち受けに期限を付け、**ホットスポットの失敗から Wi-Fi Direct の用意まで含めて PC の起動は全部で 15 秒以内**に収める。両方だめなら `wifi_unavailable`（`start_failed`）。設定で Wi-Fi の転送を切っていれば `disabled`。別の端末や直前の片付けで Wi-Fi が動いている最中なら `busy`。
+   - SSID・パスフレーズ・session・token は毎回乱数で作る。SSID に端末名や利用者名を入れない。
+   - 待ち受けは、作った Wi-Fi の PC 側の IP だけに限った TCP（1接続）。`wifi_ready` の `ttl` は **90 秒**。ttl の間に正しい相互確認が来なければ、待ち受けと Wi-Fi を閉じ、鍵を捨てる。
+   - 同時に動かす Wi-Fi の session は、PC 全体で1つだけ。
+5. **iOS が `wifi_ready` を受けたときの動き**：
+   - `NEHotspotConfiguration`（`joinOnce = true`）で参加し（参加の待ちは **75 秒**）、結果を `wifi_join_result` で返す。参加できたら `NWConnection`（`requiredInterfaceType = .wifi`）で `ip:port` へつなぎ、段階Bの部品で送る。順番は部品の決まり（iOS→PC の全件のあと PC→iOS の全件、最後に `done`）。
+   - `wifi_ready` 待ちを打ち切ったあとに遅れて届いた `wifi_ready` には `wifi_cancel`（`superseded`）を返して使わない。打ち切り後の新しい `wifi_request` は、前の要求への答え（`ready`・`unavailable`）が届くか、打ち切りから **2 秒** たってから出す。
+6. **待ち時間（期限）**：
+   - iOS の `wifi_ready` 待ち：**20 秒**（定期点検の間隔に頼らず期限どおりに打ち切る）。
+   - PC の起動（失敗時の切替を含む全体）：**15 秒以内**。
+   - iOS の参加の待ち：**75 秒**（PC の `ttl` 90 秒より先に iOS があきらめる）。
+   - `wifi_ready` の `ttl`：**90 秒**。
+   - TCP の相互確認の前：1 回の読みにつき **5 秒**。
+   - 相互確認のあとの無通信：**10 秒**。
+   - 打ち切りや失敗のときは `wifi_cancel`（理由を付ける）を BLE で送り、両側とも片付ける。
+7. **失敗と `busy` の扱い**：
+   - **`busy` は一時的なものとして扱う**。10 分の試し直し禁止にも「大きすぎる」の破棄にもせず、**5 秒後に試し直す（続けて 6 回まで）**。6 回試し直してもなお `busy` なら、10MiB 以下は BLE へ移し、10MiB 超えは捨てずに次に前面に来たときまで待つ。
+   - それ以外の失敗（`start_failed`・`disabled`・`unsupported`・参加拒否・タイムアウト・TCP 切断など）では、10MiB 以下の項目は BLE の今の送り方へ戻し、同じ項目で Wi-Fi を 10 分は試し直さない（輪にならないように）。10MiB を超え 50MiB 以下のものは Wi-Fi でだけ送れ、Wi-Fi がだめなら今までの「大きすぎる」の扱いのまま。
+8. **受け取りと片付けの整合**：受け取ったものは、BLE で受け取ったときと同じ道（途中保存、SHA-256 の確かめ、履歴への追加、`ack` と送り待ちの片付け）で扱う。BLE の待ち列は、Wi-Fi で済んだ項目を済みにする。`wifi_request` に入っていない `offer` は受けない。SHA-256 が合わなければ途中のファイルを消す。
+9. **終了時の復元**：終わったら iOS は `removeConfiguration(forSSID:)` で離れて元の Wi-Fi に戻る。PC は Wi-Fi と待ち受けを止め、モバイルホットスポットを使ったなら Windows の元の設定に戻す。
+10. **記録の秘匿**：記録には、状態・件数・バイト数・かかった時間・速さ・決まった理由のコードだけ。中身・鍵・パスフレーズ・SSID・IP・token・session・端末の ID・ファイル名は出さない。
+
+### 今の制限
+- **PC→iOS は 10MiB まで**：PC 側のクリップボード・ファイル取り込みの上限が 10MiB のため。
+- **PC→iOS は 1 件ずつ Wi-Fi を作る**：PC は 1 件ずつ BLE の `offer` を出すため、大きい項目が続くと件数の分だけ iOS で「接続」を押す必要がある。

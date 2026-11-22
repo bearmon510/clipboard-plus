@@ -282,17 +282,28 @@ internal static class WindowsWifiApController
         return new HotspotBackupRecord(previousConfig!.Ssid, previousConfig.Passphrase, previousBand, tempSsid);
     }
 
-    internal static async Task StopHotspotAndRestoreAsync(ActiveHotspotState state, Action<string> log, string logPrefix)
+    internal static async Task StopHotspotAndRestoreAsync(
+        ActiveHotspotState state,
+        Action<string> log,
+        string logPrefix,
+        TimeSpan? timeout = null)
     {
         var restored = !state.ConfigModified || !CanRestoreAccessPointConfiguration(state.PreviousConfig);
         try
         {
-            using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+            var budget = timeout ?? TimeSpan.FromSeconds(4);
+            using var stopTimeout = new CancellationTokenSource(budget);
             if (state.Manager.TetheringOperationalState == TetheringOperationalState.On)
-                await state.Manager.StopTetheringAsync().AsTask(stopTimeout.Token).ConfigureAwait(false);
+            {
+                var stopTask = state.Manager.StopTetheringAsync().AsTask(stopTimeout.Token);
+                try { await stopTask.WaitAsync(stopTimeout.Token).ConfigureAwait(false); }
+                catch { WifiStepTimeout.ObserveSilently(stopTask); throw; }
+            }
             if (state.ConfigModified && CanRestoreAccessPointConfiguration(state.PreviousConfig))
             {
-                await state.Manager.ConfigureAccessPointAsync(state.PreviousConfig!).AsTask(stopTimeout.Token).ConfigureAwait(false);
+                var configTask = state.Manager.ConfigureAccessPointAsync(state.PreviousConfig!).AsTask(stopTimeout.Token);
+                try { await configTask.WaitAsync(stopTimeout.Token).ConfigureAwait(false); }
+                catch { WifiStepTimeout.ObserveSilently(configTask); throw; }
                 restored = true;
             }
         }
@@ -408,11 +419,17 @@ internal static class WindowsWifiApController
         CancellationToken ct)
     {
         var waitClock = Stopwatch.StartNew();
+        var apipaThreshold = waitTimeout < TimeSpan.FromSeconds(4)
+            ? TimeSpan.FromMilliseconds(waitTimeout.TotalMilliseconds * 0.5)
+            : TimeSpan.FromSeconds(2);
+        var nonUpThreshold = waitTimeout < TimeSpan.FromSeconds(5)
+            ? TimeSpan.FromMilliseconds(waitTimeout.TotalMilliseconds * 0.75)
+            : TimeSpan.FromSeconds(3.5);
         while (waitClock.Elapsed < waitTimeout)
         {
             ct.ThrowIfCancellationRequested();
-            var allowApipa = waitClock.Elapsed >= TimeSpan.FromSeconds(2);
-            var allowNonUp = waitClock.Elapsed >= TimeSpan.FromSeconds(3.5);
+            var allowApipa = waitClock.Elapsed >= apipaThreshold;
+            var allowNonUp = waitClock.Elapsed >= nonUpThreshold;
             var adapters = NetworkAdapterSnapshot.CaptureSystem();
             var ip = WifiProbeIpSelector.SelectIp(adapters, allowApipa: allowApipa, allowNonUp: allowNonUp);
             if (ip is not null && (!requireProtocolValidLocalIpv4 || WifiControlMessageCodec.IsValidLocalIpv4(ip.ToString())))
