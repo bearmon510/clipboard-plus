@@ -16,6 +16,54 @@ public enum WifiProbeMode
     MobileHotspot,
 }
 
+public enum WifiProbeBand
+{
+    Auto,
+    TwoPointFourGHz,
+    FiveGHz,
+    SixGHz,
+}
+
+public sealed record WifiStationRadioInfo(
+    bool Connected,
+    WifiProbeBand? Band,
+    int? Channel)
+{
+    public static readonly WifiStationRadioInfo Disconnected = new(false, null, null);
+
+    public static WifiStationRadioInfo FromChannelAndFrequency(int? channel, int? centerFrequencyMhz)
+    {
+        var band = BandFromFrequencyMhz(centerFrequencyMhz) ?? BandFromChannel(channel);
+        var resolvedChannel = channel is > 0 ? channel : ChannelFromFrequencyMhz(centerFrequencyMhz);
+        return new WifiStationRadioInfo(true, band, resolvedChannel);
+    }
+
+    public static WifiProbeBand? BandFromFrequencyMhz(int? centerFrequencyMhz) => centerFrequencyMhz switch
+    {
+        >= 2400 and <= 2500 => WifiProbeBand.TwoPointFourGHz,
+        >= 5000 and < 5925 => WifiProbeBand.FiveGHz,
+        >= 5925 and <= 7125 => WifiProbeBand.SixGHz,
+        _ => null,
+    };
+
+    public static WifiProbeBand? BandFromChannel(int? channel) => channel switch
+    {
+        >= 1 and <= 14 => WifiProbeBand.TwoPointFourGHz,
+        >= 32 and <= 177 => WifiProbeBand.FiveGHz,
+        _ => null,
+    };
+
+    public static int? ChannelFromFrequencyMhz(int? centerFrequencyMhz) => centerFrequencyMhz switch
+    {
+        2484 => 14,
+        >= 2412 and <= 2472 when (centerFrequencyMhz.Value - 2407) % 5 == 0 => (centerFrequencyMhz.Value - 2407) / 5,
+        >= 5035 and <= 5895 when (centerFrequencyMhz.Value - 5000) % 5 == 0 => (centerFrequencyMhz.Value - 5000) / 5,
+        5935 => 2,
+        >= 5955 and <= 7115 when (centerFrequencyMhz.Value - 5950) % 5 == 0 => (centerFrequencyMhz.Value - 5950) / 5,
+        _ => null,
+    };
+}
+
 public sealed record WifiProbeCredentials(string Ssid, string Passphrase, string Token)
 {
     private const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
@@ -406,7 +454,8 @@ public sealed record WifiProbeSnapshot(
     TimeSpan? UploadDuration,
     DateTimeOffset? SentAt,
     TimeSpan? DownloadDuration,
-    int CompletedRuns);
+    int CompletedRuns,
+    WifiProbeBand? HotspotBand = null);
 
 public static class WifiProbeText
 {
@@ -440,6 +489,71 @@ public static class WifiProbeText
         _ => mode.ToString(),
     };
 
+    public static string BandName(WifiProbeBand band) => band switch
+    {
+        WifiProbeBand.Auto => "自動",
+        WifiProbeBand.TwoPointFourGHz => "2.4GHz",
+        WifiProbeBand.FiveGHz => "5GHz",
+        WifiProbeBand.SixGHz => "6GHz",
+        _ => band.ToString(),
+    };
+
+    public static string BandLogName(WifiProbeBand band) => band switch
+    {
+        WifiProbeBand.Auto => "auto",
+        WifiProbeBand.TwoPointFourGHz => "2.4GHz",
+        WifiProbeBand.FiveGHz => "5GHz",
+        WifiProbeBand.SixGHz => "6GHz",
+        _ => band.ToString(),
+    };
+
+    public static string FormatStationLog(WifiStationRadioInfo? station)
+    {
+        if (station is null || !station.Connected)
+            return "wifi probe station none";
+
+        var band = station.Band is { } b ? BandLogName(b) : "unknown";
+        var channel = station.Channel is { } ch and > 0
+            ? ch.ToString(CultureInfo.InvariantCulture)
+            : "unknown";
+        return $"wifi probe station band={band} channel={channel}";
+    }
+
+    public static string FormatHotspotBandsLog(IReadOnlyList<WifiProbeBand> supportedBands, WifiProbeBand requestedBand)
+    {
+        var supported = supportedBands.Count == 0
+            ? "none"
+            : string.Join(",", supportedBands.Select(BandLogName));
+        return $"wifi probe hotspot bands supported={supported} requested={BandLogName(requestedBand)}";
+    }
+
+    public static string FormatHotspotBandErrorLog(string exceptionTypeName) =>
+        $"wifi probe hotspot band error={exceptionTypeName}";
+
+    public static string FormatHotspotBandErrorMessage(WifiProbeBand requestedBand, string exceptionTypeName) =>
+        requestedBand == WifiProbeBand.Auto
+            ? $"ホットスポットの帯を設定できませんでした（{exceptionTypeName}）。"
+            : $"{BandName(requestedBand)} の帯を設定できませんでした（{exceptionTypeName}）。";
+
+    public static string FormatTetheringOperationStatus(int statusCode, string fallbackName) => statusCode switch
+    {
+        9 => "AlreadyOn",
+        10 => "RadioRestriction",
+        11 => "BandInterference",
+        _ => fallbackName,
+    };
+
+    public static string DescribeTetheringStartFailure(string statusName, WifiProbeBand? requestedBand)
+    {
+        if (string.Equals(statusName, "BandInterference", StringComparison.Ordinal))
+        {
+            return requestedBand is { } b && b != WifiProbeBand.Auto
+                ? $"{BandName(b)} の帯は今の接続と干渉して開始できませんでした（{statusName}）。"
+                : $"帯の干渉でモバイルホットスポットを開始できませんでした（{statusName}）。";
+        }
+        return $"モバイルホットスポットを開始できませんでした（{statusName}）。";
+    }
+
     public static string FormatTimeline(WifiProbeSnapshot state)
     {
         var uploadSpeed = state.PayloadBytes is { } upBytes && state.UploadDuration is { } upDur
@@ -450,9 +564,12 @@ public static class WifiProbeText
             : null;
 
         var sizeText = state.PayloadBytes is { } bytes ? SyncStatusText.Bytes(bytes) : "-";
+        var modeLine = state.Mode == WifiProbeMode.MobileHotspot && state.HotspotBand is { } band
+            ? $"方式: {ModeName(state.Mode)}（帯: {BandName(band)}）"
+            : $"方式: {ModeName(state.Mode)}";
         var lines = new List<string>
         {
-            $"方式: {ModeName(state.Mode)}",
+            modeLine,
             $"Wi-Fi作り始め: {FormatTimestamp(state.ApStartingAt)}",
             $"Wi-Fi作れた: {FormatTimestamp(state.ApReadyAt)}（所要 {FormatDuration(state.ApStartDuration)}）",
             $"つながった: {FormatTimestamp(state.ConnectedAt)}（試験サイズ {sizeText}）",

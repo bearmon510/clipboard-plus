@@ -21,22 +21,44 @@ public partial class MainWindow : Window
     private Action? applyHotkey;
     private CancellationTokenSource? recording;
     private readonly WifiTransferProbe? wifiProbe;
+    private readonly bool hotspotBandSupported;
+    private readonly bool hotspotSixGHzSupported;
     private string? renderedProbeQrText;
     public event Action? RepairRequested;
     public event Action? HistoryRequested;
 
     public MainWindow(SyncPairing pairing, Action<string> log, bool preview = false)
+        : this(
+            pairing,
+            log,
+            preview,
+            WifiTransferProbe.IsHotspotBandApiSupported(),
+            WifiTransferProbe.IsHotspotSixGigahertzSupported())
     {
-        this.log = log; this.preview = preview;
+    }
+
+    internal MainWindow(
+        SyncPairing pairing,
+        Action<string> log,
+        bool preview,
+        bool hotspotBandSupported,
+        bool hotspotSixGHzSupported)
+    {
+        this.log = log;
+        this.preview = preview;
+        this.hotspotBandSupported = hotspotBandSupported;
+        this.hotspotSixGHzSupported = hotspotBandSupported && hotspotSixGHzSupported;
         InitializeComponent();
         // Recording swallows keys across the PC, so it never outlives this window being in front.
         Deactivated += (_, _) => StopRecording();
         UpdatePairing(pairing);
+        UpdateWifiProbeBandVisibility();
         if (preview)
         {
             Title = "clipboard+ for Windows — プレビュー";
             RepairButton.IsEnabled = LogsButton.IsEnabled = StartupCheck.IsEnabled = false;
             WifiProbeModeDirect.IsEnabled = WifiProbeModeHotspot.IsEnabled = WifiProbeStartButton.IsEnabled = false;
+            SetWifiProbeBandControlsEnabled(false);
             UpdateBluetooth("プレビュー表示");
         }
         else
@@ -187,16 +209,47 @@ public partial class MainWindow : Window
 
     internal void StopWifiProbeSync() => wifiProbe?.StopSync();
 
+    private void OnWifiProbeModeChanged(object sender, RoutedEventArgs e) => UpdateWifiProbeBandVisibility();
+
+    private void UpdateWifiProbeBandVisibility()
+    {
+        if (WifiProbeBandPanel is null) return;
+        var showBand = hotspotBandSupported && WifiProbeModeHotspot.IsChecked == true;
+        WifiProbeBandPanel.Visibility = showBand ? Visibility.Visible : Visibility.Collapsed;
+        WifiProbeBand6.Visibility = hotspotSixGHzSupported ? Visibility.Visible : Visibility.Collapsed;
+        if (!hotspotSixGHzSupported && WifiProbeBand6.IsChecked == true)
+            WifiProbeBandAuto.IsChecked = true;
+    }
+
+    private void SetWifiProbeBandControlsEnabled(bool enabled)
+    {
+        WifiProbeBandAuto.IsEnabled = enabled;
+        WifiProbeBand24.IsEnabled = enabled;
+        WifiProbeBand5.IsEnabled = enabled;
+        WifiProbeBand6.IsEnabled = enabled && hotspotSixGHzSupported;
+    }
+
+    internal WifiProbeBand SelectedWifiProbeBand()
+    {
+        if (!hotspotBandSupported) return WifiProbeBand.Auto;
+        if (WifiProbeBand24.IsChecked == true) return WifiProbeBand.TwoPointFourGHz;
+        if (WifiProbeBand5.IsChecked == true) return WifiProbeBand.FiveGHz;
+        if (hotspotSixGHzSupported && WifiProbeBand6.IsChecked == true) return WifiProbeBand.SixGHz;
+        return WifiProbeBand.Auto;
+    }
+
     private async void OnStartWifiProbe(object sender, RoutedEventArgs e)
     {
         if (wifiProbe is null || preview) return;
         var mode = WifiProbeModeHotspot.IsChecked == true
             ? WifiProbeMode.MobileHotspot
             : WifiProbeMode.WifiDirectLegacy;
+        var band = mode == WifiProbeMode.MobileHotspot ? SelectedWifiProbeBand() : WifiProbeBand.Auto;
         WifiProbeStartButton.IsEnabled = false;
         WifiProbeModeDirect.IsEnabled = WifiProbeModeHotspot.IsEnabled = false;
+        SetWifiProbeBandControlsEnabled(false);
         WifiProbeStopButton.IsEnabled = true;
-        await wifiProbe.StartAsync(mode);
+        await wifiProbe.StartAsync(mode, band);
     }
 
     private async void OnStopWifiProbe(object sender, RoutedEventArgs e)
@@ -208,9 +261,12 @@ public partial class MainWindow : Window
 
     private void UpdateWifiProbe(WifiProbeSnapshot state)
     {
-        WifiProbeStartButton.IsEnabled = !preview && !state.IsRunning;
-        WifiProbeModeDirect.IsEnabled = !preview && !state.IsRunning;
-        WifiProbeModeHotspot.IsEnabled = !preview && !state.IsRunning;
+        var canConfigure = !preview && !state.IsRunning;
+        WifiProbeStartButton.IsEnabled = canConfigure;
+        WifiProbeModeDirect.IsEnabled = canConfigure;
+        WifiProbeModeHotspot.IsEnabled = canConfigure;
+        SetWifiProbeBandControlsEnabled(canConfigure);
+        UpdateWifiProbeBandVisibility();
         WifiProbeStopButton.IsEnabled = !preview && state.IsRunning;
         WifiProbeStatusText.Text = state.StatusMessage;
 

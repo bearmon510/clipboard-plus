@@ -70,9 +70,16 @@
           <StackPanel>
             <TextBlock Text="実機で一時Wi-FiとTCPの速度・許可ダイアログを確かめる試験用機能です（Bluetooth同期とはつながりません）。" FontSize="12" Foreground="#64748B" TextWrapping="Wrap"/>
             <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
-              <RadioButton x:Name="WifiProbeModeDirect" Content="Wi-Fi Direct（レガシー）" IsChecked="True" Margin="0,0,16,0"/>
-              <RadioButton x:Name="WifiProbeModeHotspot" Content="モバイルホットスポット"/>
+              <RadioButton x:Name="WifiProbeModeDirect" GroupName="WifiProbeMode" Content="Wi-Fi Direct（レガシー）" IsChecked="True" Margin="0,0,16,0" Checked="OnWifiProbeModeChanged"/>
+              <RadioButton x:Name="WifiProbeModeHotspot" GroupName="WifiProbeMode" Content="モバイルホットスポット" Checked="OnWifiProbeModeChanged"/>
             </StackPanel>
+            <WrapPanel x:Name="WifiProbeBandPanel" Margin="0,8,0,0" Visibility="Collapsed">
+              <TextBlock Text="帯：" Foreground="#64748B" VerticalAlignment="Center" Margin="0,0,8,0"/>
+              <RadioButton x:Name="WifiProbeBandAuto" GroupName="WifiProbeBand" Content="自動" IsChecked="True" Margin="0,0,12,0" VerticalAlignment="Center"/>
+              <RadioButton x:Name="WifiProbeBand24" GroupName="WifiProbeBand" Content="2.4GHz" Margin="0,0,12,0" VerticalAlignment="Center"/>
+              <RadioButton x:Name="WifiProbeBand5" GroupName="WifiProbeBand" Content="5GHz" Margin="0,0,12,0" VerticalAlignment="Center"/>
+              <RadioButton x:Name="WifiProbeBand6" GroupName="WifiProbeBand" Content="6GHz" VerticalAlignment="Center"/>
+            </WrapPanel>
             <WrapPanel Margin="0,12,0,0">
               <Button x:Name="WifiProbeStartButton" Content="試験を始める" Padding="12,5" Margin="0,0,8,0" Click="OnStartWifiProbe"/>
               <Button x:Name="WifiProbeStopButton" Content="試験を終える" Padding="12,5" IsEnabled="False" Click="OnStopWifiProbe"/>

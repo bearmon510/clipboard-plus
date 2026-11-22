@@ -3,7 +3,10 @@ using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Windows;
+using ClipboardPlus.Sync;
 using ClipboardPlus.Windows.Core;
+using ClipboardPlus.Windows.Infrastructure;
 using Xunit;
 
 namespace ClipboardPlus.Windows.Tests;
@@ -331,6 +334,196 @@ public sealed class WifiProbeTests
         Assert.NotNull(timeoutMetrics);
         Assert.True(timeoutMetrics!.AckTimedOut);
         Assert.True(timeoutOutcome.AckWaitElapsed >= TimeSpan.FromMilliseconds(25));
+    }
+
+    [Fact]
+    public void BandLabelsAndHotspotLogFormattingCoverAllBandsAndErrors()
+    {
+        Assert.Equal("自動", WifiProbeText.BandName(WifiProbeBand.Auto));
+        Assert.Equal("2.4GHz", WifiProbeText.BandName(WifiProbeBand.TwoPointFourGHz));
+        Assert.Equal("5GHz", WifiProbeText.BandName(WifiProbeBand.FiveGHz));
+        Assert.Equal("6GHz", WifiProbeText.BandName(WifiProbeBand.SixGHz));
+
+        Assert.Equal("auto", WifiProbeText.BandLogName(WifiProbeBand.Auto));
+        Assert.Equal("2.4GHz", WifiProbeText.BandLogName(WifiProbeBand.TwoPointFourGHz));
+        Assert.Equal("5GHz", WifiProbeText.BandLogName(WifiProbeBand.FiveGHz));
+        Assert.Equal("6GHz", WifiProbeText.BandLogName(WifiProbeBand.SixGHz));
+
+        Assert.Equal(
+            "wifi probe hotspot bands supported=2.4GHz,5GHz requested=5GHz",
+            WifiProbeText.FormatHotspotBandsLog(
+                [WifiProbeBand.TwoPointFourGHz, WifiProbeBand.FiveGHz],
+                WifiProbeBand.FiveGHz));
+        Assert.Equal(
+            "wifi probe hotspot bands supported=2.4GHz,5GHz,6GHz requested=6GHz",
+            WifiProbeText.FormatHotspotBandsLog(
+                [WifiProbeBand.TwoPointFourGHz, WifiProbeBand.FiveGHz, WifiProbeBand.SixGHz],
+                WifiProbeBand.SixGHz));
+        Assert.Equal(
+            "wifi probe hotspot bands supported=none requested=auto",
+            WifiProbeText.FormatHotspotBandsLog([], WifiProbeBand.Auto));
+
+        Assert.Equal(
+            "wifi probe hotspot band error=COMException",
+            WifiProbeText.FormatHotspotBandErrorLog("COMException"));
+        Assert.Equal(
+            "5GHz の帯を設定できませんでした（COMException）。",
+            WifiProbeText.FormatHotspotBandErrorMessage(WifiProbeBand.FiveGHz, "COMException"));
+        Assert.Equal(
+            "ホットスポットの帯を設定できませんでした（InvalidOperationException）。",
+            WifiProbeText.FormatHotspotBandErrorMessage(WifiProbeBand.Auto, "InvalidOperationException"));
+
+        Assert.Equal("AlreadyOn", WifiProbeText.FormatTetheringOperationStatus(9, "9"));
+        Assert.Equal("RadioRestriction", WifiProbeText.FormatTetheringOperationStatus(10, "10"));
+        Assert.Equal("BandInterference", WifiProbeText.FormatTetheringOperationStatus(11, "11"));
+        Assert.Equal("Unknown", WifiProbeText.FormatTetheringOperationStatus(1, "Unknown"));
+
+        Assert.Contains("5GHz", WifiProbeText.DescribeTetheringStartFailure("BandInterference", WifiProbeBand.FiveGHz));
+        Assert.Contains("BandInterference", WifiProbeText.DescribeTetheringStartFailure("BandInterference", WifiProbeBand.FiveGHz));
+        Assert.Contains("帯の干渉", WifiProbeText.DescribeTetheringStartFailure("BandInterference", WifiProbeBand.Auto));
+        Assert.Equal(
+            "モバイルホットスポットを開始できませんでした（WiFiDeviceOff）。",
+            WifiProbeText.DescribeTetheringStartFailure("WiFiDeviceOff", WifiProbeBand.FiveGHz));
+    }
+
+    [Fact]
+    public void StationRadioInfoDistinguishes24GHz5GHz6GHzAndDisconnected()
+    {
+        Assert.Equal("wifi probe station none", WifiProbeText.FormatStationLog(null));
+        Assert.Equal("wifi probe station none", WifiProbeText.FormatStationLog(WifiStationRadioInfo.Disconnected));
+
+        // 2.4 GHz (with and without center frequency)
+        Assert.Equal(
+            "wifi probe station band=2.4GHz channel=6",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(6, 2437)));
+        Assert.Equal(
+            "wifi probe station band=2.4GHz channel=6",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(6, null)));
+        Assert.Equal(
+            "wifi probe station band=2.4GHz channel=14",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(null, 2484)));
+
+        // 5 GHz (with and without center frequency)
+        Assert.Equal(
+            "wifi probe station band=5GHz channel=36",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(36, 5180)));
+        Assert.Equal(
+            "wifi probe station band=5GHz channel=149",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(149, null)));
+
+        // 6 GHz channels overlap numerically with 2.4 GHz (e.g. ch 5) and 5 GHz (e.g. ch 37); frequency wins.
+        Assert.Equal(
+            "wifi probe station band=6GHz channel=5",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(5, 5975)));
+        Assert.Equal(
+            "wifi probe station band=6GHz channel=37",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(37, 6135)));
+        Assert.Equal(
+            "wifi probe station band=6GHz channel=2",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(null, 5935)));
+
+        // Connected but both queries failed
+        Assert.Equal(
+            "wifi probe station band=unknown channel=unknown",
+            WifiProbeText.FormatStationLog(WifiStationRadioInfo.FromChannelAndFrequency(null, null)));
+
+        // Live query never throws and formats a single-line log
+        var liveLine = WifiProbeText.FormatStationLog(WifiTransferProbe.QueryStationRadioInfo());
+        Assert.StartsWith("wifi probe station ", liveLine, StringComparison.Ordinal);
+        Assert.DoesNotContain('\n', liveLine);
+        Assert.DoesNotContain('\r', liveLine);
+    }
+
+    [Fact]
+    public void TimelineIncludesBandOnlyForMobileHotspotWhenAvailable()
+    {
+        var baseSnapshot = new WifiProbeSnapshot(
+            IsRunning: true,
+            Mode: WifiProbeMode.MobileHotspot,
+            StatusMessage: "待機中",
+            ErrorMessage: null,
+            QrPayload: null,
+            ApStartingAt: null,
+            ApReadyAt: null,
+            ApStartDuration: null,
+            ConnectedAt: null,
+            PayloadBytes: null,
+            ReceivedAt: null,
+            UploadDuration: null,
+            SentAt: null,
+            DownloadDuration: null,
+            CompletedRuns: 0,
+            HotspotBand: WifiProbeBand.FiveGHz);
+
+        Assert.Contains("方式: モバイルホットスポット（帯: 5GHz）", WifiProbeText.FormatTimeline(baseSnapshot));
+        Assert.Contains(
+            "方式: モバイルホットスポット（帯: 自動）",
+            WifiProbeText.FormatTimeline(baseSnapshot with { HotspotBand = WifiProbeBand.Auto }));
+
+        var noBandApi = WifiProbeText.FormatTimeline(baseSnapshot with { HotspotBand = null });
+        Assert.Contains("方式: モバイルホットスポット", noBandApi);
+        Assert.DoesNotContain("帯:", noBandApi);
+
+        var direct = WifiProbeText.FormatTimeline(baseSnapshot with { Mode = WifiProbeMode.WifiDirectLegacy });
+        Assert.Contains("方式: Wi-Fi Direct（レガシー）", direct);
+        Assert.DoesNotContain("帯:", direct);
+    }
+
+    [Fact]
+    public void MainWindowShowsBandSelectorOnlyForMobileHotspotWhenApiIsPresent()
+    {
+        RunSta(() =>
+        {
+            var pairing = SyncPairing.Create("テスト");
+
+            var full = new MainWindow(pairing, _ => { }, preview: true, hotspotBandSupported: true, hotspotSixGHzSupported: true);
+            Assert.Equal(Visibility.Collapsed, full.WifiProbeBandPanel.Visibility);
+            Assert.Equal(WifiProbeBand.Auto, full.SelectedWifiProbeBand());
+
+            full.WifiProbeModeHotspot.IsChecked = true;
+            Assert.Equal(Visibility.Visible, full.WifiProbeBandPanel.Visibility);
+            Assert.Equal(Visibility.Visible, full.WifiProbeBand6.Visibility);
+            Assert.Equal(WifiProbeBand.Auto, full.SelectedWifiProbeBand());
+
+            full.WifiProbeBand24.IsChecked = true;
+            Assert.Equal(WifiProbeBand.TwoPointFourGHz, full.SelectedWifiProbeBand());
+            full.WifiProbeBand5.IsChecked = true;
+            Assert.Equal(WifiProbeBand.FiveGHz, full.SelectedWifiProbeBand());
+            full.WifiProbeBand6.IsChecked = true;
+            Assert.Equal(WifiProbeBand.SixGHz, full.SelectedWifiProbeBand());
+
+            full.WifiProbeModeDirect.IsChecked = true;
+            Assert.Equal(Visibility.Collapsed, full.WifiProbeBandPanel.Visibility);
+
+            // Band API present, but 6GHz enum value absent
+            var no6 = new MainWindow(pairing, _ => { }, preview: true, hotspotBandSupported: true, hotspotSixGHzSupported: false);
+            no6.WifiProbeModeHotspot.IsChecked = true;
+            Assert.Equal(Visibility.Visible, no6.WifiProbeBandPanel.Visibility);
+            Assert.Equal(Visibility.Collapsed, no6.WifiProbeBand6.Visibility);
+            no6.WifiProbeBand6.IsChecked = true;
+            Assert.Equal(WifiProbeBand.Auto, no6.SelectedWifiProbeBand());
+
+            // Band API absent on older Windows: selector stays hidden
+            var unsupported = new MainWindow(pairing, _ => { }, preview: true, hotspotBandSupported: false, hotspotSixGHzSupported: false);
+            unsupported.WifiProbeModeHotspot.IsChecked = true;
+            Assert.Equal(Visibility.Collapsed, unsupported.WifiProbeBandPanel.Visibility);
+            Assert.Equal(WifiProbeBand.Auto, unsupported.SelectedWifiProbeBand());
+        });
+    }
+
+    private static void RunSta(Action action)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { action(); }
+            catch (Exception ex) { failure = ex; }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 
     private sealed class RecordingWriteStream(Stream inner) : Stream
