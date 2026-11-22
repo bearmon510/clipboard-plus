@@ -641,6 +641,7 @@ actor DiskWifiTransferSink: WifiTransferSink {
     }
 
     func beginOffer(_ offer: SyncOffer) async throws -> WifiOfferDecision {
+        try Task.checkCancellation()
         try SyncProtocol.require(allowedIDs.contains(offer.id), .state)
         try offer.validate(maxSize: SyncProtocol.maxWifiItemBytes)
         closeHandle()
@@ -662,6 +663,7 @@ actor DiskWifiTransferSink: WifiTransferSink {
     }
 
     func appendChunk(id: UUID, offset: Int, data: Data) async throws -> Int {
+        try Task.checkCancellation()
         guard let offer = activeOffer, offer.id == id, let url = activeURL else {
             throw SyncProtocolError.state
         }
@@ -682,6 +684,7 @@ actor DiskWifiTransferSink: WifiTransferSink {
     }
 
     func verifyAndComplete(_ offer: SyncOffer) async throws {
+        try Task.checkCancellation()
         guard let current = activeOffer, current == offer, let url = activeURL else {
             throw SyncProtocolError.state
         }
@@ -699,6 +702,7 @@ actor DiskWifiTransferSink: WifiTransferSink {
             throw SyncProtocolError.authentication
         }
 
+        try Task.checkCancellation()
         try await commitHook(offer, url)
     }
 

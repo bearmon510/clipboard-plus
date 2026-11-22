@@ -1526,7 +1526,34 @@ final class PCSyncController: ObservableObject {
     private func handleEnteredBackground() {
         cancelWifiBusyRetry(resetCount: true)
         wifiDeferredUntilForeground.removeAll()
-        guard wifiSession == nil else { return }
+        if let active = wifiSession {
+            switch active.phase {
+            case .awaitingReady:
+                return
+            case .joining(let session), .transferring(let session):
+                let remainingOutgoing = active.outgoingIDs.filter { id in
+                    pending.contains { $0.id == id }
+                }
+                var waitingIncoming = active.incomingIDs.filter { id in
+                    pendingWifiIncomingOffers[id] != nil && !seen.contains(id)
+                }
+                for id in pendingWifiIncomingOrder where !waitingIncoming.contains(id) {
+                    waitingIncoming.append(id)
+                }
+                cancelActiveWifiTaskAndLeave()
+                if status == .connected {
+                    queueWifiControl(.cancel(session: session, reason: .userCancelled), pumpNow: false)
+                }
+                record("Wi-Fi転送中断; 理由=background")
+                fallbackWifiToBleKeepingOversized(
+                    outgoingIDs: remainingOutgoing,
+                    incomingIDs: waitingIncoming,
+                    applyCooldownToBle: false,
+                    deferOversizedUntilForeground: false
+                )
+                return
+            }
+        }
         let waitingIncoming = pendingWifiIncomingOrder
         fallbackWifiToBleKeepingOversized(
             outgoingIDs: [],
@@ -1786,7 +1813,16 @@ final class PCSyncController: ObservableObject {
         wifiBusyRetryCount = 0
         startWifiRequestHold()
         record("Wi-Fi転送失敗; 理由=ready_timeout; 送信件数=\(active.outgoingIDs.count); 受信件数=\(active.incomingIDs.count); 所要ms=\(milliseconds(since: requestedAt))")
-        fallbackWifiToBle(outgoingIDs: active.outgoingIDs, incomingIDs: active.incomingIDs, applyCooldown: true)
+        if !isForeground {
+            fallbackWifiToBleKeepingOversized(
+                outgoingIDs: active.outgoingIDs,
+                incomingIDs: active.incomingIDs,
+                applyCooldownToBle: false,
+                deferOversizedUntilForeground: false
+            )
+        } else {
+            fallbackWifiToBle(outgoingIDs: active.outgoingIDs, incomingIDs: active.incomingIDs, applyCooldown: true)
+        }
     }
 
     private func startWifiRequestHold() {
@@ -1974,7 +2010,16 @@ final class PCSyncController: ObservableObject {
         cancelActiveWifiTaskAndLeave()
         record("Wi-Fi転送中断; 相手理由=\(reason.rawValue)")
         if reason != .completed {
-            fallbackWifiToBle(outgoingIDs: remainingOutgoing, incomingIDs: remainingIncoming, applyCooldown: true)
+            if !isForeground {
+                fallbackWifiToBleKeepingOversized(
+                    outgoingIDs: remainingOutgoing,
+                    incomingIDs: remainingIncoming,
+                    applyCooldownToBle: false,
+                    deferOversizedUntilForeground: false
+                )
+            } else {
+                fallbackWifiToBle(outgoingIDs: remainingOutgoing, incomingIDs: remainingIncoming, applyCooldown: true)
+            }
         } else if status == .connected {
             pump()
         }
@@ -2401,7 +2446,16 @@ final class PCSyncController: ObservableObject {
                 : 0.0
             record("Wi-Fi転送完了; 送信件数=\(sentResults.count); 受信件数=\(receivedResults.count); 送信バイト数=\(sentBytes); 受信バイト数=\(receivedBytes); 所要ms=\(elapsedMs); MB秒=\(String(format: "%.2f", mbps))")
             if !remainingIncoming.isEmpty {
-                fallbackWifiToBle(outgoingIDs: [], incomingIDs: remainingIncoming, applyCooldown: true)
+                if !isForeground {
+                    fallbackWifiToBleKeepingOversized(
+                        outgoingIDs: [],
+                        incomingIDs: remainingIncoming,
+                        applyCooldownToBle: false,
+                        deferOversizedUntilForeground: false
+                    )
+                } else {
+                    fallbackWifiToBle(outgoingIDs: [], incomingIDs: remainingIncoming, applyCooldown: true)
+                }
             } else {
                 pump()
             }
@@ -2419,17 +2473,12 @@ final class PCSyncController: ObservableObject {
         wifiTransferTask = nil
         wifiTransferProgress = nil
         if joinStatus == .notForeground {
-            if isForeground {
-                wifiDeferredUntilForeground.formUnion(outgoingIDs)
-                wifiDeferredUntilForeground.formUnion(incomingIDs)
-            } else {
-                fallbackWifiToBleKeepingOversized(
-                    outgoingIDs: outgoingIDs,
-                    incomingIDs: incomingIDs,
-                    applyCooldownToBle: false,
-                    deferOversizedUntilForeground: false
-                )
-            }
+            fallbackWifiToBleKeepingOversized(
+                outgoingIDs: outgoingIDs,
+                incomingIDs: incomingIDs,
+                applyCooldownToBle: isForeground,
+                deferOversizedUntilForeground: isForeground
+            )
         } else {
             fallbackWifiToBle(outgoingIDs: outgoingIDs, incomingIDs: incomingIDs, applyCooldown: true)
         }
@@ -2456,7 +2505,16 @@ final class PCSyncController: ObservableObject {
             queueWifiControl(.cancel(session: payloadSession, reason: cancelReason), pumpNow: false)
         }
         record("Wi-Fi転送失敗; 理由=\(logReason); 送信件数=\(sentCount); 受信件数=\(receivedCount); 所要ms=\(milliseconds(since: startedAt))")
-        fallbackWifiToBle(outgoingIDs: remainingOutgoing, incomingIDs: remainingIncoming, applyCooldown: applyCooldown)
+        if !isForeground {
+            fallbackWifiToBleKeepingOversized(
+                outgoingIDs: remainingOutgoing,
+                incomingIDs: remainingIncoming,
+                applyCooldownToBle: false,
+                deferOversizedUntilForeground: false
+            )
+        } else {
+            fallbackWifiToBle(outgoingIDs: remainingOutgoing, incomingIDs: remainingIncoming, applyCooldown: applyCooldown)
+        }
     }
 
     private func cancelActiveWifiTaskAndLeave() {
