@@ -13,8 +13,30 @@ public sealed class SyncProtocolException(SyncError code) : Exception($"Sync pro
 
 public static class SyncProtocol
 {
-    public const byte Version = 3;
+    public const byte Version = 4;
+    public const byte MinSupportedVersion = 3;
+    public const byte WifiTransferMinVersion = 4;
+    public static bool IsSupportedVersion(byte version) => version is >= MinSupportedVersion and <= Version;
     public const int MaxItemBytes = 10 * 1024 * 1024;
+    public const int MaxWifiItemBytes = 50 * 1024 * 1024;
+    public const int DefaultWifiThresholdBytes = 500 * 1024;
+    public const int MaxWifiFrameBytes = 256 * 1024;
+    public const int WifiFrameHeaderBytes = 14;
+    public const int WifiFrameTagBytes = 16;
+    public const int MaxWifiPlaintextBytes = MaxWifiFrameBytes - WifiFrameHeaderBytes - WifiFrameTagBytes;
+    public const int MaxWifiChunkBytes = 252 * 1024;
+    public const int WifiDefaultTtlSeconds = 30;
+    public const int WifiMaxTtlSeconds = 300;
+    public const int WifiMinPassphraseBytes = 24;
+    public const int WifiMaxPassphraseBytes = 63;
+    public const int WifiMaxSsidBytes = 32;
+    public const byte WifiTcpVersion = 1;
+    public const int WifiTcpHelloBytes = 54;
+    public const int WifiTcpWelcomeBytes = 86;
+    public const int WifiTcpAuthBytes = 38;
+    public const byte WifiFrameType = 0x20;
+    public const byte WifiDirectionPadToPc = 0x01;
+    public const byte WifiDirectionPcToPad = 0x02;
     public const int ChunkBytes = 32 * 1024;
     public const int MaxPending = 100;
     public const int MaxHistory = 300;

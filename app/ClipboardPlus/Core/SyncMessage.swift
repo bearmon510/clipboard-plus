@@ -11,7 +11,7 @@ public enum SyncMessage: Equatable {
     case resume(id: UUID, offset: Int)
 }
 
-public struct SyncOffer: Codable, Equatable {
+public struct SyncOffer: Codable, Equatable, Sendable {
     public let id: UUID
     public let at: Int64
     public let from: String
@@ -20,10 +20,23 @@ public struct SyncOffer: Codable, Equatable {
     public let sha256: String
     public let name64: String
     public let type: String
+
+    public init(id: UUID, at: Int64, from: String, kind: String, size: Int, sha256: String, name64: String, type: String) {
+        self.id = id
+        self.at = at
+        self.from = from
+        self.kind = kind
+        self.size = size
+        self.sha256 = sha256
+        self.name64 = name64
+        self.type = type
+    }
+
     public var filename: String { String(data: Data(base64Encoded: name64) ?? Data(), encoding: .utf8) ?? "" }
-    func validate() throws {
+    func validate(maxSize: Int = SyncProtocol.maxItemBytes) throws {
         try SyncProtocol.require(at >= -SyncProtocol.maxTimestamp && at <= SyncProtocol.maxTimestamp && ["pc", "pad"].contains(from))
-        try SyncProtocol.require(["image", "file"].contains(kind) && (0...SyncProtocol.maxItemBytes).contains(size))
+        try SyncProtocol.require(["image", "file"].contains(kind) && size >= 0)
+        try SyncProtocol.require(size <= maxSize, maxSize > SyncProtocol.maxItemBytes ? .limit : .format)
         try SyncProtocol.require(SyncProtocol.isLowerHex64(sha256))
         try SyncProtocol.require((1...255).contains(type.utf8.count) && type.utf8.allSatisfy { (32..<127).contains($0) })
         try SyncProtocol.require(kind != "image" || ["public.png", "public.jpeg"].contains(type))

@@ -589,7 +589,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 if (frame is null) return true;
                 if (c.Stage == 0)
                 {
-                    if (frame.Length == 50 && frame[0] == 1 && frame[1] != SyncProtocol.Version) {
+                    if (frame.Length == 50 && frame[0] == 1 && !SyncProtocol.IsSupportedVersion(frame[1])) {
                         var candidateId = new Guid(frame.AsSpan(2, 16), bigEndian: true);
                         if (store.Devices.Any(d => d.Id == candidateId))
                         {

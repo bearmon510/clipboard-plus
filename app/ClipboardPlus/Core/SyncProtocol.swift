@@ -1,6 +1,6 @@
 import Foundation
 
-public enum SyncProtocolError: Error, Equatable {
+public enum SyncProtocolError: Error, Equatable, Sendable {
     case format, limit, packet, state, authentication, identity, sequence, version
 }
 
@@ -15,8 +15,32 @@ struct SyncContentRejectedError: Error, Equatable {
 }
 
 public enum SyncProtocol {
-    public static let version: UInt8 = 3
+    public static let version: UInt8 = 4
+    public static let minSupportedVersion: UInt8 = 3
+    public static let wifiTransferMinVersion: UInt8 = 4
+    public static func isSupportedVersion(_ version: UInt8) -> Bool {
+        version >= minSupportedVersion && version <= Self.version
+    }
     public static let maxItemBytes = 10 * 1024 * 1024
+    public static let maxWifiItemBytes = 50 * 1024 * 1024
+    public static let defaultWifiThresholdBytes = 500 * 1024
+    public static let maxWifiFrameBytes = 256 * 1024
+    public static let wifiFrameHeaderBytes = 14
+    public static let wifiFrameTagBytes = 16
+    public static let maxWifiPlaintextBytes = maxWifiFrameBytes - wifiFrameHeaderBytes - wifiFrameTagBytes
+    public static let maxWifiChunkBytes = 252 * 1024
+    public static let wifiDefaultTtlSeconds = 30
+    public static let wifiMaxTtlSeconds = 300
+    public static let wifiMinPassphraseBytes = 24
+    public static let wifiMaxPassphraseBytes = 63
+    public static let wifiMaxSsidBytes = 32
+    public static let wifiTcpVersion: UInt8 = 1
+    public static let wifiTcpHelloBytes = 54
+    public static let wifiTcpWelcomeBytes = 86
+    public static let wifiTcpAuthBytes = 38
+    public static let wifiFrameType: UInt8 = 0x20
+    public static let wifiDirectionPadToPc: UInt8 = 0x01
+    public static let wifiDirectionPcToPad: UInt8 = 0x02
     public static let chunkBytes = 32 * 1024
     public static let maxPending = 100
     public static let maxImagePixels: Int64 = 40_000_000

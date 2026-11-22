@@ -201,10 +201,11 @@ public static class SyncMessageCodec
         SyncProtocol.Require(value.ValueKind == JsonValueKind.Number && value.GetRawText().All(c => c is >= '0' and <= '9' or '-') && value.TryGetInt64(out _));
         return value.GetInt64();
     }
-    public static void ValidateOffer(SyncOffer o)
+    public static void ValidateOffer(SyncOffer o, int maxSize = SyncProtocol.MaxItemBytes)
     {
         SyncProtocol.Require(o.At >= -SyncProtocol.MaxTimestamp && o.At <= SyncProtocol.MaxTimestamp && o.From is "pc" or "pad");
-        SyncProtocol.Require(o.Kind is "image" or "file" && o.Size is >= 0 and <= SyncProtocol.MaxItemBytes);
+        SyncProtocol.Require(o.Kind is "image" or "file" && o.Size >= 0);
+        SyncProtocol.Require(o.Size <= maxSize, maxSize > SyncProtocol.MaxItemBytes ? SyncError.Limit : SyncError.Format);
         SyncProtocol.Require(SyncProtocol.IsLowerHex64(o.Sha256));
         SyncProtocol.Require(o.Type is { Length: > 0 and <= 255 } && o.Type.All(c => c is >= (char)32 and < (char)127));
         SyncProtocol.Require(o.Kind != "image" || o.Type is "public.png" or "public.jpeg");

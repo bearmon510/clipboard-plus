@@ -297,3 +297,24 @@ PCは家の 2.4GHz（6チャンネル）のネットワークにつながった�
 - どちらも始められないときや、途中で切れたとき：もう片方を試し、だめなら BLE で送る。
 - 「大きい送りの間だけPCのWi-Fiを切る」設定は作らない（5GHz で十分速いため）。
 - 試験のあと Windows のモバイルホットスポットの設定は元に戻す（ビルド37の時点のPC版で実装済み）。
+
+---
+
+## 10. 段階Bで決めたこと（2026年11月22日）
+
+OS 非依存の共通プロトコルと TCP ストリーム部品（Swift の `app/ClipboardPlus/Core/`、C# の `windows/ClipboardPlus.Sync/`、`protocol/make-test-vectors.mjs`）で確定した仕様の要点。詳細は [共通部品と試験データ](../protocol/README.md) を参照。
+
+- **古い相手（版3）との扱い**：通信の版を **第4版（`version = 4`、`minSupportedVersion = 3`、`wifiTransferMinVersion = 4`）** に上げ、版3と版4の両方を受理する形を採用した。
+  - **理由**：既存の版3実装は認証前のフレーム長を HELLO 50バイト・WELCOME 82バイトに厳密固定しており、認証後も未知のメッセージ `t` や `device` の追加キーを `format` エラーで切断する。そのため版3のまま HELLO を伸ばしたり認証後に機能通知を送る方法は旧版3相手とのBLE接続を壊す。版を4に上げて50/82/33バイトの枠長を維持すれば、①旧版3端末→新版4 PC は PC 側が `0x03` を受理して切断なしで BLE 継続でき、②新版4端末→旧版3 PC は旧版3 PC が返す `0x02 | 0x03 | PC ID(16) | ゼロ(64)` を `SyncPadHandshake.suggestedFallbackVersion = 3` として検知し、更新停止せず版3で1回だけつなぎ直して BLE のみで同期できる（版2以下は従来どおり更新案内停止）。
+- **BLE 上の Wi-Fi 交渉メッセージ**（版4の BLE 暗号フレーム上で送る、本体なしの正規 ASCII JSON）：
+  - `wifi_request`（`direction`: `send` / `receive` / `both`、`ids`: 重複なしUUID `0〜100` 件）
+  - `wifi_ready`（`session`、`ssid` 1〜32B印字ASCII、`passphrase` 24〜63B空白なし印字ASCII、`ip` は RFC 1918／RFC 3927 のローカル IPv4 正規表記に限定、`port` 1〜65535、`token` 32B小文字16進64文字、`ttl` 1〜300秒）
+  - `wifi_unavailable`（固定理由コード：`unsupported` / `busy` / `conflict` / `start_failed` / `disabled`）
+  - `wifi_join_result`（`session`、`status`: `joined` / `user_denied` / `not_foreground` / `join_failed` / `timeout`）
+  - `wifi_cancel`（`session`、`reason`: `user_cancelled` / `timeout` / `tcp_failed` / `protocol_error` / `completed` / `superseded`）
+- **鍵の作り方（BLE 鍵と分離）**：BLE 版4ハンドシェイクで BLE トラフィック鍵とは別に `wifiBaseKey`（HKDF info `clipboardplus v4 wifi-base`）を派生する。転送ごとに `IKM = wifiBaseKey || token`・`salt = session(16B)` から `transferKey`（`clipboardplus wifi v1 key`）と `authKey`（`clipboardplus wifi v1 auth`）を派生し、TCP 相互認証で交換した 32B 乱数 `padNonce || pcNonce` を salt として方向別の TCP 暗号鍵（`clipboardplus wifi v1 pad->pc` / `pc->pad`）を派生する。BLE の送受信鍵は TCP で一切使わない。
+- **TCP 相互認証と暗号フレームの形**：
+  - 相互認証は固定長3往復（マジック `"CPW2"`・版 `0x01`）：`TCP_HELLO`（54B）→ `TCP_WELCOME`（86B、PC側 HMAC-SHA256）→ `TCP_AUTH`（38B、端末側 HMAC-SHA256）。完了済み `session` は `WifiSessionReplayGuard` で再利用を拒否する。
+  - 暗号フレームは上限 **256 KiB（262,144B）** で `0x20 | dir(1B) | payloadLen(4B BE) | seq(8B BE) | ciphertext | tag(16B)`。AAD は先頭14バイト、nonce は `dir(1B) | 0,0,0 | seq(8B BE)`。受信側は `seq` を `0, 1, 2, ...` と厳密連続検証し、入れ替え・欠け・重複・方向違い・256KiB超過・途中切り詰め・改ざんを検知して失効する。
+- **転送の流れと上限**：1件最大 **50 MiB（52,428,800B）**、1チャンク最大 **252 KiB（258,048B）**。`offer` → `resume`（既完了・全保存済みなら `ack`）→ `chunk` 連続送信 → 全バイトの SHA-256 検証（不一致は途中ファイルを破棄し `.authentication` で切断）→ `ack` → 送信終了の認証済み `done`。1接続で iOS→PC の全件のあとに PC→iOS の全件を続けて送受し、`done` より前の EOF を切り詰めとして検知する。
+- **秘匿**：`WifiReady` / `WifiTransferKeys` / `WifiTrafficKeys` の文字列表現では SSID・パスフレーズ・IP・セッション・トークン・鍵を伏せる。

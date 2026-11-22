@@ -63,17 +63,49 @@ function parsePair(s) {
   return { pcId: uuid(decode(p[2], 16)), keyHex: hex(decode(p[3], 32)), name };
 }
 
-const protocolVersion = 3;
-const mac = label => createHmac('sha256', key).update(cat(Buffer.from([protocolVersion]), Buffer.from(label), uuidBytes(pcId), uuidBytes(padId), ni, np)).digest();
-const pcHmac = mac('pc'), padHmac = mac('pad');
-const hello = cat(bytes('0103'), uuidBytes(padId), ni);
-const welcome = cat(bytes('0203'), uuidBytes(pcId), np, pcHmac);
-const versionMismatchWelcome = cat(bytes('0203'), uuidBytes(pcId), Buffer.alloc(64));
+const protocolVersion = 4;
+const minSupportedVersion = 3;
+const wifiTransferMinVersion = 4;
+const maxWifiItemBytes = 50 * 1024 * 1024;
+const defaultWifiThresholdBytes = 500 * 1024;
+const maxWifiFrameBytes = 256 * 1024;
+const wifiFrameHeaderBytes = 14;
+const wifiFrameTagBytes = 16;
+const maxWifiPlaintextBytes = maxWifiFrameBytes - wifiFrameHeaderBytes - wifiFrameTagBytes;
+const maxWifiChunkBytes = 252 * 1024;
+const wifiDefaultTtlSeconds = 30;
+const wifiMaxTtlSeconds = 300;
+const wifiMinPassphraseBytes = 24;
+const wifiMaxPassphraseBytes = 63;
+const wifiMaxSsidBytes = 32;
+const wifiTcpVersion = 1;
+
+const macForVersion = (ver, label) => createHmac('sha256', key)
+  .update(cat(Buffer.from([ver]), Buffer.from(label), uuidBytes(pcId), uuidBytes(padId), ni, np)).digest();
+const deriveBleKeys = ver => {
+  const result = Object.fromEntries(['pad->pc','pc->pad'].map(d => [d, Buffer.from(hkdfSync('sha256', key, cat(ni,np), `clipboardplus v${ver} ${d}`, 32))]));
+  if (ver >= wifiTransferMinVersion) {
+    result.wifiBase = Buffer.from(hkdfSync('sha256', key, cat(ni,np), `clipboardplus v${ver} wifi-base`, 32));
+  }
+  return result;
+};
+
+const pcHmac = macForVersion(protocolVersion, 'pc'), padHmac = macForVersion(protocolVersion, 'pad');
+const hello = cat(Buffer.from([1, protocolVersion]), uuidBytes(padId), ni);
+const welcome = cat(Buffer.from([2, protocolVersion]), uuidBytes(pcId), np, pcHmac);
+const versionMismatchWelcome = cat(Buffer.from([2, protocolVersion]), uuidBytes(pcId), Buffer.alloc(64));
 const versionMismatchSamePc = cat(bytes('0202'), uuidBytes(pcId), Buffer.alloc(64));
 const versionMismatchOtherPc = cat(bytes('0202'), uuidBytes(otherPcId), Buffer.alloc(64));
 const versionMismatchLegacyZeroId = cat(bytes('0201'), Buffer.alloc(16), Buffer.alloc(64));
 const auth = cat(bytes('03'), padHmac);
-const keys = Object.fromEntries(['pad->pc','pc->pad'].map(d => [d, Buffer.from(hkdfSync('sha256', key, cat(ni,np), `clipboardplus v3 ${d}`, 32))]));
+const keys = deriveBleKeys(protocolVersion);
+
+const legacyV3PcHmac = macForVersion(3, 'pc'), legacyV3PadHmac = macForVersion(3, 'pad');
+const legacyV3Hello = cat(bytes('0103'), uuidBytes(padId), ni);
+const legacyV3Welcome = cat(bytes('0203'), uuidBytes(pcId), np, legacyV3PcHmac);
+const legacyV3PcMismatchForV4Hello = cat(bytes('0203'), uuidBytes(pcId), Buffer.alloc(64));
+const legacyV3Auth = cat(bytes('03'), legacyV3PadHmac);
+const legacyV3Keys = deriveBleKeys(3);
 
 function sortKeys(value) {
   if (Array.isArray(value)) return value.map(sortKeys);
@@ -1516,8 +1548,175 @@ const templatePrepareCases = [
   }),
 ];
 
+// --- Wi-Fi Direct Transfer Control Messages & TCP Stream Vectors ---
+const wifiSession = '99999999-AAAA-4BBB-8CCC-DDDDDDDDDDDD';
+const wifiToken = Buffer.from(Array.from({ length: 32 }, (_, i) => 0xA0 + i));
+const wifiPadNonce = Buffer.alloc(32, 0x33);
+const wifiPcNonce = Buffer.alloc(32, 0x44);
+
+const wifiControlMessages = {
+  wifiRequestSend: plaintext({ t: 'wifi_request', direction: 'send', ids: [id] }),
+  wifiRequestBoth: plaintext({ t: 'wifi_request', direction: 'both', ids: [] }),
+  wifiReady: plaintext({
+    t: 'wifi_ready',
+    session: wifiSession,
+    ssid: 'DIRECT-cp-Ab34Cd56',
+    passphrase: 'TestPassphrase1234567890',
+    ip: '192.168.137.1',
+    port: 49152,
+    token: hex(wifiToken),
+    ttl: 30,
+  }),
+  wifiUnavailable: plaintext({ t: 'wifi_unavailable', reason: 'conflict' }),
+  wifiJoinResultJoined: plaintext({ t: 'wifi_join_result', session: wifiSession, status: 'joined' }),
+  wifiJoinResultDenied: plaintext({ t: 'wifi_join_result', session: wifiSession, status: 'user_denied' }),
+  wifiCancel: plaintext({ t: 'wifi_cancel', session: wifiSession, reason: 'user_cancelled' }),
+};
+
+// Independent sequence starting at 0 per direction for wifiControlFrames.
+const wifiControlFrames = [
+  frameFromPlaintext('pad->pc', 0, 'wifiRequestSend', wifiControlMessages),
+  frameFromPlaintext('pc->pad', 0, 'wifiReady', wifiControlMessages),
+  frameFromPlaintext('pad->pc', 1, 'wifiJoinResultJoined', wifiControlMessages),
+  frameFromPlaintext('pc->pad', 1, 'wifiUnavailable', wifiControlMessages),
+  frameFromPlaintext('pad->pc', 2, 'wifiCancel', wifiControlMessages),
+];
+
+const validWifiReadyObj = {
+  t: 'wifi_ready',
+  session: wifiSession,
+  ssid: 'DIRECT-cp-Ab34Cd56',
+  passphrase: 'TestPassphrase1234567890',
+  ip: '192.168.137.1',
+  port: 49152,
+  token: hex(wifiToken),
+  ttl: 30,
+};
+
+const wifiControlFailures = {
+  emptySsid: { ...plaintext({ ...validWifiReadyObj, ssid: '' }), error: 'format' },
+  tooLongSsid: { ...plaintext({ ...validWifiReadyObj, ssid: 'A'.repeat(33) }), error: 'format' },
+  controlCharSsid: { ...plaintext({ ...validWifiReadyObj, ssid: 'DIRECT-cp-\u0007' }), error: 'format' },
+  shortPassphrase: { ...plaintext({ ...validWifiReadyObj, passphrase: 'A'.repeat(23) }), error: 'format' },
+  spaceInPassphrase: { ...plaintext({ ...validWifiReadyObj, passphrase: 'TestPass phrase1234567890' }), error: 'format' },
+  publicIp: { ...plaintext({ ...validWifiReadyObj, ip: '8.8.8.8' }), error: 'format' },
+  loopbackIp: { ...plaintext({ ...validWifiReadyObj, ip: '127.0.0.1' }), error: 'format' },
+  leadingZeroIp: { ...plaintext({ ...validWifiReadyObj, ip: '192.168.01.1' }), error: 'format' },
+  reservedLinkLocalIp: { ...plaintext({ ...validWifiReadyObj, ip: '169.254.0.1' }), error: 'format' },
+  zeroPort: { ...plaintext({ ...validWifiReadyObj, port: 0 }), error: 'format' },
+  oversizedPort: { ...plaintext({ ...validWifiReadyObj, port: 65536 }), error: 'format' },
+  uppercaseToken: { ...plaintext({ ...validWifiReadyObj, token: hex(wifiToken).toUpperCase() }), error: 'format' },
+  zeroTtl: { ...plaintext({ ...validWifiReadyObj, ttl: 0 }), error: 'format' },
+  oversizedTtl: { ...plaintext({ ...validWifiReadyObj, ttl: 301 }), error: 'format' },
+  invalidDirection: { ...plaintext({ t: 'wifi_request', direction: 'upload', ids: [] }), error: 'format' },
+  duplicateRequestIds: { ...plaintext({ t: 'wifi_request', direction: 'send', ids: [id, id] }), error: 'format' },
+  invalidUnavailableReason: { ...plaintext({ t: 'wifi_unavailable', reason: 'other' }), error: 'format' },
+  invalidJoinStatus: { ...plaintext({ t: 'wifi_join_result', session: wifiSession, status: 'ok' }), error: 'format' },
+  invalidCancelReason: { ...plaintext({ t: 'wifi_cancel', session: wifiSession, reason: 'unknown' }), error: 'format' },
+  nonEmptyBody: { ...plaintext({ t: 'wifi_unavailable', reason: 'busy' }, 'x'), error: 'format' },
+};
+
+const wifiTransferKey = Buffer.from(hkdfSync('sha256', cat(keys.wifiBase, wifiToken), uuidBytes(wifiSession), 'clipboardplus wifi v1 key', 32));
+const wifiAuthKey = Buffer.from(hkdfSync('sha256', wifiTransferKey, uuidBytes(wifiSession), 'clipboardplus wifi v1 auth', 32));
+const wifiTcpMagic = Buffer.from('CPW2', 'ascii');
+const wifiTcpMac = label => createHmac('sha256', wifiAuthKey)
+  .update(cat(wifiTcpMagic, Buffer.from([wifiTcpVersion]), Buffer.from(label, 'ascii'), uuidBytes(wifiSession), wifiPadNonce, wifiPcNonce))
+  .digest();
+const wifiTcpPcHmac = wifiTcpMac('pc');
+const wifiTcpPadHmac = wifiTcpMac('pad');
+const wifiTcpHello = cat(wifiTcpMagic, Buffer.from([wifiTcpVersion, 1]), uuidBytes(wifiSession), wifiPadNonce);
+const wifiTcpWelcome = cat(wifiTcpMagic, Buffer.from([wifiTcpVersion, 2]), uuidBytes(wifiSession), wifiPcNonce, wifiTcpPcHmac);
+const wifiTcpAuth = cat(wifiTcpMagic, Buffer.from([wifiTcpVersion, 3]), wifiTcpPadHmac);
+const wifiTrafficKeys = Object.fromEntries(['pad->pc', 'pc->pad'].map(d => [
+  d,
+  Buffer.from(hkdfSync('sha256', wifiTransferKey, cat(wifiPadNonce, wifiPcNonce), `clipboardplus wifi v1 ${d}`, 32)),
+]));
+
+const wifiStreamMessages = {
+  offer: plaintext({
+    t: 'offer', id: id2, at: 1794873600123, from: 'pad', kind: 'file', size: 4,
+    sha256: createHash('sha256').update(bytes('0001feff')).digest('hex'),
+    name64: Buffer.from('試験.txt').toString('base64'), type: 'public.data',
+  }),
+  largeOffer: plaintext({
+    t: 'offer', id, at: 1794873600123, from: 'pc', kind: 'file', size: 20 * 1024 * 1024,
+    sha256: sha256Hex(Buffer.from('large-20m-placeholder')),
+    name64: Buffer.from('動画.mov').toString('base64'), type: 'public.movie',
+  }),
+  resume: plaintext({ t: 'resume', id: id2, offset: 2 }),
+  largeResume: plaintext({ t: 'resume', id, offset: 12 * 1024 * 1024 }),
+  chunk: plaintext({ t: 'chunk', id: id2, offset: 0 }, bytes('0001feff')),
+  continuedChunk: plaintext({ t: 'chunk', id: id2, offset: 2 }, bytes('feff')),
+  ack: plaintext({ t: 'ack', id: id2 }),
+  done: plaintext({ t: 'done' }),
+};
+
+function wifiStreamFrame(direction, sequence, messageName) {
+  const dirByte = direction === 'pad->pc' ? 1 : 2;
+  const pt = bytes(wifiStreamMessages[messageName].plaintextHex);
+  const lenBuf = Buffer.alloc(4); lenBuf.writeUInt32BE(pt.length);
+  const seqBuf = Buffer.alloc(8); seqBuf.writeBigUInt64BE(BigInt(sequence));
+  const aad = cat(Buffer.from([0x20, dirByte]), lenBuf, seqBuf);
+  const nonce = cat(Buffer.from([dirByte, 0, 0, 0]), seqBuf);
+  const cipher = createCipheriv('aes-256-gcm', wifiTrafficKeys[direction], nonce);
+  cipher.setAAD(aad);
+  const encrypted = cat(cipher.update(pt), cipher.final());
+  const tag = cipher.getAuthTag();
+  const frameBuf = cat(aad, encrypted, tag);
+  const decipher = createDecipheriv('aes-256-gcm', wifiTrafficKeys[direction], nonce);
+  decipher.setAAD(aad); decipher.setAuthTag(tag);
+  if (hex(cat(decipher.update(encrypted), decipher.final())) !== wifiStreamMessages[messageName].plaintextHex) {
+    throw Error('wifi stream roundtrip');
+  }
+  return {
+    direction,
+    sequence: String(sequence),
+    message: messageName,
+    nonceHex: hex(nonce),
+    aadHex: hex(aad),
+    ciphertextHex: hex(encrypted),
+    tagHex: hex(tag),
+    frameHex: hex(frameBuf),
+  };
+}
+
+const wifiStreamFrames = [
+  wifiStreamFrame('pad->pc', 0, 'offer'),
+  wifiStreamFrame('pad->pc', 1, 'continuedChunk'),
+  wifiStreamFrame('pad->pc', 2, 'done'),
+  wifiStreamFrame('pc->pad', 0, 'resume'),
+  wifiStreamFrame('pc->pad', 1, 'ack'),
+  wifiStreamFrame('pc->pad', 2, 'done'),
+];
+
+const flipAt = (b, idx) => { const c = Buffer.from(b); c[idx] ^= 1; return c; };
+const wifiFrame0Bytes = bytes(wifiStreamFrames[0].frameHex);
+const wifiStreamFailures = {
+  tamperedTag: { direction: 'pad->pc', frameHex: hex(flipLast(wifiFrame0Bytes)), error: 'authentication' },
+  tamperedCiphertext: { direction: 'pad->pc', frameHex: hex(flipAt(wifiFrame0Bytes, 14)), error: 'authentication' },
+  wrongDirection: { direction: 'pad->pc', frameHex: hex(flipAt(wifiFrame0Bytes, 1)), error: 'authentication' },
+  reordered: { direction: 'pad->pc', framesHex: [wifiStreamFrames[0].frameHex, wifiStreamFrames[2].frameHex], error: 'sequence' },
+  duplicate: { direction: 'pad->pc', framesHex: [wifiStreamFrames[0].frameHex, wifiStreamFrames[0].frameHex], error: 'sequence' },
+  truncatedFrame: { direction: 'pad->pc', frameHex: hex(wifiFrame0Bytes.subarray(0, wifiFrame0Bytes.length - 5)), error: 'packet' },
+  wrongTcpWelcomeHmac: { frameHex: hex(flipLast(wifiTcpWelcome)), error: 'authentication' },
+  wrongTcpAuthHmac: { frameHex: hex(flipLast(wifiTcpAuth)), error: 'authentication' },
+  wrongTcpSession: { frameHex: hex(flipAt(wifiTcpHello, 6)), error: 'identity' },
+  wrongTcpVersion: { frameHex: hex((() => { const c = Buffer.from(wifiTcpHello); c[4] = 2; return c; })()), error: 'version' },
+  oversizedWifiFrame: { byteLength: maxWifiFrameBytes + 1, maxFrameBytes: maxWifiFrameBytes, maxPlaintextBytes: maxWifiPlaintextBytes, error: 'limit' },
+  oversizedWifiOffer: {
+    ...plaintext({
+      t: 'offer', id, at: 1794873600123, from: 'pad', kind: 'file', size: maxWifiItemBytes + 1,
+      sha256: sha256Hex(Buffer.from('too-big')), name64: Buffer.from('big.bin').toString('base64'), type: 'public.data',
+    }),
+    error: 'limit',
+  },
+  oversizedWifiChunk: { chunkBytes: maxWifiChunkBytes + 1, error: 'limit' },
+};
+
 const vectors = {
   version: protocolVersion,
+  minSupportedVersion,
+  wifiTransferMinVersion,
   warning: 'PUBLIC deterministic test secrets. Never use for real pairing or connections.',
   limits: {
     maxFrameBytes, maxHeaderBytes: 65535, maxNameUtf8Bytes: 255, maxAckIds: 1024,
@@ -1528,6 +1727,10 @@ const vectors = {
     maxTemplateTagChars, maxTemplateTagUtf8Bytes: maxTemplateTagBytes,
     maxTemplatePageBodyBytes, maxTemplatePages, maxTemplateTotalBytes,
     maxTemplateOrder, emptyContinuationPageBytes,
+    maxWifiItemBytes, defaultWifiThresholdBytes, maxWifiFrameBytes,
+    wifiFrameHeaderBytes, wifiFrameTagBytes, maxWifiPlaintextBytes, maxWifiChunkBytes,
+    wifiDefaultTtlSeconds, wifiMaxTtlSeconds, wifiMinPassphraseBytes, wifiMaxPassphraseBytes,
+    wifiMaxSsidBytes, wifiTcpVersion,
   },
   pairing: { qr, parsed: parsePair(qr) },
   handshake: {
@@ -1535,6 +1738,18 @@ const vectors = {
     helloHex: hex(hello), welcomeHex: hex(welcome), versionMismatchWelcomeHex: hex(versionMismatchWelcome),
     authHex: hex(auth), pcHmacHex: hex(pcHmac), padHmacHex: hex(padHmac),
     padToPcKeyHex: hex(keys['pad->pc']), pcToPadKeyHex: hex(keys['pc->pad']),
+    wifiBaseKeyHex: hex(keys.wifiBase),
+  },
+  legacyV3Handshake: {
+    version: 3,
+    helloHex: hex(legacyV3Hello),
+    welcomeHex: hex(legacyV3Welcome),
+    v3PcMismatchForV4HelloHex: hex(legacyV3PcMismatchForV4Hello),
+    authHex: hex(legacyV3Auth),
+    pcHmacHex: hex(legacyV3PcHmac),
+    padHmacHex: hex(legacyV3PadHmac),
+    padToPcKeyHex: hex(legacyV3Keys['pad->pc']),
+    pcToPadKeyHex: hex(legacyV3Keys['pc->pad']),
   },
   messages,
   frames,
@@ -1561,7 +1776,29 @@ const vectors = {
   templateMultiMergeCases,
   templatePageSplitCases,
   templatePrepareCases,
+  wifiControlMessages,
+  wifiControlFrames,
+  wifiControlFailures,
+  wifiTransfer: {
+    session: wifiSession,
+    bleWifiBaseKeyHex: hex(keys.wifiBase),
+    tokenHex: hex(wifiToken),
+    transferKeyHex: hex(wifiTransferKey),
+    authKeyHex: hex(wifiAuthKey),
+    padNonceHex: hex(wifiPadNonce),
+    pcNonceHex: hex(wifiPcNonce),
+    tcpHelloHex: hex(wifiTcpHello),
+    tcpWelcomeHex: hex(wifiTcpWelcome),
+    tcpAuthHex: hex(wifiTcpAuth),
+    pcHmacHex: hex(wifiTcpPcHmac),
+    padHmacHex: hex(wifiTcpPadHmac),
+    padToPcKeyHex: hex(wifiTrafficKeys['pad->pc']),
+    pcToPadKeyHex: hex(wifiTrafficKeys['pc->pad']),
+    streamMessages: wifiStreamMessages,
+    streamFrames: wifiStreamFrames,
+    failures: wifiStreamFailures,
+  },
 };
 
 writeFileSync(new URL('./test-vectors.json', import.meta.url), JSON.stringify(vectors, null, 2) + '\n');
-console.log(`Generated v${protocolVersion}: ${frames.length} frames, ${Object.keys(messages).length} messages, ${templateFrames.length} templateFrames, ${Object.keys(templateMessages).length} templateMessages, ${templateMergeCases.length} templateMergeCases, ${templateMultiMergeCases.length} templateMultiMergeCases, ${templatePageSplitCases.length} templatePageSplitCases, ${templatePrepareCases.length} templatePrepareCases; self-checks passed.`);
+console.log(`Generated v${protocolVersion}: ${frames.length} frames, ${Object.keys(messages).length} messages, ${templateFrames.length} templateFrames, ${Object.keys(templateMessages).length} templateMessages, ${templateMergeCases.length} templateMergeCases, ${templateMultiMergeCases.length} templateMultiMergeCases, ${templatePageSplitCases.length} templatePageSplitCases, ${templatePrepareCases.length} templatePrepareCases, ${wifiControlFrames.length} wifiControlFrames, ${wifiStreamFrames.length} wifiStreamFrames; self-checks passed.`);

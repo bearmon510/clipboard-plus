@@ -6,27 +6,40 @@ namespace ClipboardPlus.Sync;
 public sealed class SyncSessionKeys
 {
     private readonly byte[] padToPc, pcToPad;
+    private readonly byte[]? wifiBaseKey;
+    public byte ProtocolVersion { get; }
     public byte[] PadToPc => padToPc.ToArray();
     public byte[] PcToPad => pcToPad.ToArray();
-    internal SyncSessionKeys(byte[] key, byte[] ni, byte[] np)
+    public byte[]? WifiBaseKey => wifiBaseKey?.ToArray();
+    public bool SupportsWifiTransfer => ProtocolVersion >= SyncProtocol.WifiTransferMinVersion && wifiBaseKey is not null;
+
+    internal SyncSessionKeys(byte[] key, byte[] ni, byte[] np, byte version)
     {
+        ProtocolVersion = version;
         byte[] salt = [.. ni, .. np];
-        padToPc = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{SyncProtocol.Version} pad->pc"));
-        pcToPad = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{SyncProtocol.Version} pc->pad"));
+        padToPc = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{version} pad->pc"));
+        pcToPad = HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{version} pc->pad"));
+        wifiBaseKey = version >= SyncProtocol.WifiTransferMinVersion
+            ? HKDF.DeriveKey(HashAlgorithmName.SHA256, key, 32, salt, Encoding.ASCII.GetBytes($"clipboardplus v{version} wifi-base"))
+            : null;
     }
+
+    public override string ToString() => $"SyncSessionKeys {{ ProtocolVersion = {ProtocolVersion}, SupportsWifiTransfer = {SupportsWifiTransfer} }}";
 }
 
 internal static class SyncHandshakeWire
 {
-    internal static byte[] Mac(byte[] key, string label, byte[] ni, byte[] np, Guid pcId, Guid padId)
+    internal static byte[] Mac(byte[] key, byte version, string label, byte[] ni, byte[] np, Guid pcId, Guid padId)
     {
-        byte[] data = [SyncProtocol.Version, .. Encoding.ASCII.GetBytes(label), .. SyncProtocol.IdBytes(pcId), .. SyncProtocol.IdBytes(padId), .. ni, .. np];
+        byte[] data = [version, .. Encoding.ASCII.GetBytes(label), .. SyncProtocol.IdBytes(pcId), .. SyncProtocol.IdBytes(padId), .. ni, .. np];
         return HMACSHA256.HashData(key, data);
     }
-    internal static void Check(ReadOnlySpan<byte> frame, int count, byte type)
+
+    internal static bool IsAllZero(ReadOnlySpan<byte> bytes)
     {
-        SyncProtocol.Require(frame.Length == count && frame[0] == type);
-        if (type != 3) SyncProtocol.Require(frame[1] == SyncProtocol.Version, SyncError.Version);
+        byte acc = 0;
+        foreach (var b in bytes) acc |= b;
+        return acc == 0;
     }
 }
 
@@ -39,29 +52,49 @@ public sealed class SyncPadHandshake
     private readonly byte[] key, ni;
     private readonly Guid padId, expectedPcId;
     private int state;
-    public SyncPadHandshake(SyncPairing pairing, Guid padId, byte[]? testNonce = null)
+    public byte RequestedVersion { get; }
+    /// <summary>
+    /// Set when the paired PC replies to a newer HELLO with a supported legacy version mismatch frame
+    /// (for example v3 PC replying to v4 HELLO). Callers can reconnect once using this version over BLE.
+    /// </summary>
+    public byte? SuggestedFallbackVersion { get; private set; }
+
+    public SyncPadHandshake(SyncPairing pairing, Guid padId, byte[]? testNonce = null, byte protocolVersion = SyncProtocol.Version)
     {
+        SyncProtocol.Require(SyncProtocol.IsSupportedVersion(protocolVersion), SyncError.Version);
+        RequestedVersion = protocolVersion;
         key = pairing.Key; expectedPcId = pairing.PcId; this.padId = padId;
         ni = testNonce is null ? RandomNumberGenerator.GetBytes(32) : SyncProtocol.Fixed(testNonce, 32);
     }
+
     public byte[] CreateHello()
     {
         var previous = state; state = -1;
         SyncProtocol.Require(previous == 0, SyncError.State);
         state = 1;
-        return [1, SyncProtocol.Version, .. SyncProtocol.IdBytes(padId), .. ni];
+        return [1, RequestedVersion, .. SyncProtocol.IdBytes(padId), .. ni];
     }
+
     public SyncPadAuthentication AcceptWelcome(ReadOnlySpan<byte> frame)
     {
         var previous = state; state = -1;
+        SuggestedFallbackVersion = null;
         SyncProtocol.Require(previous == 1, SyncError.State);
         SyncProtocol.Require(frame.Length == 82 && frame[0] == 2);
         var peerPcId = new Guid(frame.Slice(2, 16), bigEndian: true);
         SyncProtocol.Require(peerPcId != Guid.Empty && peerPcId == expectedPcId, SyncError.Identity);
-        SyncProtocol.Require(frame[1] == SyncProtocol.Version, SyncError.Version);
+        var peerVersion = frame[1];
+        if (peerVersion != RequestedVersion)
+        {
+            if (SyncProtocol.IsSupportedVersion(peerVersion) && peerVersion < RequestedVersion && SyncHandshakeWire.IsAllZero(frame[18..]))
+                SuggestedFallbackVersion = peerVersion;
+            throw new SyncProtocolException(SyncError.Version);
+        }
         var np = frame.Slice(18, 32).ToArray();
-        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[50..], SyncHandshakeWire.Mac(key, "pc", ni, np, expectedPcId, padId)), SyncError.Authentication);
-        var result = new SyncPadAuthentication([3, .. SyncHandshakeWire.Mac(key, "pad", ni, np, expectedPcId, padId)], new SyncSessionKeys(key, ni, np));
+        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[50..], SyncHandshakeWire.Mac(key, RequestedVersion, "pc", ni, np, expectedPcId, padId)), SyncError.Authentication);
+        var result = new SyncPadAuthentication(
+            [3, .. SyncHandshakeWire.Mac(key, RequestedVersion, "pad", ni, np, expectedPcId, padId)],
+            new SyncSessionKeys(key, ni, np, RequestedVersion));
         state = 2;
         return result;
     }
@@ -74,14 +107,18 @@ public sealed class SyncPcHandshake
     private readonly Guid? expectedPadId;
     private byte[]? ni;
     private Guid? candidatePadId;
+    private byte? candidateVersion;
     private int state;
-    // Only publish the peer identity after AUTH succeeds.
+    // Only publish the peer identity and negotiated version after AUTH succeeds.
     public Guid? AuthenticatedPadId { get; private set; }
+    public byte? NegotiatedVersion { get; private set; }
+
     public SyncPcHandshake(SyncPairing pairing, Guid? expectedPadId = null, byte[]? testNonce = null)
     {
         key = pairing.Key; pcId = pairing.PcId; this.expectedPadId = expectedPadId;
         np = testNonce is null ? RandomNumberGenerator.GetBytes(32) : SyncProtocol.Fixed(testNonce, 32);
     }
+
     public byte[] CreateVersionMismatch()
     {
         var frame = new byte[82];
@@ -90,25 +127,36 @@ public sealed class SyncPcHandshake
         SyncProtocol.IdBytes(pcId).CopyTo(frame, 2);
         return frame;
     }
+
     public byte[] AcceptHello(ReadOnlySpan<byte> frame)
     {
-        var previous = state; state = -1; AuthenticatedPadId = null;
+        var previous = state; state = -1; AuthenticatedPadId = null; NegotiatedVersion = null;
         SyncProtocol.Require(previous == 0, SyncError.State);
-        SyncHandshakeWire.Check(frame, 50, 1);
+        SyncProtocol.Require(frame.Length == 50 && frame[0] == 1);
+        var peerVersion = frame[1];
+        SyncProtocol.Require(SyncProtocol.IsSupportedVersion(peerVersion), SyncError.Version);
         candidatePadId = new Guid(frame.Slice(2, 16), bigEndian: true);
         SyncProtocol.Require(expectedPadId is null || candidatePadId == expectedPadId, SyncError.Identity);
+        candidateVersion = peerVersion;
         ni = frame.Slice(18, 32).ToArray();
-        var result = new byte[] { 2, SyncProtocol.Version }.Concat(SyncProtocol.IdBytes(pcId)).Concat(np).Concat(SyncHandshakeWire.Mac(key, "pc", ni, np, pcId, candidatePadId!.Value)).ToArray();
-        state = 1; return result;
+        var result = new byte[] { 2, peerVersion }
+            .Concat(SyncProtocol.IdBytes(pcId))
+            .Concat(np)
+            .Concat(SyncHandshakeWire.Mac(key, peerVersion, "pc", ni, np, pcId, candidatePadId.Value))
+            .ToArray();
+        state = 1;
+        return result;
     }
+
     public SyncSessionKeys AcceptAuth(ReadOnlySpan<byte> frame)
     {
-        var previous = state; state = -1; AuthenticatedPadId = null;
+        var previous = state; state = -1; AuthenticatedPadId = null; NegotiatedVersion = null;
         SyncProtocol.Require(previous == 1, SyncError.State);
-        SyncHandshakeWire.Check(frame, 33, 3);
-        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[1..], SyncHandshakeWire.Mac(key, "pad", ni!, np, pcId, candidatePadId!.Value)), SyncError.Authentication);
-        var result = new SyncSessionKeys(key, ni!, np!);
-        state = 2; AuthenticatedPadId = candidatePadId;
+        SyncProtocol.Require(frame.Length == 33 && frame[0] == 3);
+        var version = candidateVersion!.Value;
+        SyncProtocol.Require(CryptographicOperations.FixedTimeEquals(frame[1..], SyncHandshakeWire.Mac(key, version, "pad", ni!, np, pcId, candidatePadId!.Value)), SyncError.Authentication);
+        var result = new SyncSessionKeys(key, ni!, np!, version);
+        state = 2; AuthenticatedPadId = candidatePadId; NegotiatedVersion = version;
         return result;
     }
 }
