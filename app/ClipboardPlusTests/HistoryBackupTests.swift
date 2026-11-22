@@ -27,14 +27,17 @@ final class HistoryBackupTests: XCTestCase {
             .map { ($0.lastPathComponent, try Data(contentsOf: $0)) })
     }
 
-    private func write(_ entries: [HistoryEntry], files: HistoryImageFiles, root: URL) throws -> URL {
+    private func write(_ entries: [HistoryEntry], files: HistoryImageFiles, root: URL,
+                       temporaryFiles: BackupTemporaryFiles) throws -> URL {
         let url = root.appendingPathComponent(UUID().uuidString + ".clipboardplus")
-        _ = try HistoryBackup.write(entries: entries, files: files, to: url, cancellation: BackupCancellation())
+        _ = try HistoryBackup.write(entries: entries, files: files, to: url,
+                                    cancellation: BackupCancellation(), temporaryFiles: temporaryFiles)
         return url
     }
 
     func testRoundTripPreservesTextURLImagesPinsTimesCountsAndSourcesAndIsIdempotent() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.roundtrip")
         let originals = HistoryImageFiles(directory: root.appendingPathComponent("originals"))
         let source = try HistoryDatabase(url: root.appendingPathComponent("source.sqlite"))
         let first = try source.collect("文章\n\0原文", source: .automatic, at: Date(timeIntervalSince1970: 10.125))
@@ -46,10 +49,11 @@ final class HistoryBackupTests: XCTestCase {
         try source.collectImage(image, source: .automatic, at: Date(timeIntervalSince1970: 40.75))
         try source.moveToTemplates(id: imageEntry.id)
         let entries = try source.fetchAll()
-        let url = try write(entries, files: originals, root: root)
+        let url = try write(entries, files: originals, root: root, temporaryFiles: backupFiles)
         let files = HistoryImageFiles(directory: root.appendingPathComponent("restored"))
         let database = try HistoryDatabase(url: root.appendingPathComponent("target.sqlite"))
-        let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+        let backup = try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         XCTAssertTrue(try database.fetchAll().isEmpty)
         XCTAssertTrue(try directoryContents(files.directory).isEmpty)
         XCTAssertEqual(try database.estimateBackup(backup.entries), RestoreCounts(added: 3))
@@ -60,16 +64,18 @@ final class HistoryBackupTests: XCTestCase {
         let restoredImage = try XCTUnwrap(restored.first?.image)
         XCTAssertEqual(try files.read(restoredImage), try originals.read(image))
         XCTAssertTrue(FileManager.default.fileExists(atPath: files.url(for: restoredImage.thumbnailFilename).path))
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
 
         let beforeFiles = try directoryContents(files.directory)
-        let second = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+        let second = try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         XCTAssertEqual(try database.estimateBackup(second.entries), RestoreCounts(unchanged: 3))
         XCTAssertEqual(try HistoryRestore.apply(second, database: database, files: files, cancellation: BackupCancellation()),
                        RestoreCounts(unchanged: 3))
         XCTAssertEqual(try database.fetchAll(), restored)
         XCTAssertEqual(try directoryContents(files.directory), beforeFiles)
+        waitForBackupCleanup(backupFiles)
     }
 
     func testMergeRulesEarlierSavedLaterCollectedMaximumCountAndSourceTie() throws {
@@ -130,13 +136,14 @@ final class HistoryBackupTests: XCTestCase {
 
     func testRejectsCountsAboveLimitIncludingNearIntMaxForTextAndImages() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.counts")
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"))
         try database.collect("original", source: .manual)
         try database.collectImage(ImageTestSupport.prepare(files), source: .manual, at: nil)
         let before = try database.fetchAll()
         let beforeFiles = try directoryContents(files.directory)
-        let valid = try Data(contentsOf: write(before, files: files, root: root))
+        let valid = try Data(contentsOf: write(before, files: files, root: root, temporaryFiles: backupFiles))
         for index in before.indices {
             for count in [HistoryCollectionCount.maximum, HistoryCollectionCount.maximum + 1, Int.max - 1, Int.max] {
                 let data = try replaceManifest(in: valid) { object in
@@ -147,15 +154,17 @@ final class HistoryBackupTests: XCTestCase {
                 let url = root.appendingPathComponent("count.clipboardplus")
                 try data.write(to: url)
                 if count == HistoryCollectionCount.maximum {
-                    let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+                    let backup = try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                            cancellation: BackupCancellation(), temporaryFiles: backupFiles)
                     XCTAssertEqual(backup.entries[index].collectionCount, count)
                     backup.discard()
                 } else {
-                    XCTAssertThrowsError(try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())) { error in
+                    XCTAssertThrowsError(try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                                    cancellation: BackupCancellation(), temporaryFiles: backupFiles)) { error in
                         guard case BackupError.manifest = error else { return XCTFail("Expected invalid manifest, got \(error)") }
                     }
                 }
-                waitForBackupCleanup()
+                waitForBackupCleanup(backupFiles)
                 XCTAssertEqual(try database.fetchAll(), before)
                 XCTAssertEqual(try directoryContents(files.directory), beforeFiles)
             }
@@ -164,13 +173,14 @@ final class HistoryBackupTests: XCTestCase {
 
     func testRejectsEntireCorruptArchiveWithoutChangingDatabaseOrImages() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.corrupt")
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"))
         try database.collect("keep", source: .manual)
         try database.collectImage(ImageTestSupport.prepare(files), source: .drag, at: nil)
         let before = try database.fetchAll()
         let beforeFiles = try directoryContents(files.directory)
-        let validURL = try write(before, files: files, root: root)
+        let validURL = try write(before, files: files, root: root, temporaryFiles: backupFiles)
         let valid = try Data(contentsOf: validURL)
         let manifestLength = valid[16..<24].reduce(0) { ($0 << 8) | Int($1) }
         var badHash = valid
@@ -213,16 +223,18 @@ final class HistoryBackupTests: XCTestCase {
         for (index, data) in variants.enumerated() {
             let url = root.appendingPathComponent("bad-\(index).clipboardplus")
             try data.write(to: url)
-            XCTAssertThrowsError(try HistoryBackup.validate(at: url, temporaryRoot: staging, cancellation: BackupCancellation()), "variant \(index)")
+            XCTAssertThrowsError(try HistoryBackup.validate(at: url, temporaryRoot: staging,
+                                                            cancellation: BackupCancellation(), temporaryFiles: backupFiles), "variant \(index)")
             XCTAssertEqual(try database.fetchAll(), before)
             XCTAssertEqual(try directoryContents(files.directory), beforeFiles)
-            waitForBackupCleanup()
+            waitForBackupCleanup(backupFiles)
             XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
         }
     }
 
     func testFilePlacementFailureRollsBackSQLRemovalJournalAndAllPlacedFiles() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.placement")
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
         let database = try HistoryDatabase(url: root.appendingPathComponent("history.sqlite"), historyLimit: 1)
         let preserved = try database.collectImage(ImageTestSupport.prepare(files, color: .blue), source: .manual,
@@ -234,8 +246,9 @@ final class HistoryBackupTests: XCTestCase {
         let incoming = HistoryEntry(id: 1, kind: .image, text: "", savedAt: Date(timeIntervalSince1970: 20),
                                     lastCollectedAt: Date(timeIntervalSince1970: 20), collectionCount: 4,
                                     isTemplate: false, source: .manual, image: image)
-        let url = try write([text("new"), incoming], files: originalFiles, root: root)
-        let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+        let url = try write([text("new"), incoming], files: originalFiles, root: root, temporaryFiles: backupFiles)
+        let backup = try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         let before = try database.fetchAll()
         let beforeFiles = try directoryContents(files.directory)
         var moves = 0
@@ -248,12 +261,13 @@ final class HistoryBackupTests: XCTestCase {
         XCTAssertEqual(try database.fetchAll(), before)
         XCTAssertTrue(database.takeRemovals().isEmpty)
         XCTAssertEqual(try directoryContents(files.directory), beforeFiles)
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 
     func testSQLFailureRollsBackEarlierWritesAndRemovesStaging() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.sql-failure")
         let url = root.appendingPathComponent("history.sqlite")
         let database = try HistoryDatabase(url: url)
         try database.collect("keep", source: .manual)
@@ -261,13 +275,13 @@ final class HistoryBackupTests: XCTestCase {
         try ImageTestSupport.sql("CREATE TRIGGER fail_restore BEFORE INSERT ON history WHEN NEW.text = 'fail' BEGIN SELECT RAISE(ABORT, 'test'); END;", at: url)
         let staging = root.appendingPathComponent("staging")
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        let backup = ValidatedBackup(directory: staging, entries: [text("first"), text("fail")])
+        let backup = ValidatedBackup(directory: staging, entries: [text("first"), text("fail")], temporaryFiles: backupFiles)
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
         XCTAssertThrowsError(try HistoryRestore.apply(backup, database: database, files: files, cancellation: BackupCancellation()))
         XCTAssertEqual(try database.fetchAll(), before)
         XCTAssertTrue(database.takeRemovals().isEmpty)
         XCTAssertTrue(try directoryContents(files.directory).isEmpty)
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
     }
 
@@ -299,6 +313,7 @@ final class HistoryBackupTests: XCTestCase {
 
     func testCreateAndValidationCancellationRemovePartialFiles() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.cancel")
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
         let image = try ImageTestSupport.prepare(files)
         let entry = HistoryEntry(id: 1, kind: .image, text: "", savedAt: Date(), lastCollectedAt: Date(),
@@ -306,23 +321,26 @@ final class HistoryBackupTests: XCTestCase {
         let entries = [entry, text("later")]
         let url = root.appendingPathComponent("cancel.clipboardplus")
         let createToken = BackupCancellation()
-        XCTAssertThrowsError(try HistoryBackup.write(entries: entries, files: files, to: url, cancellation: createToken) { value in
+        XCTAssertThrowsError(try HistoryBackup.write(entries: entries, files: files, to: url,
+                                                     cancellation: createToken, temporaryFiles: backupFiles) { value in
             if value.completed == 1 { createToken.cancel() }
         })
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
-        let valid = try write(entries, files: files, root: root)
+        let valid = try write(entries, files: files, root: root, temporaryFiles: backupFiles)
         let staging = root.appendingPathComponent("staging")
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         let validateToken = BackupCancellation()
-        XCTAssertThrowsError(try HistoryBackup.validate(at: valid, temporaryRoot: staging, cancellation: validateToken) { value in
+        XCTAssertThrowsError(try HistoryBackup.validate(at: valid, temporaryRoot: staging,
+                                                        cancellation: validateToken, temporaryFiles: backupFiles) { value in
             if value.completed == 1 { validateToken.cancel() }
         })
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
-        let prepared = try HistoryBackup.validate(at: valid, temporaryRoot: staging, cancellation: BackupCancellation())
+        let prepared = try HistoryBackup.validate(at: valid, temporaryRoot: staging,
+                                                  cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         prepared.discard() // The confirmation's Cancel button uses this same operation.
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 
@@ -340,12 +358,14 @@ final class HistoryBackupTests: XCTestCase {
 
     func testCancellationDuringApplyRollsBackAndDeletesPlacedImages() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.apply-cancel")
         let sourceFiles = HistoryImageFiles(directory: root.appendingPathComponent("source"))
         let image = try ImageTestSupport.prepare(sourceFiles)
         let entry = HistoryEntry(id: 1, kind: .image, text: "", savedAt: Date(), lastCollectedAt: Date(),
                                  collectionCount: 1, isTemplate: false, source: .drag, image: image)
-        let url = try write([entry, text("next")], files: sourceFiles, root: root)
-        let backup = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+        let url = try write([entry, text("next")], files: sourceFiles, root: root, temporaryFiles: backupFiles)
+        let backup = try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         let database = try HistoryDatabase(url: root.appendingPathComponent("target.sqlite"))
         let files = HistoryImageFiles(directory: root.appendingPathComponent("target"))
         let token = BackupCancellation()
@@ -354,7 +374,7 @@ final class HistoryBackupTests: XCTestCase {
         }))
         XCTAssertTrue(try database.fetchAll().isEmpty)
         XCTAssertTrue(try directoryContents(files.directory).isEmpty)
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 
@@ -376,6 +396,7 @@ final class HistoryBackupTests: XCTestCase {
 
     func testBackupWriteAndValidateAcceptDivergedTextAndUrlKinds() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.diverged-kind")
         let dbURL = root.appendingPathComponent("diverged.sqlite")
         let database = try HistoryDatabase(url: dbURL)
         let base = try database.createTemplate(text: "https://example.com\n", title: "改行URL", tag: nil)
@@ -386,8 +407,9 @@ final class HistoryBackupTests: XCTestCase {
         XCTAssertEqual(HistoryKind.classify(try XCTUnwrap(entries.first?.text)), .text)
 
         let files = HistoryImageFiles(directory: root.appendingPathComponent("images"))
-        let url = try write(entries, files: files, root: root)
-        let validated = try HistoryBackup.validate(at: url, temporaryRoot: root, cancellation: BackupCancellation())
+        let url = try write(entries, files: files, root: root, temporaryFiles: backupFiles)
+        let validated = try HistoryBackup.validate(at: url, temporaryRoot: root,
+                                                   cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         XCTAssertEqual(validated.entries.count, 1)
         XCTAssertEqual(validated.entries.first?.kind, .url)
         XCTAssertEqual(validated.entries.first?.text, "https://example.com\n")
@@ -397,6 +419,6 @@ final class HistoryBackupTests: XCTestCase {
         let counts = try HistoryRestore.apply(validated, database: restoredDB, files: restoredFiles, cancellation: BackupCancellation())
         XCTAssertEqual(counts, RestoreCounts(added: 1))
         XCTAssertEqual(try restoredDB.fetchAll().first?.text, "https://example.com\n")
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
     }
 }

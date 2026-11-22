@@ -3,10 +3,19 @@ import XCTest
 @testable import ClipboardPlus
 
 extension XCTestCase {
-    func waitForBackupCleanup(_ files: BackupTemporaryFiles = .shared) {
-        let done = expectation(description: "backup cleanup completed")
-        files.afterPendingCleanup { done.fulfill() }
-        wait(for: [done], timeout: 60)
+    func makeBackupTemporaryFiles(root: URL, label: String = "test.backup.cleanup") -> BackupTemporaryFiles {
+        BackupTemporaryFiles(
+            root: root.appendingPathComponent("ClipboardPlusBackup", isDirectory: true),
+            cleanupQueue: DispatchQueue(label: label, qos: .userInitiated)
+        )
+    }
+
+    func waitForBackupCleanup(_ files: BackupTemporaryFiles,
+                              file: StaticString = #filePath, line: UInt = #line) {
+        let done = DispatchSemaphore(value: 0)
+        files.afterPendingCleanup { _ = done.signal() }
+        XCTAssertEqual(done.wait(timeout: .now() + 60), .success,
+                       "backup cleanup completed", file: file, line: line)
     }
 }
 
@@ -14,7 +23,7 @@ final class BackupTemporaryFilesTests: XCTestCase {
     @MainActor
     func testFirstLoadCleansPreviousProcessButPreservesCurrentWorkOnBackgroundQueue() throws {
         let root = try ImageTestSupport.directory(self)
-        let worker = DispatchQueue(label: "test.backup.cleanup")
+        let worker = DispatchQueue(label: "test.backup.cleanup", qos: .userInitiated)
         let files = BackupTemporaryFiles(root: root.appendingPathComponent("ClipboardPlusBackup"), cleanupQueue: worker)
         let abandoned = files.root.appendingPathComponent("previous-process/restore", isDirectory: true)
         try FileManager.default.createDirectory(at: abandoned, withIntermediateDirectories: true)
@@ -63,7 +72,7 @@ final class BackupTemporaryFilesTests: XCTestCase {
     @MainActor
     func testDiscardOnlySchedulesDeletionAndIsSafeToRepeat() throws {
         let root = try ImageTestSupport.directory(self)
-        let worker = DispatchQueue(label: "test.backup.discard")
+        let worker = DispatchQueue(label: "test.backup.discard", qos: .userInitiated)
         let files = BackupTemporaryFiles(root: root, cleanupQueue: worker)
         let directory = files.processDirectory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -72,12 +81,15 @@ final class BackupTemporaryFilesTests: XCTestCase {
         var backup: ValidatedBackup? = ValidatedBackup(directory: directory, entries: [], temporaryFiles: files)
         weak var released = backup
         worker.suspend()
+        var resumed = false
+        defer { if !resumed { worker.resume() } }
         backup?.discard()
         backup?.discard()
         backup = nil // deinit must neither block nor enqueue a job retaining self.
         XCTAssertNil(released)
         XCTAssertTrue(FileManager.default.fileExists(atPath: image.path))
         worker.resume()
+        resumed = true
         waitForBackupCleanup(files)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
@@ -85,17 +97,20 @@ final class BackupTemporaryFilesTests: XCTestCase {
     @MainActor
     func testDeinitWithoutDiscardAlsoSchedulesDeletion() throws {
         let root = try ImageTestSupport.directory(self)
-        let worker = DispatchQueue(label: "test.backup.deinit")
+        let worker = DispatchQueue(label: "test.backup.deinit", qos: .userInitiated)
         let files = BackupTemporaryFiles(root: root, cleanupQueue: worker)
         let directory = files.processDirectory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var backup: ValidatedBackup? = ValidatedBackup(directory: directory, entries: [], temporaryFiles: files)
         weak var released = backup
         worker.suspend()
+        var resumed = false
+        defer { if !resumed { worker.resume() } }
         backup = nil
         XCTAssertNil(released)
         XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
         worker.resume()
+        resumed = true
         waitForBackupCleanup(files)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }

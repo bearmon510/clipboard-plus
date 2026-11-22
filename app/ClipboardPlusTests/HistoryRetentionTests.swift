@@ -236,6 +236,7 @@ final class HistoryRetentionTests: XCTestCase {
     @MainActor
     func testBackupEstimateMatchesAppliedAgeDeletionsAndCleansImages() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.retention.backup.apply")
         let now = Date(timeIntervalSince1970: 100 * day)
         let old = now.addingTimeInterval(-31 * day)
         let sourceFiles = HistoryImageFiles(directory: root.appendingPathComponent("sourceImages"))
@@ -245,7 +246,8 @@ final class HistoryRetentionTests: XCTestCase {
         try source.collectImage(image, source: .manual, at: old)
         try source.collect("new incoming", source: .manual, at: now)
         let archive = root.appendingPathComponent("test.clipboardplus")
-        _ = try HistoryBackup.write(entries: source.fetchAll(), files: sourceFiles, to: archive, cancellation: BackupCancellation())
+        _ = try HistoryBackup.write(entries: source.fetchAll(), files: sourceFiles, to: archive,
+                                    cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         let url = root.appendingPathComponent("target.sqlite")
         let files = HistoryImageFiles(directory: root.appendingPathComponent("targetImages"))
         let targetImage = try ImageTestSupport.prepare(files, color: .blue)
@@ -253,7 +255,8 @@ final class HistoryRetentionTests: XCTestCase {
         var deleted: [Int] = []
         var usage = HistoryImageUsage()
         let store = HistoryStore(makeDatabase: { try HistoryDatabase(url: url, now: { now }) },
-                                 imageDirectory: files.directory, now: { now }) { event in
+                                 imageDirectory: files.directory, now: { now },
+                                 backupTemporaryFiles: backupFiles) { event in
             if case .replace(let values) = event { replacement = values }
             if case .automaticallyDeleted(let count, _) = event { deleted.append(count) }
             if case .imageUsage(let value) = event { usage = value }
@@ -292,23 +295,26 @@ final class HistoryRetentionTests: XCTestCase {
         XCTAssertEqual(usage.count, 0)
         XCTAssertEqual(usage.byteCount, 0)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: files.directory.path), [])
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 
     @MainActor
     func testChangedEstimateRequiresConfirmationAndKeepsValidatedBackupForRetry() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.retention.backup.retry")
         var now = Date(timeIntervalSince1970: 100 * day)
         let originalDate = now
         let entries = [text("crosses boundary", at: now.addingTimeInterval(-day))]
         let archive = root.appendingPathComponent("test.clipboardplus")
         _ = try HistoryBackup.write(entries: entries, files: HistoryImageFiles(directory: root),
-                                    to: archive, cancellation: BackupCancellation())
-        let backup = try HistoryBackup.validate(at: archive, temporaryRoot: root, cancellation: BackupCancellation())
+                                    to: archive, cancellation: BackupCancellation(), temporaryFiles: backupFiles)
+        let backup = try HistoryBackup.validate(at: archive, temporaryRoot: root,
+                                                cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         let url = root.appendingPathComponent("target.sqlite")
         let store = HistoryStore(retention: .oneDay, makeDatabase: { try HistoryDatabase(url: url, now: { now }) },
-                                 imageDirectory: root.appendingPathComponent("images"), now: { now }) { _ in }
+                                 imageDirectory: root.appendingPathComponent("images"), now: { now },
+                                 backupTemporaryFiles: backupFiles) { _ in }
         complete { store.load(completion: $0) }
         let expected = try HistoryDatabase(url: url, now: { now }).estimateBackup(
             backup.entries, retentionCutoff: HistoryRetention.oneDay.cutoff(relativeTo: originalDate))
@@ -336,7 +342,7 @@ final class HistoryRetentionTests: XCTestCase {
             restored.fulfill()
         }
         wait(for: [restored], timeout: 5)
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 

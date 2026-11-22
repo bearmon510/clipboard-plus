@@ -40,7 +40,8 @@ final class BackupTemporaryFiles {
     }
 
     // Completion is queued behind earlier removals; never wait on the main thread.
-    func afterPendingCleanup(_ completion: @escaping () -> Void) {
-        cleanupQueue.async { completion() }
+    // Enforce userInitiated so callers waiting on pending cleanup promote earlier utility removals.
+    func afterPendingCleanup(_ completion: @escaping @Sendable () -> Void) {
+        cleanupQueue.async(qos: .userInitiated, flags: .enforceQoS) { completion() }
     }
 }

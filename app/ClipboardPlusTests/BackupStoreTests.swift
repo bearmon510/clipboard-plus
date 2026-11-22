@@ -21,9 +21,11 @@ final class BackupStoreTests: XCTestCase {
         let databaseURL = root.appendingPathComponent("history.sqlite")
         let imageDirectory = root.appendingPathComponent("images")
         let worker = DispatchQueue(label: "test.backup")
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.snapshot.cleanup")
         var entries: [HistoryEntry] = []
         let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, historyLimit: 1) },
-                                 imageDirectory: imageDirectory, backupQueue: worker) { event in
+                                 imageDirectory: imageDirectory, backupQueue: worker,
+                                 backupTemporaryFiles: backupFiles) { event in
             if case .saved(let entry, _) = event { entries.append(entry) }
         }
         store.collect("undo pending", source: .manual, at: Date(timeIntervalSince1970: 1))
@@ -60,27 +62,33 @@ final class BackupStoreTests: XCTestCase {
         wait(for: [created], timeout: 10)
         let snapshot = try XCTUnwrap(export)
         defer { try? FileManager.default.removeItem(at: snapshot.url) }
-        let backup = try HistoryBackup.validate(at: snapshot.url, temporaryRoot: root, cancellation: BackupCancellation())
+        let backup = try HistoryBackup.validate(at: snapshot.url, temporaryRoot: root,
+                                                cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         XCTAssertEqual(backup.entries.count, 1)
         XCTAssertEqual(backup.entries.first?.image?.hash, image.hash)
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.imageFiles.url(for: image.filename).path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.imageFiles.url(for: image.thumbnailFilename).path))
+        backup.discard()
+        waitForBackupCleanup(backupFiles)
     }
 
     @MainActor
     func testApplyReestimatesAfterCollectionAndReplacesTheVisibleListAndCleansLimitImages() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.apply.cleanup")
         let originalFiles = HistoryImageFiles(directory: root.appendingPathComponent("originals"))
         let image = try ImageTestSupport.prepare(originalFiles)
         let source = try HistoryDatabase(url: root.appendingPathComponent("source.sqlite"))
         try source.collect("duplicate", source: .manual, at: Date(timeIntervalSince1970: 10))
         try source.collectImage(image, source: .drag, at: Date(timeIntervalSince1970: 11))
         let url = root.appendingPathComponent("test.clipboardplus")
-        _ = try HistoryBackup.write(entries: source.fetchAll(), files: originalFiles, to: url, cancellation: BackupCancellation())
+        _ = try HistoryBackup.write(entries: source.fetchAll(), files: originalFiles, to: url,
+                                    cancellation: BackupCancellation(), temporaryFiles: backupFiles)
         let databaseURL = root.appendingPathComponent("target.sqlite")
         var replacement: [HistoryEntry] = []
         let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, historyLimit: 2) },
-                                 imageDirectory: root.appendingPathComponent("targetImages")) { event in
+                                 imageDirectory: root.appendingPathComponent("targetImages"),
+                                 backupTemporaryFiles: backupFiles) { event in
             if case .replace(let entries) = event { replacement = entries }
         }
         store.collectImage(.data(ImageTestSupport.png(.blue), typeIdentifier: "public.png"), source: .manual,
@@ -118,7 +126,7 @@ final class BackupStoreTests: XCTestCase {
         for name in oldNames {
             XCTAssertFalse(FileManager.default.fileExists(atPath: store.imageFiles.url(for: name).path))
         }
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: backup.directory.path))
     }
 
@@ -126,9 +134,11 @@ final class BackupStoreTests: XCTestCase {
     func testCancelledSnapshotReleasesProtectionAndLeavesNoExport() throws {
         let root = try ImageTestSupport.directory(self)
         let worker = DispatchQueue(label: "test.cancel.backup")
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.cancelled.cleanup")
         let databaseURL = root.appendingPathComponent("history.sqlite")
         let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL, historyLimit: 1) },
-                                 imageDirectory: root.appendingPathComponent("images"), backupQueue: worker) { _ in }
+                                 imageDirectory: root.appendingPathComponent("images"), backupQueue: worker,
+                                 backupTemporaryFiles: backupFiles) { _ in }
         store.collectImage(.data(ImageTestSupport.png(), typeIdentifier: "public.png"), source: .manual, at: Date())
         drain(store)
         let names = try FileManager.default.contentsOfDirectory(atPath: store.imageFiles.directory.path)
@@ -154,14 +164,17 @@ final class BackupStoreTests: XCTestCase {
         for name in names {
             XCTAssertFalse(FileManager.default.fileExists(atPath: store.imageFiles.url(for: name).path))
         }
+        waitForBackupCleanup(backupFiles)
     }
 
     @MainActor
     func testControllerCleansSharedFileAndLogsCountsWithoutContentsOrProviderPaths() throws {
         let root = try ImageTestSupport.directory(self)
+        let backupFiles = makeBackupTemporaryFiles(root: root, label: "test.backup.controller.cleanup")
         let databaseURL = root.appendingPathComponent("history.sqlite")
         let store = HistoryStore(retention: .never, makeDatabase: { try HistoryDatabase(url: databaseURL) },
-                                 imageDirectory: root.appendingPathComponent("images")) { _ in }
+                                 imageDirectory: root.appendingPathComponent("images"),
+                                 backupTemporaryFiles: backupFiles) { _ in }
         let secret = "backup-test-original-not-for-log"
         store.collect(secret, source: .manual, at: Date())
         drain(store)
@@ -180,7 +193,7 @@ final class BackupStoreTests: XCTestCase {
         XCTAssertTrue(records.contains { $0.contains("開始") })
         XCTAssertTrue(records.contains { $0.contains("完了") && $0.contains("件数=1") })
         controller.removeExport() // Shared sheet's onDismiss.
-        waitForBackupCleanup()
+        waitForBackupCleanup(backupFiles)
         XCTAssertFalse(FileManager.default.fileExists(atPath: snapshot.url.path))
         let providerSecret = "private-provider-file-name"
         controller.importFailed(NSError(domain: "provider", code: 1, userInfo: [NSLocalizedDescriptionKey: providerSecret]))
