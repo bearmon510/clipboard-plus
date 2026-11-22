@@ -270,6 +270,14 @@ private actor FakeByteChannel {
 
     private func enqueue(_ chunk: Data) {
         guard !chunk.isEmpty else { return }
+        if case .stallAllReads = fault {
+            queue.append(chunk)
+            return
+        }
+        if case let .stallAfterBytes(limit) = fault, readBytes >= limit {
+            queue.append(chunk)
+            return
+        }
         if let cont = waiter {
             waiter = nil
             cont.resume(returning: chunk)
@@ -353,13 +361,20 @@ private actor FakeWifiConnection: PCSyncWifiConnection {
 
     private let incoming: FakeByteChannel
     private let outgoing: FakeByteChannel
+    private let readSleeper: ControlledWifiSleeper?
     private var timeoutSeconds: TimeInterval
     private(set) var timeoutHistory: [TimeInterval]
     private(set) var isClosed = false
 
-    init(incoming: FakeByteChannel, outgoing: FakeByteChannel, initialReadTimeout: TimeInterval) {
+    init(
+        incoming: FakeByteChannel,
+        outgoing: FakeByteChannel,
+        initialReadTimeout: TimeInterval,
+        readSleeper: ControlledWifiSleeper? = nil
+    ) {
         self.incoming = incoming
         self.outgoing = outgoing
+        self.readSleeper = readSleeper
         self.timeoutSeconds = initialReadTimeout
         self.timeoutHistory = [initialReadTimeout]
     }
@@ -379,25 +394,37 @@ private actor FakeWifiConnection: PCSyncWifiConnection {
         if isClosed { throw PCSyncWifiClientError.cancelled }
         let limitSeconds = timeoutSeconds
         let channel = incoming
+        let sleeper = readSleeper
         let outcome = try await withThrowingTaskGroup(of: ReadOutcome.self) { group in
             group.addTask {
                 let bytes = await channel.read(maxLength: maxLength)
                 return .data(bytes)
             }
             group.addTask {
-                let nanos = UInt64(max(0.01, limitSeconds) * 1_000_000_000)
-                try await Task.sleep(nanoseconds: nanos)
+                if let sleeper {
+                    try await sleeper.sleep(limitSeconds)
+                } else {
+                    let nanos = UInt64(max(0.01, limitSeconds) * 1_000_000_000)
+                    try await Task.sleep(nanoseconds: nanos)
+                }
                 return .timedOut
             }
-            guard let first = try await group.next() else {
+            do {
+                guard let first = try await group.next() else {
+                    group.cancelAll()
+                    await channel.close()
+                    throw PCSyncWifiClientError.cancelled
+                }
                 group.cancelAll()
-                throw PCSyncWifiClientError.cancelled
-            }
-            group.cancelAll()
-            if case .timedOut = first {
+                if case .timedOut = first {
+                    await channel.close()
+                }
+                return first
+            } catch {
+                group.cancelAll()
                 await channel.close()
+                throw error
             }
-            return first
         }
         switch outcome {
         case .data(let data):
@@ -604,17 +631,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
 
         init(
             test: XCTestCase,
-            timeouts: PCSyncController.WifiTransferTimeouts = PCSyncController.WifiTransferTimeouts(
-                readySeconds: 20,
-                joinSeconds: 75,
-                tcpConnectSeconds: 1,
-                preAuthReadSeconds: 0.15,
-                idleSeconds: 0.25,
-                cooldownSeconds: 600,
-                busyRetrySeconds: 5,
-                maxBusyRetries: 6,
-                readyTimeoutHoldSeconds: 2
-            ),
+            timeouts: PCSyncController.WifiTransferTimeouts = PCSyncController.WifiTransferTimeouts(),
             sleeper: ControlledWifiSleeper? = nil
         ) throws {
             self.sleeper = sleeper
@@ -882,11 +899,11 @@ final class PCSyncWifiTransferTests: XCTestCase {
 
         let padToPc = FakeByteChannel()
         let pcToPad = FakeByteChannel()
-        let padConn = FakeWifiConnection(incoming: pcToPad, outgoing: padToPc, initialReadTimeout: 0.15)
+        let padConn = FakeWifiConnection(incoming: pcToPad, outgoing: padToPc, initialReadTimeout: 5)
         let pcEnd = FakePcStreamEnd(incoming: padToPc, outgoing: pcToPad)
 
         await f.wifiClient.setConnectHandler { _, _, initialTimeout in
-            XCTAssertEqual(initialTimeout, 0.15, accuracy: 0.001)
+            XCTAssertEqual(initialTimeout, 5, accuracy: 0.001)
             return padConn
         }
 
@@ -933,7 +950,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let timeoutHistory = await padConn.timeoutHistory
         XCTAssertEqual(joinedSSIDs, [ready.ssid])
         XCTAssertEqual(leftSSIDs, [ready.ssid])
-        XCTAssertEqual(timeoutHistory, [0.15, 0.25])
+        XCTAssertEqual(timeoutHistory, [5, 10])
 
         let log = try await readLog(f)
         XCTAssertTrue(log.contains("Wi-Fi転送要求"))
@@ -1051,7 +1068,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         // Cut PC->iOS stream after ~300 KB (after handshake + offer + 1 chunk written to PCSync-v2/).
         let padToPc = FakeByteChannel()
         let pcToPad = FakeByteChannel(fault: .cutAfterBytes(300_000))
-        let padConn = FakeWifiConnection(incoming: pcToPad, outgoing: padToPc, initialReadTimeout: 0.15)
+        let padConn = FakeWifiConnection(incoming: pcToPad, outgoing: padToPc, initialReadTimeout: 5)
         let pcEnd = FakePcStreamEnd(incoming: padToPc, outgoing: pcToPad)
 
         await f.wifiClient.setConnectHandler { _, _, _ in padConn }
@@ -1077,6 +1094,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let resume = try XCTUnwrap(f.link.resumes.first(where: { $0.id == inOffer.id }))
         XCTAssertGreaterThan(resume.offset, 0)
         XCTAssertLessThan(resume.offset, inData.count)
+        XCTAssertEqual(f.link.wifiRequests.count, 1)
         XCTAssertEqual(f.link.wifiCancels.first?.reason, .tcpFailed)
         let leftSSIDs = await f.wifiClient.leftSSIDs
         XCTAssertEqual(leftSSIDs, [ready.ssid])
@@ -1138,59 +1156,80 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let joinTimeouts2 = await f2.wifiClient.joinTimeouts
         XCTAssertEqual(joinTimeouts2, [75])
 
-        // 3. Pre-auth TCP read timeout (stalled TCP_WELCOME)
-        let f3 = try Fixture(test: self)
+        // 3. Pre-auth TCP read timeout (stalled TCP_WELCOME) driven by controlled sleeper without wall-clock waiting.
+        let sleeper3 = ControlledWifiSleeper()
+        let connSleeper3 = ControlledWifiSleeper()
+        addTeardownBlock { connSleeper3.cancelAll() }
+        let f3 = try Fixture(test: self, sleeper: sleeper3)
         let p3 = try pair(f3)
         f3.monitor.updateScene("active")
         try f3.link.connect(p3, limit: 512)
         let d3 = makeDeterministicBytes(count: 520_000, seed: 3)
         f3.monitor.saveManually([try makeFileProvider(in: f3.root, bytes: d3, name: "t-auth.bin")], receivedAt: f3.clock.date)
         await awaitSave(f3, savedCount: 1)
+        XCTAssertEqual(f3.link.wifiRequests.count, 1)
         let ready3 = makeReadyPayload()
         let stallConn3 = FakeWifiConnection(
             incoming: FakeByteChannel(fault: .stallAllReads),
             outgoing: FakeByteChannel(),
-            initialReadTimeout: 0.05
+            initialReadTimeout: defaultTimeouts.preAuthReadSeconds,
+            readSleeper: connSleeper3
         )
         await f3.wifiClient.setConnectHandler { _, _, _ in stallConn3 }
         try f3.link.send(.ready(ready3))
+        let preAuthWait = await connSleeper3.waitForSleep(duration: defaultTimeouts.preAuthReadSeconds)
+        preAuthWait.fire()
         let fellBack3 = await waitUntil(timeoutSeconds: 5) { f3.link.offers.count == 1 }
         XCTAssertTrue(fellBack3)
+        XCTAssertEqual(f3.link.wifiRequests.count, 1)
         XCTAssertEqual(f3.link.wifiCancels.last?.reason, .timeout)
+        let connectRecords3 = await f3.wifiClient.connectRecords
+        XCTAssertEqual(connectRecords3.map(\.initialReadTimeout), [defaultTimeouts.preAuthReadSeconds])
         let left3 = await f3.wifiClient.leftSSIDs
         XCTAssertEqual(left3, [ready3.ssid])
 
-        // 4. Post-auth idle read timeout (PC authenticates then stalls without replying to offer)
-        let f4 = try Fixture(test: self)
+        // 4. Post-auth idle read timeout (PC authenticates then stalls without replying to offer).
+        let sleeper4 = ControlledWifiSleeper()
+        let connSleeper4 = ControlledWifiSleeper()
+        addTeardownBlock { connSleeper4.cancelAll() }
+        let f4 = try Fixture(test: self, sleeper: sleeper4)
         let p4 = try pair(f4)
         f4.monitor.updateScene("active")
         try f4.link.connect(p4, limit: 512)
         let d4 = makeDeterministicBytes(count: 520_000, seed: 4)
         f4.monitor.saveManually([try makeFileProvider(in: f4.root, bytes: d4, name: "t-idle.bin")], receivedAt: f4.clock.date)
         await awaitSave(f4, savedCount: 1)
+        XCTAssertEqual(f4.link.wifiRequests.count, 1)
         let ready4 = makeReadyPayload()
         let bleKeys4 = try XCTUnwrap(f4.link.pcSessionKeys)
         let pcKeys4 = try WifiTransferKeys.derive(bleKeys: bleKeys4, token: ready4.token, session: ready4.session)
         let padToPc4 = FakeByteChannel()
         let pcToPad4 = FakeByteChannel()
-        let padConn4 = FakeWifiConnection(incoming: pcToPad4, outgoing: padToPc4, initialReadTimeout: 0.15)
+        let padConn4 = FakeWifiConnection(
+            incoming: pcToPad4,
+            outgoing: padToPc4,
+            initialReadTimeout: defaultTimeouts.preAuthReadSeconds,
+            readSleeper: connSleeper4
+        )
         let pcEnd4 = FakePcStreamEnd(incoming: padToPc4, outgoing: pcToPad4)
         await f4.wifiClient.setConnectHandler { _, _, _ in padConn4 }
         let stallPcTask = Task {
             let guard4 = try WifiSessionReplayGuard()
             _ = try await WifiEncryptedStream.acceptAsPc(stream: pcEnd4, keys: pcKeys4, replayGuard: guard4)
-            // Intentionally stall without reading or replying.
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            // Intentionally leave the stream open without replying to the offer.
         }
         try f4.link.send(.ready(ready4))
+        let idleWait = await connSleeper4.waitForSleep(duration: defaultTimeouts.idleSeconds)
+        idleWait.fire()
         let fellBack4 = await waitUntil(timeoutSeconds: 5) { f4.link.offers.count == 1 }
-        stallPcTask.cancel()
+        try await stallPcTask.value
         XCTAssertTrue(fellBack4)
+        XCTAssertEqual(f4.link.wifiRequests.count, 1)
         XCTAssertEqual(f4.link.wifiCancels.last?.reason, .timeout)
         let left4 = await f4.wifiClient.leftSSIDs
         XCTAssertEqual(left4, [ready4.ssid])
         let timeouts4 = await padConn4.timeoutHistory
-        XCTAssertEqual(timeouts4, [0.15, 0.25])
+        XCTAssertEqual(timeouts4, [defaultTimeouts.preAuthReadSeconds, defaultTimeouts.idleSeconds])
     }
 
     @MainActor
@@ -1212,7 +1251,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let pcGuard1 = try WifiSessionReplayGuard()
         let padToPc1 = FakeByteChannel()
         let pcToPad1 = FakeByteChannel()
-        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 0.15)
+        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 5)
         let pcEnd1 = FakePcStreamEnd(incoming: padToPc1, outgoing: pcToPad1)
         await f.wifiClient.setConnectHandler { _, _, _ in padConn1 }
         let pcTask1 = Task {
@@ -1240,6 +1279,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         try f.link.send(.ready(readyReplay))
         let fellBack = await waitUntil { f.link.offers.count == 1 }
         XCTAssertTrue(fellBack)
+        XCTAssertEqual(f.link.wifiRequests.count, 2)
         let joinsAfter = await f.wifiClient.joinedSSIDs.count
         XCTAssertEqual(joinsAfter, joinsBefore)
         XCTAssertEqual(f.link.wifiCancels.last?.session, sessionA)
@@ -1268,7 +1308,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let pcGuard1 = try WifiSessionReplayGuard()
         let padToPc1 = FakeByteChannel()
         let pcToPad1 = FakeByteChannel()
-        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 0.15)
+        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 5)
         let pcEnd1 = FakePcStreamEnd(incoming: padToPc1, outgoing: pcToPad1)
         await f1.wifiClient.setConnectHandler { _, _, _ in padConn1 }
         let pcTask1 = Task {
@@ -1286,6 +1326,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         }
         _ = await pcTask1.value
         XCTAssertTrue(rejectedUnrequested)
+        XCTAssertEqual(f1.link.wifiRequests.count, 1)
         XCTAssertEqual(f1.link.wifiCancels.first?.reason, .protocolError)
         XCTAssertTrue(f1.monitor.entries.isEmpty)
 
@@ -1316,7 +1357,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let pcGuard2 = try WifiSessionReplayGuard()
         let padToPc2 = FakeByteChannel()
         let pcToPad2 = FakeByteChannel()
-        let padConn2 = FakeWifiConnection(incoming: pcToPad2, outgoing: padToPc2, initialReadTimeout: 0.15)
+        let padConn2 = FakeWifiConnection(incoming: pcToPad2, outgoing: padToPc2, initialReadTimeout: 5)
         let pcEnd2 = FakePcStreamEnd(incoming: padToPc2, outgoing: pcToPad2)
         await f2.wifiClient.setConnectHandler { _, _, _ in padConn2 }
         let pcTask2 = Task {
@@ -1334,6 +1375,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         }
         _ = await pcTask2.value
         XCTAssertTrue(sawCancel2)
+        XCTAssertEqual(f2.link.wifiRequests.count, 1)
         XCTAssertEqual(f2.link.wifiCancels.first?.reason, .protocolError)
         XCTAssertTrue(f2.monitor.entries.isEmpty)
         XCTAssertFalse(f2.link.ackIDs.contains(badOffer.id))
@@ -1526,7 +1568,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let pcSink1 = InMemoryWifiTransferSink()
         let padToPc1 = FakeByteChannel()
         let pcToPad1 = FakeByteChannel()
-        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 0.5)
+        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 5)
         let pcEnd1 = FakePcStreamEnd(incoming: padToPc1, outgoing: pcToPad1)
         await f1.wifiClient.setConnectHandler { _, _, _ in padConn1 }
         let pcTask1 = Task {
@@ -1695,7 +1737,7 @@ final class PCSyncWifiTransferTests: XCTestCase {
         let pcSink1 = InMemoryWifiTransferSink()
         let padToPc1 = FakeByteChannel()
         let pcToPad1 = FakeByteChannel()
-        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 0.5)
+        let padConn1 = FakeWifiConnection(incoming: pcToPad1, outgoing: padToPc1, initialReadTimeout: 5)
         let pcEnd1 = FakePcStreamEnd(incoming: padToPc1, outgoing: pcToPad1)
         await f1.wifiClient.setConnectHandler { _, _, _ in padConn1 }
         let pcTask1 = Task {

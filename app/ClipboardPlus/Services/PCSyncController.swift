@@ -1553,15 +1553,17 @@ final class PCSyncController: ObservableObject {
         if let active = wifiSession {
             let remainingOutgoing = active.outgoingIDs.filter { id in pending.contains { $0.id == id } }
             let remainingIncoming = active.incomingIDs.filter { id in pendingWifiIncomingOffers[id] != nil && !seen.contains(id) }
+            let activeSessionToCancel: UUID?
             switch active.phase {
             case .joining(let session), .transferring(let session):
-                if status == .connected {
-                    queueWifiControl(.cancel(session: session, reason: .userCancelled))
-                }
+                activeSessionToCancel = session
             case .awaitingReady:
-                break
+                activeSessionToCancel = nil
             }
             cancelActiveWifiTaskAndLeave()
+            if let session = activeSessionToCancel, status == .connected {
+                queueWifiControl(.cancel(session: session, reason: .userCancelled), pumpNow: false)
+            }
             fallbackWifiToBle(outgoingIDs: remainingOutgoing, incomingIDs: remainingIncoming, applyCooldown: false)
         } else if status == .connected {
             let waitingIncoming = pendingWifiIncomingOrder
@@ -1907,14 +1909,16 @@ final class PCSyncController: ObservableObject {
         )
     }
 
-    private func queueWifiControl(_ message: WifiControlMessage) {
+    private func queueWifiControl(_ message: WifiControlMessage, pumpNow: Bool = true) {
         guard status == .connected, sessionKeys?.supportsWifiTransfer == true else { return }
         if wifiControlOutgoing.count >= 64 {
             fail(reject: false, reason: "Wi-Fi制御待ち上限")
             return
         }
         wifiControlOutgoing.append(message)
-        pump()
+        if pumpNow {
+            pump()
+        }
     }
 
     private func handleWifiControlMessage(_ message: WifiControlMessage) throws {
@@ -1993,13 +1997,13 @@ final class PCSyncController: ObservableObject {
         wifiBusyRetryCount = 0
         guard let sessionKeys, sessionKeys.supportsWifiTransfer else {
             wifiSession = nil
-            queueWifiControl(.cancel(session: payload.session, reason: .protocolError))
+            queueWifiControl(.cancel(session: payload.session, reason: .protocolError), pumpNow: false)
             fallbackWifiToBle(outgoingIDs: session.outgoingIDs, incomingIDs: session.incomingIDs, applyCooldown: true)
             return
         }
         guard isForeground else {
             wifiSession = nil
-            queueWifiControl(.joinResult(session: payload.session, status: .notForeground))
+            queueWifiControl(.joinResult(session: payload.session, status: .notForeground), pumpNow: false)
             record("Wi-Fi参加; 状態=not_foreground; 所要ms=0")
             fallbackWifiToBleKeepingOversized(
                 outgoingIDs: session.outgoingIDs,
@@ -2015,7 +2019,7 @@ final class PCSyncController: ObservableObject {
             transferKeys = try WifiTransferKeys.derive(bleKeys: sessionKeys, token: payload.token, session: payload.session)
         } catch {
             wifiSession = nil
-            queueWifiControl(.cancel(session: payload.session, reason: .protocolError))
+            queueWifiControl(.cancel(session: payload.session, reason: .protocolError), pumpNow: false)
             record("Wi-Fi転送失敗; 理由=key_derivation; 送信件数=0; 受信件数=0; 所要ms=0")
             fallbackWifiToBle(outgoingIDs: session.outgoingIDs, incomingIDs: session.incomingIDs, applyCooldown: true)
             return
@@ -2449,7 +2453,7 @@ final class PCSyncController: ObservableObject {
         wifiTransferTask = nil
         wifiTransferProgress = nil
         if sendCancel && status == .connected {
-            queueWifiControl(.cancel(session: payloadSession, reason: cancelReason))
+            queueWifiControl(.cancel(session: payloadSession, reason: cancelReason), pumpNow: false)
         }
         record("Wi-Fi転送失敗; 理由=\(logReason); 送信件数=\(sentCount); 受信件数=\(receivedCount); 所要ms=\(milliseconds(since: startedAt))")
         fallbackWifiToBle(outgoingIDs: remainingOutgoing, incomingIDs: remainingIncoming, applyCooldown: applyCooldown)
@@ -2552,17 +2556,27 @@ final class PCSyncController: ObservableObject {
             }
         }
 
+        var incomingToDrop: [SyncOffer] = []
+        var incomingToBle: [SyncOffer] = []
         for id in incomingIDs {
             guard let offer = pendingWifiIncomingOffers.removeValue(forKey: id) else { continue }
             pendingWifiIncomingOrder.removeAll { $0 == id }
             if seen.contains(id) || receiving.contains(id) { continue }
             if offer.size > SyncProtocol.maxItemBytes {
-                do { try dropOversizedIncomingOffer(offer) }
-                catch { fail(reject: false, reason: "受信確認保存失敗"); return }
-            } else if status == .connected {
-                do { try beginBleIncomingOffer(offer, at: current) }
-                catch { fail(reject: false, reason: "BLE受信再開失敗"); return }
+                incomingToDrop.append(offer)
+            } else {
+                incomingToBle.append(offer)
             }
+        }
+
+        for offer in incomingToDrop {
+            do { try dropOversizedIncomingOffer(offer) }
+            catch { fail(reject: false, reason: "受信確認保存失敗"); return }
+        }
+
+        for offer in incomingToBle where status == .connected {
+            do { try beginBleIncomingOffer(offer, at: current) }
+            catch { fail(reject: false, reason: "BLE受信再開失敗"); return }
         }
 
         if status == .connected {

@@ -1188,12 +1188,13 @@ final class PCSyncControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.pendingCount, 0)
 
         // Zero-byte attachment also blocks the next offer until ACKed.
+        // Incoming PC text above incremented savedCount to 4, so use relative counts.
+        let savedBeforeEmpty = f.monitor.savedCount
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data(), name: "empty.bin")], receivedAt: baseDate.addingTimeInterval(3))
-        await awaitSave(f, savedCount: 4)
+        await awaitSave(f, savedCount: savedBeforeEmpty + 1)
         f.monitor.saveManually([try makeFileProvider(in: f.root, bytes: Data([9]), name: "after.bin")], receivedAt: baseDate.addingTimeInterval(4))
-        await awaitSave(f, savedCount: 5)
-        // awaitSave covers the history write only; after.bin joins the send queue asynchronously.
-        await drain(f)
+        await awaitSave(f, savedCount: savedBeforeEmpty + 2)
+        XCTAssertEqual(f.controller.pendingCount, 2)
         XCTAssertEqual(f.link.offers.count, 3)
         let emptyOffer = f.link.offers[2]
         XCTAssertEqual(emptyOffer.filename, "empty.bin")
