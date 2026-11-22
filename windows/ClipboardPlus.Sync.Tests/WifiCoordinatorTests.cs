@@ -1259,6 +1259,41 @@ public sealed class WifiCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public void HotspotBackupRecordTracksMultipleTempSsidsDeserializesLegacyJsonAndRedactsSecrets()
+    {
+        var first = new HotspotBackupRecord("MyHomeHotspot", "OriginalPass123", Band: 2, TempSsid: "DIRECT-cp-FIRST001");
+        var second = first.WithAdditionalTempSsid("DIRECT-cp-SECOND02");
+        var third = second.WithAdditionalTempSsid("DIRECT-cp-THIRD003");
+
+        Assert.Equal("MyHomeHotspot", third.Ssid);
+        Assert.Equal("OriginalPass123", third.Passphrase);
+        Assert.Equal(2, third.Band);
+        Assert.Equal("DIRECT-cp-THIRD003", third.TempSsid);
+        Assert.True(third.ShouldRestoreForCurrentSsid("DIRECT-cp-FIRST001"));
+        Assert.True(third.ShouldRestoreForCurrentSsid("DIRECT-cp-SECOND02"));
+        Assert.True(third.ShouldRestoreForCurrentSsid("DIRECT-cp-THIRD003"));
+        Assert.False(third.ShouldRestoreForCurrentSsid("UserRenamedHotspot"));
+        Assert.False(third.ShouldRestoreForCurrentSsid("MyHomeHotspot"));
+
+        var summary = third.ToString();
+        Assert.DoesNotContain("MyHomeHotspot", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("OriginalPass123", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("DIRECT-cp-FIRST001", summary, StringComparison.Ordinal);
+        Assert.DoesNotContain("DIRECT-cp-THIRD003", summary, StringComparison.Ordinal);
+
+        var json = System.Text.Json.JsonSerializer.Serialize(third);
+        var roundTripped = System.Text.Json.JsonSerializer.Deserialize<HotspotBackupRecord>(json);
+        Assert.Equal(third, roundTripped);
+
+        const string legacyJson = """{"Ssid":"MyHomeHotspot","Passphrase":"OriginalPass123","Band":2,"TempSsid":"DIRECT-cp-LEGACY01"}""";
+        var legacy = System.Text.Json.JsonSerializer.Deserialize<HotspotBackupRecord>(legacyJson);
+        Assert.NotNull(legacy);
+        Assert.Null(legacy!.PreviousTempSsids);
+        Assert.True(legacy.ShouldRestoreForCurrentSsid("DIRECT-cp-LEGACY01"));
+        Assert.False(legacy.ShouldRestoreForCurrentSsid("UserRenamedHotspot"));
+    }
+
+    [Fact]
     public async Task TtlTimerClosesSessionEvenWithoutTickAsync()
     {
         var delay = new ControlledDelay();

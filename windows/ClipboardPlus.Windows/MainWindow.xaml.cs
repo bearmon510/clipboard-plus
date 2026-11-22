@@ -42,7 +42,9 @@ public partial class MainWindow : Window
         Action<string> log,
         bool preview,
         bool hotspotBandSupported,
-        bool hotspotSixGHzSupported)
+        bool hotspotSixGHzSupported,
+        HotspotConfigBackupStore? hotspotBackups = null,
+        Task? startupHotspotRestore = null)
     {
         this.log = log;
         this.preview = preview;
@@ -64,7 +66,7 @@ public partial class MainWindow : Window
         else
         {
             StartupCheck.IsChecked = LocalStore.StartupEnabled;
-            wifiProbe = new WifiTransferProbe(log, Dispatcher);
+            wifiProbe = new WifiTransferProbe(log, Dispatcher, hotspotBackups, startupHotspotRestore);
             wifiProbe.SnapshotChanged += UpdateWifiProbe;
             UpdateWifiProbe(wifiProbe.CurrentSnapshot);
         }
@@ -209,7 +211,7 @@ public partial class MainWindow : Window
             await wifiProbe.DisposeAsync();
     }
 
-    internal void StopWifiProbeSync() => wifiProbe?.StopSync();
+    internal void StopWifiProbeSync(TimeSpan? stepTimeout = null) => wifiProbe?.StopSync(stepTimeout);
 
     private void OnWifiProbeModeChanged(object sender, RoutedEventArgs e) => UpdateWifiProbeBandVisibility();
 

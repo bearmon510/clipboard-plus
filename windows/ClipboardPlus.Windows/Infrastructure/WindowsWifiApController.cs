@@ -14,11 +14,128 @@ using global::Windows.Security.Credentials;
 
 namespace ClipboardPlus.Windows.Infrastructure;
 
+internal sealed record HotspotAccessPointConfig(
+    string Ssid,
+    string Passphrase,
+    int? Band)
+{
+    public bool IsRestorable =>
+        !string.IsNullOrEmpty(Ssid) &&
+        !string.IsNullOrEmpty(Passphrase) &&
+        Passphrase.Length >= 8;
+
+    // Never expose SSID or passphrase in logs/formatting.
+    public override string ToString() => "HotspotAccessPointConfig { Redacted = true }";
+}
+
+internal sealed record HotspotBackupPrepareOutcome(
+    bool Succeeded,
+    HotspotBackupRecord? Record,
+    bool PreservedExistingBackup,
+    string? FailureCode)
+{
+    public static HotspotBackupPrepareOutcome Success(HotspotBackupRecord record, bool preservedExistingBackup) =>
+        new(true, record, preservedExistingBackup, null);
+
+    public static HotspotBackupPrepareOutcome Failure(string failureCode) =>
+        new(false, null, false, failureCode);
+}
+
+internal interface IHotspotConfigBackupStore
+{
+    bool Exists { get; }
+    void Save(HotspotBackupRecord record);
+    HotspotBackupRecord? Load(Action<string>? log = null);
+    HotspotBackupPrepareOutcome PrepareForSession(
+        HotspotAccessPointConfig? currentConfig,
+        string tempSsid,
+        Action<string>? log = null);
+    void Clear();
+}
+
+internal interface IHotspotTetheringManager
+{
+    bool IsOn { get; }
+    HotspotAccessPointConfig? GetCurrentConfiguration();
+    Task ConfigureAccessPointAsync(HotspotAccessPointConfig config, CancellationToken ct, bool ignoreBandErrors = false);
+    Task<(bool Succeeded, string StatusName)> StartTetheringAsync(CancellationToken ct);
+    Task StopTetheringAsync(CancellationToken ct);
+    Task<IReadOnlyList<WifiProbeBand>> QuerySupportedBandsAsync(HotspotAccessPointConfig config, CancellationToken ct);
+}
+
+internal sealed class WinRtHotspotTetheringManager(NetworkOperatorTetheringManager manager) : IHotspotTetheringManager
+{
+    public bool IsOn => manager.TetheringOperationalState == TetheringOperationalState.On;
+
+    public HotspotAccessPointConfig? GetCurrentConfiguration()
+    {
+        var current = manager.GetCurrentAccessPointConfiguration();
+        if (current is null)
+            return null;
+
+        int? band = null;
+        if (WindowsWifiApController.IsHotspotBandApiSupported())
+        {
+            try { band = (int)current.Band; }
+            catch { band = null; }
+        }
+        return new HotspotAccessPointConfig(current.Ssid ?? "", current.Passphrase ?? "", band);
+    }
+
+    public Task ConfigureAccessPointAsync(HotspotAccessPointConfig config, CancellationToken ct, bool ignoreBandErrors = false)
+    {
+        var winrt = ToWinRtConfig(config, ignoreBandErrors);
+        return manager.ConfigureAccessPointAsync(winrt).AsTask(ct);
+    }
+
+    public async Task<(bool Succeeded, string StatusName)> StartTetheringAsync(CancellationToken ct)
+    {
+        var result = await manager.StartTetheringAsync().AsTask(ct).ConfigureAwait(false);
+        if (result.Status == TetheringOperationStatus.Success)
+            return (true, nameof(TetheringOperationStatus.Success));
+        var statusName = WifiProbeText.FormatTetheringOperationStatus((int)result.Status, result.Status.ToString());
+        return (false, statusName);
+    }
+
+    public Task StopTetheringAsync(CancellationToken ct) =>
+        manager.StopTetheringAsync().AsTask(ct);
+
+    public Task<IReadOnlyList<WifiProbeBand>> QuerySupportedBandsAsync(HotspotAccessPointConfig config, CancellationToken ct)
+    {
+        var winrt = ToWinRtConfig(config, ignoreBandErrors: true);
+        return WindowsWifiApController.QuerySupportedHotspotBandsAsync(winrt, ct);
+    }
+
+    private static NetworkOperatorTetheringAccessPointConfiguration ToWinRtConfig(
+        HotspotAccessPointConfig config,
+        bool ignoreBandErrors)
+    {
+        var winrt = new NetworkOperatorTetheringAccessPointConfiguration
+        {
+            Ssid = config.Ssid,
+            Passphrase = config.Passphrase,
+        };
+        if (config.Band is int band && WindowsWifiApController.IsHotspotBandApiSupported())
+        {
+            if (ignoreBandErrors)
+            {
+                try { winrt.Band = (TetheringWiFiBand)band; }
+                catch { }
+            }
+            else
+            {
+                winrt.Band = (TetheringWiFiBand)band;
+            }
+        }
+        return winrt;
+    }
+}
+
 /// <summary>
 /// Persists the user's previous Windows Mobile Hotspot configuration protected with DPAPI
 /// so it can be restored even if the app crashes while a temporary hotspot is active.
 /// </summary>
-internal sealed class HotspotConfigBackupStore
+internal sealed class HotspotConfigBackupStore : IHotspotConfigBackupStore
 {
     private const string FileName = "hotspot-restore.dat";
     private readonly string directory;
@@ -43,69 +160,143 @@ internal sealed class HotspotConfigBackupStore
 
         lock (gate)
         {
-            Directory.CreateDirectory(directory);
-            var plaintext = JsonSerializer.SerializeToUtf8Bytes(record);
+            // Never overwrite a pending backup's original config with one of its own temporary SSIDs.
+            var existing = LoadLocked(log: null, out var loadIoFailed);
+            if (loadIoFailed)
+                throw new IOException("Existing hotspot backup could not be read.");
+            var toSave = existing is not null && existing.ShouldRestoreForCurrentSsid(record.Ssid)
+                ? existing.WithAdditionalTempSsid(record.TempSsid)
+                : record;
+            SaveLocked(toSave);
+        }
+    }
+
+    public HotspotBackupPrepareOutcome PrepareForSession(
+        HotspotAccessPointConfig? currentConfig,
+        string tempSsid,
+        Action<string>? log = null)
+    {
+        if (string.IsNullOrEmpty(tempSsid))
+            throw new ArgumentException("Temporary SSID is required.", nameof(tempSsid));
+
+        lock (gate)
+        {
+            var existing = LoadLocked(log, out var loadIoFailed);
+            if (loadIoFailed)
+                return HotspotBackupPrepareOutcome.Failure("hotspot_backup_save_failed");
+
+            if (currentConfig is null || string.IsNullOrEmpty(currentConfig.Ssid))
+                return HotspotBackupPrepareOutcome.Failure("hotspot_config_unreadable");
+
+            HotspotBackupRecord recordToSave;
+            bool preservedExisting;
+
+            if (existing is not null && existing.ShouldRestoreForCurrentSsid(currentConfig.Ssid))
+            {
+                // Current hotspot SSID matches one of our recorded temporary SSIDs, not the user's setting.
+                // Preserve the original user configuration and add the new temporary SSID.
+                recordToSave = existing.WithAdditionalTempSsid(tempSsid);
+                preservedExisting = true;
+            }
+            else
+            {
+                if (!currentConfig.IsRestorable)
+                    return HotspotBackupPrepareOutcome.Failure("hotspot_config_unreadable");
+
+                recordToSave = new HotspotBackupRecord(
+                    currentConfig.Ssid,
+                    currentConfig.Passphrase,
+                    currentConfig.Band,
+                    tempSsid);
+                preservedExisting = false;
+            }
+
             try
             {
-                var protectedBytes = ProtectedData.Protect(plaintext, null, DataProtectionScope.CurrentUser);
-                var tempPath = Path.Combine(directory, $"hotspot-restore.{Guid.NewGuid():N}.tmp");
-                try
-                {
-                    using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        stream.Write(protectedBytes);
-                        stream.Flush(true);
-                    }
-                    File.Move(tempPath, filePath, overwrite: true);
-                }
-                catch
-                {
-                    try { File.Delete(tempPath); } catch { }
-                    throw;
-                }
+                SaveLocked(recordToSave);
+                return HotspotBackupPrepareOutcome.Success(recordToSave, preservedExisting);
             }
-            finally
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException or NotSupportedException)
             {
-                CryptographicOperations.ZeroMemory(plaintext);
+                log?.Invoke($"wifi hotspot backup save error={ex.GetType().Name}");
+                return HotspotBackupPrepareOutcome.Failure("hotspot_backup_save_failed");
             }
         }
     }
 
     public HotspotBackupRecord? Load(Action<string>? log = null)
     {
-        lock (gate)
-        {
-            if (!File.Exists(filePath)) return null;
-            byte[]? plaintext = null;
-            try
-            {
-                var encrypted = File.ReadAllBytes(filePath);
-                plaintext = ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser);
-                var record = JsonSerializer.Deserialize<HotspotBackupRecord>(plaintext);
-                if (record is null || !record.IsRestorable)
-                {
-                    ClearLocked();
-                    return null;
-                }
-                return record;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException or JsonException)
-            {
-                log?.Invoke($"wifi hotspot backup load error={ex.GetType().Name}");
-                ClearLocked();
-                return null;
-            }
-            finally
-            {
-                if (plaintext is not null)
-                    CryptographicOperations.ZeroMemory(plaintext);
-            }
-        }
+        lock (gate) return LoadLocked(log, out _);
     }
 
     public void Clear()
     {
         lock (gate) ClearLocked();
+    }
+
+    private void SaveLocked(HotspotBackupRecord record)
+    {
+        Directory.CreateDirectory(directory);
+        var plaintext = JsonSerializer.SerializeToUtf8Bytes(record);
+        try
+        {
+            var protectedBytes = ProtectedData.Protect(plaintext, null, DataProtectionScope.CurrentUser);
+            var tempPath = Path.Combine(directory, $"hotspot-restore.{Guid.NewGuid():N}.tmp");
+            try
+            {
+                using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    stream.Write(protectedBytes);
+                    stream.Flush(true);
+                }
+                File.Move(tempPath, filePath, overwrite: true);
+            }
+            catch
+            {
+                try { File.Delete(tempPath); } catch { }
+                throw;
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+        }
+    }
+
+    private HotspotBackupRecord? LoadLocked(Action<string>? log, out bool ioFailed)
+    {
+        ioFailed = false;
+        if (!File.Exists(filePath)) return null;
+        byte[]? plaintext = null;
+        try
+        {
+            var encrypted = File.ReadAllBytes(filePath);
+            plaintext = ProtectedData.Unprotect(encrypted, null, DataProtectionScope.CurrentUser);
+            var record = JsonSerializer.Deserialize<HotspotBackupRecord>(plaintext);
+            if (record is null || !record.IsRestorable)
+            {
+                ClearLocked();
+                return null;
+            }
+            return record;
+        }
+        catch (Exception ex) when (ex is CryptographicException or JsonException)
+        {
+            log?.Invoke($"wifi hotspot backup load error={ex.GetType().Name}");
+            ClearLocked();
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log?.Invoke($"wifi hotspot backup load error={ex.GetType().Name}");
+            ioFailed = true;
+            return null;
+        }
+        finally
+        {
+            if (plaintext is not null)
+                CryptographicOperations.ZeroMemory(plaintext);
+        }
     }
 
     private void ClearLocked()
@@ -137,15 +328,55 @@ internal static class WindowsWifiHardwareLease
 }
 
 internal sealed class ActiveHotspotState(
-    NetworkOperatorTetheringManager manager,
-    NetworkOperatorTetheringAccessPointConfiguration? previousConfig,
-    bool configModified,
-    HotspotConfigBackupStore backupStore)
+    IHotspotTetheringManager manager,
+    HotspotBackupRecord restoreRecord,
+    bool hadPendingRestore,
+    IHotspotConfigBackupStore backupStore)
 {
-    public NetworkOperatorTetheringManager Manager { get; } = manager;
-    public NetworkOperatorTetheringAccessPointConfiguration? PreviousConfig { get; } = previousConfig;
-    public bool ConfigModified { get; set; } = configModified;
-    public HotspotConfigBackupStore BackupStore { get; } = backupStore;
+    private readonly object gate = new();
+    private bool configModified;
+    private bool teardownStarted;
+
+    public IHotspotTetheringManager Manager { get; } = manager;
+    public HotspotBackupRecord RestoreRecord { get; } = restoreRecord;
+    public bool HadPendingRestore { get; } = hadPendingRestore;
+    public IHotspotConfigBackupStore BackupStore { get; } = backupStore;
+
+    public bool ConfigModified
+    {
+        get { lock (gate) return configModified; }
+    }
+
+    public bool IsTeardownStarted
+    {
+        get { lock (gate) return teardownStarted; }
+    }
+
+    public bool TryMarkConfigModified()
+    {
+        lock (gate)
+        {
+            if (teardownStarted)
+                return false;
+            configModified = true;
+            return true;
+        }
+    }
+
+    public bool TryBeginTeardown(out bool needsRestore)
+    {
+        lock (gate)
+        {
+            if (teardownStarted)
+            {
+                needsRestore = false;
+                return false;
+            }
+            teardownStarted = true;
+            needsRestore = configModified || HadPendingRestore;
+            return true;
+        }
+    }
 }
 
 /// <summary>
@@ -260,6 +491,9 @@ internal static class WindowsWifiApController
         return supported;
     }
 
+    internal static readonly TimeSpan SyncStopDefaultStepTimeout = TimeSpan.FromSeconds(1.5);
+    internal static readonly TimeSpan EmergencyStopStepTimeout = TimeSpan.FromMilliseconds(750);
+
     internal static bool CanRestoreAccessPointConfiguration(NetworkOperatorTetheringAccessPointConfiguration? config) =>
         config is not null &&
         !string.IsNullOrEmpty(config.Ssid) &&
@@ -286,26 +520,40 @@ internal static class WindowsWifiApController
         ActiveHotspotState state,
         Action<string> log,
         string logPrefix,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
     {
-        var restored = !state.ConfigModified || !CanRestoreAccessPointConfiguration(state.PreviousConfig);
+        if (!state.TryBeginTeardown(out var needsRestore))
+            return;
+
+        var restored = !needsRestore;
         try
         {
             var budget = timeout ?? TimeSpan.FromSeconds(4);
-            using var stopTimeout = new CancellationTokenSource(budget);
-            if (state.Manager.TetheringOperationalState == TetheringOperationalState.On)
-            {
-                var stopTask = state.Manager.StopTetheringAsync().AsTask(stopTimeout.Token);
-                try { await stopTask.WaitAsync(stopTimeout.Token).ConfigureAwait(false); }
-                catch { WifiStepTimeout.ObserveSilently(stopTask); throw; }
-            }
-            if (state.ConfigModified && CanRestoreAccessPointConfiguration(state.PreviousConfig))
-            {
-                var configTask = state.Manager.ConfigureAccessPointAsync(state.PreviousConfig!).AsTask(stopTimeout.Token);
-                try { await configTask.WaitAsync(stopTimeout.Token).ConfigureAwait(false); }
-                catch { WifiStepTimeout.ObserveSilently(configTask); throw; }
-                restored = true;
-            }
+            var completedRestore = await WifiStepTimeout.RunAsync(
+                async stepCt =>
+                {
+                    if (state.Manager.IsOn)
+                        await state.Manager.StopTetheringAsync(stepCt).ConfigureAwait(false);
+
+                    if (!needsRestore)
+                        return true;
+
+                    if (!state.RestoreRecord.IsRestorable)
+                        return false;
+
+                    var restoreConfig = new HotspotAccessPointConfig(
+                        state.RestoreRecord.Ssid,
+                        state.RestoreRecord.Passphrase,
+                        state.RestoreRecord.Band);
+                    await state.Manager.ConfigureAccessPointAsync(restoreConfig, stepCt, ignoreBandErrors: true).ConfigureAwait(false);
+                    return true;
+                },
+                budget,
+                "hotspot_cleanup_timeout",
+                CancellationToken.None,
+                delayAsync).ConfigureAwait(false);
+            restored = completedRestore;
         }
         catch (Exception ex)
         {
@@ -318,20 +566,56 @@ internal static class WindowsWifiApController
         }
     }
 
-    internal static void StopHotspotAndRestoreSync(ActiveHotspotState state)
+    internal static void StopHotspotAndRestoreSync(
+        ActiveHotspotState state,
+        TimeSpan? stepTimeout = null,
+        Func<Task, TimeSpan, bool>? waitSync = null)
     {
-        var restored = !state.ConfigModified || !CanRestoreAccessPointConfiguration(state.PreviousConfig);
+        if (!state.TryBeginTeardown(out var needsRestore))
+            return;
+
+        var wait = waitSync ?? WaitTaskSync;
+        var budget = stepTimeout ?? SyncStopDefaultStepTimeout;
+        var restored = !needsRestore;
         try
         {
-            if (state.Manager.TetheringOperationalState == TetheringOperationalState.On)
-                state.Manager.StopTetheringAsync().AsTask().Wait(TimeSpan.FromSeconds(1.5));
-            if (state.ConfigModified && CanRestoreAccessPointConfiguration(state.PreviousConfig))
+            if (state.Manager.IsOn)
             {
-                state.Manager.ConfigureAccessPointAsync(state.PreviousConfig!).AsTask().Wait(TimeSpan.FromSeconds(1.5));
-                restored = true;
+                var stopTask = state.Manager.StopTetheringAsync(CancellationToken.None);
+                var stopped = wait(stopTask, budget);
+                if (!stopped)
+                {
+                    WifiStepTimeout.ObserveSilently(stopTask);
+                    return;
+                }
+                if (!stopTask.IsCompletedSuccessfully)
+                    return;
+            }
+
+            if (needsRestore)
+            {
+                if (!state.RestoreRecord.IsRestorable)
+                    return;
+
+                var restoreConfig = new HotspotAccessPointConfig(
+                    state.RestoreRecord.Ssid,
+                    state.RestoreRecord.Passphrase,
+                    state.RestoreRecord.Band);
+                var configTask = state.Manager.ConfigureAccessPointAsync(restoreConfig, CancellationToken.None, ignoreBandErrors: true);
+                var configured = wait(configTask, budget);
+                if (!configured)
+                {
+                    WifiStepTimeout.ObserveSilently(configTask);
+                    return;
+                }
+                if (configTask.IsCompletedSuccessfully)
+                    restored = true;
             }
         }
-        catch { }
+        catch
+        {
+            restored = false;
+        }
         finally
         {
             if (restored)
@@ -339,49 +623,75 @@ internal static class WindowsWifiApController
         }
     }
 
+    private static bool WaitTaskSync(Task task, TimeSpan timeout) => task.Wait(timeout);
+
     /// <summary>
     /// Restores Windows Mobile Hotspot settings if a previous process crashed while a temporary hotspot was active.
     /// </summary>
-    internal static async Task TryRestorePendingHotspotConfigAsync(
+    internal static Task TryRestorePendingHotspotConfigAsync(
         HotspotConfigBackupStore backupStore,
         Action<string> log,
+        CancellationToken cancellationToken = default) =>
+        TryRestorePendingHotspotConfigAsync(
+            (IHotspotConfigBackupStore)backupStore,
+            TryCreateAnyTetheringManager,
+            log,
+            delayAsync: null,
+            timeout: null,
+            cancellationToken);
+
+    internal static async Task TryRestorePendingHotspotConfigAsync(
+        IHotspotConfigBackupStore backupStore,
+        Func<IHotspotTetheringManager?> createAnyManager,
+        Action<string> log,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
+        TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
     {
         var backup = backupStore.Load(log);
         if (backup is null)
             return;
 
-        NetworkOperatorTetheringManager? manager = TryCreateAnyTetheringManager();
+        IHotspotTetheringManager? manager;
+        try
+        {
+            manager = createAnyManager();
+        }
+        catch (Exception ex)
+        {
+            log($"wifi hotspot restore error={ex.GetType().Name}");
+            return;
+        }
         if (manager is null)
             return; // Offline at startup; keep backup so a later online launch can restore it.
 
         try
         {
-            var current = manager.GetCurrentAccessPointConfiguration();
-            if (!backup.ShouldRestoreForCurrentSsid(current?.Ssid))
+            var current = manager.GetCurrentConfiguration();
+            if (current is null || string.IsNullOrEmpty(current.Ssid))
+                return; // Current config unreadable; keep backup for a later attempt.
+
+            if (!backup.ShouldRestoreForCurrentSsid(current.Ssid))
             {
                 backupStore.Clear();
                 return;
             }
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            var budget = timeout ?? TimeSpan.FromSeconds(5);
+            await WifiStepTimeout.RunAsync(
+                async stepCt =>
+                {
+                    if (manager.IsOn)
+                        await manager.StopTetheringAsync(stepCt).ConfigureAwait(false);
 
-            if (manager.TetheringOperationalState == TetheringOperationalState.On)
-                await manager.StopTetheringAsync().AsTask(timeout.Token).ConfigureAwait(false);
+                    var restoredConfig = new HotspotAccessPointConfig(backup.Ssid, backup.Passphrase, backup.Band);
+                    await manager.ConfigureAccessPointAsync(restoredConfig, stepCt, ignoreBandErrors: true).ConfigureAwait(false);
+                },
+                budget,
+                "hotspot_restore_timeout",
+                cancellationToken,
+                delayAsync).ConfigureAwait(false);
 
-            var restoredConfig = new NetworkOperatorTetheringAccessPointConfiguration
-            {
-                Ssid = backup.Ssid,
-                Passphrase = backup.Passphrase,
-            };
-            if (backup.Band is int savedBand && IsHotspotBandApiSupported())
-            {
-                try { restoredConfig.Band = (TetheringWiFiBand)savedBand; }
-                catch { }
-            }
-
-            await manager.ConfigureAccessPointAsync(restoredConfig).AsTask(timeout.Token).ConfigureAwait(false);
             backupStore.Clear();
             log("wifi hotspot config restored from previous run");
         }
@@ -391,19 +701,19 @@ internal static class WindowsWifiApController
         }
     }
 
-    private static NetworkOperatorTetheringManager? TryCreateAnyTetheringManager()
+    private static IHotspotTetheringManager? TryCreateAnyTetheringManager()
     {
         try
         {
             var internet = NetworkInformation.GetInternetConnectionProfile();
             if (internet is not null)
             {
-                try { return NetworkOperatorTetheringManager.CreateFromConnectionProfile(internet); }
+                try { return new WinRtHotspotTetheringManager(NetworkOperatorTetheringManager.CreateFromConnectionProfile(internet)); }
                 catch { }
             }
             foreach (var profile in NetworkInformation.GetConnectionProfiles())
             {
-                try { return NetworkOperatorTetheringManager.CreateFromConnectionProfile(profile); }
+                try { return new WinRtHotspotTetheringManager(NetworkOperatorTetheringManager.CreateFromConnectionProfile(profile)); }
                 catch { }
             }
         }

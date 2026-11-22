@@ -17,7 +17,8 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
 
     private readonly Action<string> log;
     private readonly Dispatcher? dispatcher;
-    private readonly HotspotConfigBackupStore hotspotBackups;
+    private readonly IHotspotConfigBackupStore hotspotBackups;
+    private readonly Task? startupRestoreTask;
     private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private readonly object stateLock = new();
 
@@ -38,11 +39,16 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
 
     internal static WifiStationRadioInfo QueryStationRadioInfo() => WindowsWifiApController.QueryStationRadioInfo();
 
-    public WifiTransferProbe(Action<string> log, Dispatcher? dispatcher = null, HotspotConfigBackupStore? hotspotBackups = null)
+    public WifiTransferProbe(
+        Action<string> log,
+        Dispatcher? dispatcher = null,
+        IHotspotConfigBackupStore? hotspotBackups = null,
+        Task? startupRestoreTask = null)
     {
         this.log = log;
         this.dispatcher = dispatcher;
         this.hotspotBackups = hotspotBackups ?? new HotspotConfigBackupStore();
+        this.startupRestoreTask = startupRestoreTask;
         snapshot = new WifiProbeSnapshot(
             IsRunning: false,
             Mode: WifiProbeMode.WifiDirectLegacy,
@@ -217,14 +223,14 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         lifecycleGate.Dispose();
     }
 
-    public void StopSync()
+    public void StopSync(TimeSpan? stepTimeout = null)
     {
         try { sessionCts?.Cancel(); } catch { }
         try { listener?.Stop(); } catch { }
         try { publisher?.Stop(); } catch { }
         var hotspot = Interlocked.Exchange(ref activeHotspot, null);
         if (hotspot is not null)
-            WindowsWifiApController.StopHotspotAndRestoreSync(hotspot);
+            WindowsWifiApController.StopHotspotAndRestoreSync(hotspot, stepTimeout);
         if (holdsLease)
         {
             holdsLease = false;
@@ -375,6 +381,22 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         WifiProbeBand requestedBand,
         CancellationToken ct)
     {
+        if (startupRestoreTask is { IsCompleted: false } restore)
+        {
+            try
+            {
+                await restore.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                log($"wifi probe startup restore wait error={ex.GetType().Name}");
+            }
+        }
+
         var profile = NetworkInformation.GetInternetConnectionProfile();
         if (profile is null)
             throw new ProbeException("PCがインターネットにつながっていないため、モバイルホットスポットを開始できません。「Wi-Fi Direct（レガシー）」を試してください。");
@@ -386,10 +408,10 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
             throw new ProbeException(DescribeTetheringCapability(capability));
         }
 
-        NetworkOperatorTetheringManager manager;
+        NetworkOperatorTetheringManager rawManager;
         try
         {
-            manager = NetworkOperatorTetheringManager.CreateFromConnectionProfile(profile);
+            rawManager = NetworkOperatorTetheringManager.CreateFromConnectionProfile(profile);
         }
         catch (Exception ex)
         {
@@ -397,33 +419,41 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
             throw new ProbeException("モバイルホットスポットを作成できませんでした。");
         }
 
-        if (manager.TetheringOperationalState == TetheringOperationalState.On)
+        var manager = new WinRtHotspotTetheringManager(rawManager);
+        if (manager.IsOn)
             throw new ProbeException("すでにWindowsのモバイルホットスポットがオンです。設定を壊さないよう、いったんオフにしてから試してください。");
 
-        NetworkOperatorTetheringAccessPointConfiguration? previousConfig = null;
-        try { previousConfig = manager.GetCurrentAccessPointConfiguration(); }
-        catch { previousConfig = null; }
-
-        var hotspotState = new ActiveHotspotState(manager, previousConfig, configModified: false, hotspotBackups);
-        activeHotspot = hotspotState;
-
-        var backupRecord = WindowsWifiApController.CreateBackupRecord(previousConfig, credentials.Ssid);
-        if (backupRecord is not null)
+        HotspotAccessPointConfig? currentConfig;
+        try
         {
-            try { hotspotBackups.Save(backupRecord); }
-            catch (Exception ex) { log($"wifi hotspot backup save error={ex.GetType().Name}"); }
+            currentConfig = manager.GetCurrentConfiguration();
+        }
+        catch (Exception ex)
+        {
+            log($"wifi probe hotspot config read error={ex.GetType().Name}");
+            throw new ProbeException("現在のモバイルホットスポット設定を読み取れないため、設定を壊さないよう開始を見送りました。");
         }
 
-        var config = new NetworkOperatorTetheringAccessPointConfiguration
+        var backupPrep = hotspotBackups.PrepareForSession(currentConfig, credentials.Ssid, log);
+        if (!backupPrep.Succeeded || backupPrep.Record is null)
         {
-            Ssid = credentials.Ssid,
-            Passphrase = credentials.Passphrase,
-        };
+            log($"wifi probe hotspot prepare failed reason={backupPrep.FailureCode ?? "unknown"}");
+            throw new ProbeException("現在のモバイルホットスポット設定を退避できないため、設定を壊さないよう開始を見送りました。");
+        }
+
+        var hotspotState = new ActiveHotspotState(
+            manager,
+            backupPrep.Record,
+            hadPendingRestore: backupPrep.PreservedExistingBackup,
+            hotspotBackups);
+        activeHotspot = hotspotState;
+
+        var baseConfig = new HotspotAccessPointConfig(credentials.Ssid, credentials.Passphrase, Band: null);
 
         var bandApiSupported = IsHotspotBandApiSupported();
         if (bandApiSupported)
         {
-            var supportedBands = await WindowsWifiApController.QuerySupportedHotspotBandsAsync(config, ct);
+            var supportedBands = await manager.QuerySupportedBandsAsync(baseConfig, ct);
             log(WifiProbeText.FormatHotspotBandsLog(supportedBands, requestedBand));
 
             if (requestedBand == WifiProbeBand.SixGHz && !IsHotspotSixGigahertzSupported())
@@ -435,9 +465,10 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
 
             try
             {
-                config.Band = WindowsWifiApController.ToWinRtBand(requestedBand);
-                hotspotState.ConfigModified = true;
-                await manager.ConfigureAccessPointAsync(config).AsTask(ct);
+                var config = baseConfig with { Band = (int)WindowsWifiApController.ToWinRtBand(requestedBand) };
+                if (!hotspotState.TryMarkConfigModified())
+                    throw new OperationCanceledException(ct);
+                await manager.ConfigureAccessPointAsync(config, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -452,14 +483,14 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         }
         else
         {
-            hotspotState.ConfigModified = true;
-            await manager.ConfigureAccessPointAsync(config).AsTask(ct);
+            if (!hotspotState.TryMarkConfigModified())
+                throw new OperationCanceledException(ct);
+            await manager.ConfigureAccessPointAsync(baseConfig, ct);
         }
 
-        var result = await manager.StartTetheringAsync().AsTask(ct);
-        if (result.Status != TetheringOperationStatus.Success)
+        var (succeeded, statusName) = await manager.StartTetheringAsync(ct);
+        if (!succeeded)
         {
-            var statusName = WifiProbeText.FormatTetheringOperationStatus((int)result.Status, result.Status.ToString());
             log($"wifi probe tethering start status={statusName}");
             throw new ProbeException(
                 WifiProbeText.DescribeTetheringStartFailure(statusName, bandApiSupported ? requestedBand : null));

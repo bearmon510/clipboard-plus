@@ -20,13 +20,16 @@ public partial class App : System.Windows.Application
     private BleServer? server;
     private SyncCoordinator? coordinator;
     private readonly WifiSessionReplayGuard wifiReplayGuard = new();
+    private readonly object emergencyCleanupGate = new();
     private HotspotConfigBackupStore? hotspotBackups;
+    private Task? startupHotspotRestore;
     private WindowsWifiTransferHost? wifiTransferHost;
     private AppLog? log;
     private MainWindow? window;
     private KeyboardHook? keyboardHook;
     private IHistoryPresenter? historyPresenter;
     private HistoryWindow? historyWindow;
+    private bool crashHandlersRegistered;
     private bool exiting;
     private bool repairing;
     private Task? repairTask;
@@ -75,11 +78,19 @@ public partial class App : System.Windows.Application
             log = new AppLog(); log.Write("application starting");
             Settings = new AppSettings(log: log.Write);
             hotspotBackups = new HotspotConfigBackupStore();
-            wifiTransferHost = new WindowsWifiTransferHost(log.Write, hotspotBackups);
-            _ = Task.Run(() => WindowsWifiApController.TryRestorePendingHotspotConfigAsync(hotspotBackups, log.Write));
+            startupHotspotRestore = Task.Run(() => WindowsWifiApController.TryRestorePendingHotspotConfigAsync(hotspotBackups, log.Write));
+            wifiTransferHost = new WindowsWifiTransferHost(log.Write, hotspotBackups, startupHotspotRestore);
+            RegisterCrashRecoveryHandlers();
             HistoryWindow.ClearDragStaging(HistoryWindow.DragStagingRoot);
             var pairing = LocalStore.LoadOrCreate();
-            window = new MainWindow(pairing, log.Write);
+            window = new MainWindow(
+                pairing,
+                log.Write,
+                preview: false,
+                WifiTransferProbe.IsHotspotBandApiSupported(),
+                WifiTransferProbe.IsHotspotSixGigahertzSupported(),
+                hotspotBackups,
+                startupHotspotRestore);
             MainWindow = window;
             _ = new WindowInteropHelper(window).EnsureHandle();
             window.RepairRequested += RepairAsync;
@@ -306,14 +317,73 @@ public partial class App : System.Windows.Application
         {
             if (currentCoordinator is not null) await currentCoordinator.DisposeAsync();
         }
+        if (startupHotspotRestore is { IsCompleted: false } pendingRestore)
+        {
+            try { await pendingRestore.WaitAsync(TimeSpan.FromSeconds(2)); }
+            catch { }
+        }
         log?.Write("application stopped");
         Shutdown();
     }
 
+    private void RegisterCrashRecoveryHandlers()
+    {
+        if (crashHandlersRegistered) return;
+        crashHandlersRegistered = true;
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
+        AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+    }
+
+    private void UnregisterCrashRecoveryHandlers()
+    {
+        if (!crashHandlersRegistered) return;
+        crashHandlersRegistered = false;
+        DispatcherUnhandledException -= OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException -= OnDomainUnhandledException;
+        AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+    }
+
+    private void OnDispatcherUnhandledException(object sender, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e)
+    {
+        RunEmergencyHotspotCleanup();
+    }
+
+    private void OnDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)
+    {
+        RunEmergencyHotspotCleanup();
+    }
+
+    private void OnProcessExit(object? sender, EventArgs e)
+    {
+        RunEmergencyHotspotCleanup();
+    }
+
+    private void RunEmergencyHotspotCleanup()
+    {
+        lock (emergencyCleanupGate)
+        {
+            RunBestEffortHotspotStop(
+                () => wifiTransferHost?.StopSync(WindowsWifiApController.EmergencyStopStepTimeout),
+                () => window?.StopWifiProbeSync(WindowsWifiApController.EmergencyStopStepTimeout));
+        }
+    }
+
+    internal static void RunBestEffortHotspotStop(Action? stopTransferHost, Action? stopProbe)
+    {
+        try { stopTransferHost?.Invoke(); } catch { }
+        try { stopProbe?.Invoke(); } catch { }
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
-        wifiTransferHost?.StopSync();
-        window?.StopWifiProbeSync();
+        UnregisterCrashRecoveryHandlers();
+        lock (emergencyCleanupGate)
+        {
+            RunBestEffortHotspotStop(
+                () => wifiTransferHost?.StopSync(),
+                () => window?.StopWifiProbeSync());
+        }
         keyboardHook?.Dispose();
         tray?.Dispose();
         activationWait?.Unregister(null); activation?.Dispose();

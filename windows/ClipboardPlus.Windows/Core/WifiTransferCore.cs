@@ -460,17 +460,120 @@ public sealed record HotspotBackupRecord(
     string Ssid,
     string Passphrase,
     int? Band,
-    string TempSsid)
+    string TempSsid,
+    IReadOnlyList<string>? PreviousTempSsids = null)
 {
+    public const int MaxTrackedTempSsids = 64;
+
     public bool IsRestorable =>
         !string.IsNullOrEmpty(Ssid) &&
         !string.IsNullOrEmpty(Passphrase) &&
         Passphrase.Length >= 8;
 
+    public IEnumerable<string> AllTempSsids()
+    {
+        if (!string.IsNullOrEmpty(TempSsid))
+            yield return TempSsid;
+        if (PreviousTempSsids is not null)
+        {
+            foreach (var ssid in PreviousTempSsids)
+            {
+                if (!string.IsNullOrEmpty(ssid) &&
+                    !string.Equals(ssid, TempSsid, StringComparison.Ordinal))
+                {
+                    yield return ssid;
+                }
+            }
+        }
+    }
+
+    public bool MatchesTempSsid(string? currentSsid)
+    {
+        if (string.IsNullOrEmpty(currentSsid))
+            return false;
+        foreach (var temp in AllTempSsids())
+        {
+            if (string.Equals(currentSsid, temp, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
     public bool ShouldRestoreForCurrentSsid(string? currentSsid) =>
-        IsRestorable &&
-        !string.IsNullOrEmpty(TempSsid) &&
-        string.Equals(currentSsid, TempSsid, StringComparison.Ordinal);
+        IsRestorable && MatchesTempSsid(currentSsid);
+
+    public HotspotBackupRecord WithAdditionalTempSsid(string newTempSsid)
+    {
+        if (string.IsNullOrEmpty(newTempSsid))
+            return this;
+        if (string.Equals(TempSsid, newTempSsid, StringComparison.Ordinal))
+            return this;
+
+        var history = new List<string>();
+        if (!string.IsNullOrEmpty(TempSsid))
+            history.Add(TempSsid);
+        if (PreviousTempSsids is not null)
+        {
+            foreach (var ssid in PreviousTempSsids)
+            {
+                if (!string.IsNullOrEmpty(ssid) &&
+                    !string.Equals(ssid, newTempSsid, StringComparison.Ordinal) &&
+                    !history.Contains(ssid, StringComparer.Ordinal))
+                {
+                    history.Add(ssid);
+                }
+            }
+        }
+        var maxPrevious = MaxTrackedTempSsids - 1;
+        if (history.Count > maxPrevious)
+            history.RemoveRange(maxPrevious, history.Count - maxPrevious);
+
+        return new HotspotBackupRecord(
+            Ssid,
+            Passphrase,
+            Band,
+            newTempSsid,
+            history.Count > 0 ? history : null);
+    }
+
+    public bool Equals(HotspotBackupRecord? other)
+    {
+        if (ReferenceEquals(this, other)) return true;
+        if (other is null) return false;
+        return string.Equals(Ssid, other.Ssid, StringComparison.Ordinal) &&
+            string.Equals(Passphrase, other.Passphrase, StringComparison.Ordinal) &&
+            Band == other.Band &&
+            string.Equals(TempSsid, other.TempSsid, StringComparison.Ordinal) &&
+            SequenceEquals(PreviousTempSsids, other.PreviousTempSsids);
+    }
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Ssid, StringComparer.Ordinal);
+        hash.Add(Passphrase, StringComparer.Ordinal);
+        hash.Add(Band);
+        hash.Add(TempSsid, StringComparer.Ordinal);
+        if (PreviousTempSsids is not null)
+        {
+            foreach (var ssid in PreviousTempSsids)
+                hash.Add(ssid, StringComparer.Ordinal);
+        }
+        return hash.ToHashCode();
+    }
+
+    private static bool SequenceEquals(IReadOnlyList<string>? a, IReadOnlyList<string>? b)
+    {
+        var aCount = a?.Count ?? 0;
+        var bCount = b?.Count ?? 0;
+        if (aCount != bCount) return false;
+        for (var i = 0; i < aCount; i++)
+        {
+            if (!string.Equals(a![i], b![i], StringComparison.Ordinal))
+                return false;
+        }
+        return true;
+    }
 
     // Never expose SSID or passphrase in logs/formatting.
     public override string ToString() => "HotspotBackupRecord { Redacted = true }";
