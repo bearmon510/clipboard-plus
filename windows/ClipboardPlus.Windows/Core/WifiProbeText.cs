@@ -70,7 +70,7 @@ public sealed record WifiProbeCredentials(string Ssid, string Passphrase, string
 
     public static WifiProbeCredentials CreateRandom()
     {
-        var ssid = "DIRECT-cp-" + RandomText(8);
+        var ssid = WifiTransferCredentials.TemporarySsidPrefix + RandomText(WifiTransferCredentials.TemporarySsidSuffixLength);
         var passphrase = RandomText(20);
         var tokenBytes = RandomNumberGenerator.GetBytes(24);
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');

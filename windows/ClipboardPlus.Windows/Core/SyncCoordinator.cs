@@ -2475,7 +2475,7 @@ public sealed class SyncCoordinator(
         if (sessionToken.IsCancellationRequested)
         {
             try { startCts.Cancel(); } catch { }
-            DisposeHostHandleIfLateSuccess(startTask);
+            await WaitBrieflyForCancelledStartAsync(startTask, delay, wifiConfig.EffectiveStartCancelGraceTimeout).ConfigureAwait(false);
             sessionToken.ThrowIfCancellationRequested();
         }
 
@@ -2485,6 +2485,48 @@ public sealed class SyncCoordinator(
         try { startCts.Cancel(); } catch { }
         DisposeHostHandleIfLateSuccess(startTask);
         throw new TimeoutException("Wi-Fi host startup timed out.");
+    }
+
+    private static async Task WaitBrieflyForCancelledStartAsync(
+        Task<WifiHostStartResult> startTask,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        TimeSpan graceTimeout)
+    {
+        if (startTask.IsCompleted)
+        {
+            await DisposeStartResultIfSucceededAsync(startTask).ConfigureAwait(false);
+            return;
+        }
+
+        if (graceTimeout > TimeSpan.Zero)
+        {
+            using var graceCts = new CancellationTokenSource();
+            var graceDelay = delay(graceTimeout, graceCts.Token);
+            var finished = await Task.WhenAny(startTask, graceDelay).ConfigureAwait(false);
+            if (ReferenceEquals(finished, startTask))
+            {
+                try { graceCts.Cancel(); } catch { }
+                WifiStepTimeout.ObserveSilently(graceDelay);
+                await DisposeStartResultIfSucceededAsync(startTask).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        DisposeHostHandleIfLateSuccess(startTask);
+    }
+
+    private static async Task DisposeStartResultIfSucceededAsync(Task<WifiHostStartResult> startTask)
+    {
+        if (startTask.IsFaulted)
+        {
+            _ = startTask.Exception;
+            return;
+        }
+        if (startTask.IsCompletedSuccessfully && startTask.Result.Succeeded && startTask.Result.Handle is { } lateHandle)
+        {
+            try { await lateHandle.DisposeAsync().ConfigureAwait(false); }
+            catch { }
+        }
     }
 
     private static void DisposeHostHandleIfLateSuccess(Task<WifiHostStartResult> startTask)

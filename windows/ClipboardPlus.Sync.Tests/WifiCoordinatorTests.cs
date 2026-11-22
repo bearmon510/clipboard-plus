@@ -1626,4 +1626,81 @@ public sealed class WifiCoordinatorTests : IDisposable
         hungStart.SetResult(WifiHostStartResult.Success(lateHandle));
         await lateHandle.Disposed.WaitAsync(TimeSpan.FromSeconds(5));
     }
+
+    [Fact]
+    public async Task CoordinatorDisposeDuringStartWaitsBrieflyForHostFinishAndCapsAtGraceTimeout()
+    {
+        // 1. Host completes cleanup shortly after cancellation -> DisposeAsync waits for it before returning.
+        {
+            var delay = new ControlledDelay();
+            var hostStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hostCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var finishHost = new TaskCompletionSource<WifiHostStartResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var host = new FakeWifiHost
+            {
+                CustomStart = (_, ct) =>
+                {
+                    hostStarted.TrySetResult();
+                    ct.Register(() => hostCancelled.TrySetResult());
+                    return finishHost.Task;
+                },
+            };
+            var rig = new Rig(
+                NewRoot(),
+                host: host,
+                options: new WifiTransferOptions(DelayAsync: delay.DelayAsync));
+            var pad = await rig.ConnectAsync();
+
+            await pad.SendWifiAsync(new WifiRequest(WifiTransferDirection.Send, [Guid.NewGuid()]));
+            await hostStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var disposeTask = rig.DisposeAsync().AsTask();
+            await hostCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            _ = await delay.WaitForRequestedDelayAsync(TimeSpan.FromSeconds(1)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(disposeTask.IsCompleted);
+
+            // Host resolves with a late handle before the 1s grace expires -> DisposeAsync disposes it before returning.
+            var lateHandle = new FakeWifiSessionHandle(WifiApMode.Hotspot5GHz, "DIRECT-cp-GRAC0001");
+            finishHost.SetResult(WifiHostStartResult.Success(lateHandle));
+            await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(lateHandle.IsDisposed);
+        }
+
+        // 2. Host stays hung after cancellation -> DisposeAsync stops waiting after 1s grace and still disposes late handle.
+        {
+            var delay = new ControlledDelay();
+            var hostStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hostCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var hungHost = new TaskCompletionSource<WifiHostStartResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var host = new FakeWifiHost
+            {
+                CustomStart = (_, ct) =>
+                {
+                    hostStarted.TrySetResult();
+                    ct.Register(() => hostCancelled.TrySetResult());
+                    return hungHost.Task;
+                },
+            };
+            var rig = new Rig(
+                NewRoot(),
+                host: host,
+                options: new WifiTransferOptions(DelayAsync: delay.DelayAsync));
+            var pad = await rig.ConnectAsync();
+
+            await pad.SendWifiAsync(new WifiRequest(WifiTransferDirection.Send, [Guid.NewGuid()]));
+            await hostStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var disposeTask = rig.DisposeAsync().AsTask();
+            await hostCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var graceWait = await delay.WaitForRequestedDelayAsync(TimeSpan.FromSeconds(1)).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(disposeTask.IsCompleted);
+
+            graceWait.Trigger();
+            await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var lateHandle = new FakeWifiSessionHandle(WifiApMode.Hotspot5GHz, "DIRECT-cp-GRAC0002");
+            hungHost.SetResult(WifiHostStartResult.Success(lateHandle));
+            await lateHandle.Disposed.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
 }

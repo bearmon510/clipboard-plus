@@ -466,9 +466,9 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
             try
             {
                 var config = baseConfig with { Band = (int)WindowsWifiApController.ToWinRtBand(requestedBand) };
-                if (!hotspotState.TryMarkConfigModified())
+                if (!hotspotState.TryStartConfigure(config, ct, out var configureTask))
                     throw new OperationCanceledException(ct);
-                await manager.ConfigureAccessPointAsync(config, ct);
+                await configureTask;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -483,12 +483,14 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         }
         else
         {
-            if (!hotspotState.TryMarkConfigModified())
+            if (!hotspotState.TryStartConfigure(baseConfig, ct, out var configureTask))
                 throw new OperationCanceledException(ct);
-            await manager.ConfigureAccessPointAsync(baseConfig, ct);
+            await configureTask;
         }
 
-        var (succeeded, statusName) = await manager.StartTetheringAsync(ct);
+        if (!hotspotState.TryStartTethering(ct, out var startTask))
+            throw new OperationCanceledException(ct);
+        var (succeeded, statusName) = await startTask;
         if (!succeeded)
         {
             log($"wifi probe tethering start status={statusName}");

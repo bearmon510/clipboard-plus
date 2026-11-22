@@ -17,12 +17,30 @@ public sealed record WifiTransferCredentials(
     string Passphrase,
     byte[] Token)
 {
+    public const string TemporarySsidPrefix = "DIRECT-cp-";
+    public const int TemporarySsidSuffixLength = 8;
     private const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+
+    public static bool IsTemporarySsid(string? ssid)
+    {
+        if (string.IsNullOrEmpty(ssid) ||
+            ssid.Length != TemporarySsidPrefix.Length + TemporarySsidSuffixLength ||
+            !ssid.StartsWith(TemporarySsidPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        for (var i = TemporarySsidPrefix.Length; i < ssid.Length; i++)
+        {
+            if (!char.IsAsciiLetterOrDigit(ssid[i]))
+                return false;
+        }
+        return true;
+    }
 
     public static WifiTransferCredentials CreateRandom()
     {
         var session = Guid.NewGuid();
-        var ssid = "DIRECT-cp-" + RandomText(8);
+        var ssid = TemporarySsidPrefix + RandomText(TemporarySsidSuffixLength);
         var passphrase = RandomText(SyncProtocol.WifiMinPassphraseBytes);
         var token = RandomNumberGenerator.GetBytes(32);
         return new WifiTransferCredentials(session, ssid, passphrase, token);
@@ -47,7 +65,8 @@ public sealed record WifiTransferOptions(
     TimeSpan? PostDoneCloseGrace = null,
     Func<TimeSpan, CancellationToken, Task>? DelayAsync = null,
     Func<WifiTransferCredentials>? CredentialsFactory = null,
-    TimeSpan? StartTimeout = null)
+    TimeSpan? StartTimeout = null,
+    TimeSpan? StartCancelGraceTimeout = null)
 {
     public static readonly WifiTransferOptions Default = new();
 
@@ -55,6 +74,7 @@ public sealed record WifiTransferOptions(
     public TimeSpan EffectivePostAuthIdleTimeout => PostAuthIdleTimeout ?? TimeSpan.FromSeconds(10);
     public TimeSpan EffectivePostDoneCloseGrace => PostDoneCloseGrace ?? TimeSpan.FromSeconds(2);
     public TimeSpan EffectiveStartTimeout => StartTimeout ?? WifiApStarter.DefaultTotalStartTimeout;
+    public TimeSpan EffectiveStartCancelGraceTimeout => StartCancelGraceTimeout ?? TimeSpan.FromSeconds(1);
     public Func<TimeSpan, CancellationToken, Task> EffectiveDelayAsync => DelayAsync ?? Task.Delay;
 }
 
@@ -122,6 +142,8 @@ public sealed record WifiApAttemptResult(
 public interface IWifiApBackend
 {
     bool HasInternetConnection();
+    Task<WifiApAttemptResult?> PrepareHotspotAsync(CancellationToken cancellationToken) =>
+        Task.FromResult<WifiApAttemptResult?>(null);
     Task<WifiApAttemptResult> TryStartHotspotAsync(WifiTransferCredentials credentials, CancellationToken cancellationToken);
     Task<WifiApAttemptResult> TryStartWifiDirectAsync(WifiTransferCredentials credentials, CancellationToken cancellationToken);
 }
@@ -259,16 +281,35 @@ public static class WifiApStarter
 
         try
         {
-            var primary = await RunAttemptAsync(
-                ct => online
-                    ? backend.TryStartHotspotAsync(credentials, ct)
-                    : backend.TryStartWifiDirectAsync(credentials, ct),
-                primaryBudget,
-                delay,
-                overallCts.Token,
-                overallTimeoutTask,
-                cancellationToken,
-                () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+            WifiApAttemptResult primary;
+            if (online)
+            {
+                var prepFailure = await RunPrepareHotspotAsync(
+                    backend,
+                    overallCts.Token,
+                    overallTimeoutTask,
+                    cancellationToken,
+                    () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+                primary = prepFailure ?? await RunAttemptAsync(
+                    ct => backend.TryStartHotspotAsync(credentials, ct),
+                    primaryBudget,
+                    delay,
+                    overallCts.Token,
+                    overallTimeoutTask,
+                    cancellationToken,
+                    () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+            }
+            else
+            {
+                primary = await RunAttemptAsync(
+                    ct => backend.TryStartWifiDirectAsync(credentials, ct),
+                    primaryBudget,
+                    delay,
+                    overallCts.Token,
+                    overallTimeoutTask,
+                    cancellationToken,
+                    () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+            }
 
             if (primary.Succeeded && primary.Handle is not null)
                 return WifiHostStartResult.Success(primary.Handle);
@@ -318,16 +359,35 @@ public static class WifiApStarter
                 return WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
             }
 
-            var secondary = await RunAttemptAsync(
-                ct => online
-                    ? backend.TryStartWifiDirectAsync(credentials, ct)
-                    : backend.TryStartHotspotAsync(credentials, ct),
-                attemptBudget: null,
-                delay,
-                overallCts.Token,
-                overallTimeoutTask,
-                cancellationToken,
-                () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+            WifiApAttemptResult secondary;
+            if (online)
+            {
+                secondary = await RunAttemptAsync(
+                    ct => backend.TryStartWifiDirectAsync(credentials, ct),
+                    attemptBudget: null,
+                    delay,
+                    overallCts.Token,
+                    overallTimeoutTask,
+                    cancellationToken,
+                    () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+            }
+            else
+            {
+                var prepFailure = await RunPrepareHotspotAsync(
+                    backend,
+                    overallCts.Token,
+                    overallTimeoutTask,
+                    cancellationToken,
+                    () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+                secondary = prepFailure ?? await RunAttemptAsync(
+                    ct => backend.TryStartHotspotAsync(credentials, ct),
+                    attemptBudget: null,
+                    delay,
+                    overallCts.Token,
+                    overallTimeoutTask,
+                    cancellationToken,
+                    () => Volatile.Read(ref overallExpired) != 0).ConfigureAwait(false);
+            }
 
             if (secondary.Succeeded && secondary.Handle is not null)
                 return WifiHostStartResult.Success(secondary.Handle);
@@ -347,6 +407,44 @@ public static class WifiApStarter
             try { overallTimerCts.Cancel(); } catch { }
             WifiStepTimeout.ObserveSilently(overallTimeoutTask);
         }
+    }
+
+    private static async Task<WifiApAttemptResult?> RunPrepareHotspotAsync(
+        IWifiApBackend backend,
+        CancellationToken overallToken,
+        Task overallTimeoutTask,
+        CancellationToken callerToken,
+        Func<bool> isOverallExpired)
+    {
+        var prepTask = backend.PrepareHotspotAsync(overallToken);
+        if (prepTask.IsCompletedSuccessfully)
+            return prepTask.Result;
+
+        var winner = await Task.WhenAny(prepTask, overallTimeoutTask).ConfigureAwait(false);
+        if (ReferenceEquals(winner, prepTask))
+        {
+            try
+            {
+                var result = await prepTask.ConfigureAwait(false);
+                if (callerToken.IsCancellationRequested)
+                    callerToken.ThrowIfCancellationRequested();
+                if (isOverallExpired())
+                    return WifiApAttemptResult.Failure("total_timeout", WifiUnavailableReason.StartFailed);
+                return result;
+            }
+            catch (OperationCanceledException) when (callerToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                return WifiApAttemptResult.Failure("total_timeout", WifiUnavailableReason.StartFailed);
+            }
+        }
+
+        WifiStepTimeout.ObserveSilently(prepTask);
+        callerToken.ThrowIfCancellationRequested();
+        return WifiApAttemptResult.Failure("total_timeout", WifiUnavailableReason.StartFailed);
     }
 
     private static async Task RunTimeoutSignalAsync(
