@@ -63,6 +63,8 @@
         <Button x:Name="RepairButton" Content="組み直す" Click="OnRepair"/>
         <Button x:Name="LogsButton" Content="ログのフォルダを開く" Click="OnOpenLogs"/>
       </WrapPanel>
+      <CheckBox x:Name="WifiTransferCheck" Content="Wi-Fi で速く送る" IsChecked="True" Click="OnWifiTransferChanged"/>
+      <TextBlock Text="大きい画像やファイルを、PCが一時的に作るWi-Fiで速く送ります。" FontSize="12" Foreground="#64748B" Margin="22,2,0,10" TextWrapping="Wrap"/>
       <CheckBox x:Name="StartupCheck" Content="Windowsの起動時に開く" Click="OnStartupChanged"/>
       <TextBlock Text="ウインドウを閉じても同期を続けます。終了するには、タスクトレイのアイコンから「終了」を選んでください。" FontSize="12" Foreground="#64748B" Margin="0,14,0,0"/>
       <Expander Header="Wi-Fi 転送の試験（段階A・開発用）" Foreground="#64748B" Margin="0,18,0,0">

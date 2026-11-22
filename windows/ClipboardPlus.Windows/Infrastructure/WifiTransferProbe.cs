@@ -2,11 +2,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Windows.Threading;
 using ClipboardPlus.Windows.Core;
 using global::Windows.Devices.WiFiDirect;
-using global::Windows.Foundation.Metadata;
 using global::Windows.Networking.Connectivity;
 using global::Windows.Networking.NetworkOperators;
 using global::Windows.Security.Credentials;
@@ -15,69 +13,36 @@ namespace ClipboardPlus.Windows.Infrastructure;
 
 internal sealed class WifiTransferProbe : IAsyncDisposable
 {
-    private const string TetheringConfigTypeName =
-        "Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration";
-    private const string TetheringBandTypeName =
-        "Windows.Networking.NetworkOperators.TetheringWiFiBand";
-    // SixGigahertz (= 3) was added in UniversalApiContract v16 (Windows 11 23H2/24H2) and is not in the 22621 SDK enum.
-    private const TetheringWiFiBand SixGigahertzBand = (TetheringWiFiBand)3;
-
-    private const uint WlanInterfaceStateConnected = 1;
-    private const uint WlanIntfOpcodeChannelNumber = 8;
-    private const uint WlanIntfOpcodeRealtimeConnectionQuality = 19;
-    private const int WlanInterfaceInfoListHeaderBytes = 8;
-    private const int WlanInterfaceInfoBytes = 532;
+    private const string HardwareLeaseOwner = "probe";
 
     private readonly Action<string> log;
     private readonly Dispatcher? dispatcher;
+    private readonly HotspotConfigBackupStore hotspotBackups;
     private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private readonly object stateLock = new();
 
     private CancellationTokenSource? sessionCts;
     private WiFiDirectAdvertisementPublisher? publisher;
-    private NetworkOperatorTetheringManager? tetheringManager;
-    private NetworkOperatorTetheringAccessPointConfiguration? previousTetheringConfig;
-    private bool tetheringConfigModified;
+    private ActiveHotspotState? activeHotspot;
     private TcpListener? listener;
     private Task? acceptLoop;
     private WifiProbeSnapshot snapshot;
+    private bool holdsLease;
     private volatile bool disposed;
 
     public event Action<WifiProbeSnapshot>? SnapshotChanged;
 
-    internal static bool IsHotspotBandApiSupported()
-    {
-        try
-        {
-            return OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041) &&
-                ApiInformation.IsTypePresent(TetheringBandTypeName) &&
-                ApiInformation.IsPropertyPresent(TetheringConfigTypeName, "Band") &&
-                (ApiInformation.IsMethodPresent(TetheringConfigTypeName, "IsBandSupportedAsync", 1) ||
-                 ApiInformation.IsMethodPresent(TetheringConfigTypeName, "IsBandSupported", 1));
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    internal static bool IsHotspotBandApiSupported() => WindowsWifiApController.IsHotspotBandApiSupported();
 
-    internal static bool IsHotspotSixGigahertzSupported()
-    {
-        try
-        {
-            return IsHotspotBandApiSupported() &&
-                ApiInformation.IsEnumNamedValuePresent(TetheringBandTypeName, "SixGigahertz");
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    internal static bool IsHotspotSixGigahertzSupported() => WindowsWifiApController.IsHotspotSixGigahertzSupported();
 
-    public WifiTransferProbe(Action<string> log, Dispatcher? dispatcher = null)
+    internal static WifiStationRadioInfo QueryStationRadioInfo() => WindowsWifiApController.QueryStationRadioInfo();
+
+    public WifiTransferProbe(Action<string> log, Dispatcher? dispatcher = null, HotspotConfigBackupStore? hotspotBackups = null)
     {
         this.log = log;
         this.dispatcher = dispatcher;
+        this.hotspotBackups = hotspotBackups ?? new HotspotConfigBackupStore();
         snapshot = new WifiProbeSnapshot(
             IsRunning: false,
             Mode: WifiProbeMode.WifiDirectLegacy,
@@ -107,6 +72,19 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         try
         {
             await StopInternalAsync(preserveResult: false);
+
+            if (!WindowsWifiHardwareLease.TryAcquire(HardwareLeaseOwner))
+            {
+                UpdateSnapshot(s => s with
+                {
+                    IsRunning = false,
+                    QrPayload = null,
+                    StatusMessage = "開始できませんでした。",
+                    ErrorMessage = "Wi-Fi 転送が動いているため試験を開始できません。終わってからもう一度試してください。",
+                });
+                return;
+            }
+            holdsLease = true;
 
             var cts = new CancellationTokenSource();
             sessionCts = cts;
@@ -148,7 +126,23 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
                     ? await StartWifiDirectLegacyAsync(credentials, cts.Token)
                     : await StartMobileHotspotAsync(credentials, requestedBand, cts.Token);
 
-                var (boundListener, virtualIp) = await BindVirtualAdapterListenerAsync(cts.Token);
+                TcpListener boundListener;
+                IPAddress virtualIp;
+                try
+                {
+                    (boundListener, virtualIp) = await WindowsWifiApController.BindVirtualAdapterListenerAsync(
+                        TimeSpan.FromSeconds(8),
+                        log,
+                        "wifi probe",
+                        requireProtocolValidLocalIpv4: false,
+                        cts.Token);
+                }
+                catch (InvalidOperationException)
+                {
+                    log("wifi probe error stage=bind reason=VirtualAdapterIpNotFound");
+                    throw new ProbeException(
+                        "仮想アダプタの IPv4 アドレスが見つかりませんでした。Wi-Fi がオンか確認するか、別の方式（モバイルホットスポット等）を切り替えて試してください。");
+                }
                 listener = boundListener;
                 var port = ((IPEndPoint)boundListener.LocalEndpoint).Port;
 
@@ -228,28 +222,19 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         try { sessionCts?.Cancel(); } catch { }
         try { listener?.Stop(); } catch { }
         try { publisher?.Stop(); } catch { }
-        var manager = tetheringManager;
-        var prevConfig = previousTetheringConfig;
-        var shouldRestoreConfig = tetheringConfigModified;
-        tetheringManager = null;
-        previousTetheringConfig = null;
-        tetheringConfigModified = false;
-        if (manager is not null)
+        var hotspot = Interlocked.Exchange(ref activeHotspot, null);
+        if (hotspot is not null)
+            WindowsWifiApController.StopHotspotAndRestoreSync(hotspot);
+        if (holdsLease)
         {
-            try
-            {
-                if (manager.TetheringOperationalState == TetheringOperationalState.On)
-                    manager.StopTetheringAsync().AsTask().Wait(TimeSpan.FromSeconds(1.5));
-                if (shouldRestoreConfig && CanRestoreAccessPointConfiguration(prevConfig))
-                    manager.ConfigureAccessPointAsync(prevConfig!).AsTask().Wait(TimeSpan.FromSeconds(1.5));
-            }
-            catch { }
+            holdsLease = false;
+            WindowsWifiHardwareLease.Release(HardwareLeaseOwner);
         }
     }
 
     private async Task StopInternalAsync(bool preserveResult)
     {
-        var hadActive = sessionCts is not null || publisher is not null || tetheringManager is not null || listener is not null;
+        var hadActive = sessionCts is not null || publisher is not null || activeHotspot is not null || listener is not null;
         await CleanupHardwareAsync();
         if (hadActive)
             log("wifi probe stopped");
@@ -296,28 +281,14 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
             try { activePublisher.Stop(); } catch { }
         }
 
-        var activeTethering = tetheringManager;
-        var prevConfig = previousTetheringConfig;
-        var shouldRestoreConfig = tetheringConfigModified;
-        tetheringManager = null;
-        previousTetheringConfig = null;
-        tetheringConfigModified = false;
-        if (activeTethering is not null)
+        var hotspot = Interlocked.Exchange(ref activeHotspot, null);
+        if (hotspot is not null)
+            await WindowsWifiApController.StopHotspotAndRestoreAsync(hotspot, log, "wifi probe");
+
+        if (holdsLease)
         {
-            try
-            {
-                using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
-                if (activeTethering.TetheringOperationalState == TetheringOperationalState.On)
-                    await activeTethering.StopTetheringAsync().AsTask(stopTimeout.Token);
-                if (shouldRestoreConfig && CanRestoreAccessPointConfiguration(prevConfig))
-                {
-                    await activeTethering.ConfigureAccessPointAsync(prevConfig!).AsTask(stopTimeout.Token);
-                }
-            }
-            catch (Exception ex)
-            {
-                log($"wifi probe tethering cleanup error={ex.GetType().Name}");
-            }
+            holdsLease = false;
+            WindowsWifiHardwareLease.Release(HardwareLeaseOwner);
         }
 
         cts?.Dispose();
@@ -429,10 +400,19 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         if (manager.TetheringOperationalState == TetheringOperationalState.On)
             throw new ProbeException("すでにWindowsのモバイルホットスポットがオンです。設定を壊さないよう、いったんオフにしてから試してください。");
 
-        tetheringManager = manager;
-        tetheringConfigModified = false;
-        try { previousTetheringConfig = manager.GetCurrentAccessPointConfiguration(); }
-        catch { previousTetheringConfig = null; }
+        NetworkOperatorTetheringAccessPointConfiguration? previousConfig = null;
+        try { previousConfig = manager.GetCurrentAccessPointConfiguration(); }
+        catch { previousConfig = null; }
+
+        var hotspotState = new ActiveHotspotState(manager, previousConfig, configModified: false, hotspotBackups);
+        activeHotspot = hotspotState;
+
+        var backupRecord = WindowsWifiApController.CreateBackupRecord(previousConfig, credentials.Ssid);
+        if (backupRecord is not null)
+        {
+            try { hotspotBackups.Save(backupRecord); }
+            catch (Exception ex) { log($"wifi hotspot backup save error={ex.GetType().Name}"); }
+        }
 
         var config = new NetworkOperatorTetheringAccessPointConfiguration
         {
@@ -443,7 +423,7 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         var bandApiSupported = IsHotspotBandApiSupported();
         if (bandApiSupported)
         {
-            var supportedBands = await QuerySupportedHotspotBandsAsync(config, ct);
+            var supportedBands = await WindowsWifiApController.QuerySupportedHotspotBandsAsync(config, ct);
             log(WifiProbeText.FormatHotspotBandsLog(supportedBands, requestedBand));
 
             if (requestedBand == WifiProbeBand.SixGHz && !IsHotspotSixGigahertzSupported())
@@ -455,8 +435,8 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
 
             try
             {
-                config.Band = ToWinRtBand(requestedBand);
-                tetheringConfigModified = true;
+                config.Band = WindowsWifiApController.ToWinRtBand(requestedBand);
+                hotspotState.ConfigModified = true;
                 await manager.ConfigureAccessPointAsync(config).AsTask(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -472,7 +452,7 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         }
         else
         {
-            tetheringConfigModified = true;
+            hotspotState.ConfigModified = true;
             await manager.ConfigureAccessPointAsync(config).AsTask(ct);
         }
 
@@ -486,178 +466,6 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         }
 
         return credentials.Ssid;
-    }
-
-    private static bool CanRestoreAccessPointConfiguration(NetworkOperatorTetheringAccessPointConfiguration? config) =>
-        config is not null &&
-        !string.IsNullOrEmpty(config.Ssid) &&
-        !string.IsNullOrEmpty(config.Passphrase) &&
-        config.Passphrase.Length >= 8;
-
-    private static TetheringWiFiBand ToWinRtBand(WifiProbeBand band) => band switch
-    {
-        WifiProbeBand.Auto => TetheringWiFiBand.Auto,
-        WifiProbeBand.TwoPointFourGHz => TetheringWiFiBand.TwoPointFourGigahertz,
-        WifiProbeBand.FiveGHz => TetheringWiFiBand.FiveGigahertz,
-        WifiProbeBand.SixGHz => SixGigahertzBand,
-        _ => TetheringWiFiBand.Auto,
-    };
-
-    private static async Task<IReadOnlyList<WifiProbeBand>> QuerySupportedHotspotBandsAsync(
-        NetworkOperatorTetheringAccessPointConfiguration config,
-        CancellationToken ct)
-    {
-        var candidates = new List<WifiProbeBand>
-        {
-            WifiProbeBand.TwoPointFourGHz,
-            WifiProbeBand.FiveGHz,
-        };
-        if (IsHotspotSixGigahertzSupported())
-            candidates.Add(WifiProbeBand.SixGHz);
-
-        var hasAsync = ApiInformation.IsMethodPresent(TetheringConfigTypeName, "IsBandSupportedAsync", 1);
-        var hasSync = ApiInformation.IsMethodPresent(TetheringConfigTypeName, "IsBandSupported", 1);
-        var supported = new List<WifiProbeBand>(candidates.Count);
-
-        foreach (var candidate in candidates)
-        {
-            ct.ThrowIfCancellationRequested();
-            try
-            {
-                var winrtBand = ToWinRtBand(candidate);
-                var ok = hasAsync
-                    ? await config.IsBandSupportedAsync(winrtBand).AsTask(ct)
-                    : hasSync && config.IsBandSupported(winrtBand);
-                if (ok)
-                    supported.Add(candidate);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch
-            {
-            }
-        }
-
-        return supported;
-    }
-
-    internal static WifiStationRadioInfo QueryStationRadioInfo()
-    {
-        try
-        {
-            if (WlanOpenHandle(2, 0, out _, out var handle) != 0 || handle == 0)
-                return WifiStationRadioInfo.Disconnected;
-
-            try
-            {
-                if (WlanEnumInterfaces(handle, 0, out var listPtr) != 0 || listPtr == 0)
-                    return WifiStationRadioInfo.Disconnected;
-
-                try
-                {
-                    var count = unchecked((uint)Marshal.ReadInt32(listPtr, 0));
-                    for (uint i = 0; i < count; i++)
-                    {
-                        var itemPtr = listPtr + WlanInterfaceInfoListHeaderBytes + (nint)(i * WlanInterfaceInfoBytes);
-                        var info = Marshal.PtrToStructure<WlanInterfaceInfoRaw>(itemPtr);
-                        if (info.State != WlanInterfaceStateConnected)
-                            continue;
-
-                        var guid = info.InterfaceGuid;
-                        var channel = QueryWlanChannel(handle, ref guid);
-                        var freqMhz = QueryWlanCenterFrequencyMhz(handle, ref guid);
-                        return WifiStationRadioInfo.FromChannelAndFrequency(channel, freqMhz);
-                    }
-                    return WifiStationRadioInfo.Disconnected;
-                }
-                finally
-                {
-                    WlanFreeMemory(listPtr);
-                }
-            }
-            finally
-            {
-                _ = WlanCloseHandle(handle, 0);
-            }
-        }
-        catch
-        {
-            return WifiStationRadioInfo.Disconnected;
-        }
-    }
-
-    private static int? QueryWlanChannel(nint handle, ref Guid interfaceGuid)
-    {
-        if (WlanQueryInterface(handle, ref interfaceGuid, WlanIntfOpcodeChannelNumber, 0, out var size, out var dataPtr, out _) != 0 ||
-            dataPtr == 0)
-            return null;
-
-        try
-        {
-            if (size < sizeof(uint))
-                return null;
-            var raw = unchecked((uint)Marshal.ReadInt32(dataPtr, 0));
-            return raw is > 0 and <= int.MaxValue ? (int)raw : null;
-        }
-        finally
-        {
-            WlanFreeMemory(dataPtr);
-        }
-    }
-
-    private static int? QueryWlanCenterFrequencyMhz(nint handle, ref Guid interfaceGuid)
-    {
-        if (WlanQueryInterface(handle, ref interfaceGuid, WlanIntfOpcodeRealtimeConnectionQuality, 0, out var size, out var dataPtr, out _) != 0 ||
-            dataPtr == 0)
-            return null;
-
-        try
-        {
-            if (size < (uint)Marshal.SizeOf<WlanRealtimeConnectionQualityHeader>())
-                return null;
-            var header = Marshal.PtrToStructure<WlanRealtimeConnectionQualityHeader>(dataPtr);
-            if (header.NumLinks == 0)
-                return null;
-            var freq = header.ChannelCenterFrequencyMhz;
-            return freq is > 0 and <= int.MaxValue ? (int)freq : null;
-        }
-        finally
-        {
-            WlanFreeMemory(dataPtr);
-        }
-    }
-
-    private async Task<(TcpListener Listener, IPAddress Address)> BindVirtualAdapterListenerAsync(CancellationToken ct)
-    {
-        var waitClock = Stopwatch.StartNew();
-        while (waitClock.Elapsed < TimeSpan.FromSeconds(8))
-        {
-            ct.ThrowIfCancellationRequested();
-            var allowApipa = waitClock.Elapsed >= TimeSpan.FromSeconds(2);
-            var allowNonUp = waitClock.Elapsed >= TimeSpan.FromSeconds(3.5);
-            var adapters = NetworkAdapterSnapshot.CaptureSystem();
-            var ip = WifiProbeIpSelector.SelectIp(adapters, allowApipa: allowApipa, allowNonUp: allowNonUp);
-            if (ip is not null)
-            {
-                try
-                {
-                    var tcp = new TcpListener(ip, 0);
-                    tcp.Start(1);
-                    return (tcp, ip);
-                }
-                catch (SocketException ex)
-                {
-                    log($"wifi probe bind retry socketError={ex.SocketErrorCode}");
-                }
-            }
-            await Task.Delay(150, ct);
-        }
-
-        log("wifi probe error stage=bind reason=VirtualAdapterIpNotFound");
-        throw new ProbeException(
-            "仮想アダプタの IPv4 アドレスが見つかりませんでした。Wi-Fi がオンか確認するか、別の方式（モバイルホットスポット等）を切り替えて試してください。");
     }
 
     private async Task AcceptLoopAsync(TcpListener tcpListener, string expectedToken, CancellationToken ct)
@@ -786,57 +594,6 @@ internal sealed class WifiTransferProbe : IAsyncDisposable
         TetheringCapability.DisabledByOperator => "通信事業者の制限でモバイルホットスポットを使えません。",
         _ => $"モバイルホットスポットを使えません（{capability}）。",
     };
-
-    [StructLayout(LayoutKind.Explicit, Size = WlanInterfaceInfoBytes)]
-    private struct WlanInterfaceInfoRaw
-    {
-        [FieldOffset(0)] public Guid InterfaceGuid;
-        [FieldOffset(528)] public uint State;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct WlanRealtimeConnectionQualityHeader
-    {
-        public uint Dot11PhyType;
-        public uint LinkQuality;
-        public uint RxRate;
-        public uint TxRate;
-        public int IsMloConnection;
-        public uint NumLinks;
-        public byte LinkId;
-        public uint ChannelCenterFrequencyMhz;
-        public uint Bandwidth;
-        public int Rssi;
-    }
-
-    [DllImport("wlanapi.dll")]
-    private static extern uint WlanOpenHandle(
-        uint dwClientVersion,
-        nint pReserved,
-        out uint pdwNegotiatedVersion,
-        out nint phClientHandle);
-
-    [DllImport("wlanapi.dll")]
-    private static extern uint WlanCloseHandle(nint hClientHandle, nint pReserved);
-
-    [DllImport("wlanapi.dll")]
-    private static extern uint WlanEnumInterfaces(
-        nint hClientHandle,
-        nint pReserved,
-        out nint ppInterfaceList);
-
-    [DllImport("wlanapi.dll")]
-    private static extern uint WlanQueryInterface(
-        nint hClientHandle,
-        ref Guid pInterfaceGuid,
-        uint opCode,
-        nint pReserved,
-        out uint pdwDataSize,
-        out nint ppData,
-        out uint pWlanOpcodeValueType);
-
-    [DllImport("wlanapi.dll")]
-    private static extern void WlanFreeMemory(nint pMemory);
 
     private sealed class ProbeException(string message) : Exception(message);
 }

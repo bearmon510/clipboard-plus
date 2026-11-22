@@ -19,6 +19,9 @@ public partial class App : System.Windows.Application
     private ClipboardMonitor? clipboard;
     private BleServer? server;
     private SyncCoordinator? coordinator;
+    private readonly WifiSessionReplayGuard wifiReplayGuard = new();
+    private HotspotConfigBackupStore? hotspotBackups;
+    private WindowsWifiTransferHost? wifiTransferHost;
     private AppLog? log;
     private MainWindow? window;
     private KeyboardHook? keyboardHook;
@@ -71,6 +74,9 @@ public partial class App : System.Windows.Application
         {
             log = new AppLog(); log.Write("application starting");
             Settings = new AppSettings(log: log.Write);
+            hotspotBackups = new HotspotConfigBackupStore();
+            wifiTransferHost = new WindowsWifiTransferHost(log.Write, hotspotBackups);
+            _ = Task.Run(() => WindowsWifiApController.TryRestorePendingHotspotConfigAsync(hotspotBackups, log.Write));
             HistoryWindow.ClearDragStaging(HistoryWindow.DragStagingRoot);
             var pairing = LocalStore.LoadOrCreate();
             window = new MainWindow(pairing, log.Write);
@@ -122,7 +128,10 @@ public partial class App : System.Windows.Application
             clipboard!,
             log!.Write,
             new SyncRepository(LocalStore.Root, pairing.PcId),
-            templateRepository: new TemplateRepository(LocalStore.Root, log!.Write));
+            templateRepository: new TemplateRepository(LocalStore.Root, log!.Write),
+            wifiHost: wifiTransferHost,
+            isWifiTransferEnabled: () => Settings.WifiTransferEnabled,
+            wifiReplayGuard: wifiReplayGuard);
         var current = coordinator;
         historyWindow?.Attach(current);
         coordinator.Changed += state => Dispatcher.BeginInvoke(() => { if (coordinator == current) window!.UpdateSync(state); });
@@ -303,6 +312,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        wifiTransferHost?.StopSync();
         window?.StopWifiProbeSync();
         keyboardHook?.Dispose();
         tray?.Dispose();

@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text.Json;
 using ClipboardPlus.Sync;
 
@@ -35,7 +37,17 @@ public sealed class ClipboardContentRejectedException(ClipboardRejectReason reas
 public sealed record SyncStatus(int Connected, int Pending, DateTimeOffset? LastSent, DateTimeOffset? LastReceived, bool Paired = true, IReadOnlyList<DeviceStatus>? Devices = null, IReadOnlyList<TransferProgress>? Transfers = null, bool RequiresPeerUpdate = false);
 
 /// <summary>All protocol state is serialized here, independently of WinRT and the UI.</summary>
-public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipboard, Action<string> log, SyncRepository? repository = null, Func<DateTimeOffset>? clock = null, TemplateRepository? templateRepository = null) : IAsyncDisposable
+public sealed class SyncCoordinator(
+    SyncPairing pairing,
+    IClipboardAccess clipboard,
+    Action<string> log,
+    SyncRepository? repository = null,
+    Func<DateTimeOffset>? clock = null,
+    TemplateRepository? templateRepository = null,
+    IWifiTransferHost? wifiHost = null,
+    Func<bool>? isWifiTransferEnabled = null,
+    WifiSessionReplayGuard? wifiReplayGuard = null,
+    WifiTransferOptions? wifiOptions = null) : IAsyncDisposable
 {
     private sealed class Connection(SyncPairing pair, ISyncPeer peer, DateTimeOffset now)
     {
@@ -46,6 +58,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly Queue<byte[]> ControlFrames = new();
         public readonly List<Guid> AckQueue = [];
         public readonly Queue<SyncMessage> Replies = new();
+        public readonly Queue<WifiControlMessage> WifiMessages = new();
         public readonly Queue<TemplateSyncMessage> TemplateMessages = new();
         public TemplateSyncPageAssembler? IncomingTemplatePush;
         public Guid? IncomingTemplatePushOp;
@@ -80,6 +93,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly HashSet<Guid> ResumedAttachments = [];
         public readonly HashSet<Guid> FinalChunkSentAttachments = [];
         public TransferProgress? Progress;
+        public volatile TransferProgress? WifiProgress;
         public bool VersionRejected;
         public readonly SyncPcHandshake Handshake = new(pair);
         public readonly Dictionary<Guid, PendingReply> Sent = [];
@@ -89,8 +103,35 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         public readonly DateTimeOffset Started = now;
         public DateTimeOffset LastPacket = now;
         public int Stage;
+        public SyncSessionKeys? SessionKeys;
+        public bool SupportsWifiTransfer => SessionKeys?.SupportsWifiTransfer == true;
         public SyncFrameSender? Sender;
         public SyncFrameReceiver? Receiver;
+    }
+
+    private sealed class ActiveWifiSession(
+        Connection connection,
+        Guid sessionId,
+        WifiTransferDirection direction,
+        HashSet<Guid> requestedIds)
+    {
+        public readonly Connection Connection = connection;
+        public readonly Guid DeviceId = connection.DeviceId;
+        public readonly Guid SessionId = sessionId;
+        public readonly WifiTransferDirection Direction = direction;
+        public readonly HashSet<Guid> RequestedIds = requestedIds;
+        public readonly CancellationTokenSource SessionCts = new();
+        public readonly CancellationTokenSource PreAuthCts = new();
+        public readonly CancellationTokenSource TtlTimerCts = new();
+        public readonly TaskCompletionSource PeerClosedOrCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public IWifiTransferSessionHandle? Handle;
+        public DateTimeOffset? ExpiresAt;
+        public bool ReadySent;
+        public bool Authenticated;
+        public bool TtlExpired;
+        public bool CancelledByPeer;
+        public bool CancelMessageSent;
+        public string? PeerFallbackReason;
     }
 
     private sealed record PendingChunk(int EndOffset, bool HandedOffLastPacket, PendingReply? Reply);
@@ -151,6 +192,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
     private const int MaxAttachmentChunksInFlight = 4;
     private const int MaxQueuedTemplateMessages = SyncProtocol.MaxTemplatePages * 4;
+    private const int MaxQueuedWifiMessages = 32;
     internal TimeSpan SendPacketTimeout { get; set; } = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan HighThroughputIdleGrace = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ReplyTimeout = TimeSpan.FromSeconds(60);
@@ -163,10 +205,15 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
     private readonly Dictionary<ISyncPeer, Connection> connections = new(ReferenceEqualityComparer.Instance);
     private readonly SyncRepository store = repository ?? new SyncRepository(Path.Combine(Path.GetTempPath(), "clipboardplus-tests", Guid.NewGuid().ToString("N")), pairing.PcId);
     private readonly TemplateRepository templateStore = templateRepository ?? new TemplateRepository(Path.Combine(Path.GetTempPath(), "clipboardplus-tests", Guid.NewGuid().ToString("N")), log);
+    private readonly WifiSessionReplayGuard wifiReplay = wifiReplayGuard ?? new WifiSessionReplayGuard();
+    private readonly WifiTransferOptions wifiConfig = wifiOptions ?? WifiTransferOptions.Default;
     private readonly List<Guid> incompatibleDevices = [];
     private readonly HashSet<Guid> attempted = [];
     private readonly HashSet<Task> activeOutgoing = [];
+    private readonly HashSet<Task> activeWifiTasks = [];
     private TemplateSyncSession? activeTemplateSync;
+    private ActiveWifiSession? activeWifi;
+    private int wifiPublishScheduled;
     private bool stopped;
     private uint? ownSequence;
     private uint? lastClipboardSequence;
@@ -179,7 +226,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
     private SyncStatus Snapshot() => new(connections.Values.Count(c => c.Stage == 2), store.PendingCount, lastSent, lastReceived, true,
         store.Devices.Select(d => new DeviceStatus(d.Id, d.Kind, connections.Values.Any(c => c.Stage == 2 && c.DeviceId == d.Id), d.LastConnected, store.Pending(d.Id).Count)).ToArray(),
-        connections.Values.Select(c => c.Progress).OfType<TransferProgress>().ToArray(), RequiresPeerUpdate);
+        connections.Values.Select(c => c.WifiProgress ?? c.Progress).OfType<TransferProgress>().ToArray(), RequiresPeerUpdate);
     private void Publish() { if (!stopped) Changed?.Invoke(Snapshot()); }
     public event Action? HistoryChanged;
     public async Task<SyncStatus> GetStatusAsync() { await gate.WaitAsync(); try { return Snapshot(); } finally { gate.Release(); } }
@@ -449,10 +496,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         ClipboardRejectReason.ImageCorrupt => "image-corrupt",
         _ => "content"
     };
-    private async Task CommitAsync(Connection c, HistoryItem item) {
+    private async Task CommitAsync(Connection c, HistoryItem item, bool queueBleAck = true, bool logBleAttachmentSpeed = true) {
         var now = Now();
         var duplicate = store.Duplicate(item, c.DeviceId, now);
-        c.Progress = new(c.DeviceId, "receive", item.Id, 1, 1, item.Size, item.Size); Publish();
+        if (queueBleAck) { c.Progress = new(c.DeviceId, "receive", item.Id, 1, 1, item.Size, item.Size); Publish(); }
         AttachmentReceive? rx = null;
         if (item.Kind != "text")
         {
@@ -467,7 +514,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             {
                 store.CommitRejected(c.DeviceId, item.Id);
                 log($"received rejected reason={RejectReasonText(ex.Reason)}");
-                QueueAck(c, item.Id); c.Progress = null;
+                if (queueBleAck) { QueueAck(c, item.Id); c.Progress = null; }
                 return;
             }
         }
@@ -475,14 +522,14 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         lastReceived = now;
         if (!duplicate) HistoryChanged?.Invoke();
         log(duplicate ? "duplicate content items=1" : $"received items=1 bytes={item.Size}");
-        if (item.Kind != "text")
+        if (item.Kind != "text" && logBleAttachmentSpeed)
         {
             var elapsedMs = rx is null ? 0 : Math.Max(0, (now - rx.StartedAt).TotalMilliseconds);
             var transferred = rx is null ? item.Size : Math.Max(0, item.Size - rx.StartOffset);
             var kbps = elapsedMs > 0 ? (transferred / 1024.0) / (elapsedMs / 1000.0) : 0.0;
             log($"attachment received bytes={item.Size} elapsedMs={elapsedMs:F0} speedKBps={kbps:F1}");
         }
-        QueueAck(c, item.Id); c.Progress = null;
+        if (queueBleAck) { QueueAck(c, item.Id); c.Progress = null; }
     }
     private string Source(Connection c) => store.Devices.First(d => d.Id == c.DeviceId).Kind == "phone" ? "iPhone" : "iPad";
     private async Task FinishIncomingAsync(Connection c, SyncOffer offer) {
@@ -611,6 +658,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 else if (c.Stage == 1)
                 {
                     var keys = c.Handshake.AcceptAuth(frame);
+                    c.SessionKeys = keys;
                     c.Sender = new(keys.PcToPad);
                     c.Receiver = new(keys.PadToPc);
                     c.Stage = 2;
@@ -628,7 +676,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 }
                 else
                 {
-                    var decoded = DecodeStage2Message(c.Receiver!.Open(frame));
+                    var decoded = DecodeStage2Message(c.Receiver!.Open(frame), allowWifiControl: c.SupportsWifiTransfer);
                     if (decoded is SyncPing or SyncPong)
                     {
                         RevertReplyExtension(c, frameToken);
@@ -657,6 +705,10 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                             default:
                                 throw new SyncProtocolException(SyncError.Format);
                         }
+                    }
+                    else if (decoded is WifiControlMessage wifiMessage)
+                    {
+                        HandleWifiControlMessage(c, wifiMessage);
                     }
                     else
                     {
@@ -873,13 +925,21 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 {
                     // An attachment whose 60-second reply deadline expires drops the connection so the
                     // next session restarts cleanly from offer; text items may resend on the same link.
-                    var expired = c.Sent.Where(p => p.Key != c.InFlight && now > p.Value.Deadline).Select(p => p.Key).ToArray();
+                    var wifiIds = activeWifi is { } currentWifi && ReferenceEquals(currentWifi.Connection, c)
+                        ? currentWifi.RequestedIds
+                        : null;
+                    var expired = c.Sent
+                        .Where(p => p.Key != c.InFlight && (wifiIds is null || !wifiIds.Contains(p.Key)) && now > p.Value.Deadline)
+                        .Select(p => p.Key)
+                        .ToArray();
                     bool attachmentExpired;
                     Guid? activeAttachmentId;
                     bool outgoingAttachmentActive;
                     lock (c.HandoffStateGate)
                     {
-                        attachmentExpired = c.ActiveAttachment?.Chunks.Any(ch => ch.Reply is { } reply && now > reply.Deadline) ?? false;
+                        attachmentExpired = c.ActiveAttachment is { } activeForExpiry &&
+                            (wifiIds is null || !wifiIds.Contains(activeForExpiry.Id)) &&
+                            activeForExpiry.Chunks.Any(ch => ch.Reply is { } reply && now > reply.Deadline);
                         activeAttachmentId = c.ActiveAttachment?.Id;
                         outgoingAttachmentActive = c.ActiveAttachment is { } activeAtt &&
                             (c.InFlight == activeAtt.Id || now - activeAtt.LastActivity < HighThroughputIdleGrace);
@@ -921,6 +981,7 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                 }
             }
             TickTemplateSyncSession(now);
+            TickWifiSession(now);
             Publish();
         }
         finally { gate.Release(); }
@@ -941,6 +1002,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             if (!stopped)
             {
                 stopped = true;
+                if (activeWifi is { } runningWifi)
+                {
+                    try { runningWifi.SessionCts.Cancel(); } catch { }
+                    try { runningWifi.PreAuthCts.Cancel(); } catch { }
+                    try { runningWifi.TtlTimerCts.Cancel(); } catch { }
+                }
                 foreach (var c in connections.Values.ToArray()) Drop(c, "stopped");
                 if (activeTemplateSync is { } dangling)
                 {
@@ -956,6 +1023,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             lock (activeOutgoing) tasks = activeOutgoing.ToArray();
             if (tasks.Length == 0) break;
             await Task.WhenAll(tasks);
+        }
+        while (true)
+        {
+            Task[] wifiTasks;
+            lock (activeWifiTasks) wifiTasks = activeWifiTasks.ToArray();
+            if (wifiTasks.Length == 0) break;
+            await Task.WhenAll(wifiTasks);
         }
     }
 
@@ -992,6 +1066,13 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         StartSending(c);
     }
 
+    private void QueueWifiMessage(Connection c, WifiControlMessage message)
+    {
+        if (c.WifiMessages.Count >= MaxQueuedWifiMessages) throw new SyncProtocolException(SyncError.Limit);
+        c.WifiMessages.Enqueue(message);
+        StartSending(c);
+    }
+
     // Test synchronization only. Production must not wait for the sender to become idle.
     internal async Task WaitForOutgoingAsync(ISyncPeer? peer = null)
     {
@@ -1000,6 +1081,18 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         try { tasks = connections.Values.Where(c => peer is null || c.Peer == peer).Select(c => c.Outgoing).ToArray(); }
         finally { gate.Release(); }
         await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15));
+    }
+
+    // Test synchronization only.
+    internal async Task WaitForWifiIdleAsync()
+    {
+        while (true)
+        {
+            Task[] tasks;
+            lock (activeWifiTasks) tasks = activeWifiTasks.ToArray();
+            if (tasks.Length == 0) break;
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15));
+        }
     }
 
     private async Task SendLoopAsync(Connection c)
@@ -1031,6 +1124,8 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     }
                     else if (c.Stage == 2 && c.Replies.TryDequeue(out var reply))
                         frame = c.Sender!.Seal(SyncMessageCodec.Encode(reply));
+                    else if (c.Stage == 2 && c.WifiMessages.TryDequeue(out var wifiMsg))
+                        frame = c.Sender!.Seal(WifiControlMessageCodec.Encode(wifiMsg));
                     else if (c.Stage == 2 && c.TemplateMessages.TryDequeue(out var templateMsg))
                     {
                         sendingTemplate = true;
@@ -1040,11 +1135,15 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                     }
                     else
                     {
+                        var wifiIds = activeWifi is { } currentWifi && ReferenceEquals(currentWifi.Connection, c)
+                            ? currentWifi.RequestedIds
+                            : null;
                         var pendingList = store.Pending(c.DeviceId);
                         if (c.Stage == 2 && (item = pendingList.FirstOrDefault(i =>
                             i.Kind == "text"
                                 ? !c.Sent.ContainsKey(i.Id)
-                                : (c.ActiveAttachment is null ? !c.Sent.ContainsKey(i.Id) : c.ActiveAttachment.Id == i.Id && c.ActiveAttachment.CanSendChunk))) is not null)
+                                : (wifiIds is null || !wifiIds.Contains(i.Id)) &&
+                                  (c.ActiveAttachment is null ? !c.Sent.ContainsKey(i.Id) : c.ActiveAttachment.Id == i.Id && c.ActiveAttachment.CanSendChunk))) is not null)
                         {
                             SyncMessage message;
                             var sentNow = Now();
@@ -1264,11 +1363,17 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
             c.ResumedAttachments.Clear();
             c.FinalChunkSentAttachments.Clear();
         }
-        c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.Sent.Clear();
+        c.ControlFrames.Clear(); c.AckQueue.Clear(); c.Replies.Clear(); c.WifiMessages.Clear(); c.Sent.Clear();
         c.TemplateMessages.Clear(); c.AwaitingPeerTemplateAcks.Clear(); c.PcInitiatedTemplateOps.Clear(); c.PcInitiatedTemplateOpOrder.Clear(); c.SendingTemplateMessage = false;
         ClearIncomingTemplatePush(c, "disconnect");
         c.ActiveIncomingAttachments.Clear(); c.AttachmentReceives.Clear();
-        c.OfferedThisConnection.Clear(); c.Progress = null;
+        c.OfferedThisConnection.Clear(); c.Progress = null; c.WifiProgress = null; c.SessionKeys = null;
+        if (activeWifi is { } wf && ReferenceEquals(wf.Connection, c))
+        {
+            try { wf.SessionCts.Cancel(); } catch { }
+            try { wf.PreAuthCts.Cancel(); } catch { }
+            try { wf.TtlTimerCts.Cancel(); } catch { }
+        }
         if (c.HighThroughputRequested) { c.HighThroughputRequested = false; c.Peer.SetHighThroughput(false); }
         connections.Remove(c.Peer);
         attempted.RemoveWhere(id => !store.Devices.Any(d => store.Pending(d.Id).Any(i => i.Id == id)));
@@ -1280,16 +1385,19 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
         Publish();
     }
 
-    private static object DecodeStage2Message(byte[] plaintext)
+    private static object DecodeStage2Message(byte[] plaintext, bool allowWifiControl)
     {
-        // Peek "t" only to dispatch to the right strict codec; both codecs perform full validation.
+        // Peek "t" only to dispatch to the right strict codec; each codec performs full validation.
         if (plaintext.Length >= 2)
         {
             var headerLen = BinaryPrimitives.ReadUInt16BigEndian(plaintext);
             if (headerLen > 0 && headerLen <= plaintext.Length - 2)
             {
                 var headerSpan = plaintext.AsSpan(2, headerLen);
-                if (headerSpan.IndexOf("tpl_"u8) >= 0 || headerSpan.IndexOf("\\u"u8) >= 0)
+                var maybeTemplate = headerSpan.IndexOf("tpl_"u8) >= 0;
+                var maybeWifi = allowWifiControl && headerSpan.IndexOf("wifi_"u8) >= 0;
+                var maybeEscaped = headerSpan.IndexOf("\\u"u8) >= 0;
+                if (maybeTemplate || maybeWifi || maybeEscaped)
                 {
                     try
                     {
@@ -1297,10 +1405,12 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
                         if (doc.RootElement.ValueKind == JsonValueKind.Object &&
                             doc.RootElement.TryGetProperty("t", out var tProp) &&
                             tProp.ValueKind == JsonValueKind.String &&
-                            tProp.GetString() is string t &&
-                            t.StartsWith("tpl_", StringComparison.Ordinal))
+                            tProp.GetString() is string t)
                         {
-                            return TemplateSyncMessageCodec.Decode(plaintext);
+                            if (t.StartsWith("tpl_", StringComparison.Ordinal))
+                                return TemplateSyncMessageCodec.Decode(plaintext);
+                            if (allowWifiControl && t.StartsWith("wifi_", StringComparison.Ordinal))
+                                return WifiControlMessageCodec.Decode(plaintext);
                         }
                     }
                     catch (JsonException) { /* Fall through to SyncMessageCodec.Decode which throws SyncError.Format. */ }
@@ -1944,6 +2054,684 @@ public sealed class SyncCoordinator(SyncPairing pairing, IClipboardAccess clipbo
 
     private static void ConfirmReplyExtension(Connection c, ulong frameToken) =>
         TransformReplies(c, entry => ConfirmReply(entry, frameToken));
+
+    private void HandleWifiControlMessage(Connection c, WifiControlMessage message)
+    {
+        if (!c.SupportsWifiTransfer)
+            throw new SyncProtocolException(SyncError.Format);
+
+        switch (message)
+        {
+            case WifiRequest request:
+            {
+                var enabled = isWifiTransferEnabled?.Invoke() ?? true;
+                if (!enabled)
+                {
+                    QueueWifiMessage(c, new WifiUnavailable(WifiUnavailableReason.Disabled));
+                    log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.UnavailableReason(WifiUnavailableReason.Disabled)));
+                    return;
+                }
+                if (wifiHost is null)
+                {
+                    QueueWifiMessage(c, new WifiUnavailable(WifiUnavailableReason.Unsupported));
+                    log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.UnavailableReason(WifiUnavailableReason.Unsupported)));
+                    return;
+                }
+                if (activeWifi is not null)
+                {
+                    QueueWifiMessage(c, new WifiUnavailable(WifiUnavailableReason.Busy));
+                    log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.UnavailableReason(WifiUnavailableReason.Busy)));
+                    return;
+                }
+
+                var credentials = wifiConfig.CredentialsFactory?.Invoke() ?? WifiTransferCredentials.CreateRandom();
+                var session = new ActiveWifiSession(c, credentials.Session, request.Direction, request.Ids.ToHashSet());
+                activeWifi = session;
+                LaunchWifiSession(session, credentials);
+                return;
+            }
+
+            case WifiJoinResult joinResult:
+            {
+                if (activeWifi is { } wf && ReferenceEquals(wf.Connection, c) && wf.SessionId == joinResult.Session)
+                {
+                    log(WifiTransferLogFormat.Join(joinResult.Status));
+                    if (joinResult.Status != WifiJoinStatus.Joined)
+                    {
+                        wf.CancelledByPeer = true;
+                        wf.PeerFallbackReason ??= WifiTransferLogFormat.JoinStatus(joinResult.Status);
+                        try { wf.SessionCts.Cancel(); } catch { }
+                        try { wf.PreAuthCts.Cancel(); } catch { }
+                        try { wf.TtlTimerCts.Cancel(); } catch { }
+                    }
+                }
+                return;
+            }
+
+            case WifiCancel cancel:
+            {
+                if (activeWifi is { } wf && ReferenceEquals(wf.Connection, c) && wf.SessionId == cancel.Session)
+                {
+                    if (cancel.Reason == WifiCancelReason.Completed)
+                    {
+                        wf.PeerClosedOrCompleted.TrySetResult();
+                    }
+                    else
+                    {
+                        wf.CancelledByPeer = true;
+                        wf.PeerFallbackReason ??= WifiTransferLogFormat.CancelReason(cancel.Reason);
+                        try { wf.SessionCts.Cancel(); } catch { }
+                        try { wf.PreAuthCts.Cancel(); } catch { }
+                        try { wf.TtlTimerCts.Cancel(); } catch { }
+                    }
+                }
+                return;
+            }
+
+            default:
+                throw new SyncProtocolException(SyncError.Format);
+        }
+    }
+
+    private void TickWifiSession(DateTimeOffset now)
+    {
+        if (activeWifi is { ReadySent: true, Authenticated: false, TtlExpired: false, ExpiresAt: DateTimeOffset expiresAt } wf &&
+            now >= expiresAt)
+        {
+            wf.TtlExpired = true;
+            try { wf.PreAuthCts.Cancel(); } catch { }
+            try { wf.TtlTimerCts.Cancel(); } catch { }
+        }
+    }
+
+    private void LaunchWifiSession(ActiveWifiSession session, WifiTransferCredentials credentials)
+    {
+        lock (activeWifiTasks)
+        {
+            Task? task = null;
+            task = Task.Run(async () =>
+            {
+                try { await RunWifiSessionAsync(session, credentials).ConfigureAwait(false); }
+                finally { lock (activeWifiTasks) activeWifiTasks.Remove(task!); }
+            });
+            activeWifiTasks.Add(task);
+        }
+    }
+
+    private async Task RunWifiSessionAsync(ActiveWifiSession session, WifiTransferCredentials credentials)
+    {
+        var c = session.Connection;
+        IWifiTransferSessionHandle? handle = null;
+        WifiAcceptedConnection? accepted = null;
+        WifiTransferKeys? transferKeys = null;
+        Task? ttlTimerTask = null;
+        var tokenCopy = credentials.Token.ToArray();
+
+        try
+        {
+            var startWatch = Stopwatch.StartNew();
+            WifiHostStartResult startResult;
+            try
+            {
+                startResult = await wifiHost!.StartAsync(credentials, session.SessionCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                if (session.CancelledByPeer && session.PeerFallbackReason is { } peerReason)
+                    log(WifiTransferLogFormat.Fallback(peerReason));
+                else if (!stopped)
+                    log(WifiTransferLogFormat.Fallback("disconnected"));
+                return;
+            }
+            catch (Exception ex)
+            {
+                log($"wifi transfer start error={ex.GetType().Name}");
+                startResult = WifiHostStartResult.Failure(WifiUnavailableReason.StartFailed);
+            }
+            startWatch.Stop();
+
+            if (!startResult.Succeeded || startResult.Handle is null)
+            {
+                await gate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (!stopped && !c.Retired && ReferenceEquals(activeWifi, session) && !session.CancelledByPeer)
+                    {
+                        QueueWifiMessage(c, new WifiUnavailable(startResult.FailureReason));
+                        log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.UnavailableReason(startResult.FailureReason)));
+                    }
+                }
+                finally { gate.Release(); }
+                return;
+            }
+
+            handle = startResult.Handle;
+            var ttlSeconds = Math.Clamp(wifiConfig.TtlSeconds, 1, SyncProtocol.WifiMaxTtlSeconds);
+
+            WifiReady ready;
+            try
+            {
+                ready = new WifiReady(
+                    session.SessionId,
+                    handle.ActualSsid,
+                    credentials.Passphrase,
+                    handle.Ip,
+                    handle.Port,
+                    tokenCopy.ToArray(),
+                    ttlSeconds);
+                WifiControlMessageCodec.ValidateReady(ready);
+            }
+            catch (SyncProtocolException)
+            {
+                await gate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (!stopped && !c.Retired && ReferenceEquals(activeWifi, session) && !session.CancelledByPeer)
+                    {
+                        QueueWifiMessage(c, new WifiUnavailable(WifiUnavailableReason.StartFailed));
+                        log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.UnavailableReason(WifiUnavailableReason.StartFailed)));
+                    }
+                }
+                finally { gate.Release(); }
+                return;
+            }
+
+            await gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (stopped || c.Retired || !ReferenceEquals(activeWifi, session) || session.SessionCts.IsCancellationRequested)
+                {
+                    if (session.CancelledByPeer && session.PeerFallbackReason is { } peerReason)
+                        log(WifiTransferLogFormat.Fallback(peerReason));
+                    return;
+                }
+                var bleKeys = c.SessionKeys;
+                if (bleKeys is null || !bleKeys.SupportsWifiTransfer)
+                {
+                    QueueWifiMessage(c, new WifiUnavailable(WifiUnavailableReason.Unsupported));
+                    log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.UnavailableReason(WifiUnavailableReason.Unsupported)));
+                    return;
+                }
+                transferKeys = WifiTransferKeys.Derive(bleKeys, tokenCopy, session.SessionId);
+                session.Handle = handle;
+                session.ReadySent = true;
+                session.ExpiresAt = Now() + TimeSpan.FromSeconds(ttlSeconds);
+                QueueWifiMessage(c, ready);
+                log(WifiTransferLogFormat.Ready(handle.Mode, session.Direction, session.RequestedIds.Count, startWatch.ElapsedMilliseconds));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(tokenCopy);
+                gate.Release();
+            }
+
+            ttlTimerTask = RunWifiTtlTimerAsync(session, ttlSeconds);
+
+            using var preAuthLinked = CancellationTokenSource.CreateLinkedTokenSource(session.SessionCts.Token, session.PreAuthCts.Token);
+            accepted = await handle.AcceptAsync(preAuthLinked.Token).ConfigureAwait(false);
+
+            var acceptedRef = accepted;
+            await using var timedStream = new IdleTimeoutStream(
+                accepted.Stream,
+                wifiConfig.EffectivePreAuthReadTimeout,
+                wifiConfig.EffectiveDelayAsync,
+                onTimeout: () => { try { acceptedRef.Stream.Close(); } catch { } });
+
+            var channel = await WifiEncryptedStream
+                .AcceptAsPcAsync(timedStream, transferKeys, wifiReplay, preAuthLinked.Token)
+                .ConfigureAwait(false);
+
+            long plannedOutgoingBytes;
+            await gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (session.TtlExpired)
+                    throw new TimeoutException("Wi-Fi session TTL expired before authentication completed.");
+                if (stopped || c.Retired || session.SessionCts.IsCancellationRequested)
+                    throw new OperationCanceledException(session.SessionCts.Token);
+
+                session.Authenticated = true;
+                try { session.TtlTimerCts.Cancel(); } catch { }
+                plannedOutgoingBytes = session.Direction is WifiTransferDirection.Receive or WifiTransferDirection.Both
+                    ? store.Pending(c.DeviceId)
+                        .Where(i => i.Kind != "text" && session.RequestedIds.Contains(i.Id))
+                        .Sum(i => (long)i.Size)
+                    : 0;
+            }
+            finally { gate.Release(); }
+
+            transferKeys = null;
+            timedStream.Timeout = wifiConfig.EffectivePostAuthIdleTimeout;
+
+            log(WifiTransferLogFormat.Start(handle.Mode, session.RequestedIds.Count, plannedOutgoingBytes));
+            var transferWatch = Stopwatch.StartNew();
+
+            var allowReceive = session.Direction is WifiTransferDirection.Send or WifiTransferDirection.Both;
+            var sink = new CoordinatorWifiTransferSink(this, c, session, allowReceive);
+            var received = await WifiTransferEngine.ReceiveItemsAsync(
+                channel,
+                sink,
+                expectedFrom: "pad",
+                onProgress: null,
+                cancellationToken: session.SessionCts.Token).ConfigureAwait(false);
+
+            var outgoingSources = await BuildWifiOutgoingSourcesAsync(c, session).ConfigureAwait(false);
+            IReadOnlyList<WifiSentItemResult> sent;
+            try
+            {
+                var sendIndexById = new Dictionary<Guid, int>(outgoingSources.Count);
+                for (var i = 0; i < outgoingSources.Count; i++)
+                    sendIndexById[outgoingSources[i].Offer.Id] = i + 1;
+
+                sent = await WifiTransferEngine.SendItemsAsync(
+                    channel,
+                    outgoingSources,
+                    onProgress: (id, bytes, total) =>
+                    {
+                        var num = sendIndexById.GetValueOrDefault(id, 1);
+                        ScheduleWifiProgressPublish(c, "send", id, num, Math.Max(1, outgoingSources.Count), bytes, total);
+                    },
+                    cancellationToken: session.SessionCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                foreach (var src in outgoingSources)
+                    src.Dispose();
+            }
+
+            if (sent.Count > 0)
+            {
+                await gate.WaitAsync().ConfigureAwait(false);
+                try { AckSentWifiItemsLocked(c, sent); }
+                finally { gate.Release(); }
+            }
+
+            transferWatch.Stop();
+            var totalBytes = received.Sum(r => (long)r.TransferredBytes) + sent.Sum(s => (long)s.TransferredBytes);
+            log(WifiTransferLogFormat.Done(handle.Mode, received.Count, sent.Count, totalBytes, transferWatch.Elapsed));
+
+            await WaitForPeerCloseOrGraceAsync(accepted, session).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (session.TtlExpired && !session.SessionCts.IsCancellationRequested)
+        {
+            await SendWifiCancelAndLogAsync(c, session, WifiCancelReason.Timeout).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            if (session.CancelledByPeer)
+                log(WifiTransferLogFormat.Fallback(session.PeerFallbackReason ?? "user_cancelled"));
+            else if (!stopped)
+                log(WifiTransferLogFormat.Fallback("disconnected"));
+        }
+        catch (TimeoutException)
+        {
+            await SendWifiCancelAndLogAsync(c, session, WifiCancelReason.Timeout).ConfigureAwait(false);
+        }
+        catch (SyncProtocolException ex)
+        {
+            var cancelReason = ex.Code == SyncError.Packet ? WifiCancelReason.TcpFailed : WifiCancelReason.ProtocolError;
+            await SendWifiCancelAndLogAsync(c, session, cancelReason).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException)
+        {
+            await SendWifiCancelAndLogAsync(c, session, WifiCancelReason.TcpFailed).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            log($"wifi transfer error={ex.GetType().Name}");
+            await SendWifiCancelAndLogAsync(c, session, WifiCancelReason.TcpFailed).ConfigureAwait(false);
+        }
+        finally
+        {
+            transferKeys = null;
+            CryptographicOperations.ZeroMemory(tokenCopy);
+
+            try { session.TtlTimerCts.Cancel(); } catch { }
+            if (ttlTimerTask is not null)
+            {
+                try { await ttlTimerTask.ConfigureAwait(false); } catch { }
+            }
+
+            if (accepted is not null)
+            {
+                try { await accepted.DisposeAsync().ConfigureAwait(false); } catch { }
+            }
+            if (handle is not null)
+            {
+                try { await handle.DisposeAsync().ConfigureAwait(false); } catch { }
+            }
+
+            await gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                c.WifiProgress = null;
+                if (ReferenceEquals(activeWifi, session))
+                    activeWifi = null;
+                if (!stopped && !c.Retired)
+                {
+                    var refreshedNow = Now();
+                    var refreshedDeadline = refreshedNow + ReplyTimeout;
+                    foreach (var id in session.RequestedIds)
+                    {
+                        if (c.Sent.ContainsKey(id))
+                            c.Sent[id] = new(refreshedNow, refreshedDeadline, refreshedDeadline, null);
+                    }
+                    lock (c.HandoffStateGate)
+                    {
+                        if (c.ActiveAttachment is { } att && session.RequestedIds.Contains(att.Id))
+                            att.LastActivity = refreshedNow;
+                    }
+                    StartSending(c);
+                }
+                Publish();
+            }
+            finally { gate.Release(); }
+
+            session.SessionCts.Dispose();
+            session.PreAuthCts.Dispose();
+            session.TtlTimerCts.Dispose();
+        }
+    }
+
+    private async Task RunWifiTtlTimerAsync(ActiveWifiSession session, int ttlSeconds)
+    {
+        try
+        {
+            await wifiConfig.EffectiveDelayAsync(TimeSpan.FromSeconds(ttlSeconds), session.TtlTimerCts.Token).ConfigureAwait(false);
+            await gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (ReferenceEquals(activeWifi, session) &&
+                    !session.Authenticated &&
+                    !session.TtlExpired &&
+                    !session.SessionCts.IsCancellationRequested)
+                {
+                    session.TtlExpired = true;
+                    try { session.PreAuthCts.Cancel(); } catch { }
+                }
+            }
+            finally { gate.Release(); }
+        }
+        catch (OperationCanceledException) { }
+        catch { }
+    }
+
+    private async Task SendWifiCancelAndLogAsync(Connection c, ActiveWifiSession session, WifiCancelReason reason)
+    {
+        if (session.CancelledByPeer)
+        {
+            log(WifiTransferLogFormat.Fallback(session.PeerFallbackReason ?? WifiTransferLogFormat.CancelReason(reason)));
+            return;
+        }
+        await gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!stopped && !c.Retired && !session.CancelMessageSent && session.ReadySent)
+            {
+                session.CancelMessageSent = true;
+                QueueWifiMessage(c, new WifiCancel(session.SessionId, reason));
+            }
+            log(WifiTransferLogFormat.Fallback(WifiTransferLogFormat.CancelReason(reason)));
+        }
+        finally { gate.Release(); }
+    }
+
+    private async Task WaitForPeerCloseOrGraceAsync(WifiAcceptedConnection accepted, ActiveWifiSession session)
+    {
+        try { accepted.ShutdownSend(); } catch { }
+        var grace = wifiConfig.EffectivePostDoneCloseGrace;
+        if (grace <= TimeSpan.Zero) return;
+
+        using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(session.SessionCts.Token);
+        var buf = new byte[1];
+        var readTask = WaitForStreamEofAsync(accepted.Stream, buf, drainCts.Token);
+        var delayTask = wifiConfig.EffectiveDelayAsync(grace, drainCts.Token);
+        try
+        {
+            await Task.WhenAny(readTask, session.PeerClosedOrCompleted.Task, delayTask).ConfigureAwait(false);
+        }
+        catch { }
+        finally
+        {
+            try { drainCts.Cancel(); } catch { }
+        }
+    }
+
+    private static async Task WaitForStreamEofAsync(Stream stream, byte[] buffer, CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var read = await stream.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false);
+                if (read == 0) return;
+            }
+        }
+        catch { }
+    }
+
+    private void ScheduleWifiProgressPublish(Connection c, string direction, Guid itemId, int itemNumber, int itemCount, int bytes, int totalBytes)
+    {
+        c.WifiProgress = new TransferProgress(c.DeviceId, direction, itemId, itemNumber, itemCount, bytes, totalBytes);
+        if (Interlocked.CompareExchange(ref wifiPublishScheduled, 1, 0) != 0)
+            return;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await gate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    Volatile.Write(ref wifiPublishScheduled, 0);
+                    if (!stopped) Publish();
+                }
+                finally { gate.Release(); }
+            }
+            catch
+            {
+                Volatile.Write(ref wifiPublishScheduled, 0);
+            }
+        });
+    }
+
+    private async Task<List<FileWifiTransferSource>> BuildWifiOutgoingSourcesAsync(Connection c, ActiveWifiSession session)
+    {
+        var sources = new List<FileWifiTransferSource>();
+        if (session.Direction is not (WifiTransferDirection.Receive or WifiTransferDirection.Both))
+            return sources;
+
+        await gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (stopped || c.Retired) return sources;
+            foreach (var item in store.Pending(c.DeviceId))
+            {
+                if (item.Kind == "text") continue;
+                if (!session.RequestedIds.Contains(item.Id)) continue;
+                if (string.IsNullOrEmpty(item.Path) || !File.Exists(item.Path)) continue;
+                sources.Add(new FileWifiTransferSource(item.Offer, item.Path));
+            }
+        }
+        finally { gate.Release(); }
+        return sources;
+    }
+
+    private void AckSentWifiItemsLocked(Connection c, IReadOnlyList<WifiSentItemResult> sent)
+    {
+        var ids = sent.Select(s => s.Id).ToHashSet();
+        if (ids.Count == 0) return;
+        store.Ack(c.DeviceId, ids);
+        lock (c.HandoffStateGate)
+        {
+            if (c.ActiveAttachment is { } activeAtt && ids.Contains(activeAtt.Id))
+                c.ActiveAttachment = null;
+        }
+        foreach (var id in ids)
+        {
+            c.Sent.Remove(id);
+            c.Attempted.Remove(id);
+            c.ResumedAttachments.Remove(id);
+            c.FinalChunkSentAttachments.Remove(id);
+        }
+        if (c.InFlight is Guid current && ids.Contains(current)) c.InFlight = null;
+        if (c.Progress is { Direction: "send" } p && ids.Contains(p.ItemId)) c.Progress = null;
+        lastSent = Now();
+        Publish();
+    }
+
+    private sealed class CoordinatorWifiTransferSink(
+        SyncCoordinator coordinator,
+        Connection connection,
+        ActiveWifiSession session,
+        bool allowReceive) : IWifiTransferSink
+    {
+        private readonly HashSet<Guid> offeredThisWifiSession = [];
+        public int CurrentItemNumber { get; private set; }
+        public int EstimatedItemCount => Math.Max(1, session.RequestedIds.Count);
+
+        public async Task<WifiOfferDecision> BeginOfferAsync(SyncOffer offer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!allowReceive)
+                throw new SyncProtocolException(SyncError.State);
+            if (!session.RequestedIds.Contains(offer.Id))
+                throw new SyncProtocolException(SyncError.State);
+            if (!offeredThisWifiSession.Add(offer.Id))
+                throw new SyncProtocolException(SyncError.State);
+            if (offer.From != "pad")
+                throw new SyncProtocolException(SyncError.Format);
+            SyncMessageCodec.ValidateOffer(offer, maxSize: SyncProtocol.MaxWifiItemBytes);
+
+            await coordinator.gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (coordinator.stopped || connection.Retired)
+                    throw new OperationCanceledException(cancellationToken);
+
+                CurrentItemNumber++;
+                if (coordinator.store.Seen(connection.DeviceId, offer.Id))
+                    return WifiOfferDecision.AlreadyCompleted;
+
+                var offset = coordinator.store.Begin(
+                    connection.DeviceId,
+                    offer,
+                    coordinator.Now(),
+                    maxSize: SyncProtocol.MaxWifiItemBytes);
+                connection.WifiProgress = new(connection.DeviceId, "receive", offer.Id, CurrentItemNumber, EstimatedItemCount, offset, offer.Size);
+                coordinator.Publish();
+                return WifiOfferDecision.Resume(offset);
+            }
+            finally { coordinator.gate.Release(); }
+        }
+
+        public async Task<int> AppendChunkAsync(Guid id, int offset, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!allowReceive || !session.RequestedIds.Contains(id))
+                throw new SyncProtocolException(SyncError.State);
+
+            await coordinator.gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (coordinator.stopped || connection.Retired)
+                    throw new OperationCanceledException(cancellationToken);
+
+                var saved = coordinator.store.Append(connection.DeviceId, id, offset, data.Span, flushToDisk: false);
+                if (coordinator.store.Incoming(connection.DeviceId, id) is { } incoming)
+                {
+                    connection.WifiProgress = new(connection.DeviceId, "receive", id, CurrentItemNumber, EstimatedItemCount, saved, incoming.Size);
+                    coordinator.Publish();
+                }
+                return saved;
+            }
+            finally { coordinator.gate.Release(); }
+        }
+
+        public async Task VerifyAndCompleteAsync(SyncOffer offer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!allowReceive || !session.RequestedIds.Contains(offer.Id))
+                throw new SyncProtocolException(SyncError.State);
+
+            await coordinator.gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (coordinator.stopped || connection.Retired)
+                    throw new OperationCanceledException(cancellationToken);
+
+                try
+                {
+                    var item = coordinator.store.Complete(connection.DeviceId, offer, coordinator.Source(connection));
+                    await coordinator.CommitAsync(connection, item, queueBleAck: false, logBleAttachmentSpeed: false).ConfigureAwait(false);
+                    coordinator.store.DiscardPartial(connection.DeviceId, offer.Id);
+                    connection.WifiProgress = null;
+                    coordinator.Publish();
+                }
+                catch
+                {
+                    connection.WifiProgress = null;
+                    connection.ActiveIncomingAttachments.Remove(offer.Id);
+                    connection.AttachmentReceives.Remove(offer.Id);
+                    try { coordinator.store.DiscardPartial(connection.DeviceId, offer.Id); }
+                    catch { }
+                    coordinator.Publish();
+                    throw;
+                }
+            }
+            finally { coordinator.gate.Release(); }
+        }
+
+        public async Task DiscardPartialAsync(Guid id, CancellationToken cancellationToken = default)
+        {
+            await coordinator.gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                coordinator.store.DiscardPartial(connection.DeviceId, id);
+            }
+            finally { coordinator.gate.Release(); }
+        }
+    }
+
+    private sealed class FileWifiTransferSource(SyncOffer offer, string path) : IWifiTransferSource, IDisposable
+    {
+        private FileStream? stream;
+        public SyncOffer Offer { get; } = offer;
+
+        public async Task<int> ReadChunkAsync(int offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (offset < 0 || offset >= Offer.Size)
+                throw new SyncProtocolException(SyncError.State);
+
+            stream ??= new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                bufferSize: 64 * 1024,
+                useAsync: true);
+
+            if (stream.Position != offset)
+                stream.Position = offset;
+
+            var want = Math.Min(buffer.Length, Offer.Size - offset);
+            var totalRead = 0;
+            while (totalRead < want)
+            {
+                var read = await stream.ReadAsync(buffer.Slice(totalRead, want - totalRead), cancellationToken).ConfigureAwait(false);
+                if (read == 0)
+                    throw new IOException("Attachment body truncated while reading for Wi-Fi transfer.");
+                totalRead += read;
+            }
+            return totalRead;
+        }
+
+        public void Dispose()
+        {
+            stream?.Dispose();
+            stream = null;
+        }
+    }
 
     // Exception messages can contain paths or external input. Log only a fixed code/type.
     private static string Failure(Exception e) => e is SyncProtocolException p ? p.Code.ToString() : e.GetType().Name;

@@ -27,6 +27,7 @@ internal sealed class AppSettings
         public bool? HotkeyEnabled { get; set; }
         public string? Hotkey { get; set; }
         public bool? PasteOnSelect { get; set; }
+        public bool? WifiTransferEnabled { get; set; }
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public WindowBoundsData? HistoryWindow { get; set; }
     }
@@ -40,6 +41,7 @@ internal sealed class AppSettings
     public bool HotkeyEnabled { get; set; } = true;
     public string Hotkey { get; set; } = HotkeyChord.Default.ToString();
     public bool PasteOnSelect { get; set; } = true;
+    public bool WifiTransferEnabled { get; set; } = true;
     public WindowPlacement? HistoryWindow
     {
         get { lock (gate) return historyWindow; }
@@ -78,6 +80,7 @@ internal sealed class AppSettings
 
                 HotkeyEnabled = data.HotkeyEnabled ?? true;
                 PasteOnSelect = data.PasteOnSelect ?? true;
+                WifiTransferEnabled = data.WifiTransferEnabled ?? true;
 
                 if (data.Hotkey is null)
                 {
@@ -157,6 +160,7 @@ internal sealed class AppSettings
                 HotkeyEnabled = HotkeyEnabled,
                 Hotkey = Hotkey,
                 PasteOnSelect = PasteOnSelect,
+                WifiTransferEnabled = WifiTransferEnabled,
                 HistoryWindow = historyBounds,
             };
 
@@ -185,6 +189,7 @@ internal sealed class AppSettings
         HotkeyEnabled = true;
         Hotkey = HotkeyChord.Default.ToString();
         PasteOnSelect = true;
+        WifiTransferEnabled = true;
         historyWindow = null;
     }
 }

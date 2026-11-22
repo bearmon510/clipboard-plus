@@ -27,6 +27,7 @@ public sealed class AppSettingsTests : IDisposable
         Assert.Equal("Win+V", settings.Hotkey);
         Assert.Equal(HotkeyChord.Default, settings.ParsedHotkey);
         Assert.True(settings.PasteOnSelect);
+        Assert.True(settings.WifiTransferEnabled);
         Assert.Empty(logs);
     }
 
@@ -39,6 +40,7 @@ public sealed class AppSettingsTests : IDisposable
             HotkeyEnabled = false,
             Hotkey = "Ctrl+NonConvert",
             PasteOnSelect = false,
+            WifiTransferEnabled = false,
         };
         settings.Save();
 
@@ -50,6 +52,7 @@ public sealed class AppSettingsTests : IDisposable
         Assert.Equal("Ctrl+NonConvert", reloaded.Hotkey);
         Assert.Equal(new HotkeyChord(HotkeyModifier.Ctrl, 0x1D), reloaded.ParsedHotkey);
         Assert.False(reloaded.PasteOnSelect);
+        Assert.False(reloaded.WifiTransferEnabled);
         Assert.Empty(logs);
     }
 

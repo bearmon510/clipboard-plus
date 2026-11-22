@@ -120,10 +120,10 @@ public sealed class SyncRepository
     }
     public void ClearHistory()
     { state.History.Clear(); foreach (var queue in state.Pending.Values) queue.Clear(); Save(); CleanupBodies(); }
-    public HistoryItem Create(ClipboardContent content, long at, string source, Guid? id = null)
+    public HistoryItem Create(ClipboardContent content, long at, string source, Guid? id = null, int maxSize = SyncProtocol.MaxItemBytes)
     {
         var bytes = content.Kind == "text" ? Encoding.UTF8.GetBytes(content.Text ?? "") : content.Data ?? throw new IOException("Body missing");
-        if (bytes.Length > SyncProtocol.MaxItemBytes) throw new SyncProtocolException(SyncError.Limit);
+        if (bytes.Length > maxSize) throw new SyncProtocolException(SyncError.Limit);
         var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
         string? path = null;
         if (content.Kind != "text")
@@ -151,9 +151,9 @@ public sealed class SyncRepository
         Save(); CleanupBodies();
     }
     public string PartialPath(Guid device, Guid id) => System.IO.Path.Combine(root, "partial", $"{device:N}-{id:N}.part");
-    public int Begin(Guid device, SyncOffer offer, DateTimeOffset now)
+    public int Begin(Guid device, SyncOffer offer, DateTimeOffset now, int maxSize = SyncProtocol.MaxItemBytes)
     {
-        SyncMessageCodec.ValidateOffer(offer);
+        SyncMessageCodec.ValidateOffer(offer, maxSize);
         var previous = state.Partials.FirstOrDefault(p => p.Device == device && p.Offer.Id == offer.Id);
         if (previous is not null && previous.Offer != offer) throw new SyncProtocolException(SyncError.Format);
         if (previous is null)
@@ -178,12 +178,16 @@ public sealed class SyncRepository
         return (int)length;
     }
     public SyncOffer? Incoming(Guid device, Guid id) => state.Partials.FirstOrDefault(p => p.Device == device && p.Offer.Id == id)?.Offer;
-    public int Append(Guid device, SyncChunk chunk)
+    public int Append(Guid device, SyncChunk chunk) => Append(device, chunk.Id, chunk.Offset, chunk.Data, flushToDisk: true);
+    public int Append(Guid device, Guid id, int offset, ReadOnlySpan<byte> data, bool flushToDisk = true)
     {
-        var offer = Incoming(device, chunk.Id) ?? throw new SyncProtocolException(SyncError.State);
-        using var file = new FileStream(PartialPath(device, chunk.Id), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-        if (chunk.Offset != file.Length || chunk.Data.Length > offer.Size - file.Length) throw new SyncProtocolException(SyncError.Format);
-        file.Position = file.Length; file.Write(chunk.Data); file.Flush(true); return checked((int)file.Length);
+        var offer = Incoming(device, id) ?? throw new SyncProtocolException(SyncError.State);
+        using var file = new FileStream(PartialPath(device, id), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        if (offset != file.Length || data.Length > offer.Size - file.Length) throw new SyncProtocolException(SyncError.Format);
+        file.Position = file.Length;
+        file.Write(data);
+        if (flushToDisk) file.Flush(true);
+        return checked((int)file.Length);
     }
     public HistoryItem Complete(Guid device, SyncOffer offer, string source)
     {

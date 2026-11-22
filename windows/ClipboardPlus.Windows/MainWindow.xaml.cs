@@ -56,7 +56,7 @@ public partial class MainWindow : Window
         if (preview)
         {
             Title = "clipboard+ for Windows — プレビュー";
-            RepairButton.IsEnabled = LogsButton.IsEnabled = StartupCheck.IsEnabled = false;
+            RepairButton.IsEnabled = LogsButton.IsEnabled = StartupCheck.IsEnabled = WifiTransferCheck.IsEnabled = false;
             WifiProbeModeDirect.IsEnabled = WifiProbeModeHotspot.IsEnabled = WifiProbeStartButton.IsEnabled = false;
             SetWifiProbeBandControlsEnabled(false);
             UpdateBluetooth("プレビュー表示");
@@ -112,7 +112,7 @@ public partial class MainWindow : Window
     internal void ConfigureHotkey(AppSettings value, Func<CancellationToken, Task<HotkeyChord?>> record, Action apply)
     {
         settings = value; recordHotkey = record; applyHotkey = apply;
-        if (preview) HotkeyCheck.IsEnabled = RecordButton.IsEnabled = PasteCheck.IsEnabled = HistoryButton.IsEnabled = false;
+        if (preview) HotkeyCheck.IsEnabled = RecordButton.IsEnabled = PasteCheck.IsEnabled = WifiTransferCheck.IsEnabled = HistoryButton.IsEnabled = false;
         ShowHotkey();
     }
 
@@ -122,6 +122,7 @@ public partial class MainWindow : Window
         HotkeyCheck.IsChecked = settings.HotkeyEnabled;
         HotkeyText.Text = settings.ParsedHotkey.DisplayName;
         PasteCheck.IsChecked = settings.PasteOnSelect;
+        WifiTransferCheck.IsChecked = settings.WifiTransferEnabled;
         ResetHotkeyButton.IsEnabled = !preview && settings.ParsedHotkey != HotkeyChord.Default;
     }
 
@@ -149,6 +150,7 @@ public partial class MainWindow : Window
 
     private void OnHotkeyEnabledChanged(object sender, RoutedEventArgs e) { StopRecording(); SaveHotkey(s => s.HotkeyEnabled = HotkeyCheck.IsChecked == true); }
     private void OnPasteChanged(object sender, RoutedEventArgs e) { StopRecording(); SaveHotkey(s => s.PasteOnSelect = PasteCheck.IsChecked == true); }
+    private void OnWifiTransferChanged(object sender, RoutedEventArgs e) { StopRecording(); SaveHotkey(s => s.WifiTransferEnabled = WifiTransferCheck.IsChecked == true); }
     private void OnResetHotkey(object sender, RoutedEventArgs e)
     {
         StopRecording();
